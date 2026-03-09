@@ -1,0 +1,497 @@
+"""ib_insync concrete implementation of IBClientBase.
+
+This is the ONLY file in the project that imports ib_insync.
+All IB API interaction goes through this class.
+outsideRth = True is enforced here — engine code never sets IB order fields directly.
+"""
+import asyncio
+import json
+import logging
+import time
+from decimal import Decimal
+from ib_insync import IB, Contract, LimitOrder, MarketOrder, Trade, Fill
+
+from ib_trader.ib.base import IBClientBase
+
+logger = logging.getLogger(__name__)
+
+
+class InsyncClient(IBClientBase):
+    """IB API client implemented via ib_insync.
+
+    Connects to TWS or IB Gateway over TCP.
+    Manages a single IB() connection and registers event callbacks.
+    All orders enforce outsideRth=True for extended-hours trading.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        client_id: int,
+        account_id: str,
+        min_call_interval_ms: int = 100,
+        connect_timeout: int = 10,
+        market_data_type: int = 3,
+    ) -> None:
+        """Initialize with connection parameters.
+
+        Args:
+            host: TWS/Gateway hostname or IP.
+            port: TWS/Gateway port (7497 live, 7496 paper, 4001 GW live, 4002 GW paper).
+            client_id: Unique client ID for this connection.
+            account_id: IB account ID (e.g. U1234567 or DU1234567 for paper).
+                Set on every order to satisfy IB error 435 "You must specify an
+                account" when the client is connected to multiple accounts.
+            min_call_interval_ms: Minimum ms between IB API calls.
+            connect_timeout: Seconds to wait for connection.
+            market_data_type: IB market data type (1=live, 2=frozen, 3=delayed,
+                4=delayed-frozen).  Paper accounts require 3 to avoid error 10197
+                (competing live session); live accounts with real-time subscriptions
+                should use 1.
+        """
+        super().__init__(min_call_interval_ms=min_call_interval_ms)
+        self._host = host
+        self._port = port
+        self._client_id = client_id
+        self._account_id = account_id
+        self._connect_timeout = connect_timeout
+        self._market_data_type = market_data_type
+        self._ib = IB()
+        self._fill_callbacks: list = []
+        self._status_callbacks: list = []
+        # Maps ib_order_id -> Trade object for amendment support
+        self._active_trades: dict[str, Trade] = {}
+        # Maps con_id -> fully-qualified Contract ready for order placement.
+        # Populated by qualify_contract(); reused by place_* methods so that
+        # symbol, secType, exchange, and currency are all present in the IB
+        # API message.  A bare Contract(conId=...) omits these fields and
+        # causes IB to reject orders with "Missing order exchange".
+        self._contract_cache: dict[int, Contract] = {}
+        # Short-lived price cache to avoid hammering the IB API on every
+        # reprice step when live market data is unavailable (e.g. error 10197).
+        # Keyed by con_id; value is (bid, ask, last, expiry_monotonic).
+        # This is NOT order/trade/position state — it is ephemeral pricing data
+        # that is acceptable to cache in memory and safe to lose on crash.
+        self._snapshot_cache: dict[int, tuple[Decimal, Decimal, Decimal, float]] = {}
+        self._snapshot_cache_ttl: float = 60.0  # seconds
+        # IB order-rejection errors captured by the errorEvent callback.
+        # Keyed by ib_order_id (str).  The PendingSubmit wait loop in the engine
+        # polls this so it can surface the real IB rejection reason instead of
+        # a generic timeout message.  Safe to lose on crash (in-flight orders
+        # are recovered from SQLite as ABANDONED on next startup).
+        self._order_errors: dict[str, str] = {}
+        # IB error codes that indicate an order was rejected or has a price/
+        # validation problem.  110 = price doesn't conform to min tick.
+        # 200-299 = order/account-level errors (201=rejected, 203=no shorting…).
+        self._order_error_codes: frozenset[int] = frozenset({110}) | frozenset(range(200, 300))
+
+    async def connect(self) -> None:
+        """Connect to TWS or IB Gateway."""
+        # Silence ib_insync's own logger — it logs every IB error message at
+        # ERROR level before our errorEvent callback fires, producing duplicates.
+        # We handle all error-level reporting ourselves in _on_error.
+        import logging as _logging
+        _logging.getLogger("ib_insync").setLevel(_logging.CRITICAL)
+
+        await self._throttle()
+        await self._ib.connectAsync(
+            self._host,
+            self._port,
+            clientId=self._client_id,
+            timeout=self._connect_timeout,
+        )
+        self._ib.disconnectedEvent += self._on_disconnected
+        self._ib.execDetailsEvent += self._on_exec_details
+        self._ib.orderStatusEvent += self._on_order_status
+        self._ib.errorEvent += self._on_error
+        self._ib.reqMarketDataType(self._market_data_type)
+        logger.info(
+            '{"event": "IB_CONNECTED", "host": "%s", "port": %d, "client_id": %d}',
+            self._host, self._port, self._client_id,
+        )
+
+    async def disconnect(self) -> None:
+        """Disconnect from TWS or IB Gateway."""
+        self._ib.disconnect()
+        logger.info('{"event": "IB_DISCONNECTED"}')
+
+    async def qualify_contract(
+        self,
+        symbol: str,
+        sec_type: str = "STK",
+        exchange: str = "SMART",
+        currency: str = "USD",
+    ) -> dict:
+        """Qualify an IB contract and return its details."""
+        await self._throttle()
+        contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
+        [qualified] = await self._ib.qualifyContractsAsync(contract)
+        raw = json.dumps({
+            "conId": qualified.conId,
+            "symbol": qualified.symbol,
+            "secType": qualified.secType,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": qualified.multiplier,
+        })
+        # Build a fully-specified contract for order placement.  We keep the
+        # symbol and secType from the qualified result so that ib_insync
+        # includes them in the serialised API message.  exchange is forced to
+        # 'SMART' regardless of what IB reports as the primary exchange —
+        # SMART is the correct routing value for order submission.
+        self._contract_cache[qualified.conId] = Contract(
+            conId=qualified.conId,
+            symbol=qualified.symbol,
+            secType=qualified.secType,
+            exchange="SMART",
+            currency=qualified.currency,
+        )
+        logger.info(
+            '{"event": "CONTRACT_FETCHED", "symbol": "%s", "con_id": %d}',
+            symbol, qualified.conId,
+        )
+        return {
+            "con_id": qualified.conId,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": qualified.multiplier or None,
+            "raw": raw,
+        }
+
+    async def get_market_snapshot(self, con_id: int) -> dict:
+        """Fetch a bid/ask/last snapshot for a contract.
+
+        Primary path: reqMktData snapshot.  Polls up to 5 s for valid data
+        and breaks early once bid+ask or last arrive.
+
+        Fallback path: reqHistoricalData MIDPOINT.  Used when reqMktData
+        returns zeros — this happens on paper accounts that share credentials
+        with a live account (IB error 10197 'competing live session').
+        Historical data uses a separate IB data pathway not subject to the
+        competing-session restriction, so it succeeds where reqMktData fails.
+        When falling back, bid and ask are both set to the midpoint so that
+        calc_mid() returns the same value, keeping order pricing consistent.
+
+        Cache: results are cached for snapshot_cache_ttl seconds.  Without
+        this, every reprice step triggers the full 5 s reqMktData polling loop,
+        burning the entire reprice window on a single step.
+        """
+        cached = self._snapshot_cache.get(con_id)
+        if cached is not None:
+            bid, ask, last, expiry = cached
+            if time.monotonic() < expiry:
+                logger.debug(
+                    '{"event": "SNAPSHOT_CACHE_HIT", "con_id": %d}', con_id
+                )
+                return {"bid": bid, "ask": ask, "last": last}
+
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, exchange="SMART", currency="USD"
+        )
+        ticker = self._ib.reqMktData(contract, "", True, False)
+        for _ in range(50):  # up to 5 s in 100 ms steps
+            await asyncio.sleep(0.1)
+            if ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0:
+                break
+            # Outside market hours bid/ask are absent; last (closing price) is
+            # the best available reference — break early rather than spin 5 s.
+            if ticker.last and ticker.last > 0:
+                break
+        bid = Decimal(str(ticker.bid)) if ticker.bid and ticker.bid > 0 else Decimal("0")
+        ask = Decimal(str(ticker.ask)) if ticker.ask and ticker.ask > 0 else Decimal("0")
+        last = Decimal(str(ticker.last)) if ticker.last and ticker.last > 0 else Decimal("0")
+        if bid == 0 and ask == 0 and last == 0:
+            ref = await self._historical_midpoint(contract)
+            if ref > 0:
+                logger.info(
+                    '{"event": "SNAPSHOT_HIST_FALLBACK", "con_id": %d, "mid": "%s"}',
+                    con_id, ref,
+                )
+                bid = ask = last = ref
+
+        if bid > 0 or ask > 0 or last > 0:
+            expiry = time.monotonic() + self._snapshot_cache_ttl
+            self._snapshot_cache[con_id] = (bid, ask, last, expiry)
+
+        return {"bid": bid, "ask": ask, "last": last}
+
+    async def _historical_midpoint(self, contract: Contract) -> Decimal:
+        """Return the most recent MIDPOINT price from historical data.
+
+        Uses a 1-hour lookback with 1-minute bars.  Historical data requests
+        use a separate IB pathway that is not blocked by error 10197
+        (competing live session), making this a reliable fallback when
+        reqMktData is unavailable.
+
+        Returns Decimal("0") on any error so callers can handle it uniformly.
+        """
+        await self._throttle()
+        try:
+            bars = await self._ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr="3600 S",
+                barSizeSetting="1 min",
+                whatToShow="MIDPOINT",
+                useRTH=False,
+                formatDate=1,
+            )
+            if bars:
+                return Decimal(str(bars[-1].close))
+        except Exception as e:
+            logger.warning(
+                '{"event": "SNAPSHOT_HIST_FALLBACK_FAILED", "error": "%s"}', str(e)
+            )
+        return Decimal("0")
+
+    async def place_limit_order(
+        self,
+        con_id: int,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        price: Decimal,
+        outside_rth: bool = True,
+        tif: str = "GTC",
+    ) -> str:
+        """Place a GTC limit order. Returns IB order ID as string."""
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, exchange="SMART", currency="USD"
+        )
+        order = LimitOrder(side, float(qty), float(price))
+        order.account = self._account_id
+        order.outsideRth = outside_rth
+        order.tif = tif
+        trade = self._ib.placeOrder(contract, order)
+        ib_order_id = str(trade.order.orderId)
+        self._active_trades[ib_order_id] = trade
+        logger.info(
+            '{"event": "ORDER_PLACED", "symbol": "%s", "side": "%s", '
+            '"qty": "%s", "price": "%s", "ib_order_id": "%s"}',
+            symbol, side, qty, price, ib_order_id,
+        )
+        return ib_order_id
+
+    async def place_market_order(
+        self,
+        con_id: int,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        outside_rth: bool = True,
+    ) -> str:
+        """Place a market order. Returns IB order ID as string."""
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, exchange="SMART", currency="USD"
+        )
+        order = MarketOrder(side, float(qty))
+        order.account = self._account_id
+        order.outsideRth = outside_rth
+        trade = self._ib.placeOrder(contract, order)
+        ib_order_id = str(trade.order.orderId)
+        self._active_trades[ib_order_id] = trade
+        logger.info(
+            '{"event": "ORDER_PLACED", "symbol": "%s", "side": "%s", '
+            '"qty": "%s", "type": "MARKET", "ib_order_id": "%s"}',
+            symbol, side, qty, ib_order_id,
+        )
+        return ib_order_id
+
+    async def amend_order(self, ib_order_id: str, new_price: Decimal) -> None:
+        """Amend an existing limit order to a new price in place."""
+        await self._throttle()
+        trade = self._active_trades.get(ib_order_id)
+        if trade is None:
+            logger.warning(
+                '{"event": "ORDER_AMENDED", "warning": "trade not in active cache", '
+                '"ib_order_id": "%s"}', ib_order_id
+            )
+            return
+        # Wait for IB to acknowledge the order (assign permId) before amending.
+        # Amending while still PendingSubmit causes error 103 (duplicate order id)
+        # because IB hasn't recorded the order yet and treats the amendment as a
+        # second new order with the same client-assigned orderId.
+        for _ in range(50):  # up to 5 s in 100 ms steps
+            status = trade.orderStatus.status
+            if status and status not in ("", "PendingSubmit"):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            logger.warning(
+                '{"event": "ORDER_AMENDED", "warning": "order still PendingSubmit after 5s, skipping", '
+                '"ib_order_id": "%s"}', ib_order_id
+            )
+            return
+        trade.order.lmtPrice = float(new_price)
+        self._ib.placeOrder(trade.contract, trade.order)
+        logger.info(
+            '{"event": "ORDER_AMENDED", "ib_order_id": "%s", "new_price": "%s"}',
+            ib_order_id, new_price,
+        )
+
+    async def cancel_order(self, ib_order_id: str) -> None:
+        """Cancel an open order."""
+        await self._throttle()
+        trade = self._active_trades.get(ib_order_id)
+        if trade is None:
+            logger.warning(
+                '{"event": "ORDER_CANCELED", "warning": "trade not in active cache", '
+                '"ib_order_id": "%s"}', ib_order_id
+            )
+            return
+        # Skip if order is already in a terminal state — sending a cancel in that
+        # case causes IB error 10147 "OrderId not found for cancellation".
+        terminal = {"Cancelled", "Filled", "Inactive"}
+        if trade.orderStatus.status in terminal:
+            logger.info(
+                '{"event": "ORDER_CANCEL_SKIPPED", "reason": "already terminal", '
+                '"status": "%s", "ib_order_id": "%s"}',
+                trade.orderStatus.status, ib_order_id,
+            )
+            return
+        self._ib.cancelOrder(trade.order)
+        logger.info('{"event": "ORDER_CANCELED", "ib_order_id": "%s"}', ib_order_id)
+
+    async def get_order_status(self, ib_order_id: str) -> dict:
+        """Get current status of an order from IB."""
+        await self._throttle()
+        trade = self._active_trades.get(ib_order_id)
+        if trade is None:
+            return {
+                "status": "UNKNOWN",
+                "qty_filled": Decimal("0"),
+                "avg_fill_price": None,
+                "commission": None,
+            }
+        status = trade.orderStatus.status
+        qty_filled = Decimal(str(trade.orderStatus.filled))
+        avg_price = (
+            Decimal(str(trade.orderStatus.avgFillPrice))
+            if trade.orderStatus.avgFillPrice
+            else None
+        )
+        commission = None
+        if trade.fills:
+            total_commission = sum(
+                Decimal(str(f.commissionReport.commission))
+                for f in trade.fills
+                if f.commissionReport
+            )
+            commission = total_commission if total_commission else None
+        return {
+            "status": status,
+            "qty_filled": qty_filled,
+            "avg_fill_price": avg_price,
+            "commission": commission,
+        }
+
+    async def get_open_orders(self) -> list[dict]:
+        """Get all currently open orders from IB."""
+        await self._throttle()
+        open_trades = await self._ib.reqOpenOrdersAsync()
+        result = []
+        for trade in open_trades:
+            result.append({
+                "ib_order_id": str(trade.order.orderId),
+                "symbol": trade.contract.symbol,
+                "status": trade.orderStatus.status,
+                "qty_filled": Decimal(str(trade.orderStatus.filled)),
+                "avg_fill_price": (
+                    Decimal(str(trade.orderStatus.avgFillPrice))
+                    if trade.orderStatus.avgFillPrice
+                    else None
+                ),
+            })
+        return result
+
+    def get_order_error(self, ib_order_id: str) -> str | None:
+        """Return the stored IB rejection message for this order, or None."""
+        return self._order_errors.get(ib_order_id)
+
+    def has_contract_cached(self, con_id: int) -> bool:
+        """Return True if the in-memory contract cache has a fully-specified
+        Contract for this con_id."""
+        return con_id in self._contract_cache
+
+    def register_fill_callback(self, callback) -> None:
+        """Register a callback for fill events."""
+        self._fill_callbacks.append(callback)
+
+    def register_status_callback(self, callback) -> None:
+        """Register a callback for order status change events."""
+        self._status_callbacks.append(callback)
+
+    # IB codes that are purely informational — connectivity/farm status notices.
+    # Logged at INFO level; never treated as errors.
+    _INFO_CODES: frozenset[int] = frozenset({
+        1100,  # Connectivity between IB and TWS lost
+        1101,  # Connectivity restored — data lost
+        1102,  # Connectivity restored — data maintained
+        2104,  # Market data farm connection OK
+        2106,  # HMDS data farm connection OK
+        2107,  # HMDS data farm connection inactive (not an error)
+        2108,  # Market data farm connection inactive (not an error)
+        2158,  # Sec-def data farm connection OK
+    })
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, *_) -> None:
+        """Handle IB error events.
+
+        Order-level errors (codes 110, 200-299) are stored in _order_errors
+        keyed by ib_order_id so the PendingSubmit wait loop in the engine can
+        surface the real rejection reason immediately instead of waiting for the
+        full 10-second timeout before reporting a generic message.
+
+        Connectivity/farm status codes (1100-1102, 2104-2158) are logged at
+        INFO level — they are notifications, not errors.
+
+        The *_ absorbs the optional advancedOrderRejectJson argument present in
+        newer ib_insync versions without breaking older ones.
+        """
+        ib_order_id = str(reqId)
+        if errorCode in self._order_error_codes and ib_order_id in self._active_trades:
+            logger.error(
+                '{"event": "IB_ORDER_ERROR", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                ib_order_id, errorCode, errorString,
+            )
+            self._order_errors[ib_order_id] = f"[{errorCode}] {errorString}"
+        elif errorCode in self._INFO_CODES:
+            logger.info(
+                '{"event": "IB_NOTICE", "reqId": %d, "code": %d, "msg": "%s"}',
+                reqId, errorCode, errorString,
+            )
+        else:
+            logger.warning(
+                '{"event": "IB_ERROR", "reqId": %d, "code": %d, "msg": "%s"}',
+                reqId, errorCode, errorString,
+            )
+
+    def _on_disconnected(self) -> None:
+        """Handle IB disconnect event."""
+        logger.error('{"event": "IB_DISCONNECTED", "unexpected": true}')
+
+    def _on_exec_details(self, trade: Trade, fill: Fill) -> None:
+        """Handle fill event from IB and dispatch to registered callbacks."""
+        ib_order_id = str(trade.order.orderId)
+        qty_filled = Decimal(str(trade.orderStatus.filled))
+        avg_price = Decimal(str(trade.orderStatus.avgFillPrice))
+        commission = Decimal("0")
+        if fill.commissionReport:
+            commission = Decimal(str(fill.commissionReport.commission))
+
+        loop = asyncio.get_event_loop()
+        for cb in self._fill_callbacks:
+            loop.create_task(cb(ib_order_id, qty_filled, avg_price, commission))
+
+    def _on_order_status(self, trade: Trade) -> None:
+        """Handle order status change event from IB and dispatch to callbacks."""
+        ib_order_id = str(trade.order.orderId)
+        status = trade.orderStatus.status
+
+        loop = asyncio.get_event_loop()
+        for cb in self._status_callbacks:
+            loop.create_task(cb(ib_order_id, status))

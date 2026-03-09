@@ -1,0 +1,447 @@
+"""Concrete SQLAlchemy repository implementations.
+
+All database access goes through these classes.
+No raw SQL strings — use SQLAlchemy ORM only.
+Sessions are scoped and never exposed outside this module.
+Contract caching logic lives here, not in a separate module.
+"""
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker, Session
+
+from ib_trader.data.base import (
+    TradeRepositoryBase, OrderRepositoryBase, RepriceEventRepositoryBase,
+    ContractRepositoryBase, HeartbeatRepositoryBase, AlertRepositoryBase,
+)
+from ib_trader.data.models import (
+    Base, TradeGroup, Order, RepriceEvent, Contract,
+    SystemHeartbeat, SystemAlert, TradeStatus, OrderStatus
+)
+from sqlalchemy import event as sa_event
+
+
+def create_db_engine(db_url: str):
+    """Create a SQLAlchemy engine with WAL mode and foreign keys enabled.
+
+    Args:
+        db_url: SQLAlchemy database URL (e.g. 'sqlite:///trader.db')
+
+    Returns:
+        Configured SQLAlchemy engine.
+    """
+    engine = create_engine(db_url, echo=False)
+
+    if db_url.startswith("sqlite"):
+        @sa_event.listens_for(engine, "connect")
+        def set_pragmas(dbapi_conn, _):
+            """Enable WAL mode and foreign key enforcement on every connection."""
+            dbapi_conn.execute("PRAGMA journal_mode=WAL")
+            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    return engine
+
+
+def create_session_factory(engine) -> scoped_session:
+    """Create a thread-safe scoped session factory.
+
+    Args:
+        engine: SQLAlchemy engine.
+
+    Returns:
+        scoped_session factory bound to the engine.
+    """
+    factory = sessionmaker(bind=engine)
+    return scoped_session(factory)
+
+
+def init_db(engine) -> None:
+    """Create all tables if they do not exist.
+
+    In production this is superseded by Alembic migrations.
+    Used for in-memory SQLite in tests.
+    """
+    Base.metadata.create_all(engine)
+
+
+def _now_utc() -> datetime:
+    """Return the current UTC datetime (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+class TradeRepository(TradeRepositoryBase):
+    """SQLAlchemy implementation of trade group persistence."""
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def create(self, trade: TradeGroup) -> TradeGroup:
+        """Persist a new trade group and return it."""
+        s = self._session()
+        s.add(trade)
+        s.commit()
+        s.refresh(trade)
+        return trade
+
+    def get_by_serial(self, serial: int) -> TradeGroup | None:
+        """Return the trade group with the given serial number, or None."""
+        return (
+            self._session()
+            .query(TradeGroup)
+            .filter(TradeGroup.serial_number == serial)
+            .one_or_none()
+        )
+
+    def get_open(self) -> list[TradeGroup]:
+        """Return all trade groups with status OPEN."""
+        return (
+            self._session()
+            .query(TradeGroup)
+            .filter(TradeGroup.status == TradeStatus.OPEN)
+            .all()
+        )
+
+    def get_all(self) -> list[TradeGroup]:
+        """Return all trade groups ordered by serial number descending."""
+        return (
+            self._session()
+            .query(TradeGroup)
+            .order_by(TradeGroup.serial_number.desc())
+            .all()
+        )
+
+    def update_status(self, trade_id: str, status: TradeStatus) -> None:
+        """Update the status of a trade group."""
+        s = self._session()
+        trade = s.query(TradeGroup).filter(TradeGroup.id == trade_id).one()
+        trade.status = status
+        if status == TradeStatus.CLOSED:
+            trade.closed_at = _now_utc()
+        s.commit()
+
+    def update_pnl(self, trade_id: str, pnl: Decimal, commission: Decimal) -> None:
+        """Update realized P&L and total commission for a trade group."""
+        s = self._session()
+        trade = s.query(TradeGroup).filter(TradeGroup.id == trade_id).one()
+        trade.realized_pnl = pnl
+        trade.total_commission = commission
+        s.commit()
+
+    def next_serial_number(self) -> int:
+        """Return the lowest unused integer serial number in range 0–999.
+
+        Reuses the lowest available number. Wraps within 0–999.
+        """
+        s = self._session()
+        used = {
+            row.serial_number
+            for row in s.query(TradeGroup.serial_number).all()
+            if row.serial_number is not None
+        }
+        for n in range(1000):
+            if n not in used:
+                return n
+        raise RuntimeError("All serial numbers 0–999 are in use.")
+
+
+class OrderRepository(OrderRepositoryBase):
+    """SQLAlchemy implementation of order leg persistence."""
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def create(self, order: Order) -> Order:
+        """Persist a new order and return it."""
+        s = self._session()
+        s.add(order)
+        s.commit()
+        s.refresh(order)
+        return order
+
+    def get_by_id(self, order_id: str) -> Order | None:
+        """Return the order with the given UUID, or None."""
+        return (
+            self._session()
+            .query(Order)
+            .filter(Order.id == order_id)
+            .one_or_none()
+        )
+
+    def get_by_ib_order_id(self, ib_order_id: str) -> Order | None:
+        """Return the order with the given IB order ID, or None."""
+        return (
+            self._session()
+            .query(Order)
+            .filter(Order.ib_order_id == ib_order_id)
+            .one_or_none()
+        )
+
+    def get_for_trade(self, trade_id: str) -> list[Order]:
+        """Return all orders for a trade group regardless of status."""
+        return (
+            self._session()
+            .query(Order)
+            .filter(Order.trade_id == trade_id)
+            .order_by(Order.placed_at)
+            .all()
+        )
+
+    def get_open_for_trade(self, trade_id: str) -> list[Order]:
+        """Return all non-terminal orders for a trade group."""
+        terminal = {
+            OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.ABANDONED,
+            OrderStatus.CLOSED_MANUAL, OrderStatus.CLOSED_EXTERNAL,
+            OrderStatus.REJECTED,
+        }
+        return (
+            self._session()
+            .query(Order)
+            .filter(
+                Order.trade_id == trade_id,
+                Order.status.notin_(terminal),
+            )
+            .all()
+        )
+
+    def get_all_open(self) -> list[Order]:
+        """Return all orders that are currently in a non-terminal status."""
+        terminal = {
+            OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.ABANDONED,
+            OrderStatus.CLOSED_MANUAL, OrderStatus.CLOSED_EXTERNAL,
+            OrderStatus.REJECTED,
+        }
+        return (
+            self._session()
+            .query(Order)
+            .filter(Order.status.notin_(terminal))
+            .all()
+        )
+
+    def get_in_states(self, states: list[OrderStatus]) -> list[Order]:
+        """Return all orders in any of the given statuses."""
+        return (
+            self._session()
+            .query(Order)
+            .filter(Order.status.in_(states))
+            .all()
+        )
+
+    def update_status(self, order_id: str, status: OrderStatus) -> None:
+        """Update the status of an order, setting timestamp fields as appropriate."""
+        s = self._session()
+        order = s.query(Order).filter(Order.id == order_id).one()
+        order.status = status
+        now = _now_utc()
+        if status in (OrderStatus.FILLED, OrderStatus.PARTIAL):
+            order.filled_at = now
+        elif status in (OrderStatus.CANCELED, OrderStatus.ABANDONED):
+            order.canceled_at = now
+        s.commit()
+
+    def update_fill(self, order_id: str, qty_filled: Decimal,
+                    avg_price: Decimal, commission: Decimal) -> None:
+        """Record fill details on an order."""
+        s = self._session()
+        order = s.query(Order).filter(Order.id == order_id).one()
+        order.qty_filled = qty_filled
+        order.avg_fill_price = avg_price
+        order.commission = commission
+        order.filled_at = _now_utc()
+        s.commit()
+
+    def update_ib_order_id(self, order_id: str, ib_order_id: str) -> None:
+        """Write the IB-assigned order ID to the order record."""
+        s = self._session()
+        order = s.query(Order).filter(Order.id == order_id).one()
+        order.ib_order_id = ib_order_id
+        s.commit()
+
+    def update_amended(self, order_id: str, new_price: Decimal) -> None:
+        """Record the latest amendment price and timestamp."""
+        s = self._session()
+        order = s.query(Order).filter(Order.id == order_id).one()
+        order.price_placed = new_price
+        order.last_amended_at = _now_utc()
+        s.commit()
+
+    def set_raw_response(self, order_id: str, raw: str) -> None:
+        """Store the raw IB API response JSON string."""
+        s = self._session()
+        order = s.query(Order).filter(Order.id == order_id).one()
+        order.raw_ib_response = raw
+        s.commit()
+
+
+class RepriceEventRepository(RepriceEventRepositoryBase):
+    """SQLAlchemy implementation of reprice event persistence."""
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def create(self, evt: RepriceEvent) -> RepriceEvent:
+        """Persist a new reprice event and return it."""
+        s = self._session()
+        s.add(evt)
+        s.commit()
+        s.refresh(evt)
+        return evt
+
+    def get_for_order(self, order_id: str) -> list[RepriceEvent]:
+        """Return all reprice events for an order, ordered by step number."""
+        return (
+            self._session()
+            .query(RepriceEvent)
+            .filter(RepriceEvent.order_id == order_id)
+            .order_by(RepriceEvent.step_number)
+            .all()
+        )
+
+    def confirm_amendment(self, event_id: str) -> None:
+        """Mark a reprice event as amendment confirmed by IB."""
+        s = self._session()
+        evt = s.query(RepriceEvent).filter(RepriceEvent.id == event_id).one()
+        evt.amendment_confirmed = True
+        s.commit()
+
+
+class ContractRepository(ContractRepositoryBase):
+    """SQLAlchemy implementation of contract cache persistence.
+
+    Cache logic: contracts are fresh if fetched_at is within ttl_seconds.
+    Invalidation deletes the row, forcing re-fetch on next use.
+    """
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def get(self, symbol: str) -> Contract | None:
+        """Return the cached contract for the symbol, or None."""
+        return (
+            self._session()
+            .query(Contract)
+            .filter(Contract.symbol == symbol)
+            .one_or_none()
+        )
+
+    def upsert(self, contract: Contract) -> None:
+        """Insert or update the cached contract for the symbol."""
+        s = self._session()
+        existing = s.query(Contract).filter(Contract.symbol == contract.symbol).one_or_none()
+        if existing:
+            existing.con_id = contract.con_id
+            existing.exchange = contract.exchange
+            existing.currency = contract.currency
+            existing.multiplier = contract.multiplier
+            existing.raw_response = contract.raw_response
+            existing.fetched_at = contract.fetched_at
+        else:
+            s.add(contract)
+        s.commit()
+
+    def invalidate(self, symbol: str) -> None:
+        """Delete the cached contract for the symbol, forcing re-fetch."""
+        s = self._session()
+        s.query(Contract).filter(Contract.symbol == symbol).delete()
+        s.commit()
+
+    def is_fresh(self, symbol: str, ttl_seconds: int) -> bool:
+        """Return True if the cached contract is within the TTL window."""
+        contract = self.get(symbol)
+        if not contract:
+            return False
+        fetched = contract.fetched_at
+        # Ensure timezone-aware comparison
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        age = (_now_utc() - fetched).total_seconds()
+        return age < ttl_seconds
+
+
+class HeartbeatRepository(HeartbeatRepositoryBase):
+    """SQLAlchemy implementation of process heartbeat persistence."""
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def upsert(self, process: str, pid: int) -> None:
+        """Insert or update the heartbeat record for a process."""
+        s = self._session()
+        existing = s.query(SystemHeartbeat).filter(SystemHeartbeat.process == process).one_or_none()
+        if existing:
+            existing.last_seen_at = _now_utc()
+            existing.pid = pid
+        else:
+            s.add(SystemHeartbeat(process=process, last_seen_at=_now_utc(), pid=pid))
+        s.commit()
+
+    def get(self, process: str) -> SystemHeartbeat | None:
+        """Return the heartbeat record for a process, or None."""
+        return (
+            self._session()
+            .query(SystemHeartbeat)
+            .filter(SystemHeartbeat.process == process)
+            .one_or_none()
+        )
+
+    def delete(self, process: str) -> None:
+        """Delete the heartbeat record for a process (on clean exit)."""
+        s = self._session()
+        s.query(SystemHeartbeat).filter(SystemHeartbeat.process == process).delete()
+        s.commit()
+
+
+class AlertRepository(AlertRepositoryBase):
+    """SQLAlchemy implementation of system alert persistence."""
+
+    def __init__(self, session_factory: scoped_session) -> None:
+        """Initialize with a scoped session factory."""
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        return self._session_factory()
+
+    def create(self, alert: SystemAlert) -> SystemAlert:
+        """Persist a new system alert and return it."""
+        s = self._session()
+        s.add(alert)
+        s.commit()
+        s.refresh(alert)
+        return alert
+
+    def get_open(self) -> list[SystemAlert]:
+        """Return all unresolved system alerts."""
+        return (
+            self._session()
+            .query(SystemAlert)
+            .filter(SystemAlert.resolved_at.is_(None))
+            .order_by(SystemAlert.created_at)
+            .all()
+        )
+
+    def resolve(self, alert_id: str) -> None:
+        """Mark an alert as resolved with the current UTC timestamp."""
+        s = self._session()
+        alert = s.query(SystemAlert).filter(SystemAlert.id == alert_id).one()
+        alert.resolved_at = _now_utc()
+        s.commit()

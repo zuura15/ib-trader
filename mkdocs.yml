@@ -1,0 +1,14 @@
+site_name: IB Trader
+site_description: Interactive Brokers Python trading engine documentation
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+
+nav:
+  - Home: index.md
+  - Architecture Decisions: decisions/
+
+docs_dir: docs

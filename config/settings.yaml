@@ -1,0 +1,25 @@
+max_order_size_shares: 10
+max_retries: 3
+retry_delay_seconds: 2
+retry_backoff_multiplier: 2.0
+reprice_interval_seconds: 1
+reprice_duration_seconds: 10
+ib_host: 127.0.0.1
+ib_port: 4001
+ib_client_id: 1
+ib_min_call_interval_ms: 100
+# IB market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen.
+# Paper trading accounts must use 3 to avoid error 10197 (competing live session).
+# Live accounts with real-time subscriptions should use 1.
+ib_market_data_type: 1
+cache_ttl_seconds: 86400
+log_level: INFO
+log_file_path: logs/ib_trader.log
+log_rotation_max_bytes: 10485760
+log_rotation_backup_count: 10
+log_compress_old: true
+heartbeat_interval_seconds: 30
+heartbeat_stale_threshold_seconds: 300
+reconciliation_interval_seconds: 1800
+db_integrity_check_interval_seconds: 21600
+daemon_tui_refresh_seconds: 5

@@ -1,0 +1,14 @@
+# Allowed symbol whitelist for trading
+# Only symbols listed here can be traded.
+# Add new symbols and restart is NOT required — whitelist is reloaded on each run.
+# Symbol validation happens before any IB network call.
+- MSFT
+- AAPL
+- GOOGL
+- AMZN
+- TSLA
+- SPY
+- QQQ
+- META
+- NVDA
+- AMD
