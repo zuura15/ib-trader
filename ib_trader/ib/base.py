@@ -174,15 +174,25 @@ class IBClientBase(ABC):
             ib_order_id: IB order ID.
 
         Returns:
-            dict with keys: status (str), qty_filled (Decimal),
-                            avg_fill_price (Decimal | None),
-                            commission (Decimal | None).
+            dict with keys:
+              status (str)              — IB order status string (Submitted, PreSubmitted,
+                                          Filled, Cancelled, Inactive, …)
+              qty_filled (Decimal)      — shares filled so far
+              avg_fill_price (Decimal | None)
+              commission (Decimal | None)
+              why_held (str | None)     — IB whyHeld field; non-empty when IB is
+                                          holding the order (short-locate, regulatory
+                                          block, etc.).  Always check this alongside
+                                          the Inactive status.
         """
         ...
 
     @abstractmethod
     async def get_open_orders(self) -> list[dict]:
-        """Get all currently open orders from IB.
+        """Get all currently open orders from IB across all client IDs.
+
+        Uses reqAllOpenOrders so the daemon (which connects with a different
+        client ID) can see orders placed by the REPL.
 
         Returns:
             List of dicts with keys: ib_order_id (str), symbol (str),
@@ -205,6 +215,14 @@ class IBClientBase(ABC):
         """
         ...
 
+    def get_live_order_status(self, ib_order_id: str) -> str | None:
+        """Return the live IB status string for an order, or None if unknown.
+
+        Uses the in-memory active trades cache — no IB API call.
+        Returns None if the order is not in the cache (e.g. from a previous session).
+        """
+        return None
+
     @abstractmethod
     def has_contract_cached(self, con_id: int) -> bool:
         """Return True if the in-memory contract cache has a fully-specified
@@ -220,22 +238,42 @@ class IBClientBase(ABC):
         ...
 
     @abstractmethod
-    def register_fill_callback(self, callback) -> None:
+    def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:
         """Register a callback for fill events.
 
         Args:
             callback: async callable with signature:
                 async def on_fill(ib_order_id: str, qty_filled: Decimal,
                                   avg_price: Decimal, commission: Decimal) -> None
+            ib_order_id: If provided, the callback is scoped to this order and
+                will be automatically removed when the order reaches a terminal
+                state (Filled, Cancelled, Inactive).  If None, the callback
+                fires for all orders and is never auto-removed.
         """
         ...
 
     @abstractmethod
-    def register_status_callback(self, callback) -> None:
+    def register_status_callback(self, callback, ib_order_id: str | None = None) -> None:
         """Register a callback for order status change events.
 
         Args:
             callback: async callable with signature:
                 async def on_status(ib_order_id: str, status: str) -> None
+            ib_order_id: If provided, the callback is scoped to this order and
+                will be automatically removed when the order reaches a terminal
+                state (Filled, Cancelled, Inactive).  If None, the callback
+                fires for all orders and is never auto-removed.
+        """
+        ...
+
+    @abstractmethod
+    def unregister_callbacks(self, ib_order_id: str) -> None:
+        """Remove all fill and status callbacks registered for an order.
+
+        Called automatically when a terminal status is dispatched, but can
+        also be called explicitly by engine code during cleanup.
+
+        Args:
+            ib_order_id: IB order ID whose callbacks should be removed.
         """
         ...

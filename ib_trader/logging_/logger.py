@@ -95,7 +95,9 @@ def setup_logging(
             backupCount=backup_count,
         )
     file_handler.setFormatter(formatter)
-    file_handler.setLevel(level)
+    # File always captures DEBUG — the log file is for troubleshooting.
+    # The log_level parameter controls stdout verbosity only.
+    file_handler.setLevel(logging.DEBUG)
 
     # Stdout handler
     stream_handler = logging.StreamHandler()
@@ -103,6 +105,6 @@ def setup_logging(
     stream_handler.setLevel(logging.WARNING)  # Only warnings+ to stdout to avoid cluttering REPL
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(level)
+    root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(stream_handler)

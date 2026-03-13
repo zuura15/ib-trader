@@ -36,7 +36,6 @@ except ImportError:
     readline = None  # type: ignore[assignment]
 
 import click  # noqa: E402
-from ib_insync import util  # noqa: E402
 
 from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions  # noqa: E402
 from ib_trader.config.context import AppContext  # noqa: E402
@@ -45,9 +44,10 @@ from ib_trader.data.repository import (  # noqa: E402
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
+from ib_trader.data.repositories.transaction_repository import TransactionRepository  # noqa: E402
 from ib_trader.engine.tracker import OrderTracker  # noqa: E402
 from ib_trader.engine.exceptions import ConfigurationError, SafetyLimitError  # noqa: E402
-from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings  # noqa: E402
+from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings, close_orphaned_trade_groups  # noqa: E402
 from ib_trader.engine.order import execute_order, execute_close  # noqa: E402
 from ib_trader.ib.insync_client import InsyncClient  # noqa: E402
 from ib_trader.logging_.logger import setup_logging  # noqa: E402
@@ -465,10 +465,13 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) 
         tracker=OrderTracker(),
         settings=settings,
         account_id=account_id,
+        transactions=TransactionRepository(session_factory),
     )
 
     logger.info('{"event": "APP_STARTED", "process": "REPL", "db": "%s"}', db)
 
-    # Use ib_insync's event loop integration
-    util.startLoop()
-    asyncio.run(run_repl(ctx, symbols))
+    # Launch Textual TUI — it owns the asyncio event loop.
+    # ib_insync async coroutines run as tasks within Textual's loop.
+    from ib_trader.repl.tui import IBTraderApp
+    app = IBTraderApp(ctx=ctx, symbols=symbols)
+    app.run()

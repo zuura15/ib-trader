@@ -4,6 +4,9 @@ retry_delay_seconds: 2
 retry_backoff_multiplier: 2.0
 reprice_interval_seconds: 1
 reprice_duration_seconds: 10
+# How long to wait for an immediate fill on bid/ask GTC orders before moving on.
+# The order stays live in IB after this window; daemon reconciler catches the fill.
+bid_ask_wait_seconds: 30
 ib_host: 127.0.0.1
 ib_port: 4001
 ib_client_id: 1
@@ -20,6 +23,31 @@ log_rotation_backup_count: 10
 log_compress_old: true
 heartbeat_interval_seconds: 30
 heartbeat_stale_threshold_seconds: 300
-reconciliation_interval_seconds: 1800
+poll_interval_seconds: 60
+reconciliation_interval_seconds: 3600
 db_integrity_check_interval_seconds: 21600
 daemon_tui_refresh_seconds: 5
+tui_refresh_interval_seconds: 5
+
+tui:
+  panes:
+    - name: header
+      rank: 1
+      height: 1
+      enabled: true
+    - name: log
+      rank: 2
+      height: 10
+      enabled: true
+    - name: positions
+      rank: 3
+      height: 10
+      enabled: true
+    - name: command
+      rank: 4
+      height: 8
+      enabled: true
+    - name: orders
+      rank: 5
+      height: 10
+      enabled: true

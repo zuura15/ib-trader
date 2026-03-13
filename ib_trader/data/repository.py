@@ -198,9 +198,9 @@ class OrderRepository(OrderRepositoryBase):
     def get_open_for_trade(self, trade_id: str) -> list[Order]:
         """Return all non-terminal orders for a trade group."""
         terminal = {
-            OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.ABANDONED,
-            OrderStatus.CLOSED_MANUAL, OrderStatus.CLOSED_EXTERNAL,
-            OrderStatus.REJECTED,
+            OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.CANCELED,
+            OrderStatus.ABANDONED, OrderStatus.CLOSED_MANUAL,
+            OrderStatus.CLOSED_EXTERNAL, OrderStatus.REJECTED,
         }
         return (
             self._session()
@@ -215,9 +215,9 @@ class OrderRepository(OrderRepositoryBase):
     def get_all_open(self) -> list[Order]:
         """Return all orders that are currently in a non-terminal status."""
         terminal = {
-            OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.ABANDONED,
-            OrderStatus.CLOSED_MANUAL, OrderStatus.CLOSED_EXTERNAL,
-            OrderStatus.REJECTED,
+            OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.CANCELED,
+            OrderStatus.ABANDONED, OrderStatus.CLOSED_MANUAL,
+            OrderStatus.CLOSED_EXTERNAL, OrderStatus.REJECTED,
         }
         return (
             self._session()

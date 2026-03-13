@@ -40,6 +40,82 @@ class _ImmediateRejectMock:
         return ib_id
 
 
+class _PreSubmittedMock:
+    """Mixin: marks every placed order as PreSubmitted (market closed simulation)."""
+
+    async def place_limit_order(self, con_id, symbol, side, qty, price,
+                                outside_rth=True, tif="GTC") -> str:
+        ib_id = await super().place_limit_order(
+            con_id, symbol, side, qty, price, outside_rth, tif
+        )
+        self._order_statuses[ib_id] = {
+            "status": "PreSubmitted",
+            "qty_filled": Decimal("0"),
+            "avg_fill_price": None,
+            "commission": None,
+        }
+        return ib_id
+
+
+class TestOrderPlacementPreSubmitted:
+    """Order goes to PreSubmitted — IB queues it for next trading session."""
+
+    async def test_presubmitted_weekend_skips_reprice_leaves_open(self, ctx):
+        """PreSubmitted during weekend: reprice loop skipped, order stays OPEN."""
+        from unittest.mock import patch
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tests.conftest import MockIBClient
+
+        class PreSubmittedMock(_PreSubmittedMock, MockIBClient):
+            pass
+
+        ctx.ib = PreSubmittedMock()
+
+        cmd = BuyCommand(
+            symbol="MSFT", qty=Decimal("2"), dollars=None,
+            strategy="mid", profit_amount=None,
+            take_profit_price=None, stop_loss=None,
+        )
+
+        # Saturday noon ET = weekend closure.
+        _saturday = datetime(2026, 3, 7, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+        with patch("ib_trader.engine.market_hours._now_et", return_value=_saturday):
+            await execute_order(cmd, ctx)
+
+        assert len(ctx.ib.amended_orders) == 0
+        open_orders = ctx.orders.get_all_open()
+        assert len(open_orders) == 1
+        assert open_orders[0].status == OrderStatus.OPEN
+
+    async def test_presubmitted_active_hours_raises_and_abandons(self, ctx):
+        """PreSubmitted during an active session: order cancelled, marked ABANDONED, error raised."""
+        from unittest.mock import patch
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tests.conftest import MockIBClient
+        from ib_trader.engine.exceptions import IBOrderRejectedError
+
+        class PreSubmittedMock(_PreSubmittedMock, MockIBClient):
+            pass
+
+        ctx.ib = PreSubmittedMock()
+
+        cmd = BuyCommand(
+            symbol="MSFT", qty=Decimal("2"), dollars=None,
+            strategy="mid", profit_amount=None,
+            take_profit_price=None, stop_loss=None,
+        )
+
+        # Monday 2 PM ET = RTH.
+        _monday_rth = datetime(2026, 3, 9, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+        with patch("ib_trader.engine.market_hours._now_et", return_value=_monday_rth):
+            await execute_order(cmd, ctx)
+
+        abandoned = ctx.orders.get_in_states([OrderStatus.ABANDONED])
+        assert len(abandoned) == 1
+
+
 class TestOrderPlacementUnacknowledged:
     """Order stays PendingSubmit / gets immediately cancelled by IB."""
 
@@ -202,6 +278,7 @@ class TestHandlePartial:
             commission=Decimal("0.60"),
             cmd=cmd,
             con_id=12345,
+            ib_order_id="mock-ib-123",
             ctx=ctx,
         )
 

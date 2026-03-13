@@ -24,7 +24,8 @@ from ib_trader.data.repository import (
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
-from ib_trader.daemon.reconciler import run_reconciliation
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
+from ib_trader.daemon.reconciler import run_reconciliation, run_transaction_reconciliation
 from ib_trader.daemon.monitor import check_repl_heartbeat, check_ib_connectivity
 from ib_trader.daemon.integrity import run_integrity_check
 from ib_trader.engine.exceptions import ConfigurationError
@@ -57,6 +58,14 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
         await ctx.ib.connect()
     except Exception as e:
         logger.warning('{"event": "IB_DISCONNECTED", "startup": true, "error": "%s"}', str(e))
+
+    # Run transaction reconciliation once on startup
+    try:
+        await run_transaction_reconciliation(ctx)
+        logger.info('{"event": "STARTUP_TRANSACTION_RECONCILIATION_COMPLETE"}')
+    except Exception as e:
+        logger.error('{"event": "STARTUP_TRANSACTION_RECONCILIATION_FAILED", "error": "%s"}',
+                     str(e), exc_info=True)
 
     consecutive_ib_failures: list = []
     last_recon_time = None
@@ -188,10 +197,11 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
                 await check_ib_connectivity(ctx, consecutive_ib_failures)
                 ib_counter = 0
 
-            # Reconciliation (every 30 min)
+            # Reconciliation (hourly per reconciliation_interval_seconds)
             recon_counter += 30
             if recon_counter >= recon_interval:
                 result = await run_reconciliation(ctx)
+                await run_transaction_reconciliation(ctx)
                 last_recon_time = datetime.now(timezone.utc)
                 last_recon_changes = result["changes"]
                 recon_counter = 0
@@ -291,6 +301,7 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool, 
         tracker=OrderTracker(),
         settings=settings,
         account_id=account_id,
+        transactions=TransactionRepository(session_factory),
     )
 
     asyncio.run(run_daemon(ctx, session_factory))

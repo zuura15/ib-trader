@@ -34,8 +34,8 @@ class MockIBClient(IBClientBase):
         self.placed_orders: list[dict] = []
         self.amended_orders: list[dict] = []
         self.canceled_orders: list[str] = []
-        self.fill_callbacks: list = []
-        self.status_callbacks: list = []
+        self.fill_callbacks: dict[str, list] = {}
+        self.status_callbacks: dict[str, list] = {}
         self._next_order_id = 1000
         self._market_snapshot = {"bid": Decimal("100.00"), "ask": Decimal("100.10"), "last": Decimal("100.05")}
         self._order_statuses: dict[str, dict] = {}
@@ -123,11 +123,18 @@ class MockIBClient(IBClientBase):
     def has_contract_cached(self, con_id: int) -> bool:
         return True  # Mock always reports cache hit to skip re-qualification
 
-    def register_fill_callback(self, callback) -> None:
-        self.fill_callbacks.append(callback)
+    def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:
+        key = ib_order_id or "_GLOBAL"
+        self.fill_callbacks.setdefault(key, []).append(callback)
 
-    def register_status_callback(self, callback) -> None:
-        self.status_callbacks.append(callback)
+    def register_status_callback(self, callback, ib_order_id: str | None = None) -> None:
+        key = ib_order_id or "_GLOBAL"
+        self.status_callbacks.setdefault(key, []).append(callback)
+
+    def unregister_callbacks(self, ib_order_id: str) -> None:
+        """Remove all callbacks registered for an order."""
+        self.fill_callbacks.pop(ib_order_id, None)
+        self.status_callbacks.pop(ib_order_id, None)
 
     async def simulate_fill(self, ib_order_id: str, qty: Decimal, price: Decimal,
                             commission: Decimal = Decimal("1.00")) -> None:
@@ -138,7 +145,10 @@ class MockIBClient(IBClientBase):
             "avg_fill_price": price,
             "commission": commission,
         }
-        for cb in self.fill_callbacks:
+        # Dispatch to order-specific callbacks, then global callbacks.
+        for cb in self.fill_callbacks.get(ib_order_id, []):
+            await cb(ib_order_id, qty, price, commission)
+        for cb in self.fill_callbacks.get("_GLOBAL", []):
             await cb(ib_order_id, qty, price, commission)
 
 

@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.18.4",
     "click>=8.3.1",
-    "ib-insync>=0.9",
+    "ib-async>=2.1.0",
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.7.4",
     "mypy>=1.19.1",
@@ -59,6 +59,7 @@ omit = [
     "ib_trader/repl/main.py",
     # Requires Textual TUI runtime
     "ib_trader/daemon/tui.py",
+    "ib_trader/repl/tui.py",
     # Daemon main requires full async TUI + IB
     "ib_trader/daemon/main.py",
     # Logging setup is I/O-only, tested implicitly

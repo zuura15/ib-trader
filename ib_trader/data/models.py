@@ -59,6 +59,19 @@ class TradeStatus(enum.Enum):
     PARTIAL = "PARTIAL"
 
 
+class TransactionAction(str, enum.Enum):
+    """Action type for each row in the append-only transactions audit log."""
+    PLACE_ATTEMPT = "PLACE_ATTEMPT"
+    PLACE_ACCEPTED = "PLACE_ACCEPTED"
+    PLACE_REJECTED = "PLACE_REJECTED"
+    PARTIAL_FILL = "PARTIAL_FILL"
+    FILLED = "FILLED"
+    CANCEL_ATTEMPT = "CANCEL_ATTEMPT"
+    CANCELLED = "CANCELLED"
+    ERROR_TERMINAL = "ERROR_TERMINAL"
+    RECONCILED = "RECONCILED"
+
+
 class AlertSeverity(enum.Enum):
     """Alert severity levels.
 
@@ -182,3 +195,30 @@ class SystemAlert(Base):
     message     = Column(Text, nullable=False)
     created_at  = Column(DateTime, nullable=False)
     resolved_at = Column(DateTime, nullable=True)
+
+
+class TransactionEvent(Base):
+    """Append-only audit log of every interaction our system has with IB
+    around an order. One row per event. Never updated after insert."""
+
+    __tablename__ = "transactions"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    ib_order_id       = Column(Integer, nullable=True)
+    ib_perm_id        = Column(Integer, nullable=True)
+    action            = Column(Enum(TransactionAction), nullable=False)
+    symbol            = Column(String(20), nullable=False)
+    side              = Column(String(4), nullable=False)
+    order_type        = Column(String(10), nullable=False)
+    quantity          = Column(Numeric(18, 4), nullable=False)
+    limit_price       = Column(Numeric(18, 4), nullable=True)
+    account_id        = Column(String(50), nullable=False)
+    ib_status         = Column(String(50), nullable=True)
+    ib_filled_qty     = Column(Numeric(18, 4), nullable=True)
+    ib_avg_fill_price = Column(Numeric(18, 8), nullable=True)
+    ib_error_code     = Column(Integer, nullable=True)
+    ib_error_message  = Column(Text, nullable=True)
+    trade_serial      = Column(Integer, nullable=True)
+    requested_at      = Column(DateTime, nullable=False)
+    ib_responded_at   = Column(DateTime, nullable=True)
+    is_terminal       = Column(Boolean, nullable=False, default=False)

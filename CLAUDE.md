@@ -83,3 +83,36 @@ No exceptions. Treat these as team-level non-negotiables.
 - Daemon TUI reads ONLY from SQLite — it never calls IB directly.
 - REPL warns if daemon is absent but never blocks trading because of it.
 - Daemon alerts on stale REPL heartbeat but never attempts to restart the REPL.
+
+## TUI Output Routing
+- ALL user-facing output in engine and command code must go through `ctx.router.emit()`.
+- NEVER call `print()` directly in `engine/`, `repl/commands.py`, or any module that
+  receives an AppContext — use `ctx.router.emit()` with the appropriate OutputPane and
+  OutputSeverity.
+- `repl/output_router.py` has NO project imports — it must remain importable without
+  Textual or any project module installed.
+- `repl/tui.py` is the ONLY file that imports Textual. It is omitted from test coverage
+  (requires Textual runtime). Add it to pyproject.toml omit list, not to tests.
+- The `IBTraderApp` owns the asyncio event loop. NEVER call `util.startLoop()` or
+  `asyncio.run()` in `repl/main.py` — use `IBTraderApp(...).run()`.
+- Command queue maxsize is 10. Reject with WARNING when full — never block the UI thread.
+- TUI pane layout is driven by `config/settings.yaml` `tui.panes` block. Default layout
+  defined in `repl/pane_config.py` `_DEFAULTS`. At least 2 enabled panes required.
+- HEADER pane height is always forced to 1 row regardless of settings.
+- Routing rules: DEBUG → file only; ERROR/WARNING → BOTH panes; others → specified pane.
+
+## P&L Display
+- `realized_pnl` field in `trade_groups` is written when a trade closes with a known fill
+  price and entry price. The calculation is deferred until a full close leg is present.
+- Commission is summed across all legs and displayed in the stats/positions pane.
+- Never display P&L as zero when data is unavailable — use "—" as the placeholder.
+
+## IB as Source of Truth (Addendum #2)
+- IB is the authoritative source for all live order state. The local `orders` table is
+  legacy and must not be written to by new code.
+- The `transactions` table is append-only — never UPDATE or DELETE rows.
+- The orders pane in the TUI is populated from IB's open orders, not from SQLite.
+- One `TransactionEvent` row must be written for every interaction with IB around an order.
+- Reconciliation (daemon) surfaces discrepancies as WARNINGs — it never auto-heals.
+- Poll interval and reconciliation interval are tunables in settings.yaml.
+- Live account detection runs on every REPL startup and cannot be bypassed.

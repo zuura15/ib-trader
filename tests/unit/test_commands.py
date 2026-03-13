@@ -51,10 +51,44 @@ class TestParseBuySell:
         assert cmd.symbol == "MSFT"
 
     def test_invalid_strategy_returns_none(self, capsys):
-        cmd = parse_buy_sell(["buy", "MSFT", "10", "limit"])
+        cmd = parse_buy_sell(["buy", "MSFT", "10", "foobar"])
         assert cmd is None
         captured = capsys.readouterr()
         assert "Error" in captured.out
+
+    def test_buy_limit_with_price(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit", "400.00"])
+        assert isinstance(cmd, BuyCommand)
+        assert cmd.strategy == "limit"
+        assert cmd.limit_price == Decimal("400.00")
+        assert cmd.qty == Decimal("1")
+
+    def test_sell_limit_with_price(self):
+        cmd = parse_buy_sell(["sell", "AAPL", "2", "limit", "250.00"])
+        assert isinstance(cmd, SellCommand)
+        assert cmd.strategy == "limit"
+        assert cmd.limit_price == Decimal("250.00")
+
+    def test_limit_missing_price_returns_none(self, capsys):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit"])
+        assert cmd is None
+        assert "Error" in capsys.readouterr().out
+
+    def test_limit_with_profit(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit", "400.00", "500"])
+        assert isinstance(cmd, BuyCommand)
+        assert cmd.limit_price == Decimal("400.00")
+        assert cmd.profit_amount == Decimal("500")
+
+    def test_limit_negative_price_returns_none(self, capsys):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit", "-100"])
+        assert cmd is None
+        assert "Error" in capsys.readouterr().out
+
+    def test_non_limit_strategy_has_no_limit_price(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "mid"])
+        assert isinstance(cmd, BuyCommand)
+        assert cmd.limit_price is None
 
     def test_invalid_qty_returns_none(self, capsys):
         cmd = parse_buy_sell(["buy", "MSFT", "abc", "mid"])
@@ -95,6 +129,26 @@ class TestParseClose:
     def test_close_with_take_profit_price(self):
         cmd = parse_close(["close", "4", "--take-profit-price", "420.00"])
         assert cmd.take_profit_price == Decimal("420.00")
+
+    def test_close_with_limit(self):
+        cmd = parse_close(["close", "4", "limit", "450.00"])
+        assert isinstance(cmd, CloseCommand)
+        assert cmd.strategy == "limit"
+        assert cmd.limit_price == Decimal("450.00")
+
+    def test_close_limit_missing_price(self, capsys):
+        cmd = parse_close(["close", "4", "limit"])
+        assert cmd is None
+        assert "Error" in capsys.readouterr().out
+
+    def test_close_limit_with_profit(self):
+        cmd = parse_close(["close", "4", "limit", "450.00", "200"])
+        assert cmd.limit_price == Decimal("450.00")
+        assert cmd.profit_amount == Decimal("200")
+
+    def test_close_non_limit_has_no_limit_price(self):
+        cmd = parse_close(["close", "4", "mid"])
+        assert cmd.limit_price is None
 
     def test_invalid_serial(self, capsys):
         cmd = parse_close(["close", "abc"])
