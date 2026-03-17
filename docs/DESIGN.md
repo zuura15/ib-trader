@@ -1,353 +1,374 @@
 # IB Trader — Technical Design
 
-Version: 0.1.0
+Version: 1.0.0
 
 ---
 
 ## System Architecture
 
-```mermaid
-graph TB
-    subgraph User["User Terminal"]
-        REPL["ib-trader (REPL)\nasyncio event loop\nib_insync client_id=1"]
-        DAEMON["ib-daemon\nasyncio + Textual TUI\nib_insync client_id=2"]
-    end
+```
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│  REPL (CLI) │   │ API Server  │   │ Bot Runner  │
+│  no broker  │   │  (FastAPI)  │   │  no broker  │
+│  connection │   │  port 8000  │   │  connection │
+└──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+       │                 │                 │
+       │  INSERT INTO    │  INSERT INTO    │  INSERT INTO
+       │  pending_cmds   │  pending_cmds   │  pending_cmds
+       │                 │                 │
+       └────────┬────────┴────────┬────────┘
+                │    SQLite       │
+                │   (WAL mode)    │
+                ▼                 │
+       ┌─────────────────┐       │
+       │  Engine Service  │◄──────┘
+       │  (sole broker    │
+       │   connection)    │  polls pending_cmds
+       │  client_id = 1   │  executes via broker
+       │                  │  writes results back
+       └────────┬─────────┘
+                │
+        ┌───────┴───────┐
+        │               │
+   ┌────▼────┐    ┌─────▼─────┐
+   │   IB    │    │  Alpaca   │
+   │ Gateway │    │  REST API │
+   └─────────┘    └───────────┘
 
-    subgraph Storage["SQLite (trader.db — WAL mode)"]
-        TG["trade_groups"]
-        OR["orders"]
-        RE["reprice_events"]
-        CO["contracts"]
-        HB["system_heartbeats"]
-        AL["system_alerts"]
-        ME["metrics"]
-    end
-
-    subgraph IB["Interactive Brokers"]
-        GW["IB Gateway / TWS"]
-    end
-
-    REPL -->|"place / amend / cancel\nvia ib_insync"| GW
-    DAEMON -->|"get_open_orders\nconnectivity check\nvia ib_insync"| GW
-    GW -->|"execDetailsEvent\norderStatusEvent\nerrorEvent"| REPL
-
-    REPL -->|"write: trade, order,\nreprice_event, contract\nheartbeat"| Storage
-    DAEMON -->|"read: orders, heartbeats\nwrite: alerts, order status"| Storage
-
-    DAEMON -.->|"NO direct call"| REPL
-    REPL -.->|"NO direct call"| DAEMON
+       ┌─────────────┐
+       │   Daemon     │  (separate, own IB connection)
+       │  client_id=2 │  reconciliation + monitoring
+       └─────────────┘
 ```
 
-The two processes never communicate directly. SQLite is the only IPC mechanism.
+### Central Engine Pattern
+
+Only the engine service holds broker connections. All other processes are clients that:
+1. Write commands to the `pending_commands` SQLite table
+2. Read results from the same table
+3. Read state from other tables (orders, trades, positions, alerts)
+
+This eliminates the IB client_id conflict problem (where multiple processes placing
+orders on different client_ids can't see each other's fills) and follows the project's
+core principle: **communicate only through SQLite**.
+
+### Process Roles
+
+| Process | Broker Connection | Writes | Reads |
+|---------|-------------------|--------|-------|
+| Engine (`ib-engine`) | YES (IB client_id=1) | Orders, trades, transactions, heartbeat | pending_commands |
+| Daemon (`ib-daemon`) | YES (IB client_id=2, read-only) | Reconciliation, alerts, heartbeat | Orders, trades |
+| API (`ib-api`) | NO | pending_commands, templates, heartbeat | Everything (for REST/WebSocket) |
+| REPL (`ib-trader`) | NO | pending_commands, heartbeat | Everything (for display) |
+| Bots (`ib-bots`) | NO | pending_commands, bot status, bot_events | Positions, bot config |
 
 ---
 
-## Two-Process Model
+## Command Execution Flow
 
-### REPL (`ib-trader`)
+```
+User types "buy AAPL 10 mid" in GUI
+    │
+    ▼
+POST /api/commands {"command": "buy AAPL 10 mid"}
+    │
+    ▼
+API inserts into pending_commands (status=PENDING)
+Returns 202 Accepted with command_id
+    │
+    ▼
+Engine polls pending_commands every 100ms
+Picks up PENDING row, sets status=RUNNING
+    │
+    ▼
+Engine parses command → BuyCommand
+Engine calls execute_order(cmd, ctx)
+    │
+    ├── resolve_instrument (contract cache)
+    ├── get_market_snapshot (bid/ask/last)
+    ├── create TradeGroup + Order in SQLite
+    ├── place_limit_order via IB
+    ├── reprice_loop (amend every 1s for 10s)
+    ├── wait for fill (callback or poll)
+    └── handle_fill (update DB, place profit taker)
+    │
+    ▼
+Engine sets pending_commands status=SUCCESS with output
+    │
+    ▼
+GUI polls GET /api/commands/{id} every 500ms
+Updates console with result
+Refreshes positions, orders, trades panels
+```
 
-- Owns the user-facing prompt and all order placement.
-- Maintains a persistent `ib_insync` connection (client ID from settings, default 1).
-- Runs a single asyncio event loop. All IB callbacks are async.
-- Writes a heartbeat to `system_heartbeats` every 30 seconds.
-- Reads the daemon heartbeat on startup and warns if absent.
-- Exits cleanly, deletes its heartbeat row.
+### Concurrent Execution
 
-### Daemon (`ib-daemon`)
+The engine executes commands concurrently via `asyncio.create_task()` with a
+semaphore (default max 5 concurrent). Each command gets an isolated `AppContext`
+copy (via `dataclasses.replace`) so output routing doesn't leak between commands.
 
-- Runs independently — never started or stopped by the REPL.
-- Maintains its own `ib_insync` connection (client ID = REPL client ID + 1).
-- Runs three background loops on configurable intervals:
-  - **Reconciliation**: compares IB open orders against SQLite, updates discrepancies.
-  - **REPL heartbeat monitor**: raises CATASTROPHIC alert if REPL heartbeat is stale.
-  - **IB connectivity monitor**: raises CATASTROPHIC alert after 3 consecutive failures.
-- Runs SQLite integrity check on startup and every 6 hours.
-- Drives the Textual TUI dashboard (read-only from SQLite — never calls IB directly from TUI).
-- On CATASTROPHIC alert: pauses all loops, turns TUI red, waits for Enter.
+### Crash Recovery
 
-### Why Two Processes
+On startup, the engine:
+1. Marks any `RUNNING` commands as `FAILURE` (stale from previous crash)
+2. Marks `PENDING` orders with no `ib_order_id` as `ABANDONED`
+3. Closes orphaned trade groups where all legs are terminal
 
-A single process tightly couples the interactive shell with the background watchdog. If
-the REPL hangs during a slow order, the watchdog stops. With two processes: the daemon
-continues monitoring and reconciling even when the REPL is blocked waiting for a fill.
+### Cancel-vs-Fill Race Condition
+
+When the reprice window expires, the engine cancels the order. But IB may fill
+the order between the cancel request and confirmation. The engine now waits up
+to 3 seconds after cancelling, polling `get_order_status()` to check if a fill
+arrived. If qty_filled > 0, it processes the fill instead of marking EXPIRED.
+
+This applies to both entry orders and close orders.
 
 ---
 
-## Zero Memory State
+## Broker Abstraction
 
-The application can crash at any point and restart with full context from SQLite alone.
+```
+ib_trader/broker/
+├── base.py              # BrokerClientBase (abstract)
+├── types.py             # Instrument, Snapshot, OrderResult, FillResult
+├── fill_stream.py       # FillStream (push for IB, WebSocket for Alpaca)
+├── market_hours.py      # MarketHoursProvider (per-broker session logic)
+├── factory.py           # create_broker(name, settings)
+├── ib/
+│   ├── client.py        # IBClient wrapping InsyncClient
+│   └── hours.py         # IB session windows (overnight, RTH, etc.)
+└── alpaca/
+    ├── client.py         # AlpacaClient (REST + WebSocket fills)
+    └── hours.py          # Alpaca session windows
+```
 
-- Every IB action is written to SQLite **before** proceeding to the next step.
-- Order state is never inferred from in-memory variables — always read from the DB.
-- The `OrderTracker` (asyncio events for fill coordination) is ephemeral coordination
-  state, not trade state. It is rebuilt per-order from scratch and does not need to
-  survive crashes.
-- On REPL startup: any order in `REPRICING` or `AMENDING` state is marked `ABANDONED`
-  and printed as a warning. The system does not attempt to reconstruct the reprice loop.
-- The only acceptable data loss on crash is the current reprice step number and the
-  precise amendment price — the order itself is preserved in IB and SQLite.
+### BrokerClientBase
+
+All broker IDs are strings. No `int con_id` in the interface.
+
+Key methods:
+- `resolve_instrument(symbol)` → Instrument (replaces `qualify_contract`)
+- `get_snapshot(asset_id)` → Snapshot (bid, ask, last)
+- `place_limit_order(asset_id, symbol, side, qty, price, extended_hours, tif)` → broker_order_id
+- `amend_order(broker_order_id, new_price)` → broker_order_id (same for IB, new for Alpaca)
+- `cancel_order(broker_order_id)`
+- `create_fill_stream()` → FillStream
+
+### BrokerCapabilities
+
+Each broker declares what it supports:
+- `supports_in_place_amend` — IB=True (same order ID), Alpaca=False (PATCH gives new ID)
+- `supports_overnight` — IB=True, Alpaca=False
+- `commission_free` — IB=False, Alpaca=True
+- `fill_delivery` — "push" (IB callbacks) or "websocket" (Alpaca TradingStream)
+
+### Market Hours
+
+Each broker has session-aware order parameters:
+
+| Session | IB | Alpaca |
+|---------|----|----|
+| RTH | tif=GTC, outsideRth=True | tif=gtc, extended_hours=False |
+| Overnight | tif=DAY, includeOvernight=True | No overnight session |
+| Extended hours | tif=GTC, outsideRth=True | tif=day, extended_hours=True |
+| Market orders | Always allowed | Rejected during extended hours |
+
+### Legacy Compatibility
+
+The existing engine code uses `ctx.ib` (IBClientBase). `BrokerClientBase` provides
+legacy methods (`qualify_contract`, `get_market_snapshot` with int con_id) that
+delegate to the new interface. No engine changes needed for IB to keep working.
 
 ---
 
-## Data Flow: Order Placement
+## API Server
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant REPL
-    participant Engine
-    participant DB as SQLite
-    participant IB as IB Gateway
+FastAPI application with no broker connection. Reads from SQLite, submits commands.
 
-    User->>REPL: buy MSFT 5 mid
-    REPL->>Engine: execute_order(cmd, ctx)
-    Engine->>DB: validate symbol whitelist
-    Engine->>Engine: check safety limits
-    Engine->>DB: qualify_contract (cache-first)
-    Engine->>IB: get_market_snapshot(con_id)
-    IB-->>Engine: bid, ask, last
-    Engine->>DB: INSERT trade_group (OPEN)
-    Engine->>DB: INSERT order (PENDING)
-    Engine->>IB: place_limit_order(con_id, side, qty, mid)
-    IB-->>Engine: ib_order_id
-    Engine->>DB: UPDATE order.ib_order_id
-    Engine->>DB: UPDATE order.status = REPRICING
-    loop Reprice loop (every reprice_interval_seconds)
-        Engine->>IB: get_market_snapshot(con_id)
-        IB-->>Engine: bid, ask
-        Engine->>IB: amend_order(ib_order_id, new_price)
-        Engine->>DB: INSERT reprice_event
-        Engine->>DB: UPDATE order.last_amended_at
-    end
-    IB-->>Engine: execDetailsEvent (fill)
-    Engine->>DB: UPDATE order (FILLED, qty, avg_price, commission)
-    Engine->>DB: UPDATE trade_group.total_commission
-    Engine->>IB: place_limit_order (profit taker, GTC)
-    Engine->>DB: INSERT order (PROFIT_TAKER)
-    REPL->>User: ✓ FILLED: 5 shares MSFT @ $412.33 avg
+### REST Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | /api/commands | Submit command (returns 202) |
+| GET | /api/commands/{id} | Poll command status |
+| GET | /api/orders | Open orders |
+| GET | /api/trades | Trade groups (filterable) |
+| GET | /api/positions | IB positions from cache |
+| GET | /api/alerts | System alerts |
+| POST | /api/alerts/{id}/resolve | Resolve alert |
+| GET | /api/status | Heartbeats, connection, P&L |
+| GET | /api/bots | Bot list |
+| POST | /api/bots/{id}/start\|stop | Bot lifecycle |
+| GET/POST/DELETE | /api/templates | Order templates |
+| GET | /api/logs | Recent log entries from file |
+
+### WebSocket
+
+`/ws` — subscribes to channels, receives snapshots and diffs.
+
 ```
+Client → Server: {"type": "subscribe", "channels": ["orders","trades","alerts","commands","heartbeats"]}
+Server → Client: {"type": "snapshot", "data": {...}}
+Server → Client: {"type": "diff", "channel": "orders", "added": [...], "updated": [...], "removed": [...]}
+```
+
+Polls SQLite every 1.5 seconds. Computes diffs per channel using content hashing.
+
+### Auth
+
+Optional API key auth via `API_SECRET_KEY` in `.env`. When set, all endpoints
+require `Authorization: Bearer <key>` header. WebSocket requires `?token=<key>`
+query parameter.
 
 ---
 
-## Data Flow: Daemon Reconciliation
+## Bot Framework
 
-```mermaid
-sequenceDiagram
-    participant Daemon
-    participant IB as IB Gateway
-    participant DB as SQLite
-
-    loop Every reconciliation_interval_seconds
-        Daemon->>DB: SELECT orders WHERE status NOT IN terminal
-        DB-->>Daemon: open_orders[]
-        Daemon->>IB: get_open_orders()
-        IB-->>Daemon: ib_open_orders[]
-        loop For each local open order not in IB response
-            Daemon->>IB: get_order_status(ib_order_id)
-            IB-->>Daemon: status, qty_filled, avg_price
-            alt IB shows Filled
-                Daemon->>DB: UPDATE order status=CLOSED_EXTERNAL
-            else IB shows Cancelled
-                Daemon->>DB: UPDATE order status=CANCELED
-            end
-        end
-    end
 ```
+ib_trader/bots/
+├── base.py              # BotBase abstract class
+├── runner.py            # BotRunner (manages bot lifecycle)
+├── registry.py          # Strategy name → class mapping
+├── main.py              # CLI entry point
+└── examples/
+    └── mean_revert.py   # Example strategy
+```
+
+### BotBase
+
+Bots have NO broker connection. They submit commands via `pending_commands`:
+
+```python
+class BotBase(ABC):
+    async def on_tick(self) -> None: ...          # Called every tick_interval
+    async def on_startup(self, positions) -> None # Crash recovery
+    async def place_order(self, command, broker)   # → pending_commands
+    async def wait_for_fill(self, serial, timeout) # Poll trade_groups
+    def get_open_positions(self) -> list            # Read from SQLite
+```
+
+### BotRunner
+
+Separate process. Polls the `bots` table every second:
+- `status=RUNNING` + not in running_tasks → start asyncio task
+- `status!=RUNNING` + in running_tasks → cancel task
+- Task done with exception → set `status=ERROR`
+
+Zero memory state: on startup, restarts any bots with `status=RUNNING`.
 
 ---
 
-## IB Abstraction Layer
+## Database Schema
 
-```mermaid
-classDiagram
-    class IBClientBase {
-        <<abstract>>
-        +connect()
-        +disconnect()
-        +qualify_contract()
-        +get_market_snapshot()
-        +place_limit_order()
-        +place_market_order()
-        +amend_order()
-        +cancel_order()
-        +get_order_status()
-        +get_open_orders()
-        +get_order_error()
-        +has_contract_cached()
-        +register_fill_callback()
-        +register_status_callback()
-        #_throttle()
-    }
+### Core Tables
 
-    class InsyncClient {
-        -_ib: IB
-        -_contract_cache: dict
-        -_active_trades: dict
-        -_order_errors: dict
-        -_account_id: str
-        +_on_error()
-        +_on_exec_details()
-        +_on_order_status()
-    }
+| Table | Purpose |
+|-------|---------|
+| `trade_groups` | Trade lifecycle (OPEN → CLOSED) with P&L |
+| `orders` | Order legs (ENTRY, PROFIT_TAKER, CLOSE) with fill data |
+| `reprice_events` | Amendment history per order |
+| `transactions` | Append-only audit log of every IB interaction |
+| `contracts` | Cached instrument details (TTL-based) |
 
-    class MockIBClient {
-        +placed_orders: list
-        +amended_orders: list
-        +simulate_fill()
-    }
+### System Tables
 
-    IBClientBase <|-- InsyncClient
-    IBClientBase <|-- MockIBClient
-```
+| Table | Purpose |
+|-------|---------|
+| `system_heartbeats` | Process liveness (ENGINE, DAEMON, API, BOT_RUNNER) |
+| `system_alerts` | CATASTROPHIC / WARNING conditions |
+| `pending_commands` | Command queue (engine-client communication) |
+| `position_cache` | IB positions snapshot (refreshed every 30s by engine) |
 
-All engine code depends only on `IBClientBase`. `InsyncClient` is the only file that
-imports `ib_insync`. Tests use `MockIBClient` — no live IB connection required.
+### Bot Tables
 
-The base class provides a built-in throttle layer (`_throttle()`) enforcing a minimum
-interval between API calls (default 100 ms). All subclass methods call `_throttle()`
-before making any IB request.
+| Table | Purpose |
+|-------|---------|
+| `bots` | Bot config, status, heartbeat, last signal/action |
+| `bot_events` | Append-only bot audit log with payload_json |
+| `order_templates` | Saved quick-fire order templates |
 
----
+### Key Constraints
 
-## SQLite Schema
-
-```
-trade_groups          — one row per trade (entry to close)
-  id (UUID PK)
-  serial_number       — 0-999, reused after close, shown to user
-  symbol, direction   — LONG / SHORT
-  status              — OPEN / CLOSED / PARTIAL
-  realized_pnl, total_commission
-  opened_at, closed_at
-
-orders                — one row per order leg
-  id (UUID PK)
-  trade_id (FK)
-  ib_order_id         — assigned by IB, written immediately after place
-  leg_type            — ENTRY / PROFIT_TAKER / STOP_LOSS / CLOSE
-  side                — BUY / SELL
-  security_type       — STK / ETF / OPT / FUT
-  order_type          — MID / MARKET / BID / ASK
-  qty_requested, qty_filled
-  price_placed, avg_fill_price
-  profit_taker_amount, profit_taker_price
-  stop_loss_requested — stored, no IB action
-  commission
-  status              — full lifecycle enum
-  placed_at, filled_at, canceled_at, last_amended_at
-  raw_ib_response     — JSON from IB, stored for audit
-
-reprice_events        — one row per amendment actually sent
-  order_id (FK)
-  step_number, bid, ask, new_price
-  amendment_confirmed
-  timestamp
-
-contracts             — contract cache (TTL: 24 h default)
-  symbol (PK)
-  con_id, exchange, currency, multiplier
-  fetched_at
-
-system_heartbeats     — mutual liveness tracking
-  process (PK)        — "REPL" or "DAEMON"
-  last_seen_at, pid
-
-system_alerts         — CATASTROPHIC / WARNING conditions
-  id (UUID PK)
-  severity, trigger, message
-  created_at, resolved_at
-
-metrics               — time-series events (schema only, not yet written)
-  trade_id (FK), event_type, symbol, value, meta, recorded_at
-```
-
-WAL mode is enabled on every connection. Foreign key enforcement is on. Schema managed
-by Alembic migrations (`migrations/`).
+- All monetary values: `Numeric(18, 8)` mapped to Python `Decimal`
+- All primary keys: UUID strings (except autoincrement on transactions, bot_events, position_cache)
+- All datetimes: server-local timezone
+- WAL mode enabled on every connection
+- Foreign keys enforced
 
 ---
 
 ## Dependency Injection
 
-`AppContext` is a frozen dataclass created once at process startup and passed to every
-engine function and command handler. Nothing constructs its own repositories or IB
-client. No global singletons.
+`AppContext` is created once at process startup and passed through the call stack:
 
 ```python
 @dataclass
 class AppContext:
-    ib: IBClientBase
+    ib: IBClientBase                    # Primary broker (legacy alias)
     trades: TradeRepository
     orders: OrderRepository
     reprice_events: RepriceEventRepository
     contracts: ContractRepository
     heartbeats: HeartbeatRepository
     alerts: AlertRepository
-    tracker: OrderTracker
+    tracker: OrderTracker               # Ephemeral fill coordination
     settings: dict
     account_id: str
+    transactions: TransactionRepository
+    pending_commands: PendingCommandRepository
+    bots: BotRepository
+    bot_events: BotEventRepository
+    templates: OrderTemplateRepository
+    router: OutputRouter
+    _brokers: dict                      # Multi-broker support
+
+    def get_broker(self, name: str) -> BrokerClientBase
 ```
 
 ---
 
-## Pricing Functions
+## Frontend
 
-All in `engine/pricing.py`. Pure functions — no IB calls, no DB access, no side effects.
-All inputs and outputs are `Decimal`. No `float` anywhere in the codebase.
+React 19 + TypeScript + Vite + Tailwind CSS v4 + flexlayout-react + Zustand.
 
-| Function | Formula |
-|----------|---------|
-| `calc_mid` | `(bid + ask) / 2`, rounded to 2dp |
-| `calc_step_price(side="BUY")` | `mid + (step/total) * (ask - mid)` |
-| `calc_step_price(side="SELL")` | `mid + (step/total) * (bid - mid)` |
-| `calc_profit_taker_price` | `avg_fill + (profit / qty)` |
-| `calc_profit_taker_price_short` | `avg_fill - (profit / qty)` |
-| `calc_shares_from_dollars` | `floor(dollars / mid)`, capped at max |
+### Data Flow
 
----
+- **Mock mode** (`VITE_DATA_MODE` unset): Local simulation with mock data
+- **Live mode** (`VITE_DATA_MODE=live`): Connected to API server
+  - Commands → `POST /api/commands` → poll for completion
+  - Positions → poll `/api/positions` every 30s + on command completion
+  - Orders/Trades → poll on command completion
+  - Alerts/Heartbeats → WebSocket snapshot + diffs
+  - Logs → poll `/api/logs` every 5s
 
-## Alert System
+### Panels
 
-Two severity levels:
-
-| Level | Trigger Examples | Behaviour |
-|-------|-----------------|-----------|
-| `CATASTROPHIC` | REPL heartbeat stale, SQLite integrity fail, 3× IB connectivity fail | TUI goes red, all loops pause, waits for Enter |
-| `WARNING` | Single reconciliation fail, single IB fail, ABANDONED order on startup | Amber indicator, loops continue |
-
-Severity levels are spaced to allow future insertion without restructuring the enum.
-A WARNING is never auto-escalated to CATASTROPHIC — only defined triggers can be CATASTROPHIC.
-
----
-
-## Strategy Enum
-
-```python
-class Strategy(StrEnum):
-    MID    = "mid"     # mid-price limit, reprice loop
-    MARKET = "market"  # market order
-    BID    = "bid"     # fixed limit at bid, GTC
-    ASK    = "ask"     # fixed limit at ask, GTC
-```
-
-Single definition in `repl/commands.py`. Used in command dataclasses and order
-dispatch. Adding a new strategy requires one line here — validation everywhere
-updates automatically.
+| Panel | Data Source | Refresh Trigger |
+|-------|------------|-----------------|
+| Console | Local state + API polling | Command submission |
+| Positions | `/api/positions` | 30s interval + command completion |
+| Orders | `/api/orders` | Command completion |
+| Trades | `/api/trades` | Command completion |
+| Alerts | Store + WebSocket | Real-time |
+| Logs | `/api/logs` | 5s polling |
+| Quick Orders | `/api/templates` | CRUD operations |
+| Help | Static | — |
 
 ---
 
-## Key Design Decisions (ADR Summary)
+## Key Design Decisions
 
-| ADR | Decision |
-|-----|----------|
-| 001 | Amendment not cancel-replace — single IB order ID per entry leg |
-| 002 | Zero memory state — crash at any point, restart from SQLite |
-| 003 | SQLite WAL mode — concurrent reads without blocking writes |
-| 004 | SQLite as sole IPC — no sockets, pipes, or shared memory between processes |
-| 005 | `Decimal` not `float` — all monetary values |
-| 006 | Options/futures readiness — no hardcoded STK assumptions |
-| 007 | IB abstraction layer — engine never imports ib_insync |
-| 008 | IB rate limiting — 100 ms minimum between calls in base class |
-| 009 | REPL not one-shot CLI — persistent session, single IB connection |
-| 010 | Mutual watchdog via heartbeat — SQLite only, no process management |
-| 011 | Two severity levels — CATASTROPHIC halts, WARNING logs |
-| 012 | ib_insync over REST API — full event-driven callback support |
+| # | Decision | Rationale |
+|---|----------|-----------|
+| 1 | Central engine with SQLite command queue | Eliminates multi-client IB conflicts |
+| 2 | Zero memory state | Crash at any point, restart from SQLite |
+| 3 | SQLite as sole IPC | No sockets, pipes, or shared memory |
+| 4 | Decimal not float | Monetary precision |
+| 5 | Broker abstraction | Extensible to Alpaca and future brokers |
+| 6 | Cancel-vs-fill settle window | 3s wait after cancel to catch late fills |
+| 7 | API returns 202 for commands | Non-blocking, result via polling/WebSocket |
+| 8 | Bots have no broker connection | Submit via pending_commands like any client |
+| 9 | Position cache table | API serves IB positions without broker connection |
+| 10 | Server-local timestamps | Single-user deployment, avoids UTC confusion |
+| 11 | FillStream abstraction | Push (IB callbacks) and poll (Alpaca WebSocket) unified |
+| 12 | PreSubmitted settle wait | 3s grace before declaring order NOT ACTIVE |

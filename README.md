@@ -1,22 +1,56 @@
 # IB Trader
 
-Python trading engine for Interactive Brokers. Two persistent processes:
+Trading platform for Interactive Brokers with a web GUI, central engine, and bot framework. Designed for extensibility — Alpaca broker support is built in (not yet connected).
 
-- **`ib-trader`** — Interactive REPL. Start once, trade from the prompt.
-- **`ib-daemon`** — Background TUI. Monitoring, reconciliation, system health.
+## Architecture
+
+Five processes, communicating only through SQLite:
+
+```
+┌─────────┐   ┌───────────┐   ┌────────────┐
+│  REPL   │   │ API Server│   │ Bot Runner │
+│ (CLI)   │   │ (FastAPI) │   │ (process)  │
+└────┬────┘   └─────┬─────┘   └─────┬──────┘
+     │              │               │
+     └──────┬───────┴───────┬───────┘
+            │   SQLite      │
+            │  pending_cmds │
+            ▼               │
+     ┌──────────────┐       │
+     │Engine Service │◄──────┘
+     │(sole broker  │
+     │ connection)  │
+     └──────┬───────┘
+            │
+     ┌──────┴──────┐
+     │             │
+  ┌──▼──┐    ┌────▼───┐
+  │ IB  │    │Alpaca  │
+  └─────┘    └────────┘
+```
+
+- **`ib-engine`** — Central command loop. Sole process with broker connections. Polls `pending_commands` from SQLite, executes orders via IB.
+- **`ib-api`** — FastAPI server. REST + WebSocket for the GUI. No broker connection — reads SQLite, submits commands to `pending_commands`.
+- **`ib-daemon`** — Background monitoring. Reconciliation, heartbeat checks, integrity verification. Own IB connection (read-only).
+- **`ib-bots`** — Bot runner. Manages trading bot lifecycle. Submits commands via `pending_commands`.
+- **`ib-trader`** — Interactive REPL (legacy CLI). Can also submit commands via `pending_commands`.
 
 ## Requirements
 
 - Python 3.11+
-- TWS (Trader Workstation) or IB Gateway running locally
-- `uv` package manager (installed automatically via `make install`)
+- Node.js 18+ (for the GUI frontend)
+- IB Gateway or TWS running locally
+- `uv` package manager
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install
 
 ```bash
-make install
+git clone git@github.com:zuura15/ib-trader.git
+cd ib-trader
+uv venv && uv pip install -e .
+uv pip install websockets httpx
 ```
 
 ### 2. Configure
@@ -30,115 +64,148 @@ Edit `.env` with your IB connection details:
 
 ```
 IB_HOST=127.0.0.1
-IB_PORT=7497          # 7497 = TWS live, 7496 = TWS paper, 4001 = GW live, 4002 = GW paper
-IB_CLIENT_ID=1        # Unique per connected client
+IB_PORT=4001              # 4001 = GW live, 4002 = GW paper
+IB_CLIENT_ID=1
 IB_ACCOUNT_ID=U1234567
+IB_PORT_PAPER=4002
+IB_ACCOUNT_ID_PAPER=DU1234567
 ```
 
-> **Note:** The daemon uses `IB_CLIENT_ID + 1` automatically. If REPL uses client ID 1, daemon uses 2. Both must be unique in TWS.
+### 3. Configure symbols
 
-### 3. Add symbols to trade
-
-Edit `config/symbols.yaml` — no restart required to add symbols:
+Edit `config/symbols.yaml`:
 
 ```yaml
-- MSFT
 - AAPL
-- NVDA
+- MSFT
+- QQQ
+- SPY
 ```
 
-### 4. Start TWS or IB Gateway
-
-Enable API connections in TWS: File → Global Configuration → API → Settings → Enable ActiveX and Socket Clients.
-
-### 5. Start the REPL
+### 4. Apply database migrations
 
 ```bash
-ib-trader
+uv run alembic -c migrations/alembic.ini upgrade head
 ```
 
-Or with custom paths:
+### 5. Install frontend
 
 ```bash
-ib-trader --db trader.db --env .env --settings config/settings.yaml
+cd frontend && npm install && cd ..
 ```
 
-### 6. (Optional) Start the daemon in a second terminal
+### 6. Start IB Gateway
+
+Enable API connections: Configuration → Settings → API → Enable ActiveX and Socket Clients.
+
+### 7. Start the platform
+
+Four terminals (or use Tilix for tiled panes):
 
 ```bash
-ib-daemon
+# Terminal 1 — Engine (start first)
+.venv/bin/ib-engine
+
+# Terminal 2 — API Server
+.venv/bin/ib-api
+
+# Terminal 3 — Frontend
+cd frontend && VITE_DATA_MODE=live npm run dev
+
+# Terminal 4 — Daemon (optional, for reconciliation)
+.venv/bin/ib-daemon
 ```
 
-The daemon is not required for trading. If absent, the REPL shows a warning but operates normally. The daemon adds background reconciliation, monitoring, and the TUI dashboard.
+Open `http://localhost:5173` in your browser.
+
+## GUI
+
+The web GUI provides a professional trading workstation with dockable, resizable panels:
+
+- **Console** — Command entry with live status, output history, copy button
+- **Positions** — Live IB positions (refreshed every 30s) with STK/OPT/Other filters
+- **Orders** — Open orders with status badges, auto-refresh on command completion
+- **Trades** — Trade history with P&L, filterable by all/open/closed
+- **Alerts** — Active/Dismissed tabs, severity-aware badges, dismiss with API resolution
+- **Logs** — Live log stream from engine (newest first, polling every 5s)
+- **Quick Orders** — Saved order templates with one-click fire
+- **Help** — Copyable command reference
+
+Dark/light theme toggle persists across sessions.
 
 ## Trading Commands
 
+Enter in the GUI console or the REPL:
+
 ```
-> buy MSFT 5 mid              # Buy 5 shares at mid price, reprice toward ask over 10s
-> buy MSFT 5 mid 500          # Buy at mid, place profit taker at +$500 total profit
-> buy MSFT 5 market           # Buy at market
-> buy MSFT 5 mid --dollars 1000   # Buy with $1000 notional (5 shares at ~$200 each)
-> sell MSFT 5 mid             # Short sell at mid
-> close 4                     # Close position from serial #4 at mid
-> close 4 market              # Close at market
-> orders                      # List open orders
-> status                      # Gateway and system status
-> exit                        # Clean exit
-> help                        # Full command reference
+buy AAPL 10 mid                    # Buy 10 shares at mid price with reprice loop
+buy AAPL 10 mid --profit 500       # Buy with $500 profit taker
+buy AAPL 10 market                 # Market order
+buy AAPL 10 limit 180.50           # Limit order at $180.50
+buy AAPL 10 bid                    # Passive buy at bid
+sell TSLA 5 ask                    # Aggressive sell at ask
+close 42 mid                       # Close trade #42 at mid
+close 42 market                    # Close at market
+status                             # System status and P&L summary
+orders                             # List open orders
+help                               # Command reference
 ```
+
+Strategies: `mid` (reprice loop), `market`, `bid`, `ask`, `limit PRICE`
+
+Options: `--profit N`, `--stop-loss N`, `--dollars N`, `--broker alpaca`
 
 ## Testing
 
 ```bash
-make test         # Unit + integration tests (no IB Gateway needed)
-make smoke        # Smoke tests (requires live IB Gateway — cleans up after itself)
-make lint         # Ruff linting
-make typecheck    # mypy type checking
+.venv/bin/python -m pytest tests/unit/                    # Unit tests (no IB needed)
+.venv/bin/python -m pytest tests/integration/             # Integration tests (no IB needed)
+.venv/bin/python -m pytest -m smoke tests/smoke/          # Smoke tests (requires live IB)
 ```
 
-### Running smoke tests safely
-
-```bash
-pytest -m smoke --tb=short
-```
-
-Smoke tests:
-- Skip automatically if IB Gateway is unreachable
-- Place only 1-share limit orders far outside the market (will not fill)
-- Cancel all test orders immediately after verification
-- Leave no open orders in IB
-
-## Architecture
-
-See `docs/decisions/` for Architecture Decision Records explaining all key design choices.
-
-Key principles:
-- **Zero in-memory state** — all state lives in SQLite
-- **Amendment not cancel-replace** — one IB order ID per entry leg
-- **Process isolation** — REPL and daemon communicate via SQLite only
-- **Mutual watchdog** — via `system_heartbeats` table, no sockets or signals
-- **Crash recovery** — on restart, REPRICING/AMENDING orders are marked ABANDONED
-- **Decimal not float** — all monetary values use `Decimal`
+415 tests total (362 unit + 53 integration).
 
 ## Configuration
 
-`config/settings.yaml` contains all tunables. Key settings:
+`config/settings.yaml` — all tunables:
 
 | Setting | Default | Description |
-|---|---|---|
-| `max_order_size_shares` | 10 | Safety limit — orders exceeding this are rejected |
-| `reprice_duration_seconds` | 10 | How long to reprice before canceling |
-| `reprice_interval_seconds` | 1 | Interval between reprice steps |
-| `heartbeat_stale_threshold_seconds` | 300 | Seconds before REPL heartbeat is considered stale |
-| `reconciliation_interval_seconds` | 1800 | How often daemon reconciles with IB |
+|---------|---------|-------------|
+| `max_order_size_shares` | 10 | Safety limit per order |
+| `reprice_duration_seconds` | 10 | Reprice window before cancel |
+| `reprice_interval_seconds` | 1 | Seconds between reprice steps |
+| `ib_min_call_interval_ms` | 100 | Rate limiter (ms between IB calls) |
+| `ib_market_data_type` | 1 | 1=live, 3=delayed |
+| `heartbeat_stale_threshold_seconds` | 300 | Stale heartbeat alert threshold |
+| `reconciliation_interval_seconds` | 1800 | Daemon reconciliation interval |
 
 ## Logs
 
-Structured JSON logs at `logs/ib_trader.log`. Each event is a single JSON object:
+Structured JSON at `logs/ib_trader.log`. Server-local timestamps. Rotates at 10MB, keeps 10 backups with gzip compression.
 
 ```json
-{"timestamp": "2026-03-08T10:32:01.234Z", "level": "INFO", "event": "ORDER_FILLED",
- "serial": 4, "symbol": "MSFT", "qty_filled": "5", "avg_price": "412.33"}
+{"timestamp": "2026-03-17T10:32:01.234-07:00", "level": "INFO", "event": "ORDER_FILLED",
+ "serial": 42, "symbol": "AAPL", "qty_filled": "10", "avg_price": "182.15"}
 ```
 
-Logs rotate at 10MB, keep 10 backups, and are gzip-compressed.
+## Deploy
+
+```bash
+# systemd (production)
+sudo bash deploy/setup.sh
+sudo systemctl start ib-engine ib-api ib-daemon
+
+# Background processes with log tailing
+./deploy/start.sh              # live
+./deploy/start.sh --paper      # paper trading
+./deploy/stop.sh               # stop all
+```
+
+## Key Design Principles
+
+- **Zero memory state** — crash at any point, restart from SQLite
+- **Central engine** — only one process holds broker connections
+- **SQLite as IPC** — all processes communicate through the database only
+- **Decimal not float** — all monetary values
+- **Broker-agnostic** — engine works through `BrokerClientBase` abstraction
+- **Cancel-vs-fill safety** — 3-second settle window after cancel to catch late fills

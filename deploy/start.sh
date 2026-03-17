@@ -17,7 +17,7 @@ set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$DIR/.venv/bin"
 LOGS="$DIR/logs"
-FRONTEND_DIR="$DIR/prototypes/claude-proto/ib-control-center-prototypes"
+FRONTEND_DIR="$DIR/frontend"
 PIDFILE="$DIR/logs/.pids"
 
 mkdir -p "$LOGS"

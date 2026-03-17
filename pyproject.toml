@@ -1,6 +1,6 @@
 [project]
 name = "ib-trader"
-version = "0.1.0"
+version = "1.0.0"
 description = "Interactive Brokers trading engine with persistent REPL and daemon"
 requires-python = ">=3.11"
 dependencies = [
