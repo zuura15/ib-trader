@@ -16,6 +16,7 @@ from ib_trader.data.repository import (
     TradeRepository, OrderRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
 )
+from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.engine.tracker import OrderTracker
 from ib_trader.config.context import AppContext
 from ib_trader.ib.base import IBClientBase
@@ -210,4 +211,5 @@ def ctx(session_factory, mock_ib):
         tracker=OrderTracker(),
         settings=settings,
         account_id="U1234567",
+        pending_commands=PendingCommandRepository(session_factory),
     )

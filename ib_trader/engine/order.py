@@ -47,6 +47,11 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _now_display() -> str:
+    """Local time formatted for user-visible output (not logs/DB — those stay UTC)."""
+    return datetime.now().strftime('%H:%M:%S')
+
+
 def _safe_int(val) -> int | None:
     """Convert a value to int, returning None if not convertible."""
     if val is None:
@@ -440,7 +445,7 @@ async def _execute_mid_order(
 
     ctx.router.emit(
         f"Order #{trade_group.serial_number} \u2014 {side} {qty} {cmd.symbol} @ mid\n"
-        f"[{_now_utc().strftime('%H:%M:%S')}] Placed @ ${mid} "
+        f"[{_now_display()}] Placed @ ${mid} "
         f"(bid: ${bid} ask: ${ask})",
         pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
         event="ORDER_PLACED_MID",
@@ -541,52 +546,82 @@ async def _execute_mid_order(
         raise IBOrderRejectedError(reason)
 
     if _ib_status == "PreSubmitted":
-        _why_held = _st.get("why_held") or ""
-        _expected_reason = presubmitted_reason()
-        if not is_ib_session_active():
-            # Weekend closure or 3:50-4:00 AM break — PreSubmitted is expected.
-            # Leave the GTC order in IB; daemon reconciler catches the fill.
-            ctx.orders.update_status(order.id, OrderStatus.OPEN)
-            ctx.router.emit(
-                f"\u26a0 QUEUED: {side} {qty} {cmd.symbol} @ ${mid} \u2014 "
-                f"{_expected_reason}\n"
-                f"  GTC order held by IB. No repricing will run.\n"
-                f"  Serial: #{trade_group.serial_number}",
-                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-                event="ORDER_QUEUED_DISPLAY",
-            )
+        # PreSubmitted can be transient — IB may route within milliseconds.
+        # Wait up to 3 seconds for it to progress before declaring NOT ACTIVE.
+        _PRESUBMIT_SETTLE_SECONDS = 3.0
+        _PRESUBMIT_SETTLE_POLL = 0.3
+        for _ in range(int(_PRESUBMIT_SETTLE_SECONDS / _PRESUBMIT_SETTLE_POLL)):
+            await asyncio.sleep(_PRESUBMIT_SETTLE_POLL)
+            _st = await ctx.ib.get_order_status(ib_order_id)
+            _ib_status = _st["status"]
+            if _ib_status != "PreSubmitted":
+                break
+
+        # If it progressed past PreSubmitted, continue to the reprice loop
+        if _ib_status in ("Submitted", "Filled"):
+            if _ib_status == "Filled":
+                # Filled during the settle wait — handle immediately
+                _fill_qty = _st.get("qty_filled", Decimal("0"))
+                _fill_price = _st.get("avg_fill_price")
+                _fill_commission = _st.get("commission") or Decimal("0")
+                if _fill_qty > 0 and _fill_price:
+                    await _handle_fill(
+                        order, trade_group, _fill_qty, _fill_price,
+                        _fill_commission, cmd, con_id, ctx,
+                    )
+                    ctx.tracker.unregister(ib_order_id)
+                    return
+            # Submitted — fall through to reprice loop below
             logger.info(
-                '{"event": "ORDER_QUEUED", "order_id": "%s", "serial": %d, '
-                '"symbol": "%s", "price": "%s", "reason": "%s"}',
-                order.id, trade_group.serial_number, cmd.symbol, mid, _expected_reason,
+                '{"event": "PRESUBMIT_SETTLED", "ib_order_id": "%s", '
+                '"final_status": "%s"}', ib_order_id, _ib_status,
             )
-            ctx.tracker.unregister(ib_order_id)
-            return
-        else:
-            # Active session — order should be Submitted at the exchange.
-            # PreSubmitted here means IB is NOT routing it: investigate.
-            _detail = f" (IB whyHeld: {_why_held!r})" if _why_held else ""
-            reason = (
-                f"Order not working at exchange during {session_label()}"
-                f"{_detail}. IB accepted but did not route."
-            )
-            await ctx.ib.cancel_order(ib_order_id)
-            ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
-            ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
-            ctx.tracker.unregister(ib_order_id)
-            ctx.router.emit(
-                f"\u2717 NOT ACTIVE: {side} {qty} {cmd.symbol} \u2014 {reason}\n"
-                f"  Check IB Gateway logs and account permissions.\n"
-                f"  Serial: #{trade_group.serial_number}",
-                pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
-                event="ORDER_PRESUBMITTED_UNEXPECTED_DISPLAY",
-            )
-            logger.error(
-                '{"event": "ORDER_NOT_ROUTED", "order_id": "%s", "serial": %d, '
-                '"symbol": "%s", "ib_status": "PreSubmitted", "why_held": "%s"}',
-                order.id, trade_group.serial_number, cmd.symbol, _why_held,
-            )
-            return  # error already emitted; order marked ABANDONED above
+        elif _ib_status == "PreSubmitted":
+            # Still PreSubmitted after 3 seconds — handle based on session
+            _why_held = _st.get("why_held") or ""
+            _expected_reason = presubmitted_reason()
+            if not is_ib_session_active():
+                # Weekend/break — expected, leave as GTC
+                ctx.orders.update_status(order.id, OrderStatus.OPEN)
+                ctx.router.emit(
+                    f"\u26a0 QUEUED: {side} {qty} {cmd.symbol} @ ${mid} \u2014 "
+                    f"{_expected_reason}\n"
+                    f"  GTC order held by IB. No repricing will run.\n"
+                    f"  Serial: #{trade_group.serial_number}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                    event="ORDER_QUEUED_DISPLAY",
+                )
+                logger.info(
+                    '{"event": "ORDER_QUEUED", "order_id": "%s", "serial": %d, '
+                    '"symbol": "%s", "price": "%s", "reason": "%s"}',
+                    order.id, trade_group.serial_number, cmd.symbol, mid, _expected_reason,
+                )
+                ctx.tracker.unregister(ib_order_id)
+                return
+            else:
+                # Active session, still PreSubmitted after 3s — genuinely stuck
+                _detail = f" (IB whyHeld: {_why_held!r})" if _why_held else ""
+                reason = (
+                    f"Order not working at exchange during {session_label()}"
+                    f"{_detail}. IB accepted but did not route."
+                )
+                await ctx.ib.cancel_order(ib_order_id)
+                ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
+                ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+                ctx.tracker.unregister(ib_order_id)
+                ctx.router.emit(
+                    f"\u2717 NOT ACTIVE: {side} {qty} {cmd.symbol} \u2014 {reason}\n"
+                    f"  Check IB Gateway logs and account permissions.\n"
+                    f"  Serial: #{trade_group.serial_number}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
+                    event="ORDER_PRESUBMITTED_UNEXPECTED_DISPLAY",
+                )
+                logger.error(
+                    '{"event": "ORDER_NOT_ROUTED", "order_id": "%s", "serial": %d, '
+                    '"symbol": "%s", "ib_status": "PreSubmitted", "why_held": "%s"}',
+                    order.id, trade_group.serial_number, cmd.symbol, _why_held,
+                )
+                return
 
     # Start reprice loop
     reprice_task = asyncio.create_task(
@@ -669,28 +704,65 @@ async def _execute_mid_order(
             )
         else:
             # Normal reprice window expired with no fill.
+            # CRITICAL: Cancel-vs-fill race condition.
+            # IB may fill the order between our cancel request and the
+            # cancel confirmation. We must check for fills AFTER cancelling
+            # and before marking the order as expired.
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
                        qty, ib_order_id=_safe_int(ib_order_id),
                        trade_serial=trade_group.serial_number)
             await ctx.ib.cancel_order(ib_order_id)
-            ctx.orders.update_status(order.id, OrderStatus.CANCELED)
-            ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
-            _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
-                       qty, ib_order_id=_safe_int(ib_order_id),
-                       trade_serial=trade_group.serial_number, is_terminal=True,
-                       ib_responded_at=_now_utc())
-            ctx.router.emit(
-                f"\u2717 EXPIRED: 0/{qty} filled | reprice window closed "
-                f"({settings['reprice_duration_seconds']}s)\n"
-                f"  Serial: #{trade_group.serial_number}",
-                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-                event="ORDER_EXPIRED_DISPLAY",
-            )
-            logger.info(
-                '{"event": "ORDER_EXPIRED", "order_id": "%s", "serial": %d, '
-                '"reason": "reprice_timeout_no_fill"}',
-                order.id, trade_group.serial_number,
-            )
+
+            # Wait briefly for the cancel/fill race to resolve.
+            # IB can take several seconds to confirm cancel vs fill.
+            _CANCEL_SETTLE_SECONDS = 3.0
+            _CANCEL_SETTLE_POLL = 0.3
+            settled_as_fill = False
+            for _ in range(int(_CANCEL_SETTLE_SECONDS / _CANCEL_SETTLE_POLL)):
+                await asyncio.sleep(_CANCEL_SETTLE_POLL)
+                status_dict = await ctx.ib.get_order_status(ib_order_id)
+                ib_status = status_dict.get("status", "")
+                ib_filled = status_dict.get("qty_filled", Decimal("0"))
+
+                if ib_filled and ib_filled > 0:
+                    # Fill arrived after cancel — the order actually filled!
+                    logger.warning(
+                        '{"event": "CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+                        '"symbol": "%s", "qty_filled": "%s", "resolution": "filled"}',
+                        ib_order_id, cmd.symbol, str(ib_filled),
+                    )
+                    avg_price = status_dict.get("avg_fill_price") or Decimal("0")
+                    commission = status_dict.get("commission") or Decimal("0")
+                    await _handle_fill(
+                        order, trade_group, ib_filled, avg_price,
+                        commission, cmd, con_id, ctx,
+                    )
+                    settled_as_fill = True
+                    break
+
+                if ib_status in ("Cancelled", "Inactive"):
+                    # Cancel confirmed — no fill happened.
+                    break
+
+            if not settled_as_fill:
+                ctx.orders.update_status(order.id, OrderStatus.CANCELED)
+                ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+                _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
+                           qty, ib_order_id=_safe_int(ib_order_id),
+                           trade_serial=trade_group.serial_number, is_terminal=True,
+                           ib_responded_at=_now_utc())
+                ctx.router.emit(
+                    f"\u2717 EXPIRED: 0/{qty} filled | reprice window closed "
+                    f"({settings['reprice_duration_seconds']}s)\n"
+                    f"  Serial: #{trade_group.serial_number}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                    event="ORDER_EXPIRED_DISPLAY",
+                )
+                logger.info(
+                    '{"event": "ORDER_EXPIRED", "order_id": "%s", "serial": %d, '
+                    '"reason": "reprice_timeout_no_fill"}',
+                    order.id, trade_group.serial_number,
+                )
 
     ctx.tracker.unregister(ib_order_id)
 
@@ -732,7 +804,7 @@ async def _execute_bid_ask_order(
 
     ctx.router.emit(
         f"Order #{trade_group.serial_number} \u2014 {side} {qty} {cmd.symbol} @ {cmd.strategy}\n"
-        f"[{_now_utc().strftime('%H:%M:%S')}] Placed @ ${price} "
+        f"[{_now_display()}] Placed @ ${price} "
         f"(bid: ${bid} ask: ${ask})",
         pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
         event="ORDER_PLACED_BID_ASK",
@@ -1164,7 +1236,7 @@ async def reprice_loop(
         qty_filled = status["qty_filled"]
 
         ctx.router.emit(
-            f"[{now.strftime('%H:%M:%S')}] Amended \u2192 ${new_price} | "
+            f"[{_now_display()}] Amended \u2192 ${new_price} | "
             f"step {step}/{total_steps} "
             f"(still open: {qty_filled}/? filled)",
             pane=OutputPane.LOG, severity=OutputSeverity.INFO,
@@ -1506,7 +1578,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
         ctx.orders.update_status(close_order.id, OrderStatus.REPRICING)
         ctx.router.emit(
-            f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Close #{cmd.serial} placed "
+            f"[{_now_display()}] Close #{cmd.serial} placed "
             f"@ ${initial_price} (bid: ${bid} ask: ${ask})",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_ORDER_PLACED",
@@ -1536,7 +1608,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
         ctx.orders.update_status(close_order.id, OrderStatus.OPEN)
         ctx.router.emit(
-            f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Close #{cmd.serial} placed "
+            f"[{_now_display()}] Close #{cmd.serial} placed "
             f"@ ${initial_price} ({cmd.strategy} — bid: ${bid} ask: ${ask})",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_ORDER_PLACED",
@@ -1761,18 +1833,53 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 qty_filled, avg_price, commission, ib_order_id, ctx,
             )
     else:
-        # No fill — cancel and report
+        # No fill — cancel and check for cancel-vs-fill race.
         await ctx.ib.cancel_order(ib_order_id)
-        ctx.orders.update_status(close_order.id, OrderStatus.CANCELED)
-        ctx.router.emit(
-            f"\u2717 CLOSE EXPIRED: #{cmd.serial} — 0/{qty_to_close} filled\n"
-            f"  Close order timed out. Position remains open.",
-            pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-            event="CLOSE_ORDER_EXPIRED",
-        )
-        logger.info(
-            '{"event": "CLOSE_ORDER_EXPIRED", "order_id": "%s", "serial": %d}',
-            close_order.id, cmd.serial,
-        )
+
+        # Wait briefly for the cancel/fill race to resolve.
+        _CANCEL_SETTLE_SECONDS = 3.0
+        _CANCEL_SETTLE_POLL = 0.3
+        settled_as_fill = False
+        for _ in range(int(_CANCEL_SETTLE_SECONDS / _CANCEL_SETTLE_POLL)):
+            await asyncio.sleep(_CANCEL_SETTLE_POLL)
+            status = await ctx.ib.get_order_status(ib_order_id)
+            ib_filled = status.get("qty_filled", Decimal("0"))
+
+            if ib_filled and ib_filled > 0:
+                logger.warning(
+                    '{"event": "CLOSE_CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+                    '"qty_filled": "%s", "resolution": "filled"}',
+                    ib_order_id, str(ib_filled),
+                )
+                avg_price = status.get("avg_fill_price") or Decimal("0")
+                commission = status.get("commission") or Decimal("0")
+                if ib_filled >= qty_to_close:
+                    await _handle_close_fill(
+                        close_order, trade_group, entry_order,
+                        ib_filled, avg_price, commission, ctx,
+                    )
+                else:
+                    await _handle_close_partial(
+                        close_order, trade_group, entry_order, qty_to_close,
+                        ib_filled, avg_price, commission, ib_order_id, ctx,
+                    )
+                settled_as_fill = True
+                break
+
+            if status.get("status", "") in ("Cancelled", "Inactive"):
+                break
+
+        if not settled_as_fill:
+            ctx.orders.update_status(close_order.id, OrderStatus.CANCELED)
+            ctx.router.emit(
+                f"\u2717 CLOSE EXPIRED: #{cmd.serial} — 0/{qty_to_close} filled\n"
+                f"  Close order timed out. Position remains open.",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                event="CLOSE_ORDER_EXPIRED",
+            )
+            logger.info(
+                '{"event": "CLOSE_ORDER_EXPIRED", "order_id": "%s", "serial": %d}',
+                close_order.id, cmd.serial,
+            )
 
     ctx.tracker.unregister(ib_order_id)

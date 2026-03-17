@@ -1,0 +1,18 @@
+[Unit]
+Description=IB Trader Daemon (Reconciliation & Monitoring)
+After=ib-engine.service
+
+[Service]
+Type=simple
+User=zuura
+WorkingDirectory=/home/zuura/projects/ib-trader
+ExecStart=/home/zuura/projects/ib-trader/.venv/bin/ib-daemon --paper
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

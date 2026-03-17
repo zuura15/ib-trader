@@ -72,6 +72,22 @@ class TransactionAction(str, enum.Enum):
     RECONCILED = "RECONCILED"
 
 
+class PendingCommandStatus(enum.Enum):
+    """Lifecycle status of a command in the pending_commands queue."""
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+
+
+class BotStatus(enum.Enum):
+    """Lifecycle status of a bot."""
+    RUNNING = "RUNNING"
+    STOPPED = "STOPPED"
+    ERROR = "ERROR"
+    PAUSED = "PAUSED"
+
+
 class AlertSeverity(enum.Enum):
     """Alert severity levels.
 
@@ -222,3 +238,107 @@ class TransactionEvent(Base):
     requested_at      = Column(DateTime, nullable=False)
     ib_responded_at   = Column(DateTime, nullable=True)
     is_terminal       = Column(Boolean, nullable=False, default=False)
+
+
+class PendingCommand(Base):
+    """Command queue for engine-client communication.
+
+    Clients (REPL, API server, bots) insert rows with status=PENDING.
+    The engine service polls for PENDING rows, executes them, and updates
+    status to SUCCESS or FAILURE with output/error.
+    """
+
+    __tablename__ = "pending_commands"
+
+    id           = Column(String(36), primary_key=True, default=_uuid)
+    source       = Column(String(50), nullable=False)     # "repl", "api", "bot:<bot_id>"
+    broker       = Column(String(20), nullable=False, default="ib")
+    command_text = Column(Text, nullable=False)
+    status       = Column(Enum(PendingCommandStatus), nullable=False,
+                          default=PendingCommandStatus.PENDING)
+    output       = Column(Text, nullable=True)
+    error        = Column(Text, nullable=True)
+    submitted_at = Column(DateTime, nullable=False)
+    started_at   = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class Bot(Base):
+    """Bot configuration and runtime status.
+
+    State is persisted in SQLite so the bot runner can crash and restart
+    with full context (zero memory state principle).
+    """
+
+    __tablename__ = "bots"
+
+    id                   = Column(String(36), primary_key=True, default=_uuid)
+    name                 = Column(String(100), unique=True, nullable=False)
+    strategy             = Column(String(100), nullable=False)
+    broker               = Column(String(20), nullable=False, default="ib")
+    config_json          = Column(Text, nullable=False, default="{}")
+    status               = Column(Enum(BotStatus), nullable=False, default=BotStatus.STOPPED)
+    tick_interval_seconds = Column(Integer, nullable=False, default=10)
+    last_heartbeat       = Column(DateTime, nullable=True)
+    last_signal          = Column(String(500), nullable=True)
+    last_action          = Column(String(500), nullable=True)
+    last_action_at       = Column(DateTime, nullable=True)
+    error_message        = Column(Text, nullable=True)
+    trades_total         = Column(Integer, nullable=False, default=0)
+    trades_today         = Column(Integer, nullable=False, default=0)
+    pnl_today            = Column(Numeric(18, 8), nullable=False, default=0)
+    symbols_json         = Column(Text, nullable=False, default="[]")
+    created_at           = Column(DateTime, nullable=False)
+    updated_at           = Column(DateTime, nullable=False)
+
+
+class BotEvent(Base):
+    """Append-only audit log for bot activity. Never updated after insert."""
+
+    __tablename__ = "bot_events"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    bot_id       = Column(String(36), ForeignKey("bots.id"), nullable=False)
+    event_type   = Column(String(50), nullable=False)    # STARTED, STOPPED, SIGNAL, ACTION, ERROR, HEARTBEAT
+    message      = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=True)           # Structured JSON for machine-readable data
+    trade_serial = Column(Integer, nullable=True)
+    recorded_at  = Column(DateTime, nullable=False)
+
+
+class OrderTemplate(Base):
+    """Saved order template for quick-fire orders from the GUI."""
+
+    __tablename__ = "order_templates"
+
+    id         = Column(String(36), primary_key=True, default=_uuid)
+    label      = Column(String(200), nullable=False)
+    symbol     = Column(String(20), nullable=False)
+    side       = Column(String(4), nullable=False)       # BUY / SELL
+    quantity   = Column(Numeric(18, 4), nullable=False)
+    order_type = Column(String(10), nullable=False)      # LMT / MKT / STP / MOC
+    price      = Column(Numeric(18, 4), nullable=True)
+    broker     = Column(String(20), nullable=False, default="ib")
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class PositionCache(Base):
+    """Cached broker positions, periodically updated by the engine service.
+
+    This is a full snapshot — the engine deletes all rows and re-inserts
+    on each refresh cycle. The API reads from this table for the positions
+    endpoint, providing authoritative broker positions without needing its
+    own broker connection.
+    """
+
+    __tablename__ = "position_cache"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    account_id   = Column(String(50), nullable=False)
+    symbol       = Column(String(20), nullable=False)
+    sec_type     = Column(String(10), nullable=False, default="STK")
+    quantity     = Column(Numeric(18, 4), nullable=False)
+    avg_cost     = Column(Numeric(18, 8), nullable=False)
+    broker       = Column(String(20), nullable=False, default="ib")
+    updated_at   = Column(DateTime, nullable=False)

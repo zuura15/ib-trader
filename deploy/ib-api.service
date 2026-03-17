@@ -1,0 +1,19 @@
+[Unit]
+Description=IB Trader API Server
+After=ib-engine.service
+Requires=ib-engine.service
+
+[Service]
+Type=simple
+User=zuura
+WorkingDirectory=/home/zuura/projects/ib-trader
+ExecStart=/home/zuura/projects/ib-trader/.venv/bin/ib-api --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

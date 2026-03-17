@@ -212,9 +212,25 @@ class InsyncClient(IBClientBase):
                 break
         # Cancel the streaming subscription — we only needed one quote.
         self._ib.cancelMktData(contract)
-        bid = Decimal(str(ticker.bid)) if ticker.bid and ticker.bid > 0 else Decimal("0")
-        ask = Decimal(str(ticker.ask)) if ticker.ask and ticker.ask > 0 else Decimal("0")
-        last = Decimal(str(ticker.last)) if ticker.last and ticker.last > 0 else Decimal("0")
+        bid = Decimal(str(ticker.bid)) if ticker.bid and ticker.bid == ticker.bid and ticker.bid > 0 else Decimal("0")
+        ask = Decimal(str(ticker.ask)) if ticker.ask and ticker.ask == ticker.ask and ticker.ask > 0 else Decimal("0")
+        last = Decimal(str(ticker.last)) if ticker.last and ticker.last == ticker.last and ticker.last > 0 else Decimal("0")
+
+        # When bid/ask unavailable but last price exists (common with delayed data),
+        # create a synthetic spread so the engine can calculate mid price.
+        if bid == 0 and ask == 0 and last > 0:
+            half_spread = max(
+                (last * Decimal("0.001") / 2).quantize(Decimal("0.01")),
+                Decimal("0.01"),
+            )
+            bid = last - half_spread
+            ask = last + half_spread
+            logger.info(
+                '{"event": "NO_BID_ASK_USING_LAST", "con_id": %d, '
+                '"last": "%s", "synthetic_bid": "%s", "synthetic_ask": "%s"}',
+                con_id, last, bid, ask,
+            )
+
         if bid == 0 and ask == 0 and last == 0:
             ref = await self._historical_midpoint(contract)
             if ref > 0:

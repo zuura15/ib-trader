@@ -52,5 +52,14 @@ site/
 run/
 *.pid
 
+# Node modules (frontend prototypes)
+node_modules/
+
+# Frontend build output
+prototypes/**/dist/
+
+# Debian packages
+*.deb
+
 # Claude Code internal files
 .claude/

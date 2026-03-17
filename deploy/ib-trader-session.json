@@ -1,0 +1,67 @@
+{
+    "child": {
+        "child1": {
+            "child1": {
+                "directory": "",
+                "height": 551,
+                "profile": "2b7c4080-0ddd-46c5-8f23-563fd3ba789d",
+                "readOnly": false,
+                "synchronizedInput": true,
+                "type": "Terminal",
+                "uuid": "133877c1-3252-4196-84fc-7bbc21d9cdc8",
+                "width": 960
+            },
+            "child2": {
+                "directory": "",
+                "height": 550,
+                "profile": "2b7c4080-0ddd-46c5-8f23-563fd3ba789d",
+                "readOnly": false,
+                "synchronizedInput": true,
+                "type": "Terminal",
+                "uuid": "bf5e4c04-0f21-44fe-bc45-55e4b6731346",
+                "width": 960
+            },
+            "orientation": 1,
+            "position": 50,
+            "ratio": 0.5,
+            "type": "Paned"
+        },
+        "child2": {
+            "child1": {
+                "directory": "",
+                "height": 551,
+                "profile": "2b7c4080-0ddd-46c5-8f23-563fd3ba789d",
+                "readOnly": false,
+                "synchronizedInput": true,
+                "type": "Terminal",
+                "uuid": "9314ab28-6650-4ec2-96bb-d94c731460a4",
+                "width": 959
+            },
+            "child2": {
+                "directory": "",
+                "height": 550,
+                "profile": "2b7c4080-0ddd-46c5-8f23-563fd3ba789d",
+                "readOnly": false,
+                "synchronizedInput": true,
+                "type": "Terminal",
+                "uuid": "8f58d1c9-18a5-47d8-8a71-dbc5968d61bc",
+                "width": 959
+            },
+            "orientation": 1,
+            "position": 50,
+            "ratio": 0.5,
+            "type": "Paned"
+        },
+        "orientation": 0,
+        "position": 50,
+        "ratio": 0.5,
+        "type": "Paned"
+    },
+    "height": 1102,
+    "name": "${title}",
+    "synchronizedInput": false,
+    "type": "Session",
+    "uuid": "c0ae75aa-12b6-4645-a930-50e99215ee0c",
+    "version": "1.0",
+    "width": 1920
+}

@@ -49,23 +49,47 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
     pid = os.getpid()
     ctx.heartbeats.upsert("DAEMON", pid)
     logger.info('{"event": "APP_STARTED", "process": "DAEMON", "pid": %d}', pid)
+    print(f"[DAEMON] Started (pid={pid}). Connecting to IB Gateway...")
 
     # Run integrity check on startup
     run_integrity_check(session_factory, ctx)
 
     # Connect IB for passive health checks (different client ID)
-    try:
-        await ctx.ib.connect()
-    except Exception as e:
-        logger.warning('{"event": "IB_DISCONNECTED", "startup": true, "error": "%s"}', str(e))
+    # Retry with clear output so operator knows what's happening
+    host = ctx.settings.get("ib_host", "127.0.0.1")
+    port = ctx.settings.get("ib_port", 4001)
+    retry_interval = ctx.settings.get("ib_connect_retry_seconds", 10)
+    ib_connected = False
+    attempt = 0
+    while not ib_connected:
+        attempt += 1
+        try:
+            await ctx.ib.connect()
+            ib_connected = True
+            print("[DAEMON] Connected to IB Gateway.")
+        except Exception as e:
+            print(
+                f"[DAEMON] IB Gateway not reachable at {host}:{port} "
+                f"(attempt {attempt}). Retrying in {retry_interval}s... ({e})"
+            )
+            logger.warning(
+                '{"event": "IB_CONNECT_RETRY", "process": "DAEMON", '
+                '"attempt": %d, "error": "%s"}', attempt, str(e),
+            )
+            await asyncio.sleep(retry_interval)
 
     # Run transaction reconciliation once on startup
+    print("[DAEMON] Running startup reconciliation...")
     try:
         await run_transaction_reconciliation(ctx)
+        print("[DAEMON] Startup reconciliation complete.")
         logger.info('{"event": "STARTUP_TRANSACTION_RECONCILIATION_COMPLETE"}')
     except Exception as e:
+        print(f"[DAEMON] Startup reconciliation failed: {e}")
         logger.error('{"event": "STARTUP_TRANSACTION_RECONCILIATION_FAILED", "error": "%s"}',
                      str(e), exc_info=True)
+
+    print("[DAEMON] Ready. Monitoring heartbeats, reconciliation, integrity...")
 
     consecutive_ib_failures: list = []
     last_recon_time = None
@@ -189,27 +213,48 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
                 continue
 
             # REPL heartbeat check
+            repl_hb = ctx.heartbeats.get("REPL")
+            engine_hb = ctx.heartbeats.get("ENGINE")
+            if repl_hb:
+                repl_age = (datetime.now(timezone.utc) - (repl_hb.last_seen_at.replace(tzinfo=timezone.utc) if repl_hb.last_seen_at.tzinfo is None else repl_hb.last_seen_at)).total_seconds()
+                if repl_age > ctx.settings["heartbeat_stale_threshold_seconds"]:
+                    print(f"[DAEMON] WARNING  REPL heartbeat stale ({repl_age:.0f}s ago, pid={repl_hb.pid})")
+            if engine_hb:
+                engine_age = (datetime.now(timezone.utc) - (engine_hb.last_seen_at.replace(tzinfo=timezone.utc) if engine_hb.last_seen_at.tzinfo is None else engine_hb.last_seen_at)).total_seconds()
+                if engine_age > ctx.settings["heartbeat_stale_threshold_seconds"]:
+                    print(f"[DAEMON] WARNING  ENGINE heartbeat stale ({engine_age:.0f}s ago, pid={engine_hb.pid})")
+
             await check_repl_heartbeat(ctx)
 
             # IB connectivity check (every 30 min)
             ib_counter += 30
             if ib_counter >= ib_check_interval:
-                await check_ib_connectivity(ctx, consecutive_ib_failures)
+                try:
+                    await check_ib_connectivity(ctx, consecutive_ib_failures)
+                except Exception as e:
+                    print(f"[DAEMON] WARNING  IB connectivity check failed: {e}")
                 ib_counter = 0
 
             # Reconciliation (hourly per reconciliation_interval_seconds)
             recon_counter += 30
             if recon_counter >= recon_interval:
+                print("[DAEMON] Running reconciliation...")
                 result = await run_reconciliation(ctx)
                 await run_transaction_reconciliation(ctx)
                 last_recon_time = datetime.now(timezone.utc)
                 last_recon_changes = result["changes"]
+                if last_recon_changes > 0:
+                    print(f"[DAEMON] Reconciliation found {last_recon_changes} change(s)")
+                else:
+                    print("[DAEMON] Reconciliation complete — no discrepancies")
                 recon_counter = 0
 
             # Integrity check (every 6 hours)
             integrity_counter += 30
             if integrity_counter >= integrity_interval:
+                print("[DAEMON] Running integrity check...")
                 run_integrity_check(session_factory, ctx)
+                print("[DAEMON] Integrity check complete.")
                 integrity_counter = 0
 
     # Run TUI and background loops concurrently

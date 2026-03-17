@@ -21,7 +21,9 @@ class JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Serialize a LogRecord to a JSON string."""
         log_obj: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # Server-local timezone for single-user deployment.
+            # TODO: Switch to UTC if multi-timezone deployment is needed.
+            "timestamp": datetime.now().astimezone().isoformat(),
             "level": record.levelname,
         }
 

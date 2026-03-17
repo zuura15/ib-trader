@@ -9,7 +9,8 @@ from decimal import Decimal
 
 from ib_trader.data.models import (
     TradeGroup, Order, RepriceEvent, Contract,
-    SystemHeartbeat, SystemAlert, TradeStatus, OrderStatus
+    SystemHeartbeat, SystemAlert, PendingCommand,
+    TradeStatus, OrderStatus, PendingCommandStatus,
 )
 
 
@@ -195,4 +196,44 @@ class AlertRepositoryBase(ABC):
     @abstractmethod
     def resolve(self, alert_id: str) -> None:
         """Mark an alert as resolved with the current UTC timestamp."""
+        ...
+
+
+class PendingCommandRepositoryBase(ABC):
+    """Abstract interface for the pending_commands queue."""
+
+    @abstractmethod
+    def insert(self, cmd: PendingCommand) -> PendingCommand:
+        """Insert a new pending command and return it."""
+        ...
+
+    @abstractmethod
+    def get(self, cmd_id: str) -> PendingCommand | None:
+        """Return the command with the given ID, or None."""
+        ...
+
+    @abstractmethod
+    def get_pending(self) -> list[PendingCommand]:
+        """Return all commands with status PENDING, ordered by submitted_at."""
+        ...
+
+    @abstractmethod
+    def get_by_status(self, status: PendingCommandStatus) -> list[PendingCommand]:
+        """Return all commands with the given status."""
+        ...
+
+    @abstractmethod
+    def update_status(self, cmd_id: str, status: PendingCommandStatus) -> None:
+        """Update the status and started_at timestamp of a command."""
+        ...
+
+    @abstractmethod
+    def complete(self, cmd_id: str, status: PendingCommandStatus,
+                 output: str | None = None, error: str | None = None) -> None:
+        """Mark a command as completed (SUCCESS or FAILURE) with output/error."""
+        ...
+
+    @abstractmethod
+    def get_by_source(self, source: str, limit: int = 50) -> list[PendingCommand]:
+        """Return recent commands from a given source, newest first."""
         ...

@@ -1,0 +1,20 @@
+[Unit]
+Description=IB Trader Engine Service
+After=network.target
+Wants=ib-api.service ib-bots.service
+
+[Service]
+Type=simple
+User=zuura
+WorkingDirectory=/home/zuura/projects/ib-trader
+ExecStart=/home/zuura/projects/ib-trader/.venv/bin/ib-engine --paper
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

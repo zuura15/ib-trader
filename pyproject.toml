@@ -6,10 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.18.4",
     "click>=8.3.1",
+    "fastapi>=0.115.0",
     "ib-async>=2.1.0",
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.7.4",
     "mypy>=1.19.1",
+    "pydantic>=2.10.0",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
@@ -19,11 +21,15 @@ dependencies = [
     "ruff>=0.15.5",
     "sqlalchemy>=2.0.48",
     "textual>=8.0.2",
+    "uvicorn>=0.34.0",
 ]
 
 [project.scripts]
 ib-trader = "ib_trader.repl.main:main"
 ib-daemon = "ib_trader.daemon.main:main"
+ib-engine = "ib_trader.engine.main:main"
+ib-api = "ib_trader.api.main:main"
+ib-bots = "ib_trader.bots.main:main"
 
 [tool.uv]
 package = true
@@ -62,6 +68,17 @@ omit = [
     "ib_trader/repl/tui.py",
     # Daemon main requires full async TUI + IB
     "ib_trader/daemon/main.py",
+    # Engine service main requires live IB connection
+    "ib_trader/engine/main.py",
+    # API server main requires uvicorn runtime
+    "ib_trader/api/main.py",
+    # Bot runner main requires full async runtime
+    "ib_trader/bots/main.py",
+    # Broker implementations require live broker connections
+    "ib_trader/broker/ib/client.py",
+    "ib_trader/broker/alpaca/client.py",
+    # Bot runner requires full async runtime
+    "ib_trader/bots/runner.py",
     # Logging setup is I/O-only, tested implicitly
     "ib_trader/logging_/logger.py",
 ]

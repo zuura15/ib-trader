@@ -41,7 +41,11 @@ No exceptions. Treat these as team-level non-negotiables.
 ## Code Style
 - ALL monetary values: Decimal, never float.
 - ALL UUIDs generated with uuid4().
-- ALL datetimes stored and compared in UTC.
+- ALL datetimes stored, compared, and displayed in server-local timezone.
+  <!-- TODO: If this tool is opened up for multi-user or multi-timezone deployment,
+       revisit this decision. UTC storage + per-user display conversion would be
+       needed. For now, single-user with gateway on the same machine — local time
+       is simpler and less confusing. -->
 - ALL config values read from settings.yaml — never hardcode tunables.
 - ALL secrets read from .env — never in code or settings.yaml.
 - Repository pattern for ALL database access — never write raw SQL outside data/ layer.

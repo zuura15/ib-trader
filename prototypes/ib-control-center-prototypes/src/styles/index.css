@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  background: #090b0f;
+}
+
+body {
+  color: #e2e8f0;
+}
+
+.flexlayout__layout {
+  --color-base: #10141b;
+  --color-1: #131922;
+  --color-2: #18212d;
+  --color-3: #223041;
+  --color-4: #67b7ff;
+  --color-5: #0f141b;
+  --color-6: #31455d;
+  --color-drag1: rgba(103, 183, 255, 0.15);
+  --color-drag2: rgba(103, 183, 255, 0.65);
+  --font-size: 12px;
+  --font-family: "IBM Plex Sans", system-ui, sans-serif;
+}
+
+.flexlayout__tab_toolbar_button,
+.flexlayout__tab_button_content,
+.flexlayout__tabset_header_content {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+}
+
+.flexlayout__tab {
+  background-color: #10141b;
+}
+
+.flexlayout__tab_button--selected {
+  background: #18212d;
+}
+
+.flexlayout__splitter {
+  background: #090b0f;
+}
+
+.flexlayout__border_tabset {
+  background-color: #0b0f14;
+}
