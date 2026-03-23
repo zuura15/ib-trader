@@ -192,6 +192,12 @@ async def _execute_single_command(cmd_row, ctx: AppContext,
                 output=output,
             )
 
+            # Trigger immediate position cache refresh after order execution
+            if isinstance(parsed, (BuyCommand, SellCommand, CloseCommand)):
+                await asyncio.sleep(2)  # Give IB time to update positions
+                from ib_trader.engine.main import position_refresh_event
+                position_refresh_event.set()
+
         except Exception as e:
             print(f"[ENGINE] ERROR {cmd_row.command_text!r} — {e}")
             logger.exception(json.dumps({

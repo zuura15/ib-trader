@@ -17,7 +17,6 @@ import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import scoped_session
 
@@ -183,6 +182,14 @@ class _ChannelState:
 
 def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
     """Fetch current data for a channel from SQLite."""
+    # End any open transaction so the next query sees the latest committed
+    # data.  Without this, SQLite's DEFERRED isolation keeps returning the
+    # snapshot from the first read in this long-lived session.
+    try:
+        sf().rollback()
+    except Exception:
+        pass
+
     if channel == "trades":
         repo = TradeRepository(sf)
         return [_serialize_trade(t) for t in repo.get_all()]

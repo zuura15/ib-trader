@@ -15,6 +15,9 @@ import logging
 import os
 from pathlib import Path
 
+# Module-level event signaling that a command completed and positions should refresh.
+position_refresh_event = asyncio.Event()
+
 import click
 
 from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions
@@ -196,84 +199,150 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
 
 
 async def _position_cache_loop(ctx: AppContext) -> None:
-    """Periodically fetch positions from IB and write to position_cache table.
+    """Periodically fetch positions from IB, read live streaming prices, and
+    write to run/positions.json.
 
-    The API server reads from this table so it doesn't need a broker connection.
-    Refreshes every 30 seconds.
+    Market data subscriptions are kept alive persistently — we subscribe once
+    per contract and just read the latest ticker values each cycle.  This
+    avoids the stale-ticker bug where reqMktData + cancelMktData reuses a
+    recycled Ticker object with old values.
+
+    The API server reads run/positions.json directly (no SQLite).
     """
-    from ib_trader.data.models import PositionCache, Base
-    from sqlalchemy import text
-    from datetime import datetime, timezone
+    import json as _json
+    from decimal import Decimal
 
-    # Ensure table exists
-    sf = None
-    for attr in ('_session_factory',):
-        # Get session factory from any repository
-        repo = ctx.trades
-        if hasattr(repo, '_session_factory'):
-            sf = repo._session_factory
-            break
+    positions_path = Path("run/positions.json")
+    positions_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if sf is None:
-        logger.warning('{"event": "POSITION_CACHE_NO_SESSION"}')
+    class _Enc(_json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, Decimal):
+                return str(o)
+            return super().default(o)
+
+    # Get the raw ib_async IB object for positions() and reqMktData()
+    ib_obj = None
+    if hasattr(ctx.ib, '_insync') and hasattr(ctx.ib._insync, '_ib'):
+        ib_obj = ctx.ib._insync._ib
+    elif hasattr(ctx.ib, '_ib'):
+        ib_obj = ctx.ib._ib
+
+    if ib_obj is None:
+        logger.warning('{"event": "POSITION_CACHE_NO_IB_OBJ"}')
         return
+
+    # Persistent streaming subscriptions: con_id → Ticker
+    streaming_tickers: dict[int, object] = {}
 
     # Initial delay to let connection stabilize
     await asyncio.sleep(5)
 
     while True:
         try:
-            # Fetch positions from IB
-            ib_positions = []
+            # Refresh positions from IB
             try:
-                # ib_async positions() returns Position objects
-                if hasattr(ctx.ib, '_insync') and hasattr(ctx.ib._insync, '_ib'):
-                    raw_positions = ctx.ib._insync._ib.positions()
-                elif hasattr(ctx.ib, '_ib'):
-                    raw_positions = ctx.ib._ib.positions()
-                else:
-                    raw_positions = []
-
-                for p in raw_positions:
-                    ib_positions.append({
-                        "account_id": p.account,
-                        "symbol": p.contract.symbol,
-                        "sec_type": p.contract.secType,
-                        "quantity": p.position,
-                        "avg_cost": p.avgCost,
-                    })
-            except Exception as e:
-                logger.debug('{"event": "POSITION_FETCH_ERROR", "error": "%s"}', str(e))
-
-            # Write to cache table (full snapshot replace)
-            s = sf()
-            now = datetime.now(timezone.utc)
-            try:
-                s.execute(text("DELETE FROM position_cache"))
-                for pos in ib_positions:
-                    s.add(PositionCache(
-                        account_id=pos["account_id"],
-                        symbol=pos["symbol"],
-                        sec_type=pos.get("sec_type", "STK"),
-                        quantity=pos["quantity"],
-                        avg_cost=pos["avg_cost"],
-                        broker="ib",
-                        updated_at=now,
-                    ))
-                s.commit()
+                await ib_obj.reqPositionsAsync()
             except Exception:
-                s.rollback()
-                # Table might not exist yet — create it
+                logger.debug('{"event": "REQ_POSITIONS_FAILED"}')
+            raw_positions = ib_obj.positions()
+
+            # Ensure we have streaming subscriptions for all position contracts
+            current_con_ids = set()
+            for p in raw_positions:
+                con_id = p.contract.conId
+                current_con_ids.add(con_id)
+                if con_id not in streaming_tickers:
+                    try:
+                        from ib_async import Contract
+                        # Get qualified contract from the cache or build one
+                        contract = (
+                            ctx.ib._contract_cache.get(con_id)
+                            if hasattr(ctx.ib, '_contract_cache')
+                            else None
+                        ) or Contract(
+                            conId=con_id,
+                            symbol=p.contract.symbol,
+                            secType=p.contract.secType,
+                            exchange=p.contract.exchange or "SMART",
+                            currency=p.contract.currency or "USD",
+                        )
+                        ticker = ib_obj.reqMktData(contract, "", False, False)
+                        streaming_tickers[con_id] = ticker
+                        logger.info(
+                            '{"event": "STREAMING_SUB_ADDED", "symbol": "%s", "con_id": %d}',
+                            p.contract.symbol, con_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            '{"event": "STREAMING_SUB_FAILED", "con_id": %d}',
+                            con_id,
+                        )
+
+            # Cancel subscriptions for positions we no longer hold
+            for gone_id in list(streaming_tickers.keys() - current_con_ids):
                 try:
-                    Base.metadata.create_all(s.get_bind())
-                    s.commit()
+                    ib_obj.cancelMktData(streaming_tickers[gone_id].contract)
                 except Exception:
                     pass
+                del streaming_tickers[gone_id]
+
+            # Build output — read latest values from streaming tickers (instant)
+            positions = []
+            for idx, p in enumerate(raw_positions):
+                sym = p.contract.symbol
+                sec = p.contract.secType
+                con_id = p.contract.conId
+
+                mkt_price = None
+                ticker = streaming_tickers.get(con_id)
+                if ticker is not None:
+                    bid = getattr(ticker, 'bid', None)
+                    ask = getattr(ticker, 'ask', None)
+                    last = getattr(ticker, 'last', None)
+
+                    # Use bid/ask midpoint (updates continuously).
+                    # Fall back to last trade price.
+                    if (bid and bid == bid and bid > 0
+                            and ask and ask == ask and ask > 0):
+                        mkt_price = (bid + ask) / 2
+                    elif last and last == last and last > 0:
+                        mkt_price = last
+
+                positions.append({
+                    "id": f"{sym}_{sec}_{idx}",
+                    "account_id": p.account,
+                    "symbol": sym,
+                    "sec_type": sec,
+                    "quantity": str(p.position),
+                    "avg_cost": str(p.avgCost),
+                    "market_price": f"{mkt_price:.4f}" if mkt_price is not None else None,
+                    "broker": "ib",
+                })
+
+            # Atomic write
+            tmp_path = positions_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                _json.dumps(positions, cls=_Enc),
+                encoding="utf-8",
+            )
+            tmp_path.rename(positions_path)
+
+            logger.debug(
+                '{"event": "POSITION_FILE_WRITTEN", "count": %d}',
+                len(positions),
+            )
 
         except Exception:
             logger.exception('{"event": "POSITION_CACHE_ERROR"}')
 
-        await asyncio.sleep(30)
+        # Wait up to 2s, or wake immediately if a command completed.
+        # With streaming data, reading tickers is free — we can refresh fast.
+        try:
+            await asyncio.wait_for(position_refresh_event.wait(), timeout=2)
+            position_refresh_event.clear()
+        except asyncio.TimeoutError:
+            pass
 
 
 if __name__ == "__main__":

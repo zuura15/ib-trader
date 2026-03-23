@@ -444,8 +444,7 @@ class IBTraderApp(App):
         from ib_trader.repl.commands import (
             parse_command, BuyCommand, SellCommand, CloseCommand, ModifyCommand
         )
-        from ib_trader.config.loader import validate_symbol
-        from ib_trader.engine.exceptions import SymbolNotAllowedError, SafetyLimitError
+        from ib_trader.engine.exceptions import SafetyLimitError
         from ib_trader.engine.order import execute_order, execute_close
 
         router = self._ctx.router
@@ -486,20 +485,6 @@ class IBTraderApp(App):
                     severity=OutputSeverity.INFO,
                 )
                 continue
-
-            # Validate symbol for buy/sell.
-            if isinstance(cmd, (BuyCommand, SellCommand)):
-                try:
-                    validate_symbol(cmd.symbol, self._symbols)
-                    logger.info('{"event": "SYMBOL_VALIDATED", "symbol": "%s"}', cmd.symbol)
-                except SymbolNotAllowedError as exc:
-                    logger.warning('{"event": "SYMBOL_REJECTED", "symbol": "%s"}', cmd.symbol)
-                    router.emit(
-                        f"\u2717 Error: {exc}",
-                        pane=OutputPane.COMMAND,
-                        severity=OutputSeverity.ERROR,
-                    )
-                    continue
 
             if isinstance(cmd, ModifyCommand):
                 logger.info('{"event": "MODIFY_STUB_RECEIVED", "serial": %d}', cmd.serial)

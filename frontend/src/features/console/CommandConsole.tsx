@@ -41,6 +41,20 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
     scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
   }, [commands]);
 
+  // Global 'c' hotkey to focus the command input
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'c' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+          (e.target as HTMLElement).isContentEditable) return;
+      e.preventDefault();
+      inputRef.current?.focus();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const cmd = input.trim();

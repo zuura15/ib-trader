@@ -1,4 +1,4 @@
-.PHONY: install test smoke docs lint typecheck clean
+.PHONY: install test smoke docs lint typecheck clean dev
 
 install:
 	uv sync
@@ -17,6 +17,14 @@ lint:
 
 typecheck:
 	uv run mypy ib_trader/
+
+dev:
+	@echo "Starting all services... (Ctrl+C to stop all)"
+	@trap 'kill 0; exit' INT TERM; \
+	uv run ib-engine & \
+	uv run ib-api & \
+	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
+	wait
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

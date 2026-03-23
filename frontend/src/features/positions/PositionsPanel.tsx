@@ -1,38 +1,65 @@
-import { useEffect, useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../../data/store';
 import { formatPrice, formatCurrency, pnlClass } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
 interface BrokerPosition {
+  id: string;
   account_id: string;
   symbol: string;
   sec_type: string;
   quantity: string;
   avg_cost: string;
+  market_price: string | null;
   broker: string;
+}
+
+type SortKey = 'symbol' | 'quantity' | 'price' | 'avg_cost' | 'pnl';
+type SortDir = 'asc' | 'desc';
+
+function parseNum(v: string | null | undefined): number {
+  if (v == null) return 0;
+  const n = parseFloat(v);
+  return isNaN(n) ? 0 : n;
+}
+
+function computePnl(pos: BrokerPosition): number | null {
+  if (!pos.market_price) return null;
+  return (parseNum(pos.market_price) - parseNum(pos.avg_cost)) * parseNum(pos.quantity);
+}
+
+function sortPositions(positions: BrokerPosition[], key: SortKey, dir: SortDir): BrokerPosition[] {
+  const sorted = [...positions];
+  const mult = dir === 'asc' ? 1 : -1;
+
+  sorted.sort((a, b) => {
+    let cmp = 0;
+    switch (key) {
+      case 'symbol':
+        cmp = a.symbol.localeCompare(b.symbol);
+        break;
+      case 'quantity':
+        cmp = parseNum(a.quantity) - parseNum(b.quantity);
+        break;
+      case 'price':
+        cmp = parseNum(a.market_price) - parseNum(b.market_price);
+        break;
+      case 'avg_cost':
+        cmp = parseNum(a.avg_cost) - parseNum(b.avg_cost);
+        break;
+      case 'pnl':
+        cmp = (computePnl(a) ?? -Infinity) - (computePnl(b) ?? -Infinity);
+        break;
+    }
+    return cmp * mult;
+  });
+
+  return sorted;
 }
 
 export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   const dataMode = useStore((s) => s.dataMode);
   const mockPositions = useStore((s) => s.positions);
-  const refreshTick = useStore((s) => s.positionRefreshTick);
-  const [livePositions, setLivePositions] = useState<BrokerPosition[]>([]);
-
-  // In live mode, poll the positions API every 30 seconds + on command completion
-  useEffect(() => {
-    if (dataMode !== 'live') return;
-
-    const fetchPositions = () => {
-      fetch('/api/positions')
-        .then(r => r.ok ? r.json() : [])
-        .then(setLivePositions)
-        .catch(() => {});
-    };
-
-    fetchPositions();
-    const interval = setInterval(fetchPositions, 30000);
-    return () => clearInterval(interval);
-  }, [dataMode, refreshTick]);
 
   // Mock mode — use store positions
   if (dataMode === 'mock') {
@@ -98,22 +125,84 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
     );
   }
 
-  // Live mode — show broker positions from cache
+  // --------------- Live mode ---------------
+  const REFRESH_INTERVAL = 2;
+  const [positions, setPositions] = useState<BrokerPosition[]>([]);
   const [showStocks, setShowStocks] = useState(true);
   const [showOptions, setShowOptions] = useState(false);
   const [showOther, setShowOther] = useState(false);
+  const [sortKey, setSortKey] = useState<SortKey>('symbol');
+  const [sortDir, setSortDir] = useState<SortDir>('asc');
 
-  const filtered = livePositions.filter(p => {
+  const fetchPositions = useCallback(() => {
+    fetch(`/api/positions?_t=${Date.now()}`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : [])
+      .then((data: BrokerPosition[]) => {
+        setPositions(data);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Fetch on mount + every REFRESH_INTERVAL seconds, pause when tab is hidden
+  useEffect(() => {
+    fetchPositions();
+    let timer = setInterval(fetchPositions, REFRESH_INTERVAL * 1000);
+
+    const onVisibility = () => {
+      clearInterval(timer);
+      if (!document.hidden) {
+        fetchPositions();
+        timer = setInterval(fetchPositions, REFRESH_INTERVAL * 1000);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [fetchPositions]);
+
+  const handleSort = (key: SortKey) => {
+    if (key === sortKey) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
+  const sortIndicator = (key: SortKey) => {
+    if (key !== sortKey) return '';
+    return sortDir === 'asc' ? ' ▲' : ' ▼';
+  };
+
+  const thStyle = (key: SortKey): React.CSSProperties => ({
+    cursor: 'pointer',
+    userSelect: 'none',
+    color: key === sortKey ? 'var(--text-primary)' : undefined,
+  });
+
+  const filtered = positions.filter(p => {
     const st = (p.sec_type || 'STK').toUpperCase();
     if (st === 'STK' || st === 'ETF' || st === '') return showStocks;
     if (st === 'OPT') return showOptions;
     return showOther;
   });
 
+  const sorted = sortPositions(filtered, sortKey, sortDir);
+
+  // Compute total P&L across filtered positions
+  let totalPnl = 0;
+  for (const pos of filtered) {
+    const pnl = computePnl(pos);
+    if (pnl !== null) totalPnl += pnl;
+  }
+
   return (
     <PanelShell title="Positions" accent="blue" right={
       <div className="flex items-center gap-2">
-        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{filtered.length}/{livePositions.length}</span>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{filtered.length}/{positions.length}</span>
         <div className="flex gap-1">
           {([
             { key: 'stocks', label: 'STK', active: showStocks, toggle: () => setShowStocks(!showStocks) },
@@ -136,37 +225,72 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
         <table className="data-table">
           <thead>
             <tr>
-              <th>Symbol</th>
-              <th className="text-right">Qty</th>
-              <th className="text-right">Avg Cost</th>
-              {!compact && <th>Account</th>}
+              <th style={thStyle('symbol')} onClick={() => handleSort('symbol')}>
+                Symbol{sortIndicator('symbol')}
+              </th>
+              <th className="text-right" style={thStyle('quantity')} onClick={() => handleSort('quantity')}>
+                Qty{sortIndicator('quantity')}
+              </th>
+              <th className="text-right" style={thStyle('price')} onClick={() => handleSort('price')}>
+                Price{sortIndicator('price')}
+              </th>
+              <th className="text-right" style={thStyle('avg_cost')} onClick={() => handleSort('avg_cost')}>
+                Avg Cost{sortIndicator('avg_cost')}
+              </th>
+              {!compact && (
+                <th className="text-right" style={thStyle('pnl')} onClick={() => handleSort('pnl')}>
+                  P&L{sortIndicator('pnl')}
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
-            {filtered.length === 0 ? (
+            {sorted.length === 0 ? (
               <tr>
-                <td colSpan={compact ? 3 : 4} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
-                  No positions (engine updates every 30s)
+                <td colSpan={compact ? 4 : 5} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
+                  No positions
                 </td>
               </tr>
-            ) : filtered.map((pos, i) => {
-              const qty = parseFloat(pos.quantity);
+            ) : sorted.map((pos) => {
+              const qty = parseNum(pos.quantity);
+              const avg = parseNum(pos.avg_cost);
+              const mkt = pos.market_price ? parseNum(pos.market_price) : null;
+              const pnl = computePnl(pos);
               return (
-                <tr key={`${pos.symbol}-${pos.account_id}-${i}`}>
+                <tr key={pos.id}>
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{pos.symbol}</td>
                   <td className="text-right font-mono" style={{ color: qty >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                     {qty > 0 ? '+' : ''}{qty}
                   </td>
+                  <td className="text-right font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {mkt !== null ? `$${mkt.toFixed(2)}` : <span className="value-na">—</span>}
+                  </td>
                   <td className="text-right font-mono" style={{ color: 'var(--text-secondary)' }}>
-                    ${parseFloat(pos.avg_cost).toFixed(2)}
+                    ${avg.toFixed(2)}
                   </td>
                   {!compact && (
-                    <td style={{ color: 'var(--text-muted)', fontSize: 11 }}>{pos.account_id}</td>
+                    <td className={`text-right font-mono ${pnl !== null ? pnlClass(pnl) : ''}`}>
+                      {pnl !== null ? formatCurrency(pnl) : <span className="value-na">—</span>}
+                    </td>
                   )}
                 </tr>
               );
             })}
           </tbody>
+          {sorted.length > 0 && !compact && (
+            <tfoot>
+              <tr>
+                <td colSpan={4} className="text-right font-semibold text-[10px]"
+                  style={{ color: 'var(--text-secondary)', borderTop: '1px solid var(--border-default)' }}>
+                  TOTAL
+                </td>
+                <td className={`text-right font-semibold font-mono ${pnlClass(totalPnl)}`}
+                  style={{ borderTop: '1px solid var(--border-default)' }}>
+                  {formatCurrency(totalPnl)}
+                </td>
+              </tr>
+            </tfoot>
+          )}
         </table>
       </div>
     </PanelShell>

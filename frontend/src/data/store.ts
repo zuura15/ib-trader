@@ -62,6 +62,7 @@ interface AppStore {
   updatePosition: (symbol: string, partial: Partial<Position>) => void;
   setPositions: (positions: Position[]) => void;
 
+
   // Bots
   bots: Bot[];
   updateBot: (id: string, partial: Partial<Bot>) => void;
@@ -503,8 +504,5 @@ export const useStore = create<AppStore>((set, get) => ({
         });
       }
     }
-    // For other channels, we could merge diffs incrementally,
-    // but for simplicity we re-fetch the full snapshot data
-    // that came with the diff (added/updated/removed arrays)
   },
 }));

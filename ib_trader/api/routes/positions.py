@@ -1,37 +1,32 @@
 """Positions endpoint.
 
-GET /api/positions — returns current positions from IB via the position_cache
-table, which the engine service refreshes every 30 seconds.
+GET /api/positions — returns current positions from the engine's positions
+file (run/positions.json), which is refreshed every 10 seconds directly
+from IB.  No SQLite involved — IB is the source of truth for positions.
 """
-from fastapi import APIRouter, Depends
-from sqlalchemy import text
+import json
+from pathlib import Path
 
-from ib_trader.api.deps import get_session_factory
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
+_POSITIONS_FILE = Path("run/positions.json")
+
 
 @router.get("")
-def list_positions(sf=Depends(get_session_factory)):
-    """Return current broker positions from the position_cache table."""
-    s = sf()
+def list_positions():
+    """Return current broker positions from the engine's JSON cache."""
     try:
-        rows = s.execute(text(
-            "SELECT account_id, symbol, sec_type, quantity, avg_cost, broker, updated_at "
-            "FROM position_cache ORDER BY symbol"
-        )).fetchall()
-    except Exception:
-        return []
+        data = json.loads(_POSITIONS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = []
 
-    return [
-        {
-            "account_id": r[0],
-            "symbol": r[1],
-            "sec_type": r[2],
-            "quantity": str(r[3]),
-            "avg_cost": str(r[4]),
-            "broker": r[5],
-            "updated_at": r[6],
-        }
-        for r in rows
-    ]
+    return JSONResponse(
+        content=data,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )

@@ -160,30 +160,12 @@ async def run_repl(ctx: AppContext, symbols: list[str]) -> None:
                 print("Reconciliation is a daemon feature. Start ib-daemon for background reconciliation.")
                 continue
 
-            # Validate symbol
-            from ib_trader.config.loader import validate_symbol
-            from ib_trader.engine.exceptions import SymbolNotAllowedError
-
-            symbol = None
-            if isinstance(cmd, (BuyCommand, SellCommand)):
-                symbol = cmd.symbol
-            elif isinstance(cmd, CloseCommand):
-                pass  # serial lookup, no symbol validation needed
-            elif isinstance(cmd, ModifyCommand):
+            if isinstance(cmd, ModifyCommand):
                 logger.info(
                     '{"event": "MODIFY_STUB_RECEIVED", "serial": %d}', cmd.serial
                 )
                 print(f"modify #{cmd.serial}: accepted (stub \u2014 no action taken)")
                 continue
-
-            if symbol:
-                try:
-                    validate_symbol(symbol, symbols)
-                    logger.info('{"event": "SYMBOL_VALIDATED", "symbol": "%s"}', symbol)
-                except SymbolNotAllowedError as e:
-                    logger.warning('{"event": "SYMBOL_REJECTED", "symbol": "%s"}', symbol)
-                    print(f"\u2717 Error: {e}")
-                    continue
 
             # Execute command
             try:

@@ -340,5 +340,6 @@ class PositionCache(Base):
     sec_type     = Column(String(10), nullable=False, default="STK")
     quantity     = Column(Numeric(18, 4), nullable=False)
     avg_cost     = Column(Numeric(18, 8), nullable=False)
+    market_price = Column(Numeric(18, 8), nullable=True)
     broker       = Column(String(20), nullable=False, default="ib")
     updated_at   = Column(DateTime, nullable=False)

@@ -1,4 +1,4 @@
-max_order_size_shares: 10
+max_order_size_shares: 5000
 max_retries: 3
 retry_delay_seconds: 2
 retry_backoff_multiplier: 2.0
