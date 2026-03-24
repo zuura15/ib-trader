@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from ib_trader.ib.base import IBClientBase
 from ib_trader.data.repository import (
     TradeRepository,
-    OrderRepository,
     RepriceEventRepository,
     ContractRepository,
     HeartbeatRepository,
@@ -44,7 +43,6 @@ class AppContext:
 
     ib: IBClientBase
     trades: TradeRepository
-    orders: OrderRepository
     reprice_events: RepriceEventRepository
     contracts: ContractRepository
     heartbeats: HeartbeatRepository
@@ -52,7 +50,7 @@ class AppContext:
     tracker: OrderTracker
     settings: dict          # Loaded from settings.yaml
     account_id: str         # From .env
-    transactions: TransactionRepository | None = None
+    transactions: TransactionRepository
     pending_commands: PendingCommandRepository | None = None
     bots: BotRepository | None = None
     bot_events: BotEventRepository | None = None

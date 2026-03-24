@@ -8,9 +8,9 @@ from abc import ABC, abstractmethod
 from decimal import Decimal
 
 from ib_trader.data.models import (
-    TradeGroup, Order, RepriceEvent, Contract,
+    TradeGroup, RepriceEvent, Contract,
     SystemHeartbeat, SystemAlert, PendingCommand,
-    TradeStatus, OrderStatus, PendingCommandStatus,
+    TradeStatus, PendingCommandStatus,
 )
 
 
@@ -53,71 +53,6 @@ class TradeRepositoryBase(ABC):
         ...
 
 
-class OrderRepositoryBase(ABC):
-    """Abstract interface for order leg persistence."""
-
-    @abstractmethod
-    def create(self, order: Order) -> Order:
-        """Persist a new order and return it."""
-        ...
-
-    @abstractmethod
-    def get_by_id(self, order_id: str) -> Order | None:
-        """Return the order with the given UUID, or None."""
-        ...
-
-    @abstractmethod
-    def get_by_ib_order_id(self, ib_order_id: str) -> Order | None:
-        """Return the order with the given IB order ID, or None."""
-        ...
-
-    @abstractmethod
-    def get_open_for_trade(self, trade_id: str) -> list[Order]:
-        """Return all open orders for a trade group."""
-        ...
-
-    @abstractmethod
-    def get_for_trade(self, trade_id: str) -> list[Order]:
-        """Return all orders for a trade group regardless of status."""
-        ...
-
-    @abstractmethod
-    def get_all_open(self) -> list[Order]:
-        """Return all orders that are currently open (any non-terminal status)."""
-        ...
-
-    @abstractmethod
-    def get_in_states(self, states: list[OrderStatus]) -> list[Order]:
-        """Return all orders in any of the given statuses."""
-        ...
-
-    @abstractmethod
-    def update_status(self, order_id: str, status: OrderStatus) -> None:
-        """Update the status of an order."""
-        ...
-
-    @abstractmethod
-    def update_fill(self, order_id: str, qty_filled: Decimal,
-                    avg_price: Decimal, commission: Decimal) -> None:
-        """Record fill details on an order."""
-        ...
-
-    @abstractmethod
-    def update_ib_order_id(self, order_id: str, ib_order_id: str) -> None:
-        """Write the IB-assigned order ID to the order record."""
-        ...
-
-    @abstractmethod
-    def update_amended(self, order_id: str, new_price: Decimal) -> None:
-        """Record the latest amendment price and timestamp."""
-        ...
-
-    @abstractmethod
-    def set_raw_response(self, order_id: str, raw: str) -> None:
-        """Store the raw IB API response JSON string."""
-        ...
-
-
 class RepriceEventRepositoryBase(ABC):
     """Abstract interface for reprice event persistence."""
 
@@ -127,8 +62,8 @@ class RepriceEventRepositoryBase(ABC):
         ...
 
     @abstractmethod
-    def get_for_order(self, order_id: str) -> list[RepriceEvent]:
-        """Return all reprice events for an order, ordered by step number."""
+    def get_for_correlation_id(self, correlation_id: str) -> list[RepriceEvent]:
+        """Return all reprice events for a correlation ID, ordered by step number."""
         ...
 
     @abstractmethod

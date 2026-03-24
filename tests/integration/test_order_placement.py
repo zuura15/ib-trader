@@ -2,6 +2,7 @@
 
 Uses MockIBClient — no live IB connection required.
 Tests the full flow from command → IB call → DB update.
+Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
 import pytest
@@ -9,7 +10,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import OrderStatus, LegType
+from ib_trader.data.models import TransactionAction, LegType
 from ib_trader.engine.order import execute_order, place_profit_taker
 from ib_trader.engine.exceptions import SafetyLimitError
 
@@ -125,7 +126,6 @@ class TestProfitTakerPlacement:
         """BUY entry → profit taker is SELL."""
         await place_profit_taker(
             trade_id="test-trade-id",
-            entry_order_id="test-order-id",
             entry_side="BUY",
             avg_fill_price=Decimal("100.00"),
             qty_filled=Decimal("10"),
@@ -145,7 +145,6 @@ class TestProfitTakerPlacement:
         """SELL (short) entry → profit taker is BUY (cover lower)."""
         await place_profit_taker(
             trade_id="test-trade-id",
-            entry_order_id="test-order-id",
             entry_side="SELL",
             avg_fill_price=Decimal("100.00"),
             qty_filled=Decimal("10"),
@@ -164,7 +163,6 @@ class TestProfitTakerPlacement:
         """--take-profit-price N overrides profit_amount calculation."""
         await place_profit_taker(
             trade_id="test-trade-id",
-            entry_order_id="test-order-id",
             entry_side="BUY",
             avg_fill_price=Decimal("100.00"),
             qty_filled=Decimal("10"),
@@ -181,7 +179,6 @@ class TestProfitTakerPlacement:
         """No profit taker is placed if neither profit_amount nor take_profit_price."""
         await place_profit_taker(
             trade_id="test-trade-id",
-            entry_order_id="test-order-id",
             entry_side="BUY",
             avg_fill_price=Decimal("100.00"),
             qty_filled=Decimal("10"),
@@ -198,32 +195,21 @@ class TestRepriceLoop:
     async def test_reprice_loop_amends_order(self, ctx):
         """Reprice loop calls amend_order for each step."""
         from ib_trader.engine.order import reprice_loop
-        from ib_trader.data.models import Order, SecurityType
+        import uuid
 
         from ib_trader.data.models import TradeGroup, TradeStatus
         trade = ctx.trades.create(TradeGroup(
             serial_number=1, symbol="MSFT", direction="LONG",
             status=TradeStatus.OPEN, opened_at=datetime.now(timezone.utc),
         ))
-        order = ctx.orders.create(Order(
-            trade_id=trade.id, serial_number=1, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("5"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=datetime.now(timezone.utc),
-        ))
-        ctx.orders.update_ib_order_id(order.id, "IB1000")
-        ctx.tracker.register(order.id, "IB1000", "MSFT")
+        correlation_id = str(uuid.uuid4())
+        ctx.tracker.register(correlation_id, "IB1000", "MSFT")
 
         # Run reprice loop with very fast settings (2 steps, 0.01s interval).
-        # Mock snapshot: bid=100.00, ask=100.10.
-        # initial_price = mid = 100.05.
-        # step 1: calc_step_price(100.00, 100.10, 1, 2) = 100.05 + 0.5*0.05 = 100.075 → 100.08 ≠ 100.05 → amend
-        # step 2: calc_step_price(100.00, 100.10, 2, 2) = 100.10 ≠ 100.08 → amend
         ctx.settings["reprice_interval_seconds"] = 0.01
         task = asyncio.create_task(
             reprice_loop(
-                order_id=order.id,
+                correlation_id=correlation_id,
                 ib_order_id="IB1000",
                 con_id=12345,
                 symbol="MSFT",
@@ -232,6 +218,10 @@ class TestRepriceLoop:
                 total_steps=2,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.05"),
+                trade_id=trade.id,
+                leg_type=LegType.ENTRY,
+                security_type="STK",
+                trade_serial=1,
             )
         )
         await asyncio.wait_for(task, timeout=2.0)
@@ -242,28 +232,22 @@ class TestRepriceLoop:
     async def test_reprice_loop_stops_on_fill(self, ctx):
         """Reprice loop exits immediately when fill event is set."""
         from ib_trader.engine.order import reprice_loop
-        from ib_trader.data.models import Order, SecurityType, TradeGroup, TradeStatus
+        import uuid
 
+        from ib_trader.data.models import TradeGroup, TradeStatus
         trade = ctx.trades.create(TradeGroup(
             serial_number=2, symbol="MSFT", direction="LONG",
             status=TradeStatus.OPEN, opened_at=datetime.now(timezone.utc),
         ))
-        order = ctx.orders.create(Order(
-            trade_id=trade.id, serial_number=2, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("5"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=datetime.now(timezone.utc),
-        ))
-        ctx.orders.update_ib_order_id(order.id, "IB2000")
-        ctx.tracker.register(order.id, "IB2000", "MSFT")
+        correlation_id = str(uuid.uuid4())
+        ctx.tracker.register(correlation_id, "IB2000", "MSFT")
 
         # Signal fill immediately
         ctx.tracker.notify_filled("IB2000")
 
         task = asyncio.create_task(
             reprice_loop(
-                order_id=order.id,
+                correlation_id=correlation_id,
                 ib_order_id="IB2000",
                 con_id=12345,
                 symbol="MSFT",
@@ -272,6 +256,10 @@ class TestRepriceLoop:
                 total_steps=100,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.05"),
+                trade_id=trade.id,
+                leg_type=LegType.ENTRY,
+                security_type="STK",
+                trade_serial=2,
             )
         )
         await asyncio.wait_for(task, timeout=2.0)
@@ -282,28 +270,17 @@ class TestRepriceLoop:
     async def test_reprice_loop_deduplicates_same_price(self, ctx):
         """Steps that round to the same 2dp price are skipped — no redundant amend_order calls."""
         from ib_trader.engine.order import reprice_loop
-        from ib_trader.data.models import Order, SecurityType, TradeGroup, TradeStatus
+        import uuid
 
+        from ib_trader.data.models import TradeGroup, TradeStatus
         trade = ctx.trades.create(TradeGroup(
             serial_number=3, symbol="MSFT", direction="LONG",
             status=TradeStatus.OPEN, opened_at=datetime.now(timezone.utc),
         ))
-        order = ctx.orders.create(Order(
-            trade_id=trade.id, serial_number=3, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("1"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=datetime.now(timezone.utc),
-        ))
-        ctx.orders.update_ib_order_id(order.id, "IB3000")
-        ctx.tracker.register(order.id, "IB3000", "MSFT")
+        correlation_id = str(uuid.uuid4())
+        ctx.tracker.register(correlation_id, "IB3000", "MSFT")
 
         # Tight spread: bid=100.00, ask=100.01 → mid=100.00 (ROUND_HALF_EVEN).
-        # With 10 steps the calculated prices are:
-        #   steps 1-5: round to 100.00 (same as initial) → skipped
-        #   step 6:   100.006 → 100.01                  → amend
-        #   steps 7-10: round to 100.01 (same)          → skipped
-        # Expected: exactly 1 amendment sent.
         ctx.ib._market_snapshot = {
             "bid": Decimal("100.00"),
             "ask": Decimal("100.01"),
@@ -312,7 +289,7 @@ class TestRepriceLoop:
 
         task = asyncio.create_task(
             reprice_loop(
-                order_id=order.id,
+                correlation_id=correlation_id,
                 ib_order_id="IB3000",
                 con_id=12345,
                 symbol="MSFT",
@@ -321,6 +298,10 @@ class TestRepriceLoop:
                 total_steps=10,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.00"),
+                trade_id=trade.id,
+                leg_type=LegType.ENTRY,
+                security_type="STK",
+                trade_serial=3,
             )
         )
         await asyncio.wait_for(task, timeout=2.0)

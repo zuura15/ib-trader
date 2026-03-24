@@ -2,7 +2,7 @@
 
 All monetary values use Numeric(18, 8) mapped to Decimal.
 All primary keys are UUID strings generated with uuid4().
-All datetimes are stored in UTC.
+All datetimes are stored in server-local timezone.
 """
 import uuid
 from sqlalchemy import (
@@ -64,12 +64,14 @@ class TransactionAction(str, enum.Enum):
     PLACE_ATTEMPT = "PLACE_ATTEMPT"
     PLACE_ACCEPTED = "PLACE_ACCEPTED"
     PLACE_REJECTED = "PLACE_REJECTED"
+    AMENDED = "AMENDED"
     PARTIAL_FILL = "PARTIAL_FILL"
     FILLED = "FILLED"
     CANCEL_ATTEMPT = "CANCEL_ATTEMPT"
     CANCELLED = "CANCELLED"
     ERROR_TERMINAL = "ERROR_TERMINAL"
     RECONCILED = "RECONCILED"
+    DISCREPANCY = "DISCREPANCY"
 
 
 class PendingCommandStatus(enum.Enum):
@@ -112,6 +114,7 @@ class TradeGroup(Base):
     total_commission = Column(Numeric(18, 8), nullable=True)
     opened_at        = Column(DateTime, nullable=False)
     closed_at        = Column(DateTime, nullable=True)
+    trade_config     = Column(Text, nullable=True)  # JSON: PT amount, PT price, SL
 
 
 class Order(Base):
@@ -153,7 +156,8 @@ class RepriceEvent(Base):
     __tablename__ = "reprice_events"
 
     id                  = Column(String(36), primary_key=True, default=_uuid)
-    order_id            = Column(String(36), ForeignKey("orders.id"), nullable=False)
+    order_id            = Column(String(36), nullable=True)  # Legacy FK, kept for historical rows
+    correlation_id      = Column(String(36), nullable=True)  # New: links to transaction correlation_id
     step_number         = Column(Integer, nullable=False)
     bid                 = Column(Numeric(18, 4), nullable=False)
     ask                 = Column(Numeric(18, 4), nullable=False)
@@ -176,18 +180,6 @@ class Contract(Base):
     fetched_at   = Column(DateTime, nullable=False)
 
 
-class Metric(Base):
-    """Time-series metric event for analytics and reporting."""
-
-    __tablename__ = "metrics"
-
-    id          = Column(String(36), primary_key=True, default=_uuid)
-    trade_id    = Column(String(36), ForeignKey("trade_groups.id"), nullable=True)
-    event_type  = Column(String(50), nullable=False)
-    symbol      = Column(String(20), nullable=True)
-    value       = Column(Numeric(18, 8), nullable=True)
-    meta        = Column(Text, nullable=True)    # JSON string
-    recorded_at = Column(DateTime, nullable=False)
 
 
 class SystemHeartbeat(Base):
@@ -215,7 +207,12 @@ class SystemAlert(Base):
 
 class TransactionEvent(Base):
     """Append-only audit log of every interaction our system has with IB
-    around an order. One row per event. Never updated after insert."""
+    around an order. One row per event. Never updated after insert.
+
+    This is the sole record of order state — the orders table has been
+    removed. IB is the source of truth for live state; transactions are
+    the source of truth for historical state and trade-group linkage.
+    """
 
     __tablename__ = "transactions"
 
@@ -238,6 +235,18 @@ class TransactionEvent(Base):
     requested_at      = Column(DateTime, nullable=False)
     ib_responded_at   = Column(DateTime, nullable=True)
     is_terminal       = Column(Boolean, nullable=False, default=False)
+
+    # --- Columns added to replace the orders table ---
+    trade_id          = Column(String(36), ForeignKey("trade_groups.id"), nullable=True)
+    leg_type          = Column(Enum(LegType), nullable=True)
+    commission        = Column(Numeric(18, 8), nullable=True)
+    price_placed      = Column(Numeric(18, 4), nullable=True)
+    correlation_id    = Column(String(36), nullable=True)
+    security_type     = Column(String(10), nullable=True)
+    expiry            = Column(String(10), nullable=True)
+    strike            = Column(Numeric(18, 4), nullable=True)
+    right             = Column(String(4), nullable=True)
+    raw_response      = Column(Text, nullable=True)
 
 
 class PendingCommand(Base):
@@ -323,23 +332,3 @@ class OrderTemplate(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
-class PositionCache(Base):
-    """Cached broker positions, periodically updated by the engine service.
-
-    This is a full snapshot — the engine deletes all rows and re-inserts
-    on each refresh cycle. The API reads from this table for the positions
-    endpoint, providing authoritative broker positions without needing its
-    own broker connection.
-    """
-
-    __tablename__ = "position_cache"
-
-    id           = Column(Integer, primary_key=True, autoincrement=True)
-    account_id   = Column(String(50), nullable=False)
-    symbol       = Column(String(20), nullable=False)
-    sec_type     = Column(String(10), nullable=False, default="STK")
-    quantity     = Column(Numeric(18, 4), nullable=False)
-    avg_cost     = Column(Numeric(18, 8), nullable=False)
-    market_price = Column(Numeric(18, 8), nullable=True)
-    broker       = Column(String(20), nullable=False, default="ib")
-    updated_at   = Column(DateTime, nullable=False)

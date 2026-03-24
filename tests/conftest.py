@@ -13,9 +13,10 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import Base
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, RepriceEventRepository,
+    TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
 )
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.engine.tracker import OrderTracker
 from ib_trader.config.context import AppContext
@@ -203,7 +204,6 @@ def ctx(session_factory, mock_ib):
     return AppContext(
         ib=mock_ib,
         trades=TradeRepository(session_factory),
-        orders=OrderRepository(session_factory),
         reprice_events=RepriceEventRepository(session_factory),
         contracts=ContractRepository(session_factory),
         heartbeats=HeartbeatRepository(session_factory),
@@ -211,5 +211,6 @@ def ctx(session_factory, mock_ib):
         tracker=OrderTracker(),
         settings=settings,
         account_id="U1234567",
+        transactions=TransactionRepository(session_factory),
         pending_commands=PendingCommandRepository(session_factory),
     )

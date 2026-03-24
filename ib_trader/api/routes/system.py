@@ -5,8 +5,6 @@ GET /api/status — heartbeats, alerts, system health, account info, P&L
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
-
 from ib_trader.api.deps import get_heartbeats, get_alerts, get_session_factory
 from ib_trader.api.serializers import HeartbeatResponse, AlertResponse
 from ib_trader.data.repository import HeartbeatRepository, AlertRepository
@@ -55,31 +53,25 @@ def get_status(
     engine_alive = service_health.get("engine", False)
     connection_status = "connected" if engine_alive else "disconnected"
 
-    # Account mode — read from .env via settings or detect from account_id
-    # Check the pending_commands or position_cache for account info
+    # Account mode — detect from the most recent transaction's account_id
     account_mode = "unknown"
     try:
-        s = sf()
-        row = s.execute(text(
-            "SELECT account_id FROM position_cache LIMIT 1"
-        )).fetchone()
-        if row:
-            acct = row[0]
+        from ib_trader.data.repositories.transaction_repository import TransactionRepository
+        txn_repo = TransactionRepository(sf)
+        open_orders = txn_repo.get_open_orders()
+        if open_orders:
+            acct = open_orders[0].account_id
             account_mode = "paper" if acct.startswith("DU") else "live"
     except Exception:
         pass
 
-    # P&L — sum from position_cache (basic: unrealized not available without live prices)
     # Realized P&L from closed trade groups
+    from ib_trader.data.repository import TradeRepository
     realized_pnl = 0.0
     try:
-        s = sf()
-        row = s.execute(text(
-            "SELECT COALESCE(SUM(realized_pnl), 0) FROM trade_groups "
-            "WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL"
-        )).fetchone()
-        if row:
-            realized_pnl = float(row[0])
+        all_trades = TradeRepository(sf).get_all()
+        closed = [t for t in all_trades if t.status.value == "CLOSED" and t.realized_pnl is not None]
+        realized_pnl = sum(float(t.realized_pnl) for t in closed)
     except Exception:
         pass
 

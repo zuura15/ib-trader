@@ -2,15 +2,17 @@
 
 Tests the complete mid-price order path: place → reprice → fill/cancel.
 Uses MockIBClient with simulated fills.
+Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
 import pytest
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import OrderStatus, LegType
-from ib_trader.engine.order import execute_order, _handle_fill, _handle_partial
+from ib_trader.data.models import TransactionAction, LegType, TradeGroup, TradeStatus, TransactionEvent
+from ib_trader.engine.order import execute_order, _handle_fill, _handle_partial, _OrderContext
 from ib_trader.engine.exceptions import IBOrderRejectedError
 
 
@@ -84,9 +86,10 @@ class TestOrderPlacementPreSubmitted:
             await execute_order(cmd, ctx)
 
         assert len(ctx.ib.amended_orders) == 0
-        open_orders = ctx.orders.get_all_open()
-        assert len(open_orders) == 1
-        assert open_orders[0].status == OrderStatus.OPEN
+        # Check via transactions: should have a non-terminal PLACE_ACCEPTED
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) == 1
+        assert open_txns[0].action == TransactionAction.PLACE_ACCEPTED
 
     async def test_presubmitted_active_hours_raises_and_abandons(self, ctx):
         """PreSubmitted during an active session: order cancelled, marked ABANDONED, error raised."""
@@ -112,8 +115,14 @@ class TestOrderPlacementPreSubmitted:
         with patch("ib_trader.engine.market_hours._now_et", return_value=_monday_rth):
             await execute_order(cmd, ctx)
 
-        abandoned = ctx.orders.get_in_states([OrderStatus.ABANDONED])
-        assert len(abandoned) == 1
+        # Trade should be closed (the order was canceled and trade marked CLOSED)
+        trades = ctx.trades.get_all()
+        assert len(trades) >= 1
+        from ib_trader.data.models import TradeStatus as TS
+        closed = [t for t in trades if t.status == TS.CLOSED]
+        assert len(closed) >= 1
+        # IB cancel should have been called
+        assert len(ctx.ib.canceled_orders) >= 1
 
 
 class TestOrderPlacementUnacknowledged:
@@ -138,9 +147,13 @@ class TestOrderPlacementUnacknowledged:
         with pytest.raises(IBOrderRejectedError):
             await execute_order(cmd, ctx)
 
-        # The order must be marked ABANDONED (not CANCELED — we don't know its state)
-        all_orders = ctx.orders.get_in_states([OrderStatus.ABANDONED])
-        assert len(all_orders) == 1
+        # The order must have a terminal transaction (CANCELLED or ERROR_TERMINAL)
+        trades = ctx.trades.get_all()
+        assert len(trades) >= 1
+        trade_id = trades[0].id
+        txns = ctx.transactions.get_for_trade(trade_id)
+        terminal_txns = [t for t in txns if t.is_terminal]
+        assert len(terminal_txns) >= 1
 
 
 class TestMidOrderCancelOnTimeout:
@@ -210,20 +223,18 @@ class TestMidOrderCancelOnTimeout:
 
 class TestHandleFill:
     async def test_handle_fill_updates_db(self, ctx):
-        """_handle_fill records fill details in the DB."""
-        from ib_trader.data.models import Order, TradeGroup, TradeStatus, SecurityType
-
+        """_handle_fill records fill details as TransactionEvent rows."""
         trade = ctx.trades.create(TradeGroup(
             serial_number=1, symbol="MSFT", direction="LONG",
             status=TradeStatus.OPEN, opened_at=datetime.now(timezone.utc),
         ))
-        order = ctx.orders.create(Order(
-            trade_id=trade.id, serial_number=1, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("10"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=datetime.now(timezone.utc),
-        ))
+        correlation_id = str(uuid.uuid4())
+        order_ctx = _OrderContext(
+            trade_id=trade.id, trade_serial=1, symbol="MSFT",
+            side="BUY", order_type="MID", qty_requested=Decimal("10"),
+            leg_type=LegType.ENTRY, correlation_id=correlation_id,
+            security_type="STK", ib_order_id="IB9000",
+        )
 
         cmd = BuyCommand(
             symbol="MSFT", qty=Decimal("10"), dollars=None,
@@ -232,7 +243,7 @@ class TestHandleFill:
         )
 
         await _handle_fill(
-            order, trade,
+            order_ctx, trade,
             qty_filled=Decimal("10"),
             avg_price=Decimal("100.50"),
             commission=Decimal("1.00"),
@@ -241,28 +252,29 @@ class TestHandleFill:
             ctx=ctx,
         )
 
-        updated = ctx.orders.get_by_id(order.id)
-        assert updated.qty_filled == Decimal("10")
-        assert updated.avg_fill_price == Decimal("100.50")
-        assert updated.status == OrderStatus.FILLED
+        # Verify FILLED transaction was written
+        txns = ctx.transactions.get_for_trade(trade.id)
+        filled = [t for t in txns if t.action == TransactionAction.FILLED]
+        assert len(filled) == 1
+        assert filled[0].ib_filled_qty == Decimal("10")
+        assert filled[0].ib_avg_fill_price == Decimal("100.50")
+        assert filled[0].is_terminal is True
 
 
 class TestHandlePartial:
     async def test_handle_partial_updates_db(self, ctx):
-        """_handle_partial records partial fill in the DB."""
-        from ib_trader.data.models import Order, TradeGroup, TradeStatus, SecurityType
-
+        """_handle_partial records partial fill as TransactionEvent rows."""
         trade = ctx.trades.create(TradeGroup(
             serial_number=2, symbol="MSFT", direction="LONG",
             status=TradeStatus.OPEN, opened_at=datetime.now(timezone.utc),
         ))
-        order = ctx.orders.create(Order(
-            trade_id=trade.id, serial_number=2, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("10"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=datetime.now(timezone.utc),
-        ))
+        correlation_id = str(uuid.uuid4())
+        order_ctx = _OrderContext(
+            trade_id=trade.id, trade_serial=2, symbol="MSFT",
+            side="BUY", order_type="MID", qty_requested=Decimal("10"),
+            leg_type=LegType.ENTRY, correlation_id=correlation_id,
+            security_type="STK", ib_order_id="mock-ib-123",
+        )
 
         cmd = BuyCommand(
             symbol="MSFT", qty=Decimal("10"), dollars=None,
@@ -271,7 +283,7 @@ class TestHandlePartial:
         )
 
         await _handle_partial(
-            order, trade,
+            order_ctx, trade,
             qty_requested=Decimal("10"),
             qty_filled=Decimal("6"),
             avg_price=Decimal("100.00"),
@@ -282,9 +294,14 @@ class TestHandlePartial:
             ctx=ctx,
         )
 
-        updated = ctx.orders.get_by_id(order.id)
-        assert updated.qty_filled == Decimal("6")
-        assert updated.status == OrderStatus.PARTIAL
+        # Verify partial fill + cancel transactions were written
+        txns = ctx.transactions.get_for_trade(trade.id)
+        partial = [t for t in txns if t.action == TransactionAction.PARTIAL_FILL]
+        assert len(partial) == 1
+        assert partial[0].ib_filled_qty == Decimal("6")
+        cancelled = [t for t in txns if t.action == TransactionAction.CANCELLED]
+        assert len(cancelled) == 1
+        assert cancelled[0].is_terminal is True
 
 
 class TestDollarsToSharesConversion:

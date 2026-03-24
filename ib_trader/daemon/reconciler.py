@@ -17,25 +17,18 @@ from decimal import Decimal
 
 from ib_trader.config.context import AppContext
 from ib_trader.data.models import (
-    LegType, OrderStatus, TradeStatus,
+    LegType, TradeStatus,
     TransactionAction, TransactionEvent, AlertSeverity, SystemAlert,
 )
+
+# Fill actions used for P&L calculation and position tracking
+_FILL_ACTIONS = {TransactionAction.FILLED, TransactionAction.PARTIAL_FILL}
 
 logger = logging.getLogger(__name__)
 
 # IB statuses that mean the order is no longer working
 FILLED_STATUSES = {"Filled"}
 CANCELED_STATUSES = {"Cancelled", "Inactive", "ApiCancelled"}
-
-# Order statuses that indicate no further IB activity is expected
-_TERMINAL_ORDER_STATUSES = {
-    OrderStatus.FILLED,
-    OrderStatus.CANCELED,
-    OrderStatus.ABANDONED,
-    OrderStatus.CLOSED_MANUAL,
-    OrderStatus.CLOSED_EXTERNAL,
-    OrderStatus.REJECTED,
-}
 
 
 def _now_utc() -> datetime:
@@ -53,15 +46,18 @@ def _maybe_close_trade_group(ctx: AppContext, trade_id: str) -> None:
         ctx: Application dependency injection container.
         trade_id: UUID of the trade group to check.
     """
-    all_orders = ctx.orders.get_for_trade(trade_id)
-    if not all_orders:
+    leg_summary = ctx.transactions.get_trade_leg_summary(trade_id)
+    if not leg_summary:
         return
 
-    # If any order is still non-terminal, the trade group stays open.
-    if any(o.status not in _TERMINAL_ORDER_STATUSES for o in all_orders):
+    # If any leg is still non-terminal, the trade group stays open.
+    if any(not t.is_terminal for t in leg_summary):
         return
 
-    # --- compute realized P&L ---
+    # --- compute realized P&L from filled legs ---
+    filled_legs = ctx.transactions.get_filled_legs(trade_id)
+    all_txns = ctx.transactions.get_for_trade(trade_id)
+
     entry_value = Decimal("0")
     exit_value = Decimal("0")
     total_commission = Decimal("0")
@@ -69,21 +65,20 @@ def _maybe_close_trade_group(ctx: AppContext, trade_id: str) -> None:
     has_exit = False
     direction = None
 
-    for o in all_orders:
-        commission = o.commission or Decimal("0")
+    # Sum commission from all transactions
+    for t in all_txns:
+        commission = t.commission or Decimal("0")
         total_commission += commission
 
-        if o.status != OrderStatus.FILLED:
-            continue
+    for t in filled_legs:
+        qty = t.ib_filled_qty or Decimal("0")
+        price = t.ib_avg_fill_price or Decimal("0")
 
-        qty = o.qty_filled or Decimal("0")
-        price = o.avg_fill_price or Decimal("0")
-
-        if o.leg_type == LegType.ENTRY:
+        if t.leg_type == LegType.ENTRY and t.action in _FILL_ACTIONS:
             entry_value += price * qty
             has_entry = True
-            direction = o.side  # BUY for LONG, SELL for SHORT
-        elif o.leg_type in (LegType.PROFIT_TAKER, LegType.STOP_LOSS, LegType.CLOSE):
+            direction = t.side  # BUY for LONG, SELL for SHORT
+        elif t.leg_type in (LegType.PROFIT_TAKER, LegType.STOP_LOSS, LegType.CLOSE) and t.action in _FILL_ACTIONS:
             exit_value += price * qty
             has_exit = True
 
@@ -125,48 +120,85 @@ async def run_reconciliation(ctx: AppContext) -> dict:
         ib_orders = await ctx.ib.get_open_orders()
         ib_by_id = {o["ib_order_id"]: o for o in ib_orders}
 
-        # Check all locally-tracked open orders against IB
-        local_open = ctx.orders.get_all_open()
+        # Check all locally-tracked open orders (from transactions) against IB
+        local_open = ctx.transactions.get_open_orders()
 
-        for order in local_open:
-            if not order.ib_order_id:
+        now = _now_utc()
+        for txn in local_open:
+            if not txn.ib_order_id:
                 continue
 
-            ib_status = ib_by_id.get(order.ib_order_id)
+            ib_status = ib_by_id.get(txn.ib_order_id)
 
             if ib_status is None:
                 # Order not found in IB's open orders — may have been filled or canceled externally
-                full_status = await ctx.ib.get_order_status(order.ib_order_id)
+                full_status = await ctx.ib.get_order_status(txn.ib_order_id)
                 ib_str = full_status["status"]
                 qty_filled = full_status["qty_filled"]
                 avg_price = full_status["avg_fill_price"]
                 commission = full_status["commission"] or Decimal("0")
 
-                if ib_str in FILLED_STATUSES and order.status not in (
-                    OrderStatus.FILLED, OrderStatus.PARTIAL
-                ):
-                    ctx.orders.update_fill(order.id, qty_filled, avg_price or Decimal("0"), commission)
-                    ctx.orders.update_status(order.id, OrderStatus.CLOSED_EXTERNAL)
+                if ib_str in FILLED_STATUSES:
+                    reconciled_event = TransactionEvent(
+                        ib_order_id=txn.ib_order_id,
+                        ib_perm_id=txn.ib_perm_id,
+                        action=TransactionAction.RECONCILED,
+                        symbol=txn.symbol,
+                        side=txn.side,
+                        order_type=txn.order_type,
+                        quantity=txn.quantity,
+                        limit_price=txn.limit_price,
+                        account_id=txn.account_id,
+                        ib_status=ib_str,
+                        ib_filled_qty=qty_filled,
+                        ib_avg_fill_price=avg_price or Decimal("0"),
+                        commission=commission,
+                        trade_serial=txn.trade_serial,
+                        trade_id=txn.trade_id,
+                        leg_type=txn.leg_type,
+                        requested_at=now,
+                        ib_responded_at=now,
+                        is_terminal=True,
+                    )
+                    ctx.transactions.insert(reconciled_event)
                     logger.info(
-                        '{"event": "RECONCILED_EXTERNAL", "order_id": "%s", '
-                        '"symbol": "%s", "new_status": "CLOSED_EXTERNAL", '
+                        '{"event": "RECONCILED_EXTERNAL", "ib_order_id": %d, '
+                        '"symbol": "%s", "ib_status": "Filled", '
                         '"qty_filled": "%s"}',
-                        order.id, order.symbol, qty_filled,
+                        txn.ib_order_id, txn.symbol, qty_filled,
                     )
-                    changes.append(order.id)
-                    _maybe_close_trade_group(ctx, order.trade_id)
+                    changes.append(txn.ib_order_id)
+                    if txn.trade_id:
+                        _maybe_close_trade_group(ctx, txn.trade_id)
 
-                elif ib_str in CANCELED_STATUSES and order.status not in (
-                    OrderStatus.CANCELED, OrderStatus.ABANDONED
-                ):
-                    ctx.orders.update_status(order.id, OrderStatus.CANCELED)
-                    logger.info(
-                        '{"event": "RECONCILED_EXTERNAL", "order_id": "%s", '
-                        '"symbol": "%s", "new_status": "CANCELED"}',
-                        order.id, order.symbol,
+                elif ib_str in CANCELED_STATUSES:
+                    reconciled_event = TransactionEvent(
+                        ib_order_id=txn.ib_order_id,
+                        ib_perm_id=txn.ib_perm_id,
+                        action=TransactionAction.RECONCILED,
+                        symbol=txn.symbol,
+                        side=txn.side,
+                        order_type=txn.order_type,
+                        quantity=txn.quantity,
+                        limit_price=txn.limit_price,
+                        account_id=txn.account_id,
+                        ib_status=ib_str,
+                        trade_serial=txn.trade_serial,
+                        trade_id=txn.trade_id,
+                        leg_type=txn.leg_type,
+                        requested_at=now,
+                        ib_responded_at=now,
+                        is_terminal=True,
                     )
-                    changes.append(order.id)
-                    _maybe_close_trade_group(ctx, order.trade_id)
+                    ctx.transactions.insert(reconciled_event)
+                    logger.info(
+                        '{"event": "RECONCILED_EXTERNAL", "ib_order_id": %d, '
+                        '"symbol": "%s", "ib_status": "Canceled"}',
+                        txn.ib_order_id, txn.symbol,
+                    )
+                    changes.append(txn.ib_order_id)
+                    if txn.trade_id:
+                        _maybe_close_trade_group(ctx, txn.trade_id)
 
     except Exception as e:
         logger.error(
@@ -196,11 +228,6 @@ async def run_transaction_reconciliation(ctx: AppContext) -> dict:
     """
     logger.info('{"event": "TRANSACTION_RECONCILIATION_STARTED"}')
 
-    if ctx.transactions is None:
-        logger.warning('{"event": "TRANSACTION_RECONCILIATION_SKIPPED", '
-                       '"reason": "no transactions repository"}')
-        return {"discrepancies": 0, "details": []}
-
     discrepancies = []
 
     try:
@@ -216,10 +243,10 @@ async def run_transaction_reconciliation(ctx: AppContext) -> dict:
             if txn.ib_order_id not in ib_open_ids:
                 # Discrepancy: our records say open, IB says not open
                 now = _now_utc()
-                reconciled_event = TransactionEvent(
+                discrepancy_event = TransactionEvent(
                     ib_order_id=txn.ib_order_id,
                     ib_perm_id=txn.ib_perm_id,
-                    action=TransactionAction.RECONCILED,
+                    action=TransactionAction.DISCREPANCY,
                     symbol=txn.symbol,
                     side=txn.side,
                     order_type=txn.order_type,
@@ -230,9 +257,9 @@ async def run_transaction_reconciliation(ctx: AppContext) -> dict:
                     trade_serial=txn.trade_serial,
                     requested_at=now,
                     ib_responded_at=now,
-                    is_terminal=False,  # Do NOT auto-heal
+                    is_terminal=False,
                 )
-                ctx.transactions.insert(reconciled_event)
+                ctx.transactions.insert(discrepancy_event)
 
                 # Emit WARNING alert
                 alert_msg = (

@@ -2,13 +2,14 @@
 
 Tests the complete limit order path: place at user-specified price,
 confirm IB acceptance, return immediately. No reprice loop, no timeout.
+Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
 import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy
-from ib_trader.data.models import OrderStatus, TradeStatus, LegType
+from ib_trader.data.models import TransactionAction, TradeStatus, LegType
 from ib_trader.engine.order import execute_order
 
 
@@ -56,7 +57,7 @@ class TestLimitOrderPlacement:
         assert placed[0]["side"] == "SELL"
 
     async def test_limit_order_status_is_open(self, ctx):
-        """Limit order leaves the order in OPEN status (not REPRICING)."""
+        """Limit order leaves the transaction in non-terminal state."""
         cmd = BuyCommand(
             symbol="MSFT",
             qty=Decimal("1"),
@@ -69,10 +70,10 @@ class TestLimitOrderPlacement:
         )
         await execute_order(cmd, ctx)
 
-        orders = ctx.orders.get_all_open()
-        assert len(orders) == 1
-        assert orders[0].status == OrderStatus.OPEN
-        assert orders[0].price_placed == Decimal("400.00")
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) == 1
+        assert open_txns[0].action == TransactionAction.PLACE_ACCEPTED
+        assert open_txns[0].limit_price == Decimal("400.00") or open_txns[0].price_placed == Decimal("400.00")
 
     async def test_limit_order_records_trade_group(self, ctx):
         """Limit order creates a trade group with OPEN status."""
@@ -124,9 +125,9 @@ class TestLimitOrderPlacement:
         )
         await execute_order(cmd, ctx)
 
-        # Should be filled, not OPEN
-        orders = ctx.orders.get_all_open()
-        assert len(orders) == 0  # no longer open — it's filled
+        # Should be filled — no open transactions remaining
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) == 0
 
     async def test_limit_order_rejected_raises(self, ctx):
         """If IB rejects the limit order, raise IBOrderRejectedError."""
@@ -204,7 +205,7 @@ class TestLimitOrderPlacement:
         assert len(ctx.ib.placed_orders) == 2
 
     async def test_limit_order_records_ib_order_id(self, ctx):
-        """Limit order records the IB order ID in the database."""
+        """Limit order records the IB order ID in transaction rows."""
         cmd = BuyCommand(
             symbol="MSFT",
             qty=Decimal("1"),
@@ -217,7 +218,7 @@ class TestLimitOrderPlacement:
         )
         await execute_order(cmd, ctx)
 
-        orders = ctx.orders.get_all_open()
-        assert len(orders) == 1
-        assert orders[0].ib_order_id is not None
-        assert orders[0].ib_order_id == ctx.ib.placed_orders[0]["ib_order_id"]
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) == 1
+        assert open_txns[0].ib_order_id is not None
+        assert str(open_txns[0].ib_order_id) == ctx.ib.placed_orders[0]["ib_order_id"]

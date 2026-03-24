@@ -22,10 +22,12 @@ from sqlalchemy.orm import scoped_session
 
 from ib_trader.data.models import (
     PendingCommand, PendingCommandStatus, BotEvent, Bot,
+    TransactionAction, LegType,
 )
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
-from ib_trader.data.repository import TradeRepository, OrderRepository
+from ib_trader.data.repository import TradeRepository
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ class BotBase(ABC):
         self._bot_events = BotEventRepository(session_factory)
         self._pending_commands = PendingCommandRepository(session_factory)
         self._trades = TradeRepository(session_factory)
-        self._orders = OrderRepository(session_factory)
+        self._transactions = TransactionRepository(session_factory)
 
     @abstractmethod
     async def on_tick(self) -> None:
@@ -140,16 +142,21 @@ class BotBase(ABC):
         while time.monotonic() < deadline:
             trade = self._trades.get_by_serial(trade_serial)
             if trade:
-                orders = self._orders.get_for_trade(trade.id)
-                entry_orders = [o for o in orders if o.leg_type.value == "ENTRY"]
-                if entry_orders and entry_orders[0].status.value in ("FILLED", "PARTIAL"):
+                txns = self._transactions.get_for_trade(trade.id)
+                entry_fills = [
+                    t for t in txns
+                    if t.leg_type == LegType.ENTRY
+                    and t.action in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL)
+                ]
+                if entry_fills:
+                    fill = entry_fills[0]
                     return {
                         "trade_id": trade.id,
                         "serial": trade.serial_number,
                         "symbol": trade.symbol,
                         "status": trade.status.value,
-                        "entry_fill_price": str(entry_orders[0].avg_fill_price),
-                        "entry_qty_filled": str(entry_orders[0].qty_filled),
+                        "entry_fill_price": str(fill.ib_avg_fill_price),
+                        "entry_qty_filled": str(fill.ib_filled_qty),
                     }
             await asyncio.sleep(1)
         return None

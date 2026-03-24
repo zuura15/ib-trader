@@ -19,7 +19,7 @@ from ib_trader.data.models import (
 )
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, RepriceEventRepository,
+    TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
 )
 from ib_trader.config.context import AppContext
@@ -45,7 +45,6 @@ def recon_ctx():
     return AppContext(
         ib=mock_ib,
         trades=TradeRepository(sf),
-        orders=OrderRepository(sf),
         reprice_events=RepriceEventRepository(sf),
         contracts=ContractRepository(sf),
         heartbeats=HeartbeatRepository(sf),
@@ -80,8 +79,8 @@ class TestTransactionReconciliation:
     """Tests for run_transaction_reconciliation()."""
 
     @pytest.mark.asyncio
-    async def test_discrepancy_writes_reconciled_row_and_warning(self, recon_ctx):
-        """Order in transactions but not in IB → RECONCILED row + WARNING alert."""
+    async def test_discrepancy_writes_discrepancy_row_and_warning(self, recon_ctx):
+        """Order in transactions but not in IB → DISCREPANCY row + WARNING alert."""
         _insert_open_txn(recon_ctx, ib_order_id=1000, symbol="AAPL")
 
         # Mock IB returns no open orders
@@ -92,11 +91,12 @@ class TestTransactionReconciliation:
         assert result["discrepancies"] == 1
         assert 1000 in result["details"]
 
-        # Check RECONCILED row was written
+        # Check DISCREPANCY row was written (non-terminal — does not auto-heal)
         rows = recon_ctx.transactions.get_by_ib_order_id(1000)
-        reconciled = [r for r in rows if r.action == TransactionAction.RECONCILED]
-        assert len(reconciled) == 1
-        assert reconciled[0].ib_status == "NOT_FOUND_IN_IB"
+        discrepancies = [r for r in rows if r.action == TransactionAction.DISCREPANCY]
+        assert len(discrepancies) == 1
+        assert discrepancies[0].ib_status == "NOT_FOUND_IN_IB"
+        assert discrepancies[0].is_terminal is False
 
         # Check WARNING alert was created
         alerts = recon_ctx.alerts.get_open()

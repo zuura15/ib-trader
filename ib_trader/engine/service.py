@@ -69,10 +69,9 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
 
     if verb in ("status", "stats"):
         trades = ctx.trades
-        orders = ctx.orders
         open_trades = trades.get_open()
         all_trades = trades.get_all()
-        open_orders = orders.get_all_open()
+        open_orders = ctx.transactions.get_open_orders()
 
         # P&L
         closed = [t for t in all_trades if t.status.value == "CLOSED" and t.realized_pnl is not None]
@@ -98,15 +97,15 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
         return "\n".join(lines)
 
     if verb == "orders":
-        open_orders = ctx.orders.get_all_open()
+        open_orders = ctx.transactions.get_open_orders()
         if not open_orders:
             return "No open orders."
         lines = []
-        for o in open_orders:
-            price = o.price_placed or "MKT"
+        for txn in open_orders:
+            price = txn.limit_price or "MKT"
             lines.append(
-                f"  #{o.serial_number or '-':>3} {o.symbol:5} {o.side:4} "
-                f"{o.qty_requested} @ {price} [{o.status.value}] ib_id={o.ib_order_id}"
+                f"  #{txn.trade_serial or '-':>3} {txn.symbol:5} {txn.side:4} "
+                f"{txn.quantity} @ {price} [{txn.action.value}] ib_id={txn.ib_order_id}"
             )
         return f"{len(open_orders)} open orders:\n" + "\n".join(lines)
 
@@ -206,25 +205,19 @@ async def _execute_single_command(cmd_row, ctx: AppContext,
                 "error": str(e),
             }))
 
-            # Clean up any orphaned PENDING orders created by the failed command.
-            # When execute_order throws mid-way, it may have created Order + TradeGroup
-            # records in SQLite that are stuck in PENDING with no ib_order_id.
+            # Clean up any orphaned trade groups created by the failed command.
+            # When execute_order throws mid-way, it may have created TradeGroup
+            # records in SQLite that are stuck OPEN with no confirmed placement.
             try:
-                from ib_trader.data.models import OrderStatus, TradeStatus
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc)
-                orphans = cmd_ctx.orders.get_in_states([OrderStatus.PENDING])
-                for orphan in orphans:
-                    if orphan.ib_order_id is None:
-                        cmd_ctx.orders.update_status(orphan.id, OrderStatus.ABANDONED)
-                        # Close the parent trade group too
-                        trade = cmd_ctx.trades.get_by_serial(orphan.serial_number) if orphan.serial_number is not None else None
-                        if trade and trade.status == TradeStatus.OPEN:
-                            cmd_ctx.trades.update_status(trade.id, TradeStatus.CLOSED)
+                from ib_trader.data.models import TradeStatus
+                open_trades = cmd_ctx.trades.get_open()
+                for trade in open_trades:
+                    if cmd_ctx.transactions.has_unconfirmed_placements(trade.id):
+                        cmd_ctx.trades.update_status(trade.id, TradeStatus.CLOSED)
                         logger.info(json.dumps({
-                            "event": "ORPHAN_ORDER_CLEANED",
-                            "order_id": orphan.id,
-                            "symbol": orphan.symbol,
+                            "event": "ORPHAN_TRADE_CLEANED",
+                            "trade_id": trade.id,
+                            "symbol": trade.symbol,
                         }))
             except Exception:
                 logger.exception(json.dumps({"event": "ORPHAN_CLEANUP_FAILED"}))
@@ -285,7 +278,7 @@ async def engine_loop(ctx: AppContext,
         print("[ENGINE] No stale commands found.")
 
     # Recover any abandoned orders from a previous crash
-    abandoned = recover_in_flight_orders(ctx.orders)
+    abandoned = recover_in_flight_orders(ctx.transactions, ctx.trades)
     if abandoned:
         print(f"[ENGINE] Found {len(abandoned)} abandoned order(s) from previous crash.")
         logger.warning(json.dumps({
@@ -309,5 +302,10 @@ async def engine_loop(ctx: AppContext,
                 )
         except Exception:
             logger.exception('{"event": "ENGINE_POLL_ERROR"}')
+            # Rollback any poisoned session state so the next poll cycle works
+            try:
+                ctx.pending_commands._session().rollback()
+            except Exception:
+                pass
 
         await asyncio.sleep(poll_interval)

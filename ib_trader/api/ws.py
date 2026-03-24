@@ -21,11 +21,12 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.data.models import (
-    OrderStatus, PendingCommandStatus,
+    PendingCommandStatus,
 )
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, HeartbeatRepository, AlertRepository,
+    TradeRepository, HeartbeatRepository, AlertRepository,
 )
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _POLL_INTERVAL_S = 1.5
-
-# Terminal order statuses — these orders are not "open"
-_TERMINAL_STATUSES = {
-    OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.ABANDONED,
-    OrderStatus.CLOSED_MANUAL, OrderStatus.CLOSED_EXTERNAL, OrderStatus.REJECTED,
-}
 
 
 class _JSONEncoder(json.JSONEncoder):
@@ -72,22 +67,19 @@ def _serialize_trade(t) -> dict:
     }
 
 
-def _serialize_order(o) -> dict:
+def _serialize_order(t) -> dict:
     return {
-        "id": o.id,
-        "trade_id": o.trade_id,
-        "serial_number": o.serial_number,
-        "ib_order_id": o.ib_order_id,
-        "leg_type": o.leg_type.value,
-        "symbol": o.symbol,
-        "side": o.side,
-        "qty_requested": str(o.qty_requested),
-        "qty_filled": str(o.qty_filled),
-        "order_type": o.order_type,
-        "status": o.status.value,
-        "price_placed": str(o.price_placed) if o.price_placed is not None else None,
-        "avg_fill_price": str(o.avg_fill_price) if o.avg_fill_price is not None else None,
-        "placed_at": o.placed_at.isoformat() if o.placed_at else None,
+        "id": str(t.ib_order_id or t.id),
+        "symbol": t.symbol,
+        "side": t.side,
+        "qty_requested": str(t.quantity),
+        "order_type": t.order_type,
+        "status": t.action.value,
+        "price_placed": str(t.price_placed) if t.price_placed else None,
+        "ib_order_id": t.ib_order_id,
+        "leg_type": t.leg_type.value if t.leg_type else None,
+        "trade_serial": t.trade_serial,
+        "placed_at": t.requested_at.isoformat() if t.requested_at else None,
     }
 
 
@@ -196,7 +188,7 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
             return [_serialize_trade(t) for t in TradeRepository(sf).get_all()]
 
         elif channel == "orders":
-            return [_serialize_order(o) for o in OrderRepository(sf).get_all_open()]
+            return [_serialize_order(t) for t in TransactionRepository(sf).get_open_orders()]
 
         elif channel == "alerts":
             return [_serialize_alert(a) for a in AlertRepository(sf).get_open()]

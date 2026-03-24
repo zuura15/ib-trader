@@ -360,10 +360,10 @@ class IBTraderApp(App):
             recover_in_flight_orders, format_recovery_warnings,
             close_orphaned_trade_groups,
         )
-        abandoned = recover_in_flight_orders(self._ctx.orders)
+        abandoned = recover_in_flight_orders(self._ctx.transactions, self._ctx.trades)
         for warning in format_recovery_warnings(abandoned):
             router.emit(warning, pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING)
-        orphans_closed = close_orphaned_trade_groups(self._ctx.trades, self._ctx.orders)
+        orphans_closed = close_orphaned_trade_groups(self._ctx.trades, self._ctx.transactions)
         if orphans_closed:
             router.emit(
                 f"\u26a0 Closed {orphans_closed} orphaned trade group(s) from previous session",
@@ -582,42 +582,55 @@ class IBTraderApp(App):
         except Exception:
             return
 
-        from ib_trader.data.models import LegType, OrderStatus as OS
+        from ib_trader.data.models import LegType, TransactionAction
 
         open_trades = self._ctx.trades.get_open()
         tbl.clear()
         for trade in open_trades:
-            legs = self._ctx.orders.get_for_trade(trade.id)
-            entry = next((o for o in legs if o.leg_type == LegType.ENTRY), None)
-            pt = next((o for o in legs if o.leg_type == LegType.PROFIT_TAKER), None)
+            txns = self._ctx.transactions.get_for_trade(trade.id)
+            entry = next(
+                (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.FILLED),
+                None,
+            )
+            entry_placed = next(
+                (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.PLACE_ACCEPTED),
+                None,
+            )
+            pt = next(
+                (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.FILLED),
+                None,
+            )
+            pt_placed = next(
+                (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.PLACE_ACCEPTED),
+                None,
+            )
             close = next(
-                (o for o in legs if o.leg_type == LegType.CLOSE and o.status == OS.FILLED),
+                (t for t in txns if t.leg_type == LegType.CLOSE and t.action == TransactionAction.FILLED),
                 None,
             )
 
-            if entry and entry.avg_fill_price:
-                entry_str = f"${entry.avg_fill_price}"
-                qty_str = str(entry.qty_filled)
-            elif entry and entry.price_placed:
-                entry_str = f"~${entry.price_placed}"
-                qty_str = str(entry.qty_requested)
+            if entry and entry.ib_avg_fill_price:
+                entry_str = f"${entry.ib_avg_fill_price}"
+                qty_str = str(entry.ib_filled_qty)
+            elif entry_placed and entry_placed.price_placed:
+                entry_str = f"~${entry_placed.price_placed}"
+                qty_str = str(entry_placed.quantity)
             else:
-                entry_str = "—"
-                qty_str = "—"
+                entry_str = "\u2014"
+                qty_str = "\u2014"
 
-            if close and close.avg_fill_price:
-                pt_str = f"closed@${close.avg_fill_price}"
-            elif pt:
-                if pt.status == OS.FILLED and pt.avg_fill_price:
-                    pt_str = f"PT@${pt.avg_fill_price}"
-                elif pt.price_placed:
-                    pt_str = f"PT open@${pt.price_placed}"
-                else:
-                    pt_str = "PT open"
+            if close and close.ib_avg_fill_price:
+                pt_str = f"closed@${close.ib_avg_fill_price}"
+            elif pt and pt.ib_avg_fill_price:
+                pt_str = f"PT@${pt.ib_avg_fill_price}"
+            elif pt_placed and pt_placed.price_placed:
+                pt_str = f"PT open@${pt_placed.price_placed}"
+            elif pt_placed:
+                pt_str = "PT open"
             else:
-                pt_str = "—"
+                pt_str = "\u2014"
 
-            trade_comm = sum((o.commission or Decimal("0")) for o in legs)
+            trade_comm = sum((t.commission or Decimal("0")) for t in txns)
             comm_str = f"${trade_comm}" if trade_comm else "—"
             status = "OPEN" if trade.status.value == "OPEN" else "closed"
             direction = trade.direction[:1]
@@ -644,24 +657,22 @@ class IBTraderApp(App):
         except Exception:
             return
 
-        from ib_trader.data.models import OrderStatus as OS
-
-        open_orders = self._ctx.orders.get_all_open()
+        open_orders = self._ctx.transactions.get_open_orders()
         tbl.clear()
-        for order in open_orders:
+        for txn in open_orders:
             # Enrich with live IB status if available
-            ib_status = self._ctx.ib.get_live_order_status(order.ib_order_id) if order.ib_order_id else None
-            display_status = ib_status if ib_status else order.status.value
-            price_str = f"${order.price_placed}" if order.price_placed else "—"
+            ib_status = self._ctx.ib.get_live_order_status(txn.ib_order_id) if txn.ib_order_id else None
+            display_status = ib_status if ib_status else txn.action.value
+            price_str = f"${txn.limit_price}" if txn.limit_price else "\u2014"
 
             tbl.add_row(
-                f"#{order.serial_number or '—'}",
-                order.symbol,
-                order.side,
-                str(order.qty_requested),
+                f"#{txn.trade_serial or '\u2014'}",
+                txn.symbol,
+                txn.side,
+                str(txn.quantity),
                 price_str,
                 display_status,
-                order.ib_order_id or "—",
+                txn.ib_order_id or "\u2014",
             )
 
     async def _clean_exit(self) -> None:
@@ -752,30 +763,28 @@ async def _cmd_orders(ctx: AppContext, router: OutputRouter) -> None:
 
     Shows only orders originated by our system, with live IB status when available.
     """
-    from ib_trader.data.models import OrderStatus as OS
-
-    open_orders = ctx.orders.get_all_open()
+    open_orders = ctx.transactions.get_open_orders()
     if not open_orders:
         router.emit("No open orders.", pane=OutputPane.COMMAND, severity=OutputSeverity.INFO)
         return
 
     lines = [f"{'#':<6} {'Symbol':<8} {'Side':<5} {'Qty':<8} {'Price':<12} {'Status':<14} {'IB ID'}",
              "-" * 70]
-    for order in open_orders:
-        ib_status = ctx.ib.get_live_order_status(order.ib_order_id) if order.ib_order_id else None
-        display_status = ib_status if ib_status else order.status.value
-        price_str = f"${order.price_placed}" if order.price_placed else "—"
-        serial = f"#{order.serial_number}" if order.serial_number else "—"
+    for txn in open_orders:
+        ib_status = ctx.ib.get_live_order_status(txn.ib_order_id) if txn.ib_order_id else None
+        display_status = ib_status if ib_status else txn.action.value
+        price_str = f"${txn.limit_price}" if txn.limit_price else "\u2014"
+        serial = f"#{txn.trade_serial}" if txn.trade_serial else "\u2014"
         lines.append(
-            f"{serial:<6} {order.symbol:<8} {order.side:<5} "
-            f"{str(order.qty_requested):<8} {price_str:<12} {display_status:<14} {order.ib_order_id or '—'}"
+            f"{serial:<6} {txn.symbol:<8} {txn.side:<5} "
+            f"{str(txn.quantity):<8} {price_str:<12} {display_status:<14} {txn.ib_order_id or '\u2014'}"
         )
     router.emit("\n".join(lines), pane=OutputPane.COMMAND, severity=OutputSeverity.INFO)
 
 
 async def _cmd_stats(ctx: AppContext, router: OutputRouter) -> None:
     """Emit the full trade summary table to the command output pane."""
-    from ib_trader.data.models import LegType, OrderStatus as OS
+    from ib_trader.data.models import LegType, TransactionAction
 
     all_trades = ctx.trades.get_all()
     if not all_trades:
@@ -792,35 +801,49 @@ async def _cmd_stats(ctx: AppContext, router: OutputRouter) -> None:
     ]
     total_commission = Decimal("0")
     for trade in all_trades:
-        legs = ctx.orders.get_for_trade(trade.id)
-        entry = next((o for o in legs if o.leg_type == LegType.ENTRY), None)
-        pt = next((o for o in legs if o.leg_type == LegType.PROFIT_TAKER), None)
-        close = next(
-            (o for o in legs if o.leg_type == LegType.CLOSE and o.status == OS.FILLED), None
+        txns = ctx.transactions.get_for_trade(trade.id)
+        entry = next(
+            (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.FILLED),
+            None,
         )
-        if entry and entry.avg_fill_price:
-            entry_str = f"${entry.avg_fill_price}"
-            qty_str = str(entry.qty_filled)
-        elif entry and entry.price_placed:
-            entry_str = f"~${entry.price_placed}"
-            qty_str = str(entry.qty_requested)
+        entry_placed = next(
+            (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.PLACE_ACCEPTED),
+            None,
+        )
+        pt = next(
+            (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.FILLED),
+            None,
+        )
+        pt_placed = next(
+            (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.PLACE_ACCEPTED),
+            None,
+        )
+        close = next(
+            (t for t in txns if t.leg_type == LegType.CLOSE and t.action == TransactionAction.FILLED),
+            None,
+        )
+        if entry and entry.ib_avg_fill_price:
+            entry_str = f"${entry.ib_avg_fill_price}"
+            qty_str = str(entry.ib_filled_qty)
+        elif entry_placed and entry_placed.price_placed:
+            entry_str = f"~${entry_placed.price_placed}"
+            qty_str = str(entry_placed.quantity)
         else:
-            entry_str = "—"
-            qty_str = "—"
-        if close and close.avg_fill_price:
-            pt_str = f"closed @ ${close.avg_fill_price}"
-        elif pt:
-            if pt.status == OS.FILLED and pt.avg_fill_price:
-                pt_str = f"PT filled @ ${pt.avg_fill_price}"
-            elif pt.price_placed:
-                pt_str = f"PT open @ ${pt.price_placed}"
-            else:
-                pt_str = "PT open"
+            entry_str = "\u2014"
+            qty_str = "\u2014"
+        if close and close.ib_avg_fill_price:
+            pt_str = f"closed @ ${close.ib_avg_fill_price}"
+        elif pt and pt.ib_avg_fill_price:
+            pt_str = f"PT filled @ ${pt.ib_avg_fill_price}"
+        elif pt_placed and pt_placed.price_placed:
+            pt_str = f"PT open @ ${pt_placed.price_placed}"
+        elif pt_placed:
+            pt_str = "PT open"
         else:
-            pt_str = "—"
-        trade_comm = sum((o.commission or Decimal("0")) for o in legs)
+            pt_str = "\u2014"
+        trade_comm = sum((t.commission or Decimal("0")) for t in txns)
         total_commission += trade_comm
-        comm_str = f"${trade_comm}" if trade_comm else "—"
+        comm_str = f"${trade_comm}" if trade_comm else "\u2014"
         trade_status = "OPEN" if trade.status.value == "OPEN" else "closed"
         direction = trade.direction[:1]
         lines.append(

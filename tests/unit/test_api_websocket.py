@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import (
-    Base, TradeGroup, TradeStatus, Order, LegType, OrderStatus, SecurityType,
+    Base, TradeGroup, TradeStatus,
     SystemAlert, AlertSeverity,
 )
 from ib_trader.api.app import create_app

@@ -40,7 +40,7 @@ import click  # noqa: E402
 from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions  # noqa: E402
 from ib_trader.config.context import AppContext  # noqa: E402
 from ib_trader.data.repository import (  # noqa: E402
-    TradeRepository, OrderRepository, RepriceEventRepository,
+    TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
@@ -82,7 +82,7 @@ async def run_repl(ctx: AppContext, symbols: list[str]) -> None:
             sys.exit(1)
 
     # Startup checks
-    abandoned = recover_in_flight_orders(ctx.orders)
+    abandoned = recover_in_flight_orders(ctx.transactions, ctx.trades)
     warnings = format_recovery_warnings(abandoned)
 
     # Check daemon heartbeat
@@ -211,22 +211,22 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
 
 async def _cmd_orders(ctx: AppContext) -> None:
     """Display all open orders."""
-    open_orders = ctx.orders.get_all_open()
+    open_orders = ctx.transactions.get_open_orders()
     if not open_orders:
         print("No open orders.")
         return
     print(f"{'Serial':<8} {'Symbol':<8} {'Side':<5} {'Qty':<8} {'Status':<12} {'IB ID'}")
     print("-" * 60)
-    for o in open_orders:
+    for txn in open_orders:
         print(
-            f"#{o.serial_number or '-':<7} {o.symbol:<8} {o.side:<5} "
-            f"{o.qty_requested:<8} {o.status.value:<12} {o.ib_order_id or '-'}"
+            f"#{txn.trade_serial or '-':<7} {txn.symbol:<8} {txn.side:<5} "
+            f"{txn.quantity:<8} {txn.action.value:<12} {txn.ib_order_id or '-'}"
         )
 
 
 async def _cmd_stats(ctx: AppContext) -> None:
     """Display a summary of all trades — open and closed."""
-    from ib_trader.data.models import LegType, OrderStatus as OS
+    from ib_trader.data.models import LegType, TransactionAction
 
     all_trades = ctx.trades.get_all()
     if not all_trades:
@@ -243,48 +243,60 @@ async def _cmd_stats(ctx: AppContext) -> None:
     total_commission = Decimal("0")
 
     for trade in all_trades:
-        legs = ctx.orders.get_for_trade(trade.id)
+        txns = ctx.transactions.get_for_trade(trade.id)
 
-        entry = next((o for o in legs if o.leg_type == LegType.ENTRY), None)
+        # Find ENTRY fill for entry price
+        entry = next(
+            (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.FILLED),
+            None,
+        )
+        # Find ENTRY placement for pending entry price
+        entry_placed = next(
+            (t for t in txns if t.leg_type == LegType.ENTRY and t.action == TransactionAction.PLACE_ACCEPTED),
+            None,
+        )
         pt = next(
-            (o for o in legs if o.leg_type == LegType.PROFIT_TAKER),
+            (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.FILLED),
+            None,
+        )
+        pt_placed = next(
+            (t for t in txns if t.leg_type == LegType.PROFIT_TAKER and t.action == TransactionAction.PLACE_ACCEPTED),
             None,
         )
         close = next(
-            (o for o in legs if o.leg_type == LegType.CLOSE and o.status == OS.FILLED),
+            (t for t in txns if t.leg_type == LegType.CLOSE and t.action == TransactionAction.FILLED),
             None,
         )
 
         # Entry details
-        if entry and entry.avg_fill_price:
-            entry_str = f"${entry.avg_fill_price}"
-            qty_str = str(entry.qty_filled)
-        elif entry and entry.price_placed:
-            entry_str = f"~${entry.price_placed}"
-            qty_str = str(entry.qty_requested)
+        if entry and entry.ib_avg_fill_price:
+            entry_str = f"${entry.ib_avg_fill_price}"
+            qty_str = str(entry.ib_filled_qty)
+        elif entry_placed and entry_placed.price_placed:
+            entry_str = f"~${entry_placed.price_placed}"
+            qty_str = str(entry_placed.quantity)
         else:
-            entry_str = "—"
-            qty_str = "—"
+            entry_str = "\u2014"
+            qty_str = "\u2014"
 
         # Profit taker / close status
-        if close and close.avg_fill_price:
-            pt_str = f"closed @ ${close.avg_fill_price}"
-        elif pt:
-            if pt.status == OS.FILLED and pt.avg_fill_price:
-                pt_str = f"PT filled @ ${pt.avg_fill_price}"
-            elif pt.price_placed:
-                pt_str = f"PT open @ ${pt.price_placed}"
-            else:
-                pt_str = "PT open"
+        if close and close.ib_avg_fill_price:
+            pt_str = f"closed @ ${close.ib_avg_fill_price}"
+        elif pt and pt.ib_avg_fill_price:
+            pt_str = f"PT filled @ ${pt.ib_avg_fill_price}"
+        elif pt_placed and pt_placed.price_placed:
+            pt_str = f"PT open @ ${pt_placed.price_placed}"
+        elif pt_placed:
+            pt_str = "PT open"
         else:
-            pt_str = "—"
+            pt_str = "\u2014"
 
-        # Commission: sum all legs
+        # Commission: sum all transactions
         trade_comm = sum(
-            (o.commission or Decimal("0")) for o in legs
+            (t.commission or Decimal("0")) for t in txns
         )
         total_commission += trade_comm
-        comm_str = f"${trade_comm}" if trade_comm else "—"
+        comm_str = f"${trade_comm}" if trade_comm else "\u2014"
 
         trade_status = "OPEN" if trade.status.value == "OPEN" else "closed"
         direction = trade.direction[:1]  # L / S
@@ -439,7 +451,6 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) 
     ctx = AppContext(
         ib=ib_client,
         trades=TradeRepository(session_factory),
-        orders=OrderRepository(session_factory),
         reprice_events=RepriceEventRepository(session_factory),
         contracts=ContractRepository(session_factory),
         heartbeats=HeartbeatRepository(session_factory),

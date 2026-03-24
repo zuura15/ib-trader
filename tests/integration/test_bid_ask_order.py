@@ -3,13 +3,14 @@
 Tests the complete bid/ask order path: place at current bid or ask price,
 wait briefly for fill, and handle fill / live-GTC outcomes.
 No reprice loop runs for these orders.
+Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
 import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy
-from ib_trader.data.models import OrderStatus, LegType
+from ib_trader.data.models import TransactionAction, LegType, TradeStatus
 from ib_trader.engine.order import execute_order
 
 
@@ -111,13 +112,16 @@ class TestBidOrderFlow:
         await execute_order(cmd, ctx)
         await fill_task
 
-        all_orders = ctx.orders.get_all_open()
-        # Entry should be filled and not in open list
-        from ib_trader.data.models import OrderStatus as OS
-        filled = [o for o in ctx.orders.get_in_states([OS.FILLED]) if o.leg_type == LegType.ENTRY]
+        # Entry should be filled — check via transactions
+        trades = ctx.trades.get_all()
+        assert len(trades) >= 1
+        trade_id = trades[0].id
+        txns = ctx.transactions.get_for_trade(trade_id)
+        filled = [t for t in txns if t.action == TransactionAction.FILLED
+                  and t.leg_type == LegType.ENTRY]
         assert len(filled) == 1
-        assert filled[0].qty_filled == Decimal("1")
-        assert filled[0].avg_fill_price == Decimal("100.00")
+        assert filled[0].ib_filled_qty == Decimal("1")
+        assert filled[0].ib_avg_fill_price == Decimal("100.00")
 
     async def test_bid_order_rejected_marks_canceled(self, ctx):
         """Bid order that IB cancels/rejects is marked CANCELED in DB, not OPEN."""
@@ -147,12 +151,11 @@ class TestBidOrderFlow:
         await execute_order(cmd, ctx)
         await cancel_task
 
-        from ib_trader.data.models import OrderStatus as OS, LegType
-        canceled = [
-            o for o in ctx.orders.get_in_states([OS.CANCELED])
-            if o.leg_type == LegType.ENTRY
-        ]
-        assert len(canceled) == 1
+        # Trade should be closed after cancellation
+        trades = ctx.trades.get_all()
+        assert len(trades) >= 1
+        closed = [t for t in trades if t.status == TradeStatus.CLOSED]
+        assert len(closed) >= 1
 
     async def test_bid_order_no_fill_leaves_gtc_live(self, ctx):
         """Bid order that does not fill in 30s leaves the DB in OPEN state."""
@@ -183,9 +186,9 @@ class TestBidOrderFlow:
             except asyncio.CancelledError:
                 pass
 
-        # Order is placed in IB but not filled — DB should show OPEN, not FILLED
-        open_orders = ctx.orders.get_all_open()
-        assert len(open_orders) >= 1
+        # Order is placed in IB but not filled — transactions should show non-terminal
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) >= 1
 
 
 class TestPreSubmittedFlow:
@@ -227,9 +230,9 @@ class TestPreSubmittedFlow:
         with patch("ib_trader.engine.market_hours._now_et", return_value=_saturday):
             await execute_order(cmd, ctx)
 
-        open_orders = ctx.orders.get_all_open()
-        assert len(open_orders) == 1
-        assert open_orders[0].status.value == "OPEN"
+        open_txns = ctx.transactions.get_open_orders()
+        assert len(open_txns) == 1
+        assert open_txns[0].action == TransactionAction.PLACE_ACCEPTED
 
     async def test_bid_order_presubmitted_active_hours_abandoned(self, ctx):
         """Bid order PreSubmitted during active trading hours is cancelled and marked ABANDONED."""
@@ -267,9 +270,12 @@ class TestPreSubmittedFlow:
         with patch("ib_trader.engine.market_hours._now_et", return_value=_monday_rth):
             await execute_order(cmd, ctx)
 
-        from ib_trader.data.models import OrderStatus as OS
-        abandoned = ctx.orders.get_in_states([OS.ABANDONED])
-        assert len(abandoned) == 1
+        # Trade should be closed and IB cancel should have been called
+        trades = ctx.trades.get_all()
+        assert len(trades) >= 1
+        closed = [t for t in trades if t.status == TradeStatus.CLOSED]
+        assert len(closed) >= 1
+        assert len(ctx.ib.canceled_orders) >= 1
 
 
 class TestAskOrderFlow:

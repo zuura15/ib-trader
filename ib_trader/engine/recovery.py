@@ -1,92 +1,75 @@
 """Startup crash recovery for in-flight orders.
 
-On REPL startup, scans SQLite for orders in REPRICING, AMENDING, or PENDING
-state that are stale (no IB order ID) and marks them ABANDONED.
-Also closes trade groups where all order legs are terminal.
+On REPL startup, scans SQLite for trades with PLACE_ATTEMPT but no
+PLACE_ACCEPTED and no terminal event, and marks them CLOSED.
+Also closes trade groups where all transaction legs are terminal with no fills.
 
 Does NOT attempt to cancel or continue — the order may still be open in IB.
-Prints a warning listing abandoned orders for the user to handle manually.
+Prints a warning listing abandoned trades for the user to handle manually.
 """
 import logging
-from datetime import datetime
 
-from ib_trader.data.models import OrderStatus, TradeStatus
-from ib_trader.data.repository import OrderRepository, TradeRepository
+from ib_trader.data.models import TradeStatus, TransactionAction
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
+from ib_trader.data.repository import TradeRepository
 
 logger = logging.getLogger(__name__)
 
-# Order statuses that indicate the order lifecycle is complete.
-_TERMINAL_ORDER_STATUSES = {
-    OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.CANCELED,
-    OrderStatus.ABANDONED, OrderStatus.CLOSED_MANUAL,
-    OrderStatus.CLOSED_EXTERNAL, OrderStatus.REJECTED,
-}
 
+def recover_in_flight_orders(
+    transactions: TransactionRepository, trades: TradeRepository,
+) -> list[dict]:
+    """Find trades with PLACE_ATTEMPT but no PLACE_ACCEPTED and no terminal event.
 
-def recover_in_flight_orders(orders: OrderRepository) -> list[dict]:
-    """Scan for stale in-flight orders and mark them ABANDONED.
-
-    Targets:
-      - REPRICING or AMENDING orders (crash mid-reprice)
-      - PENDING orders with no ib_order_id (never sent to IB)
-      - OPEN orders with no ib_order_id (stale close legs)
+    These are orders that crashed mid-placement — they may or may not have
+    reached IB. Mark the trade groups CLOSED and return warnings.
 
     Args:
-        orders: OrderRepository instance.
+        transactions: TransactionRepository instance.
+        trades: TradeRepository instance.
 
     Returns:
-        List of dicts describing each abandoned order, for user display.
-        Each dict has: order_id, serial_number, symbol, status, last_amended_at.
+        List of dicts describing each abandoned trade, for user display.
+        Each dict has: trade_id, serial_number, symbol.
     """
-    stale_states = [
-        OrderStatus.REPRICING, OrderStatus.AMENDING,
-        OrderStatus.PENDING, OrderStatus.OPEN,
-    ]
-    candidates = orders.get_in_states(stale_states)
-
+    open_trades = trades.get_open()
     abandoned = []
-    for order in candidates:
-        # PENDING/OPEN orders that have an ib_order_id may still be live in IB.
-        # Only abandon those with no ib_order_id (never placed or stale).
-        if order.status in (OrderStatus.PENDING, OrderStatus.OPEN) and order.ib_order_id:
+
+    for trade in open_trades:
+        if not transactions.has_unconfirmed_placements(trade.id):
             continue
 
-        previous_status = order.status.value
-        last_amended = order.last_amended_at
-        serial = order.serial_number
-        symbol = order.symbol
-        order_id = order.id
-
+        # This trade has unconfirmed placements — mark it CLOSED.
         logger.warning(
-            '{"event": "ORDER_ABANDONED", "order_id": "%s", "serial": %s, '
-            '"symbol": "%s", "previous_status": "%s", "last_amended_at": "%s"}',
-            order_id, serial, symbol, previous_status,
-            last_amended.isoformat() if last_amended else None,
+            '{"event": "TRADE_ABANDONED", "trade_id": "%s", "serial": %s, '
+            '"symbol": "%s"}',
+            trade.id, trade.serial_number, trade.symbol,
         )
-        orders.update_status(order_id, OrderStatus.ABANDONED)
+        trades.update_status(trade.id, TradeStatus.CLOSED)
         abandoned.append({
-            "order_id": order_id,
-            "serial_number": serial,
-            "symbol": symbol,
-            "previous_status": previous_status,
-            "last_amended_at": last_amended,
+            "trade_id": trade.id,
+            "serial_number": trade.serial_number,
+            "symbol": trade.symbol,
         })
 
     return abandoned
 
 
 def close_orphaned_trade_groups(
-    trades: TradeRepository, orders: OrderRepository,
+    trades: TradeRepository, transactions: TransactionRepository,
 ) -> int:
-    """Close trade groups where all order legs are terminal.
+    """Close trade groups where all transaction legs are terminal.
 
     A trade group left OPEN after all its legs completed (filled, canceled,
-    abandoned, etc.) is an orphan — typically caused by a crash or error
-    during order placement.  This function marks them CLOSED.
+    etc.) is an orphan — typically caused by a crash or error during order
+    placement. This function marks them CLOSED.
+
+    For each OPEN trade, uses get_trade_leg_summary to check if all legs
+    are terminal. If yes and no fills, closes the trade.
 
     Args:
         trades: TradeRepository instance.
-        orders: OrderRepository instance.
+        transactions: TransactionRepository instance.
 
     Returns:
         Number of trade groups closed.
@@ -94,20 +77,23 @@ def close_orphaned_trade_groups(
     open_trades = trades.get_open()
     closed_count = 0
     for trade in open_trades:
-        legs = orders.get_for_trade(trade.id)
+        legs = transactions.get_trade_leg_summary(trade.id)
         if not legs:
-            # Trade group with no legs at all — close it.
+            # Trade group with no transaction legs at all — close it.
             trades.update_status(trade.id, TradeStatus.CLOSED)
             closed_count += 1
             logger.info(
                 '{"event": "TRADE_GROUP_CLOSED_ORPHAN", "trade_id": "%s", '
-                '"serial": %s, "reason": "no order legs"}',
+                '"serial": %s, "reason": "no transaction legs"}',
                 trade.id, trade.serial_number,
             )
             continue
 
-        all_terminal = all(o.status in _TERMINAL_ORDER_STATUSES for o in legs)
-        has_fill = any(o.avg_fill_price is not None for o in legs)
+        all_terminal = all(t.is_terminal for t in legs)
+        has_fill = any(
+            t.action in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL)
+            for t in legs
+        )
 
         if all_terminal and not has_fill:
             # All legs are terminal but none filled — failed placement attempt.
@@ -123,26 +109,20 @@ def close_orphaned_trade_groups(
 
 
 def format_recovery_warnings(abandoned: list[dict]) -> list[str]:
-    """Format abandoned order info as user-facing warning lines.
+    """Format abandoned trade info as user-facing warning lines.
 
     Args:
-        abandoned: List of abandoned order dicts from recover_in_flight_orders().
+        abandoned: List of abandoned trade dicts from recover_in_flight_orders().
 
     Returns:
         List of warning strings for display at the REPL prompt.
     """
     lines = []
-    for order in abandoned:
-        serial = order.get("serial_number", "?")
-        symbol = order.get("symbol", "?")
-        prev = order.get("previous_status", "?")
-        amended_at = order.get("last_amended_at")
-        time_str = ""
-        if amended_at:
-            if isinstance(amended_at, datetime):
-                time_str = f" (last amended {amended_at.strftime('%H:%M:%S')} UTC)"
+    for trade in abandoned:
+        serial = trade.get("serial_number", "?")
+        symbol = trade.get("symbol", "?")
         lines.append(
-            f"\u26a0 Warning: Order #{serial} ({symbol}) was ABANDONED — "
-            f"was {prev}{time_str}. Check IB manually."
+            f"\u26a0 Warning: Trade #{serial} ({symbol}) had unconfirmed placements — "
+            f"marked CLOSED. Check IB manually."
         )
     return lines

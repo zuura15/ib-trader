@@ -1,11 +1,15 @@
-"""Integration tests for the close command flow."""
+"""Integration tests for the close command flow.
+
+Assertions use TransactionEvent rows instead of Order rows.
+"""
 import pytest
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.repl.commands import CloseCommand
 from ib_trader.data.models import (
-    Order, TradeGroup, OrderStatus, TradeStatus, LegType, SecurityType
+    TradeGroup, TradeStatus, LegType, TransactionAction, TransactionEvent,
 )
 from ib_trader.engine.order import execute_close
 from ib_trader.engine.exceptions import TradeNotFoundError
@@ -16,21 +20,42 @@ def _now():
 
 
 async def _setup_filled_trade(ctx, serial: int = 1, side: str = "BUY") -> tuple:
-    """Create a trade group with a filled entry order."""
+    """Create a trade group with a filled entry via TransactionEvent rows."""
     trade = ctx.trades.create(TradeGroup(
         serial_number=serial, symbol="MSFT", direction="LONG" if side == "BUY" else "SHORT",
         status=TradeStatus.OPEN, opened_at=_now(),
     ))
-    order = ctx.orders.create(Order(
-        trade_id=trade.id, serial_number=serial, leg_type=LegType.ENTRY,
-        symbol="MSFT", side=side, security_type=SecurityType.STK,
-        qty_requested=Decimal("10"), qty_filled=Decimal("10"),
-        order_type="MID", status=OrderStatus.FILLED,
-        avg_fill_price=Decimal("100.00"),
-        placed_at=_now(),
+    correlation_id = str(uuid.uuid4())
+    # Insert PLACE_ATTEMPT
+    ctx.transactions.insert(TransactionEvent(
+        ib_order_id=serial * 1000, action=TransactionAction.PLACE_ATTEMPT,
+        symbol="MSFT", side=side, order_type="MID",
+        quantity=Decimal("10"), account_id="U1234567",
+        requested_at=_now(), trade_id=trade.id,
+        leg_type=LegType.ENTRY, correlation_id=correlation_id,
+        security_type="STK",
     ))
-    ctx.orders.update_ib_order_id(order.id, f"IB{serial}000")
-    return trade, order
+    # Insert PLACE_ACCEPTED
+    ctx.transactions.insert(TransactionEvent(
+        ib_order_id=serial * 1000, action=TransactionAction.PLACE_ACCEPTED,
+        symbol="MSFT", side=side, order_type="MID",
+        quantity=Decimal("10"), account_id="U1234567",
+        requested_at=_now(), trade_id=trade.id,
+        leg_type=LegType.ENTRY, correlation_id=correlation_id,
+        security_type="STK",
+    ))
+    # Insert FILLED
+    ctx.transactions.insert(TransactionEvent(
+        ib_order_id=serial * 1000, action=TransactionAction.FILLED,
+        symbol="MSFT", side=side, order_type="MID",
+        quantity=Decimal("10"), account_id="U1234567",
+        requested_at=_now(), trade_id=trade.id,
+        leg_type=LegType.ENTRY, correlation_id=correlation_id,
+        security_type="STK", is_terminal=True,
+        ib_filled_qty=Decimal("10"), ib_avg_fill_price=Decimal("100.00"),
+        commission=Decimal("1.00"),
+    ))
+    return trade, correlation_id
 
 
 class TestCloseCommand:
@@ -65,23 +90,25 @@ class TestCloseCommand:
 
     async def test_close_cancels_profit_taker(self, ctx):
         """Close cancels any linked profit taker before placing closing order."""
-        trade, entry = await _setup_filled_trade(ctx, serial=3, side="BUY")
+        trade, entry_corr = await _setup_filled_trade(ctx, serial=3, side="BUY")
 
-        # Add a profit taker leg
-        pt_order = ctx.orders.create(Order(
-            trade_id=trade.id, leg_type=LegType.PROFIT_TAKER,
-            symbol="MSFT", side="SELL", security_type=SecurityType.STK,
-            qty_requested=Decimal("10"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN,
-            placed_at=_now(),
+        # Add a profit taker leg as non-terminal transaction
+        pt_correlation_id = str(uuid.uuid4())
+        ctx.transactions.insert(TransactionEvent(
+            ib_order_id=30001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="SELL", order_type="LMT",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.PROFIT_TAKER, correlation_id=pt_correlation_id,
+            security_type="STK", is_terminal=False,
         ))
-        ctx.orders.update_ib_order_id(pt_order.id, "PT_IB3000")
 
         cmd = CloseCommand(serial=3, strategy="market", profit_amount=None, take_profit_price=None)
         await execute_close(cmd, ctx)
 
-        # Profit taker should have been canceled
-        assert "PT_IB3000" in ctx.ib.canceled_orders
+        # Profit taker should have been canceled (ib_order_id may be int or str)
+        canceled_ids = [str(x) for x in ctx.ib.canceled_orders]
+        assert "30001" in canceled_ids
 
     async def test_close_mid_strategy_places_limit(self, ctx):
         """Close with mid strategy places a limit order at mid price."""

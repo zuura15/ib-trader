@@ -23,7 +23,7 @@ import click
 from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions
 from ib_trader.config.context import AppContext
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, RepriceEventRepository,
+    TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
@@ -94,7 +94,6 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool):
     ctx = AppContext(
         ib=ib_client,
         trades=TradeRepository(session_factory),
-        orders=OrderRepository(session_factory),
         reprice_events=RepriceEventRepository(session_factory),
         contracts=ContractRepository(session_factory),
         heartbeats=HeartbeatRepository(session_factory),

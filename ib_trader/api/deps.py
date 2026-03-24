@@ -6,7 +6,7 @@ for route handlers via FastAPI's Depends() mechanism.
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, HeartbeatRepository, AlertRepository,
+    TradeRepository, HeartbeatRepository, AlertRepository,
 )
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 
@@ -29,10 +29,6 @@ def get_session_factory() -> scoped_session:
 
 def get_trades() -> TradeRepository:
     return TradeRepository(get_session_factory())
-
-
-def get_orders() -> OrderRepository:
-    return OrderRepository(get_session_factory())
 
 
 def get_heartbeats() -> HeartbeatRepository:

@@ -117,6 +117,11 @@ No exceptions. Treat these as team-level non-negotiables.
 - The `transactions` table is append-only — never UPDATE or DELETE rows.
 - The orders pane in the TUI is populated from IB's open orders, not from SQLite.
 - One `TransactionEvent` row must be written for every interaction with IB around an order.
-- Reconciliation (daemon) surfaces discrepancies as WARNINGs — it never auto-heals.
+- Reconciliation (daemon) has two modes:
+  - `run_reconciliation`: confirms fills/cancels that IB completed externally by
+    writing terminal `RECONCILED` rows and closing trade groups. This is local
+    state catchup, not auto-healing — IB already acted.
+  - `run_transaction_reconciliation`: surfaces unknown discrepancies as
+    `DISCREPANCY` rows (non-terminal) + WARNING alerts. Never auto-heals.
 - Poll interval and reconciliation interval are tunables in settings.yaml.
 - Live account detection runs on every REPL startup and cannot be bypassed.

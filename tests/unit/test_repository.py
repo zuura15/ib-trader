@@ -6,10 +6,10 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 from ib_trader.data.models import (
-    TradeGroup, Order, Contract,
-    TradeStatus, OrderStatus, LegType, SecurityType,
+    TradeGroup, Contract, TradeStatus, TransactionAction, TransactionEvent, LegType,
 )
-from ib_trader.data.repository import TradeRepository, OrderRepository
+from ib_trader.data.repository import TradeRepository
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
 
 
 def _now():
@@ -97,7 +97,7 @@ class TestTradeRepository:
         assert repo.next_serial_number() == 1
 
 
-class TestOrderRepository:
+class TestTransactionRepository:
     def _make_trade(self, session_factory, serial=1) -> TradeGroup:
         repo = TradeRepository(session_factory)
         return repo.create(TradeGroup(
@@ -105,72 +105,247 @@ class TestOrderRepository:
             status=TradeStatus.OPEN, opened_at=_now(),
         ))
 
-    def test_create_and_get_by_id(self, session_factory):
+    def test_insert_and_get_by_ib_order_id(self, session_factory):
+        """Insert a transaction event and retrieve it by ib_order_id."""
         trade = self._make_trade(session_factory)
-        repo = OrderRepository(session_factory)
-        order = repo.create(Order(
-            trade_id=trade.id,
-            serial_number=1,
-            leg_type=LegType.ENTRY,
-            symbol="MSFT",
-            side="BUY",
-            security_type=SecurityType.STK,
-            qty_requested=Decimal("10"),
-            qty_filled=Decimal("0"),
-            order_type="MID",
-            status=OrderStatus.PENDING,
-            placed_at=_now(),
-        ))
-        assert order.id is not None
-        fetched = repo.get_by_id(order.id)
-        assert fetched is not None
-        assert fetched.symbol == "MSFT"
+        repo = TransactionRepository(session_factory)
+        evt = TransactionEvent(
+            ib_order_id=1001,
+            action=TransactionAction.PLACE_ATTEMPT,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, security_type="STK",
+        )
+        repo.insert(evt)
+        rows = repo.get_by_ib_order_id(1001)
+        assert len(rows) == 1
+        assert rows[0].symbol == "MSFT"
+        assert rows[0].action == TransactionAction.PLACE_ATTEMPT
 
-    def test_get_by_ib_order_id(self, session_factory):
+    def test_get_latest_by_ib_order_id(self, session_factory):
+        """get_latest_by_ib_order_id returns the most recent row."""
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=2001, action=TransactionAction.PLACE_ATTEMPT,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(),
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=2001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(),
+        ))
+        latest = repo.get_latest_by_ib_order_id(2001)
+        assert latest is not None
+        assert latest.action == TransactionAction.PLACE_ACCEPTED
+
+    def test_get_latest_by_ib_order_id_not_found(self, session_factory):
+        """Returns None for unknown ib_order_id."""
+        repo = TransactionRepository(session_factory)
+        assert repo.get_latest_by_ib_order_id(99999) is None
+
+    def test_get_open_orders_excludes_terminal(self, session_factory):
+        """get_open_orders excludes orders whose latest row is terminal."""
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=3001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), is_terminal=False,
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=3001, action=TransactionAction.FILLED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), is_terminal=True,
+        ))
+        assert repo.get_open_orders() == []
+
+    def test_get_for_trade(self, session_factory):
+        """get_for_trade returns all transactions for a trade group."""
         trade = self._make_trade(session_factory)
-        repo = OrderRepository(session_factory)
-        order = repo.create(Order(
-            trade_id=trade.id, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("5"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN, placed_at=_now(),
-        ))
-        repo.update_ib_order_id(order.id, "IB12345")
-        found = repo.get_by_ib_order_id("IB12345")
-        assert found is not None
-        assert found.ib_order_id == "IB12345"
-
-    def test_get_by_ib_order_id_not_found(self, session_factory):
-        repo = OrderRepository(session_factory)
-        assert repo.get_by_ib_order_id("NONEXISTENT") is None
-
-    def test_update_fill(self, session_factory):
-        trade = self._make_trade(session_factory, serial=2)
-        repo = OrderRepository(session_factory)
-        order = repo.create(Order(
-            trade_id=trade.id, leg_type=LegType.ENTRY,
-            symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-            qty_requested=Decimal("10"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN, placed_at=_now(),
-        ))
-        repo.update_fill(order.id, Decimal("10"), Decimal("412.33"), Decimal("1.00"))
-        fetched = repo.get_by_id(order.id)
-        assert fetched.qty_filled == Decimal("10")
-        assert fetched.avg_fill_price == Decimal("412.33")
-        assert fetched.commission == Decimal("1.00")
-
-    def test_get_in_states(self, session_factory):
-        trade = self._make_trade(session_factory, serial=3)
-        repo = OrderRepository(session_factory)
-        for status in [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.REPRICING]:
-            repo.create(Order(
-                trade_id=trade.id, leg_type=LegType.ENTRY,
-                symbol="MSFT", side="BUY", security_type=SecurityType.STK,
-                qty_requested=Decimal("1"), qty_filled=Decimal("0"),
-                order_type="MID", status=status, placed_at=_now(),
+        repo = TransactionRepository(session_factory)
+        for action in [TransactionAction.PLACE_ATTEMPT, TransactionAction.PLACE_ACCEPTED]:
+            repo.insert(TransactionEvent(
+                ib_order_id=4001, action=action,
+                symbol="MSFT", side="BUY", order_type="MID",
+                quantity=Decimal("1"), account_id="U1234567",
+                requested_at=_now(), trade_id=trade.id,
             ))
-        results = repo.get_in_states([OrderStatus.OPEN, OrderStatus.REPRICING])
-        assert len(results) == 2
+        rows = repo.get_for_trade(trade.id)
+        assert len(rows) == 2
+
+    def test_get_entry_fill(self, session_factory):
+        """get_entry_fill returns the FILLED ENTRY transaction."""
+        trade = self._make_trade(session_factory, serial=2)
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=5001, action=TransactionAction.FILLED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, is_terminal=True,
+            ib_filled_qty=Decimal("10"), ib_avg_fill_price=Decimal("412.33"),
+            commission=Decimal("1.00"),
+        ))
+        entry = repo.get_entry_fill(trade.id)
+        assert entry is not None
+        assert entry.ib_filled_qty == Decimal("10")
+        assert entry.ib_avg_fill_price == Decimal("412.33")
+        assert entry.commission == Decimal("1.00")
+
+    def test_get_entry_fill_partial(self, session_factory):
+        """get_entry_fill falls back to PARTIAL_FILL when no full FILLED exists."""
+        trade = self._make_trade(session_factory, serial=20)
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=5050, action=TransactionAction.PARTIAL_FILL,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY,
+            ib_filled_qty=Decimal("3"), ib_avg_fill_price=Decimal("100.00"),
+        ))
+        entry = repo.get_entry_fill(trade.id)
+        assert entry is not None
+        assert entry.action == TransactionAction.PARTIAL_FILL
+        assert entry.ib_filled_qty == Decimal("3")
+
+    def test_get_for_trade_serial(self, session_factory):
+        """get_for_trade_serial returns all transactions for a serial number."""
+        trade = self._make_trade(session_factory, serial=30)
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=6001, action=TransactionAction.PLACE_ATTEMPT,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(), trade_serial=30, trade_id=trade.id,
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=6001, action=TransactionAction.FILLED,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(), trade_serial=30, trade_id=trade.id,
+        ))
+        rows = repo.get_for_trade_serial(30)
+        assert len(rows) == 2
+
+    def test_get_filled_legs_includes_partial(self, session_factory):
+        """get_filled_legs returns both FILLED and PARTIAL_FILL transactions."""
+        trade = self._make_trade(session_factory, serial=31)
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=7001, action=TransactionAction.FILLED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, ib_filled_qty=Decimal("10"),
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=7002, action=TransactionAction.PARTIAL_FILL,
+            symbol="MSFT", side="SELL", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.CLOSE, ib_filled_qty=Decimal("5"),
+        ))
+        legs = repo.get_filled_legs(trade.id)
+        assert len(legs) == 2
+        actions = {l.action for l in legs}
+        assert TransactionAction.FILLED in actions
+        assert TransactionAction.PARTIAL_FILL in actions
+
+    def test_get_open_for_trade(self, session_factory):
+        """get_open_for_trade returns non-terminal legs for a trade."""
+        trade = self._make_trade(session_factory, serial=32)
+        repo = TransactionRepository(session_factory)
+        # Open leg
+        repo.insert(TransactionEvent(
+            ib_order_id=8001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="SELL", order_type="LIMIT",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.PROFIT_TAKER, is_terminal=False,
+        ))
+        # Terminal leg
+        repo.insert(TransactionEvent(
+            ib_order_id=8002, action=TransactionAction.FILLED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, is_terminal=True,
+        ))
+        open_legs = repo.get_open_for_trade(trade.id)
+        assert len(open_legs) == 1
+        assert open_legs[0].ib_order_id == 8001
+
+    def test_get_trade_leg_summary(self, session_factory):
+        """get_trade_leg_summary returns latest transaction per ib_order_id."""
+        trade = self._make_trade(session_factory, serial=33)
+        repo = TransactionRepository(session_factory)
+        # Two events for same ib_order_id — should only get latest
+        repo.insert(TransactionEvent(
+            ib_order_id=9001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, is_terminal=False,
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=9001, action=TransactionAction.FILLED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            leg_type=LegType.ENTRY, is_terminal=True,
+        ))
+        summary = repo.get_trade_leg_summary(trade.id)
+        assert len(summary) == 1
+        assert summary[0].action == TransactionAction.FILLED
+
+    def test_has_unconfirmed_placements(self, session_factory):
+        """has_unconfirmed_placements detects PLACE_ATTEMPT without PLACE_ACCEPTED."""
+        trade = self._make_trade(session_factory, serial=34)
+        repo = TransactionRepository(session_factory)
+        repo.insert(TransactionEvent(
+            ib_order_id=10001, action=TransactionAction.PLACE_ATTEMPT,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            correlation_id="corr-1",
+        ))
+        assert repo.has_unconfirmed_placements(trade.id) is True
+
+        # Add PLACE_ACCEPTED — should now be confirmed
+        repo.insert(TransactionEvent(
+            ib_order_id=10001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="MSFT", side="BUY", order_type="MID",
+            quantity=Decimal("10"), account_id="U1234567",
+            requested_at=_now(), trade_id=trade.id,
+            correlation_id="corr-1",
+        ))
+        assert repo.has_unconfirmed_placements(trade.id) is False
+
+    def test_get_by_correlation_id(self, session_factory):
+        """get_by_correlation_id returns all transactions with a given correlation_id."""
+        repo = TransactionRepository(session_factory)
+        corr = "test-corr-abc"
+        repo.insert(TransactionEvent(
+            ib_order_id=11001, action=TransactionAction.PLACE_ATTEMPT,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(), correlation_id=corr,
+        ))
+        repo.insert(TransactionEvent(
+            ib_order_id=11001, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("5"), account_id="U1234567",
+            requested_at=_now(), correlation_id=corr,
+        ))
+        rows = repo.get_by_correlation_id(corr)
+        assert len(rows) == 2
+        assert all(r.correlation_id == corr for r in rows)
 
 
 class TestContractRepository:

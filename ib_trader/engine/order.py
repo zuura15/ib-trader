@@ -8,21 +8,41 @@ All engine functions receive AppContext and call IB exclusively through ctx.ib.
 No engine function imports or references ib_insync directly.
 """
 import asyncio
+import dataclasses
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.config.context import AppContext
 from ib_trader.repl.output_router import OutputPane, OutputSeverity
 from ib_trader.data.models import (
-    LegType, Order, OrderStatus, RepriceEvent, SecurityType, TradeGroup, TradeStatus,
+    LegType, RepriceEvent, TradeGroup, TradeStatus,
     TransactionAction, TransactionEvent,
 )
 from ib_trader.engine.exceptions import IBOrderRejectedError, SafetyLimitError, TradeNotFoundError
 from ib_trader.engine.market_hours import (
     is_ib_session_active, is_overnight_session, presubmitted_reason, session_label,
 )
+
+
+@dataclasses.dataclass
+class _OrderContext:
+    """Ephemeral order context carried through execution flow. Not persisted to DB."""
+    trade_id: str
+    trade_serial: int
+    symbol: str
+    side: str
+    order_type: str
+    qty_requested: Decimal
+    leg_type: LegType
+    correlation_id: str
+    security_type: str = "STK"
+    expiry: str | None = None
+    strike: Decimal | None = None
+    right: str | None = None
+    ib_order_id: str | None = None
 
 
 def _session_tif() -> str:
@@ -80,14 +100,20 @@ def _write_txn(
     trade_serial: int | None = None,
     is_terminal: bool = False,
     ib_responded_at: datetime | None = None,
+    trade_id: str | None = None,
+    leg_type: LegType | None = None,
+    commission: Decimal | None = None,
+    price_placed: Decimal | None = None,
+    correlation_id: str | None = None,
+    security_type: str | None = None,
+    expiry: str | None = None,
+    strike: Decimal | None = None,
+    right: str | None = None,
+    raw_response: str | None = None,
 ) -> None:
     """Write a single TransactionEvent row to the audit log.
 
-    No-op if ctx.transactions is None (backward-compatible with tests
-    that don't set up the transactions repository).
     """
-    if ctx.transactions is None:
-        return
     now = _now_utc()
     event = TransactionEvent(
         ib_order_id=ib_order_id,
@@ -108,6 +134,16 @@ def _write_txn(
         requested_at=now,
         ib_responded_at=ib_responded_at,
         is_terminal=is_terminal,
+        trade_id=trade_id,
+        leg_type=leg_type,
+        commission=commission,
+        price_placed=price_placed,
+        correlation_id=correlation_id,
+        security_type=security_type,
+        expiry=expiry,
+        strike=strike,
+        right=right,
+        raw_response=raw_response,
     )
     try:
         ctx.transactions.insert(event)
@@ -127,7 +163,7 @@ async def execute_order(
     Sequence:
     1. Validate safety limits.
     2. Qualify contract (cache-first).
-    3. Create TradeGroup + Order in DB (status=PENDING).
+    3. Create TradeGroup in DB + ephemeral _OrderContext.
     4. Fetch bid/ask snapshot.
     5. Place IB order.
     6. Write ib_order_id to DB immediately.
@@ -143,10 +179,7 @@ async def execute_order(
         ctx: Application dependency injection container.
     """
     settings = ctx.settings
-    side = "BUY" if hasattr(cmd, "__class__") and cmd.__class__.__name__ == "BuyCommand" else "SELL"
-    # Determine side from command type
-    from ib_trader.repl.commands import BuyCommand as BC
-    side = "BUY" if isinstance(cmd, BC) else "SELL"
+    side = "BUY" if isinstance(cmd, BuyCommand) else "SELL"
 
     # 1. Resolve quantity
     qty = cmd.qty
@@ -183,40 +216,46 @@ async def execute_order(
             f"Order size {qty} exceeds max_order_size_shares={settings['max_order_size_shares']}"
         )
 
-    # 3. Create TradeGroup + Order in DB
+    # 3. Create TradeGroup in DB + ephemeral _OrderContext
     serial = ctx.trades.next_serial_number()
     direction = "LONG" if side == "BUY" else "SHORT"
+    correlation_id = str(uuid.uuid4())
+
+    # Build trade_config JSON with profit taker / stop loss parameters
+    _trade_cfg: dict = {}
+    if cmd.profit_amount is not None:
+        _trade_cfg["profit_taker_amount"] = str(cmd.profit_amount)
+    if cmd.take_profit_price is not None:
+        _trade_cfg["profit_taker_price"] = str(cmd.take_profit_price)
+    if cmd.stop_loss is not None:
+        _trade_cfg["stop_loss_requested"] = str(cmd.stop_loss)
+
     trade_group = TradeGroup(
         serial_number=serial,
         symbol=cmd.symbol,
         direction=direction,
         status=TradeStatus.OPEN,
         opened_at=_now_utc(),
+        trade_config=json.dumps(_trade_cfg) if _trade_cfg else None,
     )
     trade_group = ctx.trades.create(trade_group)
 
-    order = Order(
+    order_ctx = _OrderContext(
         trade_id=trade_group.id,
-        serial_number=serial,
-        leg_type=LegType.ENTRY,
+        trade_serial=serial,
         symbol=cmd.symbol,
         side=side,
-        security_type=SecurityType.STK,
-        qty_requested=qty,
-        qty_filled=Decimal("0"),
         order_type=cmd.strategy.upper(),
-        profit_taker_amount=cmd.profit_amount,
-        profit_taker_price=cmd.take_profit_price,
-        stop_loss_requested=cmd.stop_loss,
-        status=OrderStatus.PENDING,
-        placed_at=_now_utc(),
+        qty_requested=qty,
+        leg_type=LegType.ENTRY,
+        correlation_id=correlation_id,
+        security_type="STK",
     )
-    order = ctx.orders.create(order)
 
     if cmd.stop_loss:
         logger.info(
-            '{"event": "STOP_LOSS_STUB_RECEIVED", "order_id": "%s", "value": "%s"}',
-            order.id, cmd.stop_loss,
+            '{"event": "STOP_LOSS_STUB_RECEIVED", "correlation_id": "%s", "value": "%s"}',
+            order_ctx.correlation_id, cmd.stop_loss,
         )
 
     logger.info(
@@ -227,17 +266,17 @@ async def execute_order(
 
     try:
         if cmd.strategy == Strategy.LIMIT:
-            await _execute_limit_order(cmd, order, trade_group, con_id, side, qty, ctx)
+            await _execute_limit_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         elif cmd.strategy == Strategy.MID:
-            await _execute_mid_order(cmd, order, trade_group, con_id, side, qty, ctx)
+            await _execute_mid_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         elif cmd.strategy in (Strategy.BID, Strategy.ASK):
-            await _execute_bid_ask_order(cmd, order, trade_group, con_id, side, qty, ctx)
+            await _execute_bid_ask_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         else:
-            await _execute_market_order(cmd, order, trade_group, con_id, side, qty, ctx)
+            await _execute_market_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
     except Exception as e:
         logger.error(
-            '{"event": "ORDER_ERROR", "order_id": "%s", "error": "%s"}',
-            order.id, str(e), exc_info=True,
+            '{"event": "ORDER_ERROR", "correlation_id": "%s", "error": "%s"}',
+            order_ctx.correlation_id, str(e), exc_info=True,
         )
         raise
 
@@ -282,7 +321,7 @@ async def _get_contract(symbol: str, ctx: AppContext) -> dict:
 
 
 async def _execute_limit_order(
-    cmd, order: Order, trade_group: TradeGroup, con_id: int,
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
     side: str, qty: Decimal, ctx: AppContext,
 ) -> None:
     """Place a fire-and-forget limit order at a user-specified price.
@@ -304,25 +343,28 @@ async def _execute_limit_order(
     )
 
     _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "LIMIT",
-               qty, limit_price=price, trade_serial=trade_group.serial_number)
+               qty, limit_price=price, trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
     )
 
+    order_ctx.ib_order_id = str(ib_order_id)
+
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
-               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc())
-
-    ctx.orders.update_ib_order_id(order.id, ib_order_id)
-    ctx.orders.update_amended(order.id, price)
-    ctx.orders.update_status(order.id, OrderStatus.OPEN)
-    ctx.orders.set_raw_response(order.id, json.dumps({
-        "ib_order_id": ib_order_id, "price": str(price), "strategy": "limit",
-    }))
+               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               price_placed=price,
+               raw_response=json.dumps({
+                   "ib_order_id": ib_order_id, "price": str(price), "strategy": "limit",
+               }))
 
     # Register fill/status callbacks so SQLite gets updated on fill
-    track = ctx.tracker.register(order.id, ib_order_id, cmd.symbol)
+    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
         if fill_ib_id == ib_order_id:
@@ -358,7 +400,6 @@ async def _execute_limit_order(
     # Handle rejection / failure to acknowledge
     if _ib_status in _pending_statuses or _ib_status in ("Cancelled", "Inactive"):
         await ctx.ib.cancel_order(ib_order_id)
-        ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
         ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
         ctx.tracker.unregister(ib_order_id)
         if _ib_rejection_reason:
@@ -375,11 +416,13 @@ async def _execute_limit_order(
                    qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
                    ib_status=_ib_status, ib_error_message=reason,
                    trade_serial=trade_group.serial_number, is_terminal=True,
-                   ib_responded_at=_now_utc())
+                   ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
         logger.error(
-            '{"event": "LIMIT_ORDER_REJECTED", "order_id": "%s", '
+            '{"event": "LIMIT_ORDER_REJECTED", "correlation_id": "%s", '
             '"serial": %d, "ib_order_id": "%s", "reason": "%s"}',
-            order.id, trade_group.serial_number, ib_order_id, reason,
+            order_ctx.correlation_id, trade_group.serial_number, ib_order_id, reason,
         )
         raise IBOrderRejectedError(reason)
 
@@ -391,7 +434,7 @@ async def _execute_limit_order(
 
     if qty_filled > 0 and avg_price is not None and qty_filled >= qty:
         # Fully filled immediately — handle like any other fill
-        await _handle_fill(order, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
+        await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
         ctx.tracker.unregister(ib_order_id)
         return
 
@@ -406,9 +449,9 @@ async def _execute_limit_order(
         event="LIMIT_ORDER_LIVE_DISPLAY",
     )
     logger.info(
-        '{"event": "LIMIT_ORDER_LIVE", "order_id": "%s", "serial": %d, '
+        '{"event": "LIMIT_ORDER_LIVE", "correlation_id": "%s", "serial": %d, '
         '"symbol": "%s", "price": "%s", "ib_order_id": "%s"}',
-        order.id, trade_group.serial_number, cmd.symbol, price, ib_order_id,
+        order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, price, ib_order_id,
     )
 
     # Don't unregister tracker — callbacks stay active for the app session.
@@ -416,7 +459,7 @@ async def _execute_limit_order(
 
 
 async def _execute_mid_order(
-    cmd, order: Order, trade_group: TradeGroup, con_id: int,
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
     side: str, qty: Decimal, ctx: AppContext,
 ) -> None:
     """Place a mid-price limit order with reprice loop."""
@@ -453,24 +496,27 @@ async def _execute_mid_order(
 
     # PLACE_ATTEMPT before IB call
     _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "LIMIT",
-               qty, limit_price=mid, trade_serial=trade_group.serial_number)
+               qty, limit_price=mid, trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, cmd.symbol, side, qty, mid, outside_rth=True, tif=_session_tif()
     )
 
+    order_ctx.ib_order_id = str(ib_order_id)
+
     # PLACE_ACCEPTED — IB returned an order ID
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                qty, limit_price=mid, ib_order_id=_safe_int(ib_order_id),
-               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc())
-
-    # Write ib_order_id immediately — critical for crash recovery
-    ctx.orders.update_ib_order_id(order.id, ib_order_id)
-    ctx.orders.update_status(order.id, OrderStatus.REPRICING)
-    ctx.orders.set_raw_response(order.id, json.dumps({"ib_order_id": ib_order_id, "initial_price": str(mid)}))
+               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               price_placed=mid,
+               raw_response=json.dumps({"ib_order_id": ib_order_id, "initial_price": str(mid)}))
 
     # Register in tracker
-    track = ctx.tracker.register(order.id, ib_order_id, cmd.symbol)
+    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     # Capture fill details from the execDetailsEvent callback.  IB delivers
     # commission reports asynchronously — they may not appear in
@@ -520,7 +566,6 @@ async def _execute_mid_order(
     if _ib_status in _pending_statuses or _ib_status in ("Cancelled", "Inactive"):
         # Timed out waiting for acknowledgment, or IB rejected immediately.
         await ctx.ib.cancel_order(ib_order_id)
-        ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
         ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
         ctx.tracker.unregister(ib_order_id)
         if _ib_rejection_reason:
@@ -537,11 +582,13 @@ async def _execute_mid_order(
                    qty, limit_price=mid, ib_order_id=_safe_int(ib_order_id),
                    ib_status=_ib_status, ib_error_message=reason,
                    trade_serial=trade_group.serial_number, is_terminal=True,
-                   ib_responded_at=_now_utc())
+                   ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
         logger.error(
-            '{"event": "ORDER_PLACEMENT_FAILED", "order_id": "%s", '
+            '{"event": "ORDER_PLACEMENT_FAILED", "correlation_id": "%s", '
             '"serial": %d, "ib_order_id": "%s", "ib_status": "%s", "reason": "%s"}',
-            order.id, trade_group.serial_number, ib_order_id, _ib_status, reason,
+            order_ctx.correlation_id, trade_group.serial_number, ib_order_id, _ib_status, reason,
         )
         raise IBOrderRejectedError(reason)
 
@@ -566,7 +613,7 @@ async def _execute_mid_order(
                 _fill_commission = _st.get("commission") or Decimal("0")
                 if _fill_qty > 0 and _fill_price:
                     await _handle_fill(
-                        order, trade_group, _fill_qty, _fill_price,
+                        order_ctx, trade_group, _fill_qty, _fill_price,
                         _fill_commission, cmd, con_id, ctx,
                     )
                     ctx.tracker.unregister(ib_order_id)
@@ -582,7 +629,6 @@ async def _execute_mid_order(
             _expected_reason = presubmitted_reason()
             if not is_ib_session_active():
                 # Weekend/break — expected, leave as GTC
-                ctx.orders.update_status(order.id, OrderStatus.OPEN)
                 ctx.router.emit(
                     f"\u26a0 QUEUED: {side} {qty} {cmd.symbol} @ ${mid} \u2014 "
                     f"{_expected_reason}\n"
@@ -592,9 +638,9 @@ async def _execute_mid_order(
                     event="ORDER_QUEUED_DISPLAY",
                 )
                 logger.info(
-                    '{"event": "ORDER_QUEUED", "order_id": "%s", "serial": %d, '
+                    '{"event": "ORDER_QUEUED", "correlation_id": "%s", "serial": %d, '
                     '"symbol": "%s", "price": "%s", "reason": "%s"}',
-                    order.id, trade_group.serial_number, cmd.symbol, mid, _expected_reason,
+                    order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, mid, _expected_reason,
                 )
                 ctx.tracker.unregister(ib_order_id)
                 return
@@ -606,7 +652,6 @@ async def _execute_mid_order(
                     f"{_detail}. IB accepted but did not route."
                 )
                 await ctx.ib.cancel_order(ib_order_id)
-                ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
                 ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
                 ctx.tracker.unregister(ib_order_id)
                 ctx.router.emit(
@@ -617,16 +662,16 @@ async def _execute_mid_order(
                     event="ORDER_PRESUBMITTED_UNEXPECTED_DISPLAY",
                 )
                 logger.error(
-                    '{"event": "ORDER_NOT_ROUTED", "order_id": "%s", "serial": %d, '
+                    '{"event": "ORDER_NOT_ROUTED", "correlation_id": "%s", "serial": %d, '
                     '"symbol": "%s", "ib_status": "PreSubmitted", "why_held": "%s"}',
-                    order.id, trade_group.serial_number, cmd.symbol, _why_held,
+                    order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, _why_held,
                 )
                 return
 
     # Start reprice loop
     reprice_task = asyncio.create_task(
         reprice_loop(
-            order_id=order.id,
+            correlation_id=order_ctx.correlation_id,
             ib_order_id=ib_order_id,
             con_id=con_id,
             symbol=cmd.symbol,
@@ -635,6 +680,10 @@ async def _execute_mid_order(
             total_steps=total_steps,
             interval_seconds=float(settings["reprice_interval_seconds"]),
             initial_price=mid,
+            trade_id=order_ctx.trade_id,
+            leg_type=order_ctx.leg_type,
+            security_type=order_ctx.security_type,
+            trade_serial=trade_group.serial_number,
         )
     )
 
@@ -666,9 +715,9 @@ async def _execute_mid_order(
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty:
-            await _handle_fill(order, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
+            await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
         else:
-            await _handle_partial(order, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
+            await _handle_partial(order_ctx, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
     else:
         # No shares filled.  Distinguish between IB holding the order (Inactive)
         # and a genuine reprice timeout.
@@ -682,15 +731,18 @@ async def _execute_mid_order(
                 reason += f" (whyHeld: {_why_held!r})"
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
                        qty, ib_order_id=_safe_int(ib_order_id),
-                       trade_serial=trade_group.serial_number)
+                       trade_serial=trade_group.serial_number,
+                       trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                       correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
             await ctx.ib.cancel_order(ib_order_id)
-            ctx.orders.update_status(order.id, OrderStatus.CANCELED)
             ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
             _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
                        qty, ib_order_id=_safe_int(ib_order_id),
                        ib_error_message=reason,
                        trade_serial=trade_group.serial_number, is_terminal=True,
-                       ib_responded_at=_now_utc())
+                       ib_responded_at=_now_utc(),
+                       trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                       correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
             ctx.router.emit(
                 f"\u2717 INACTIVE: {qty} {cmd.symbol} \u2014 {reason}\n"
                 f"  Serial: #{trade_group.serial_number}",
@@ -698,9 +750,9 @@ async def _execute_mid_order(
                 event="ORDER_INACTIVE_DISPLAY",
             )
             logger.error(
-                '{"event": "ORDER_INACTIVE", "order_id": "%s", "serial": %d, '
+                '{"event": "ORDER_INACTIVE", "correlation_id": "%s", "serial": %d, '
                 '"symbol": "%s", "reason": "%s", "why_held": "%s"}',
-                order.id, trade_group.serial_number, cmd.symbol, reason, _why_held,
+                order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, reason, _why_held,
             )
         else:
             # Normal reprice window expired with no fill.
@@ -710,7 +762,9 @@ async def _execute_mid_order(
             # and before marking the order as expired.
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
                        qty, ib_order_id=_safe_int(ib_order_id),
-                       trade_serial=trade_group.serial_number)
+                       trade_serial=trade_group.serial_number,
+                       trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                       correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
             await ctx.ib.cancel_order(ib_order_id)
 
             # Wait briefly for the cancel/fill race to resolve.
@@ -734,7 +788,7 @@ async def _execute_mid_order(
                     avg_price = status_dict.get("avg_fill_price") or Decimal("0")
                     commission = status_dict.get("commission") or Decimal("0")
                     await _handle_fill(
-                        order, trade_group, ib_filled, avg_price,
+                        order_ctx, trade_group, ib_filled, avg_price,
                         commission, cmd, con_id, ctx,
                     )
                     settled_as_fill = True
@@ -745,12 +799,13 @@ async def _execute_mid_order(
                     break
 
             if not settled_as_fill:
-                ctx.orders.update_status(order.id, OrderStatus.CANCELED)
                 ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
                 _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
                            qty, ib_order_id=_safe_int(ib_order_id),
                            trade_serial=trade_group.serial_number, is_terminal=True,
-                           ib_responded_at=_now_utc())
+                           ib_responded_at=_now_utc(),
+                           trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                           correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
                 ctx.router.emit(
                     f"\u2717 EXPIRED: 0/{qty} filled | reprice window closed "
                     f"({settings['reprice_duration_seconds']}s)\n"
@@ -759,16 +814,16 @@ async def _execute_mid_order(
                     event="ORDER_EXPIRED_DISPLAY",
                 )
                 logger.info(
-                    '{"event": "ORDER_EXPIRED", "order_id": "%s", "serial": %d, '
+                    '{"event": "ORDER_EXPIRED", "correlation_id": "%s", "serial": %d, '
                     '"reason": "reprice_timeout_no_fill"}',
-                    order.id, trade_group.serial_number,
+                    order_ctx.correlation_id, trade_group.serial_number,
                 )
 
     ctx.tracker.unregister(ib_order_id)
 
 
 async def _execute_bid_ask_order(
-    cmd, order: Order, trade_group: TradeGroup, con_id: int,
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
     side: str, qty: Decimal, ctx: AppContext,
 ) -> None:
     """Place a limit order fixed at the current bid or ask price — no reprice loop.
@@ -811,21 +866,25 @@ async def _execute_bid_ask_order(
     )
 
     _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "LIMIT",
-               qty, limit_price=price, trade_serial=trade_group.serial_number)
+               qty, limit_price=price, trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
     )
 
+    order_ctx.ib_order_id = str(ib_order_id)
+
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
-               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc())
+               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               price_placed=price,
+               raw_response=json.dumps({"ib_order_id": ib_order_id, "price": str(price)}))
 
-    ctx.orders.update_ib_order_id(order.id, ib_order_id)
-    ctx.orders.update_status(order.id, OrderStatus.OPEN)
-    ctx.orders.set_raw_response(order.id, json.dumps({"ib_order_id": ib_order_id, "price": str(price)}))
-
-    track = ctx.tracker.register(order.id, ib_order_id, cmd.symbol)
+    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     _fill_commission: Decimal | None = None
 
@@ -859,18 +918,15 @@ async def _execute_bid_ask_order(
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty:
-            await _handle_fill(order, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
+            await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
         else:
-            await _handle_partial(order, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
+            await _handle_partial(order_ctx, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
     elif track.is_canceled:
         # IB cancelled or set the order Inactive (notify_canceled fires for both).
         # Check actual IB status for the right message and reason.
         _err = ctx.ib.get_order_error(ib_order_id) or ""
         _why = status.get("why_held") or ""
         if ib_status == "Inactive":
-            # Inactive = IB is holding the order due to an error condition.
-            # Always comes with an error code; whyHeld provides detail.
-            # Source: https://interactivebrokers.github.io/tws-api/order_submission.html
             reason = _err or f"IB set order Inactive"
             if _why:
                 reason += f" (whyHeld: {_why!r})"
@@ -878,7 +934,6 @@ async def _execute_bid_ask_order(
         else:
             reason = _err or "IB rejected or cancelled the order"
             event_label = "REJECTED"
-        ctx.orders.update_status(order.id, OrderStatus.CANCELED)
         ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
         ctx.router.emit(
             f"\u2717 {event_label}: {qty} {cmd.symbol} \u2014 {reason}\n"
@@ -887,9 +942,9 @@ async def _execute_bid_ask_order(
             event=f"ORDER_{event_label}_DISPLAY",
         )
         logger.error(
-            '{"event": "ORDER_%s", "order_id": "%s", "serial": %d, '
+            '{"event": "ORDER_%s", "correlation_id": "%s", "serial": %d, '
             '"symbol": "%s", "reason": "%s"}',
-            event_label, order.id, trade_group.serial_number, cmd.symbol, reason,
+            event_label, order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, reason,
         )
     elif ib_status == "PreSubmitted":
         _why = status.get("why_held") or ""
@@ -905,9 +960,9 @@ async def _execute_bid_ask_order(
                 event="ORDER_QUEUED_DISPLAY",
             )
             logger.info(
-                '{"event": "ORDER_QUEUED", "order_id": "%s", "serial": %d, '
+                '{"event": "ORDER_QUEUED", "correlation_id": "%s", "serial": %d, '
                 '"symbol": "%s", "price": "%s", "reason": "%s"}',
-                order.id, trade_group.serial_number, cmd.symbol, price, _expected_reason,
+                order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, price, _expected_reason,
             )
         else:
             # Active session — should be Submitted, not PreSubmitted. Cancel it.
@@ -917,7 +972,6 @@ async def _execute_bid_ask_order(
                 f"{_detail}. IB accepted but did not route."
             )
             await ctx.ib.cancel_order(ib_order_id)
-            ctx.orders.update_status(order.id, OrderStatus.ABANDONED)
             ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
             ctx.router.emit(
                 f"\u2717 NOT ACTIVE: {qty} {cmd.symbol} \u2014 {reason}\n"
@@ -927,12 +981,12 @@ async def _execute_bid_ask_order(
                 event="ORDER_PRESUBMITTED_UNEXPECTED_DISPLAY",
             )
             logger.error(
-                '{"event": "ORDER_NOT_ROUTED", "order_id": "%s", "serial": %d, '
+                '{"event": "ORDER_NOT_ROUTED", "correlation_id": "%s", "serial": %d, '
                 '"symbol": "%s", "strategy": "%s", "why_held": "%s"}',
-                order.id, trade_group.serial_number, cmd.symbol, cmd.strategy, _why,
+                order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, cmd.strategy, _why,
             )
     else:
-        # Order live in IB as GTC — leave trade/order OPEN, daemon will reconcile the fill.
+        # Order live in IB as GTC — leave trade OPEN, daemon will reconcile the fill.
         ctx.router.emit(
             f"\u25cf LIVE: {qty} {cmd.symbol} @ ${price} ({cmd.strategy}) — "
             f"GTC order active in IB\n"
@@ -941,16 +995,16 @@ async def _execute_bid_ask_order(
             event="ORDER_LIVE_GTC_DISPLAY",
         )
         logger.info(
-            '{"event": "ORDER_LIVE_GTC", "order_id": "%s", "serial": %d, '
+            '{"event": "ORDER_LIVE_GTC", "correlation_id": "%s", "serial": %d, '
             '"symbol": "%s", "price": "%s", "strategy": "%s"}',
-            order.id, trade_group.serial_number, cmd.symbol, price, cmd.strategy,
+            order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, price, cmd.strategy,
         )
 
     ctx.tracker.unregister(ib_order_id)
 
 
 async def _execute_market_order(
-    cmd, order: Order, trade_group: TradeGroup, con_id: int,
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
     side: str, qty: Decimal, ctx: AppContext,
 ) -> None:
     """Place a market order and wait for fill.
@@ -978,7 +1032,9 @@ async def _execute_market_order(
         )
         _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "LIMIT",
                    qty, limit_price=aggressive_price,
-                   trade_serial=trade_group.serial_number)
+                   trade_serial=trade_group.serial_number,
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, cmd.symbol, side, qty, aggressive_price,
             outside_rth=True, tif=_session_tif(),
@@ -986,19 +1042,25 @@ async def _execute_market_order(
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                    qty, limit_price=aggressive_price,
                    ib_order_id=_safe_int(ib_order_id),
-                   trade_serial=trade_group.serial_number, ib_responded_at=_now_utc())
+                   trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+                   price_placed=aggressive_price)
     else:
         _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "MARKET",
-                   qty, trade_serial=trade_group.serial_number)
+                   qty, trade_serial=trade_group.serial_number,
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
         ib_order_id = await ctx.ib.place_market_order(con_id, cmd.symbol, side, qty, outside_rth=True)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "MARKET",
                    qty, ib_order_id=_safe_int(ib_order_id),
-                   trade_serial=trade_group.serial_number, ib_responded_at=_now_utc())
+                   trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
-    ctx.orders.update_ib_order_id(order.id, ib_order_id)
-    ctx.orders.update_status(order.id, OrderStatus.OPEN)
+    order_ctx.ib_order_id = str(ib_order_id)
 
-    track = ctx.tracker.register(order.id, ib_order_id, cmd.symbol)
+    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     async def on_fill(fill_ib_id: str, qty_filled: Decimal, avg_price: Decimal, commission: Decimal):
         if fill_ib_id == ib_order_id:
@@ -1018,11 +1080,10 @@ async def _execute_market_order(
     commission = status["commission"] or Decimal("0")
 
     if qty_filled >= qty:
-        await _handle_fill(order, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
+        await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
     elif qty_filled > 0:
-        await _handle_partial(order, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
+        await _handle_partial(order_ctx, trade_group, qty, qty_filled, avg_price, commission, cmd, con_id, ib_order_id, ctx)
     else:
-        ctx.orders.update_status(order.id, OrderStatus.CANCELED)
         ctx.router.emit(
             f"\u2717 CANCELED: market order did not fill\n  Serial: #{trade_group.serial_number}",
             pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
@@ -1033,33 +1094,34 @@ async def _execute_market_order(
 
 
 async def _handle_fill(
-    order: Order, trade_group: TradeGroup, qty_filled: Decimal,
+    order_ctx: _OrderContext, trade_group: TradeGroup, qty_filled: Decimal,
     avg_price: Decimal, commission: Decimal, cmd, con_id: int, ctx: AppContext,
 ) -> None:
     """Record a complete fill and place profit taker if configured."""
-    ctx.orders.update_fill(order.id, qty_filled, avg_price, commission)
-    ctx.orders.update_status(order.id, OrderStatus.FILLED)
     ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
 
-    _write_txn(ctx, TransactionAction.FILLED, order.symbol, order.side,
-               order.order_type, qty_filled,
-               ib_order_id=_safe_int(order.ib_order_id),
+    _write_txn(ctx, TransactionAction.FILLED, order_ctx.symbol, order_ctx.side,
+               order_ctx.order_type, qty_filled,
+               ib_order_id=_safe_int(order_ctx.ib_order_id),
                ib_status="Filled", ib_filled_qty=qty_filled,
                ib_avg_fill_price=avg_price,
                trade_serial=trade_group.serial_number, is_terminal=True,
-               ib_responded_at=_now_utc())
+               ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               commission=commission)
 
     ctx.router.emit(
-        f"\u2713 FILLED: {qty_filled} shares {order.symbol} @ ${avg_price} avg\n"
+        f"\u2713 FILLED: {qty_filled} shares {order_ctx.symbol} @ ${avg_price} avg\n"
         f"  Commission: ${commission}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="ORDER_FILLED_DISPLAY",
     )
     logger.info(
-        '{"event": "ORDER_FILLED", "order_id": "%s", "serial": %d, "symbol": "%s", '
+        '{"event": "ORDER_FILLED", "correlation_id": "%s", "serial": %d, "symbol": "%s", '
         '"qty_filled": "%s", "avg_price": "%s", "commission": "%s"}',
-        order.id, trade_group.serial_number, order.symbol, qty_filled, avg_price, commission,
+        order_ctx.correlation_id, trade_group.serial_number, order_ctx.symbol, qty_filled, avg_price, commission,
     )
 
     # Place profit taker if configured
@@ -1068,43 +1130,48 @@ async def _handle_fill(
         entry_side = "BUY" if isinstance(cmd, BC) else "SELL"
         await place_profit_taker(
             trade_id=trade_group.id,
-            entry_order_id=order.id,
             entry_side=entry_side,
             avg_fill_price=avg_price,
             qty_filled=qty_filled,
             profit_amount=cmd.profit_amount,
             take_profit_price=cmd.take_profit_price,
             con_id=con_id,
-            symbol=order.symbol,
+            symbol=order_ctx.symbol,
             ctx=ctx,
+            trade_serial=trade_group.serial_number,
         )
 
 
 async def _handle_partial(
-    order: Order, trade_group: TradeGroup, qty_requested: Decimal,
+    order_ctx: _OrderContext, trade_group: TradeGroup, qty_requested: Decimal,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
     cmd, con_id: int, ib_order_id: str, ctx: AppContext,
 ) -> None:
     """Record a partial fill and cancel the remaining quantity in IB."""
-    _write_txn(ctx, TransactionAction.PARTIAL_FILL, order.symbol, order.side,
-               order.order_type, qty_requested,
+    _write_txn(ctx, TransactionAction.PARTIAL_FILL, order_ctx.symbol, order_ctx.side,
+               order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
                ib_filled_qty=qty_filled, ib_avg_fill_price=avg_price,
                trade_serial=trade_group.serial_number,
-               ib_responded_at=_now_utc())
-    _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, order.symbol, order.side,
-               order.order_type, qty_requested,
+               ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               commission=commission)
+    _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, order_ctx.symbol, order_ctx.side,
+               order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
-               trade_serial=trade_group.serial_number)
+               trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
     await ctx.ib.cancel_order(ib_order_id)
-    ctx.orders.update_fill(order.id, qty_filled, avg_price, commission)
-    ctx.orders.update_status(order.id, OrderStatus.PARTIAL)
     ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
-    _write_txn(ctx, TransactionAction.CANCELLED, order.symbol, order.side,
-               order.order_type, qty_requested,
+    _write_txn(ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
+               order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
                trade_serial=trade_group.serial_number, is_terminal=True,
-               ib_responded_at=_now_utc())
+               ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     remainder = qty_requested - qty_filled
     ctx.router.emit(
@@ -1116,9 +1183,9 @@ async def _handle_partial(
         event="ORDER_PARTIAL_DISPLAY",
     )
     logger.info(
-        '{"event": "ORDER_PARTIAL_FILL", "order_id": "%s", "serial": %d, '
+        '{"event": "ORDER_PARTIAL_FILL", "correlation_id": "%s", "serial": %d, '
         '"qty_filled": "%s", "qty_requested": "%s"}',
-        order.id, trade_group.serial_number, qty_filled, qty_requested,
+        order_ctx.correlation_id, trade_group.serial_number, qty_filled, qty_requested,
     )
 
     if cmd.take_profit_price or cmd.profit_amount:
@@ -1126,20 +1193,20 @@ async def _handle_partial(
         entry_side = "BUY" if isinstance(cmd, BC) else "SELL"
         await place_profit_taker(
             trade_id=trade_group.id,
-            entry_order_id=order.id,
             entry_side=entry_side,
             avg_fill_price=avg_price,
             qty_filled=qty_filled,
             profit_amount=cmd.profit_amount,
             take_profit_price=cmd.take_profit_price,
             con_id=con_id,
-            symbol=order.symbol,
+            symbol=order_ctx.symbol,
             ctx=ctx,
+            trade_serial=trade_group.serial_number,
         )
 
 
 async def reprice_loop(
-    order_id: str,
+    correlation_id: str,
     ib_order_id: str,
     con_id: int,
     symbol: str,
@@ -1148,6 +1215,10 @@ async def reprice_loop(
     total_steps: int,
     interval_seconds: float,
     initial_price: Decimal,
+    trade_id: str | None = None,
+    leg_type: LegType | None = None,
+    security_type: str | None = None,
+    trade_serial: int | None = None,
 ) -> None:
     """Reprice loop: amend the order toward the ask over total_steps iterations.
 
@@ -1163,7 +1234,7 @@ async def reprice_loop(
     Exits early if the fill_event is set (order filled).
 
     Args:
-        order_id: Internal UUID of the order.
+        correlation_id: Correlation ID linking this order's transaction sequence.
         ib_order_id: IB-assigned order ID (single ID throughout all amendments).
         con_id: IB contract ID for market data snapshots.
         symbol: Ticker symbol.
@@ -1174,9 +1245,11 @@ async def reprice_loop(
         initial_price: The price the order was originally placed at.  Used as
             the baseline for deduplication so the first step is also skipped
             when rounding produces the same value.
+        trade_id: Trade group UUID (for transaction linking).
+        leg_type: Leg type (for transaction linking).
+        security_type: Security type (for transaction linking).
+        trade_serial: Trade serial number (for transaction linking).
     """
-    ctx.orders.update_status(order_id, OrderStatus.AMENDING)
-
     last_sent_price: Decimal = initial_price
 
     for step in range(1, total_steps + 1):
@@ -1208,9 +1281,9 @@ async def reprice_loop(
 
         if new_price == last_sent_price:
             logger.debug(
-                '{"event": "REPRICE_SKIPPED_SAME_PRICE", "order_id": "%s", '
+                '{"event": "REPRICE_SKIPPED_SAME_PRICE", "correlation_id": "%s", '
                 '"step": %d, "price": "%s"}',
-                order_id, step, new_price,
+                correlation_id, step, new_price,
             )
             continue
 
@@ -1220,7 +1293,7 @@ async def reprice_loop(
         # Write amendment to SQLite
         now = datetime.now(timezone.utc)
         evt = RepriceEvent(
-            order_id=order_id,
+            correlation_id=correlation_id,
             step_number=step,
             bid=bid,
             ask=ask,
@@ -1229,7 +1302,15 @@ async def reprice_loop(
             timestamp=now,
         )
         evt = ctx.reprice_events.create(evt)
-        ctx.orders.update_amended(order_id, new_price)
+
+        # Write AMENDED transaction for audit trail
+        _write_txn(ctx, TransactionAction.AMENDED, symbol, side, "LIMIT",
+                   Decimal("0"), limit_price=new_price,
+                   ib_order_id=_safe_int(ib_order_id),
+                   trade_serial=trade_serial,
+                   trade_id=trade_id, leg_type=leg_type,
+                   correlation_id=correlation_id, security_type=security_type,
+                   price_placed=new_price)
 
         # Get current fill status for display
         status = await ctx.ib.get_order_status(ib_order_id)
@@ -1243,17 +1324,16 @@ async def reprice_loop(
             event="REPRICE_STEP_DISPLAY",
         )
         logger.info(
-            '{"event": "REPRICE_STEP", "order_id": "%s", "step": %d, "total": %d, '
+            '{"event": "REPRICE_STEP", "correlation_id": "%s", "step": %d, "total": %d, '
             '"bid": "%s", "ask": "%s", "new_price": "%s"}',
-            order_id, step, total_steps, bid, ask, new_price,
+            correlation_id, step, total_steps, bid, ask, new_price,
         )
 
-    logger.info('{"event": "REPRICE_TIMEOUT", "order_id": "%s"}', order_id)
+    logger.info('{"event": "REPRICE_TIMEOUT", "correlation_id": "%s"}', correlation_id)
 
 
 async def place_profit_taker(
     trade_id: str,
-    entry_order_id: str,
     entry_side: str,
     avg_fill_price: Decimal,
     qty_filled: Decimal,
@@ -1262,6 +1342,7 @@ async def place_profit_taker(
     con_id: int,
     symbol: str,
     ctx: AppContext,
+    trade_serial: int | None = None,
 ) -> None:
     """Place a GTC profit taker order after an entry fill.
 
@@ -1276,7 +1357,6 @@ async def place_profit_taker(
 
     Args:
         trade_id: Trade group UUID.
-        entry_order_id: Entry order UUID.
         entry_side: "BUY" or "SELL".
         avg_fill_price: Average fill price of the entry leg.
         qty_filled: Quantity filled on the entry leg.
@@ -1285,8 +1365,10 @@ async def place_profit_taker(
         con_id: IB contract ID.
         symbol: Ticker symbol.
         ctx: Application context.
+        trade_serial: Trade serial number for transaction linking.
     """
     pt_side = "SELL" if entry_side == "BUY" else "BUY"
+    pt_correlation_id = str(uuid.uuid4())
 
     if take_profit_price is not None:
         pt_price = take_profit_price
@@ -1299,7 +1381,10 @@ async def place_profit_taker(
         return
 
     _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, symbol, pt_side, "LIMIT",
-               qty_filled, limit_price=pt_price)
+               qty_filled, limit_price=pt_price,
+               trade_id=trade_id, leg_type=LegType.PROFIT_TAKER,
+               correlation_id=pt_correlation_id, security_type="STK",
+               trade_serial=trade_serial)
 
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, symbol, pt_side, qty_filled, pt_price,
@@ -1308,23 +1393,10 @@ async def place_profit_taker(
 
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, symbol, pt_side, "LIMIT",
                qty_filled, limit_price=pt_price, ib_order_id=_safe_int(ib_order_id),
-               ib_responded_at=_now_utc())
-
-    pt_order = Order(
-        trade_id=trade_id,
-        ib_order_id=ib_order_id,
-        leg_type=LegType.PROFIT_TAKER,
-        symbol=symbol,
-        side=pt_side,
-        security_type=SecurityType.STK,
-        qty_requested=qty_filled,
-        qty_filled=Decimal("0"),
-        order_type="MID",
-        price_placed=pt_price,
-        status=OrderStatus.OPEN,
-        placed_at=datetime.now(timezone.utc),
-    )
-    ctx.orders.create(pt_order)
+               ib_responded_at=_now_utc(),
+               trade_id=trade_id, leg_type=LegType.PROFIT_TAKER,
+               correlation_id=pt_correlation_id, security_type="STK",
+               price_placed=pt_price, trade_serial=trade_serial)
 
     ctx.router.emit(
         f"  Profit taker placed @ ${pt_price}",
@@ -1339,36 +1411,43 @@ async def place_profit_taker(
 
 
 async def _handle_close_fill(
-    close_order: Order, trade_group: TradeGroup, entry_order: Order,
+    close_ctx: _OrderContext, trade_group: TradeGroup,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
     ctx: AppContext,
 ) -> None:
     """Record a complete close fill, compute P&L, and close the trade group."""
-    ctx.orders.update_fill(close_order.id, qty_filled, avg_price, commission)
-    ctx.orders.update_status(close_order.id, OrderStatus.FILLED)
-
-    _write_txn(ctx, TransactionAction.FILLED, close_order.symbol, close_order.side,
-               close_order.order_type, qty_filled,
-               ib_order_id=_safe_int(close_order.ib_order_id),
+    _write_txn(ctx, TransactionAction.FILLED, close_ctx.symbol, close_ctx.side,
+               close_ctx.order_type, qty_filled,
+               ib_order_id=_safe_int(close_ctx.ib_order_id),
                ib_status="Filled", ib_filled_qty=qty_filled,
                ib_avg_fill_price=avg_price,
                trade_serial=trade_group.serial_number, is_terminal=True,
-               ib_responded_at=_now_utc())
+               ib_responded_at=_now_utc(),
+               trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
+               correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
+               commission=commission)
 
-    # Compute realized P&L: (exit - entry) * qty * direction - total commission
-    entry_price = entry_order.avg_fill_price or Decimal("0")
-    entry_commission = entry_order.commission or Decimal("0")
-    direction = Decimal("1") if entry_order.side == "BUY" else Decimal("-1")
-    realized_pnl = (avg_price - entry_price) * qty_filled * direction
-    total_commission = commission + entry_commission
-    realized_pnl -= total_commission
+    # Compute realized P&L: (exit - entry) * qty * direction - commission
+    # Get entry data from transactions
+    entry_txn = ctx.transactions.get_entry_fill(trade_group.id)
+    entry_price = Decimal(str(entry_txn.ib_avg_fill_price)) if entry_txn and entry_txn.ib_avg_fill_price else Decimal("0")
+    entry_side = entry_txn.side if entry_txn else ("BUY" if close_ctx.side == "SELL" else "SELL")
+    entry_filled_qty = entry_txn.ib_filled_qty or Decimal("0") if entry_txn else Decimal("0")
+    direction = Decimal("1") if entry_side == "BUY" else Decimal("-1")
+    this_pnl = (avg_price - entry_price) * qty_filled * direction - commission
 
-    # Check if the full position is now closed
-    all_legs = ctx.orders.get_for_trade(trade_group.id)
-    remaining = entry_order.qty_filled
-    for leg in all_legs:
-        if leg.leg_type in (LegType.CLOSE, LegType.PROFIT_TAKER) and leg.status == OrderStatus.FILLED:
-            remaining -= leg.qty_filled
+    # Aggregate with any existing P&L from prior partial closes or profit takers
+    existing_pnl = trade_group.realized_pnl or Decimal("0")
+    existing_commission = trade_group.total_commission or Decimal("0")
+    realized_pnl = existing_pnl + this_pnl
+    total_commission = existing_commission + commission
+
+    # Check if the full position is now closed using filled legs from transactions
+    filled_legs = ctx.transactions.get_filled_legs(trade_group.id)
+    remaining = entry_filled_qty
+    for leg in filled_legs:
+        if leg.leg_type in (LegType.CLOSE, LegType.PROFIT_TAKER):
+            remaining -= leg.ib_filled_qty or Decimal("0")
 
     ctx.trades.update_pnl(trade_group.id, realized_pnl, total_commission)
     if remaining <= 0:
@@ -1377,37 +1456,49 @@ async def _handle_close_fill(
     pnl_str = f"+${realized_pnl}" if realized_pnl >= 0 else f"-${abs(realized_pnl)}"
     closed_label = "CLOSED" if remaining <= 0 else "PARTIAL CLOSE"
     ctx.router.emit(
-        f"\u2713 {closed_label}: {qty_filled} shares {close_order.symbol} @ ${avg_price}\n"
+        f"\u2713 {closed_label}: {qty_filled} shares {close_ctx.symbol} @ ${avg_price}\n"
         f"  P&L: {pnl_str} (commission: ${total_commission})\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="CLOSE_ORDER_FILLED",
     )
     logger.info(
-        '{"event": "CLOSE_ORDER_FILLED", "order_id": "%s", "serial": %d, '
+        '{"event": "CLOSE_ORDER_FILLED", "correlation_id": "%s", "serial": %d, '
         '"qty_filled": "%s", "avg_price": "%s", "realized_pnl": "%s"}',
-        close_order.id, trade_group.serial_number, qty_filled, avg_price, realized_pnl,
+        close_ctx.correlation_id, trade_group.serial_number, qty_filled, avg_price, realized_pnl,
     )
 
 
 async def _handle_close_partial(
-    close_order: Order, trade_group: TradeGroup, entry_order: Order,
+    close_ctx: _OrderContext, trade_group: TradeGroup,
     qty_requested: Decimal, qty_filled: Decimal, avg_price: Decimal,
     commission: Decimal, ib_order_id: str, ctx: AppContext,
 ) -> None:
     """Record a partial close fill and cancel the remaining quantity."""
     await ctx.ib.cancel_order(ib_order_id)
-    ctx.orders.update_fill(close_order.id, qty_filled, avg_price, commission)
-    ctx.orders.update_status(close_order.id, OrderStatus.PARTIAL)
 
-    entry_price = entry_order.avg_fill_price or Decimal("0")
-    entry_commission = entry_order.commission or Decimal("0")
-    direction = Decimal("1") if entry_order.side == "BUY" else Decimal("-1")
-    realized_pnl = (avg_price - entry_price) * qty_filled * direction
-    # Prorate entry commission by fill ratio
-    prorated_entry_comm = entry_commission * qty_filled / entry_order.qty_filled if entry_order.qty_filled else Decimal("0")
-    total_commission = commission + prorated_entry_comm
-    realized_pnl -= total_commission
+    _write_txn(ctx, TransactionAction.PARTIAL_FILL, close_ctx.symbol, close_ctx.side,
+               close_ctx.order_type, qty_requested,
+               ib_order_id=_safe_int(ib_order_id),
+               ib_filled_qty=qty_filled, ib_avg_fill_price=avg_price,
+               trade_serial=trade_group.serial_number,
+               ib_responded_at=_now_utc(),
+               trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
+               correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
+               commission=commission)
+
+    # Get entry data from transactions for P&L calc
+    entry_txn = ctx.transactions.get_entry_fill(trade_group.id)
+    entry_price = Decimal(str(entry_txn.ib_avg_fill_price)) if entry_txn and entry_txn.ib_avg_fill_price else Decimal("0")
+    entry_side = entry_txn.side if entry_txn else ("BUY" if close_ctx.side == "SELL" else "SELL")
+    direction = Decimal("1") if entry_side == "BUY" else Decimal("-1")
+    this_pnl = (avg_price - entry_price) * qty_filled * direction - commission
+
+    # Aggregate with any existing P&L from prior partial closes
+    existing_pnl = trade_group.realized_pnl or Decimal("0")
+    existing_commission = trade_group.total_commission or Decimal("0")
+    realized_pnl = existing_pnl + this_pnl
+    total_commission = existing_commission + commission
 
     ctx.trades.update_pnl(trade_group.id, realized_pnl, total_commission)
 
@@ -1421,9 +1512,9 @@ async def _handle_close_partial(
         event="CLOSE_ORDER_PARTIAL",
     )
     logger.info(
-        '{"event": "CLOSE_ORDER_PARTIAL", "order_id": "%s", "serial": %d, '
+        '{"event": "CLOSE_ORDER_PARTIAL", "correlation_id": "%s", "serial": %d, '
         '"qty_filled": "%s", "qty_requested": "%s", "realized_pnl": "%s"}',
-        close_order.id, trade_group.serial_number, qty_filled, qty_requested, realized_pnl,
+        close_ctx.correlation_id, trade_group.serial_number, qty_filled, qty_requested, realized_pnl,
     )
 
 
@@ -1447,30 +1538,24 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         raise TradeNotFoundError(f"No trade with serial #{cmd.serial}")
 
-    # Find entry leg
-    entry_orders = ctx.orders.get_in_states([
-        OrderStatus.FILLED, OrderStatus.PARTIAL
-    ])
-    entry_order = None
-    for o in entry_orders:
-        if o.trade_id == trade_group.id and o.leg_type == LegType.ENTRY:
-            entry_order = o
-            break
-
-    if not entry_order:
+    # Find entry fill from transactions
+    entry_txn = ctx.transactions.get_entry_fill(trade_group.id)
+    if not entry_txn or not entry_txn.ib_filled_qty or entry_txn.ib_filled_qty <= 0:
         ctx.router.emit(
             f"\u2717 Error: order #{cmd.serial} has no filled quantity to close",
             pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
         )
         return
 
-    qty_to_close = entry_order.qty_filled
+    entry_symbol = entry_txn.symbol
+    entry_side = entry_txn.side
+    qty_to_close = entry_txn.ib_filled_qty
 
     # Subtract already-filled close legs and profit takers to avoid over-closing
-    all_legs = ctx.orders.get_for_trade(trade_group.id)
-    for leg in all_legs:
-        if leg.leg_type in (LegType.CLOSE, LegType.PROFIT_TAKER) and leg.status == OrderStatus.FILLED:
-            qty_to_close -= leg.qty_filled
+    filled_legs = ctx.transactions.get_filled_legs(trade_group.id)
+    for leg in filled_legs:
+        if leg.leg_type in (LegType.CLOSE, LegType.PROFIT_TAKER):
+            qty_to_close -= leg.ib_filled_qty or Decimal("0")
 
     if qty_to_close <= 0:
         ctx.router.emit(
@@ -1480,74 +1565,76 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         return
 
     # Cancel all linked open orders (profit taker, stop loss)
-    open_legs = ctx.orders.get_open_for_trade(trade_group.id)
+    open_legs = ctx.transactions.get_open_for_trade(trade_group.id)
     for leg in open_legs:
         if leg.leg_type in (LegType.PROFIT_TAKER, LegType.STOP_LOSS) and leg.ib_order_id:
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, leg.symbol, leg.side,
-                       leg.order_type, leg.qty_requested,
+                       leg.order_type, leg.quantity,
                        ib_order_id=_safe_int(leg.ib_order_id),
-                       trade_serial=trade_group.serial_number)
+                       trade_serial=trade_group.serial_number,
+                       trade_id=trade_group.id, leg_type=leg.leg_type,
+                       correlation_id=leg.correlation_id, security_type=leg.security_type)
             await ctx.ib.cancel_order(leg.ib_order_id)
-            ctx.orders.update_status(leg.id, OrderStatus.CANCELED)
             _write_txn(ctx, TransactionAction.CANCELLED, leg.symbol, leg.side,
-                       leg.order_type, leg.qty_requested,
+                       leg.order_type, leg.quantity,
                        ib_order_id=_safe_int(leg.ib_order_id),
                        trade_serial=trade_group.serial_number, is_terminal=True,
-                       ib_responded_at=_now_utc())
+                       ib_responded_at=_now_utc(),
+                       trade_id=trade_group.id, leg_type=leg.leg_type,
+                       correlation_id=leg.correlation_id, security_type=leg.security_type)
             logger.info(
-                '{"event": "PROFIT_TAKER_CANCELED", "order_id": "%s", "reason": "close"}',
-                leg.id,
+                '{"event": "PROFIT_TAKER_CANCELED", "correlation_id": "%s", "reason": "close"}',
+                leg.correlation_id,
             )
 
     # Determine close side (inverse of entry)
-    close_side = "SELL" if entry_order.side == "BUY" else "BUY"
+    close_side = "SELL" if entry_side == "BUY" else "BUY"
 
     # Get contract
-    contract_info = await _get_contract(entry_order.symbol, ctx)
+    contract_info = await _get_contract(entry_symbol, ctx)
     con_id = contract_info["con_id"]
 
-    # Create close order record
-    close_order = Order(
+    # Create close _OrderContext
+    close_correlation_id = str(uuid.uuid4())
+    close_ctx = _OrderContext(
         trade_id=trade_group.id,
-        leg_type=LegType.CLOSE,
-        symbol=entry_order.symbol,
+        trade_serial=cmd.serial,
+        symbol=entry_symbol,
         side=close_side,
-        security_type=SecurityType.STK,
-        qty_requested=qty_to_close,
-        qty_filled=Decimal("0"),
         order_type=cmd.strategy.upper(),
-        profit_taker_amount=cmd.profit_amount,
-        profit_taker_price=cmd.take_profit_price,
-        status=OrderStatus.PENDING,
-        placed_at=datetime.now(timezone.utc),
+        qty_requested=qty_to_close,
+        leg_type=LegType.CLOSE,
+        correlation_id=close_correlation_id,
+        security_type="STK",
     )
-    close_order = ctx.orders.create(close_order)
 
     logger.info(
         '{"event": "ORDER_CLOSED_MANUAL", "trade_id": "%s", "serial": %d, '
         '"symbol": "%s", "qty": "%s"}',
-        trade_group.id, cmd.serial, entry_order.symbol, qty_to_close,
+        trade_group.id, cmd.serial, entry_symbol, qty_to_close,
     )
 
     # ── Place IB order (strategy-dependent) ────────────────────────────────
     initial_price = Decimal("0")
     _close_order_type = cmd.strategy.upper() if cmd.strategy != Strategy.MARKET else "MARKET"
+    _txn_common = dict(
+        trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
+        correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
+    )
     if cmd.strategy == Strategy.LIMIT:
         initial_price = cmd.limit_price
-        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_order.symbol, close_side,
+        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
-                   trade_serial=cmd.serial)
+                   trade_serial=cmd.serial, **_txn_common)
         ib_order_id = await ctx.ib.place_limit_order(
-            con_id, entry_order.symbol, close_side, qty_to_close, initial_price,
+            con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
         )
-        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_order.symbol, close_side,
+        close_ctx.ib_order_id = str(ib_order_id)
+        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
                    ib_order_id=_safe_int(ib_order_id), trade_serial=cmd.serial,
-                   ib_responded_at=_now_utc())
-        ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
-        ctx.orders.update_amended(close_order.id, initial_price)
-        ctx.orders.update_status(close_order.id, OrderStatus.OPEN)
+                   ib_responded_at=_now_utc(), price_placed=initial_price, **_txn_common)
         ctx.router.emit(
             f"Close #{cmd.serial} limit @ ${initial_price} placed.",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
@@ -1559,24 +1646,23 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         if bid == 0 and ask == 0:
             if last == 0:
                 raise ValueError(
-                    f"Cannot close {entry_order.symbol}: no market data available "
+                    f"Cannot close {entry_symbol}: no market data available "
                     "(bid=0, ask=0, last=0). Check market data subscription."
                 )
             bid = ask = last
         initial_price = calc_mid(bid, ask)
-        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_order.symbol, close_side,
+        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
-                   trade_serial=cmd.serial)
+                   trade_serial=cmd.serial, **_txn_common)
         ib_order_id = await ctx.ib.place_limit_order(
-            con_id, entry_order.symbol, close_side, qty_to_close, initial_price,
+            con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
         )
-        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_order.symbol, close_side,
+        close_ctx.ib_order_id = str(ib_order_id)
+        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
                    ib_order_id=_safe_int(ib_order_id), trade_serial=cmd.serial,
-                   ib_responded_at=_now_utc())
-        ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
-        ctx.orders.update_status(close_order.id, OrderStatus.REPRICING)
+                   ib_responded_at=_now_utc(), price_placed=initial_price, **_txn_common)
         ctx.router.emit(
             f"[{_now_display()}] Close #{cmd.serial} placed "
             f"@ ${initial_price} (bid: ${bid} ask: ${ask})",
@@ -1589,24 +1675,23 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         if bid == 0 and ask == 0:
             if last == 0:
                 raise ValueError(
-                    f"Cannot close {entry_order.symbol}: no market data available "
+                    f"Cannot close {entry_symbol}: no market data available "
                     "(bid=0, ask=0, last=0). Check market data subscription."
                 )
             bid = ask = last
         initial_price = ask if cmd.strategy == Strategy.ASK else bid
-        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_order.symbol, close_side,
+        _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
-                   trade_serial=cmd.serial)
+                   trade_serial=cmd.serial, **_txn_common)
         ib_order_id = await ctx.ib.place_limit_order(
-            con_id, entry_order.symbol, close_side, qty_to_close, initial_price,
+            con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
         )
-        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_order.symbol, close_side,
+        close_ctx.ib_order_id = str(ib_order_id)
+        _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
                    ib_order_id=_safe_int(ib_order_id), trade_serial=cmd.serial,
-                   ib_responded_at=_now_utc())
-        ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
-        ctx.orders.update_status(close_order.id, OrderStatus.OPEN)
+                   ib_responded_at=_now_utc(), price_placed=initial_price, **_txn_common)
         ctx.router.emit(
             f"[{_now_display()}] Close #{cmd.serial} placed "
             f"@ ${initial_price} ({cmd.strategy} — bid: ${bid} ask: ${ask})",
@@ -1625,7 +1710,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             initial_price = bid if close_side == "SELL" else ask
             if initial_price == 0:
                 raise ValueError(
-                    f"Cannot close {entry_order.symbol}: no market data available "
+                    f"Cannot close {entry_symbol}: no market data available "
                     "(bid=0, ask=0, last=0). Check market data subscription."
                 )
             ctx.router.emit(
@@ -1633,41 +1718,35 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
                 event="MARKET_TO_LIMIT_OVERNIGHT",
             )
-            _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_order.symbol, close_side,
+            _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                        "LIMIT", qty_to_close, limit_price=initial_price,
-                       trade_serial=cmd.serial)
+                       trade_serial=cmd.serial, **_txn_common)
             ib_order_id = await ctx.ib.place_limit_order(
-                con_id, entry_order.symbol, close_side, qty_to_close, initial_price,
+                con_id, entry_symbol, close_side, qty_to_close, initial_price,
                 outside_rth=True, tif=_session_tif(),
             )
-            _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_order.symbol, close_side,
+            _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "LIMIT", qty_to_close, limit_price=initial_price,
                        ib_order_id=_safe_int(ib_order_id), trade_serial=cmd.serial,
-                       ib_responded_at=_now_utc())
+                       ib_responded_at=_now_utc(), price_placed=initial_price, **_txn_common)
         else:
-            _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_order.symbol, close_side,
-                       "MARKET", qty_to_close, trade_serial=cmd.serial)
+            _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
+                       "MARKET", qty_to_close, trade_serial=cmd.serial, **_txn_common)
             ib_order_id = await ctx.ib.place_market_order(
-                con_id, entry_order.symbol, close_side, qty_to_close, outside_rth=True
+                con_id, entry_symbol, close_side, qty_to_close, outside_rth=True
             )
-            _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_order.symbol, close_side,
+            _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "MARKET", qty_to_close, ib_order_id=_safe_int(ib_order_id),
-                       trade_serial=cmd.serial, ib_responded_at=_now_utc())
-        ctx.orders.update_ib_order_id(close_order.id, ib_order_id)
-        ctx.orders.update_status(close_order.id, OrderStatus.OPEN)
+                       trade_serial=cmd.serial, ib_responded_at=_now_utc(), **_txn_common)
+        close_ctx.ib_order_id = str(ib_order_id)
         ctx.router.emit(
             f"Close #{cmd.serial} market order placed.",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_ORDER_PLACED",
         )
 
-    ctx.orders.set_raw_response(
-        close_order.id,
-        json.dumps({"ib_order_id": ib_order_id, "initial_price": str(initial_price)}),
-    )
-
     # ── Register tracker + callbacks ─────────────────────────────────────
-    track = ctx.tracker.register(close_order.id, ib_order_id, entry_order.symbol)
+    track = ctx.tracker.register(close_ctx.correlation_id, ib_order_id, entry_symbol)
     _fill_commission: Decimal | None = None
 
     async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
@@ -1704,7 +1783,6 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
         if _ib_status in _pending or _ib_status in ("Cancelled", "Inactive"):
             await ctx.ib.cancel_order(ib_order_id)
-            ctx.orders.update_status(close_order.id, OrderStatus.CANCELED)
             ctx.tracker.unregister(ib_order_id)
             reason = _ib_err or f"Close order not acknowledged (status: {_ib_status!r})"
             ctx.router.emit(
@@ -1713,9 +1791,9 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 event="CLOSE_ORDER_FAILED",
             )
             logger.error(
-                '{"event": "CLOSE_ORDER_FAILED", "order_id": "%s", "serial": %d, '
+                '{"event": "CLOSE_ORDER_FAILED", "correlation_id": "%s", "serial": %d, '
                 '"ib_order_id": "%s", "reason": "%s"}',
-                close_order.id, cmd.serial, ib_order_id, reason,
+                close_ctx.correlation_id, cmd.serial, ib_order_id, reason,
             )
             return
 
@@ -1731,7 +1809,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         if qty_filled > 0 and avg_price is not None and qty_filled >= qty_to_close:
             await _handle_close_fill(
-                close_order, trade_group, entry_order, qty_filled,
+                close_ctx, trade_group, qty_filled,
                 avg_price, commission, ctx,
             )
             ctx.tracker.unregister(ib_order_id)
@@ -1740,16 +1818,16 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         # Order is live — return immediately.
         ctx.router.emit(
             f"● CLOSE LIMIT LIVE: #{cmd.serial} {close_side} {qty_to_close} "
-            f"{entry_order.symbol} @ ${initial_price}\n"
+            f"{entry_symbol} @ ${initial_price}\n"
             f"  GTC order active in IB  |  IB ID: {ib_order_id}\n"
             f"  Order will persist until filled or manually cancelled.",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_LIMIT_LIVE_DISPLAY",
         )
         logger.info(
-            '{"event": "CLOSE_LIMIT_LIVE", "order_id": "%s", "serial": %d, '
+            '{"event": "CLOSE_LIMIT_LIVE", "correlation_id": "%s", "serial": %d, '
             '"symbol": "%s", "price": "%s", "ib_order_id": "%s"}',
-            close_order.id, cmd.serial, entry_order.symbol, initial_price, ib_order_id,
+            close_ctx.correlation_id, cmd.serial, entry_symbol, initial_price, ib_order_id,
         )
         # Don't unregister tracker — callbacks stay active for the app session.
         return
@@ -1764,15 +1842,19 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         reprice_task = asyncio.create_task(
             reprice_loop(
-                order_id=close_order.id,
+                correlation_id=close_ctx.correlation_id,
                 ib_order_id=ib_order_id,
                 con_id=con_id,
-                symbol=entry_order.symbol,
+                symbol=entry_symbol,
                 side=close_side,
                 ctx=ctx,
                 total_steps=total_steps,
                 interval_seconds=float(settings["reprice_interval_seconds"]),
                 initial_price=initial_price,
+                trade_id=close_ctx.trade_id,
+                leg_type=close_ctx.leg_type,
+                security_type=close_ctx.security_type,
+                trade_serial=cmd.serial,
             )
         )
         wait_timeout = float(settings["reprice_duration_seconds"]) + 2
@@ -1824,12 +1906,12 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty_to_close:
             await _handle_close_fill(
-                close_order, trade_group, entry_order, qty_filled,
+                close_ctx, trade_group, qty_filled,
                 avg_price, commission, ctx,
             )
         else:
             await _handle_close_partial(
-                close_order, trade_group, entry_order, qty_to_close,
+                close_ctx, trade_group, qty_to_close,
                 qty_filled, avg_price, commission, ib_order_id, ctx,
             )
     else:
@@ -1855,12 +1937,12 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 commission = status.get("commission") or Decimal("0")
                 if ib_filled >= qty_to_close:
                     await _handle_close_fill(
-                        close_order, trade_group, entry_order,
+                        close_ctx, trade_group,
                         ib_filled, avg_price, commission, ctx,
                     )
                 else:
                     await _handle_close_partial(
-                        close_order, trade_group, entry_order, qty_to_close,
+                        close_ctx, trade_group, qty_to_close,
                         ib_filled, avg_price, commission, ib_order_id, ctx,
                     )
                 settled_as_fill = True
@@ -1870,7 +1952,6 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 break
 
         if not settled_as_fill:
-            ctx.orders.update_status(close_order.id, OrderStatus.CANCELED)
             ctx.router.emit(
                 f"\u2717 CLOSE EXPIRED: #{cmd.serial} — 0/{qty_to_close} filled\n"
                 f"  Close order timed out. Position remains open.",
@@ -1878,8 +1959,8 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 event="CLOSE_ORDER_EXPIRED",
             )
             logger.info(
-                '{"event": "CLOSE_ORDER_EXPIRED", "order_id": "%s", "serial": %d}',
-                close_order.id, cmd.serial,
+                '{"event": "CLOSE_ORDER_EXPIRED", "correlation_id": "%s", "serial": %d}',
+                close_ctx.correlation_id, cmd.serial,
             )
 
     ctx.tracker.unregister(ib_order_id)

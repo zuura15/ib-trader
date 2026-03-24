@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import (
-    Base, TradeGroup, TradeStatus, Order, LegType, OrderStatus, SecurityType,
+    Base, TradeGroup, TradeStatus, TransactionAction, TransactionEvent, LegType,
     SystemAlert, AlertSeverity, PendingCommand, PendingCommandStatus,
 )
 # Ensure all models are registered with Base.metadata before create_all
@@ -143,22 +143,29 @@ class TestOrderRoutes:
         )
         s.add(tg)
         s.flush()
-        s.add(Order(
-            trade_id=tg.id, symbol="AAPL", side="BUY", leg_type=LegType.ENTRY,
-            qty_requested=Decimal("100"), qty_filled=Decimal("0"),
-            order_type="MID", status=OrderStatus.OPEN, security_type=SecurityType.STK,
+        # Insert a non-terminal PLACE_ACCEPTED (open) transaction
+        s.add(TransactionEvent(
+            ib_order_id=8000, action=TransactionAction.PLACE_ACCEPTED,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("100"), account_id="U1234567",
+            requested_at=_now(), is_terminal=False,
+            trade_id=tg.id, leg_type=LegType.ENTRY,
         ))
-        s.add(Order(
-            trade_id=tg.id, symbol="AAPL", side="BUY", leg_type=LegType.ENTRY,
-            qty_requested=Decimal("100"), qty_filled=Decimal("100"),
-            order_type="MID", status=OrderStatus.FILLED, security_type=SecurityType.STK,
+        # Insert a terminal FILLED transaction for a different ib_order_id
+        s.add(TransactionEvent(
+            ib_order_id=8001, action=TransactionAction.FILLED,
+            symbol="AAPL", side="BUY", order_type="MID",
+            quantity=Decimal("100"), account_id="U1234567",
+            requested_at=_now(), is_terminal=True,
+            trade_id=tg.id, leg_type=LegType.ENTRY,
+            ib_filled_qty=Decimal("100"), ib_avg_fill_price=Decimal("150.00"),
         ))
         s.commit()
 
         resp = client.get("/api/orders")
         data = resp.json()
         assert len(data) == 1
-        assert data[0]["status"] == "OPEN"
+        assert data[0]["status"] == "PLACE_ACCEPTED"
 
 
 class TestAlertRoutes:

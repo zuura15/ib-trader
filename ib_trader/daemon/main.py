@@ -20,7 +20,7 @@ import click
 from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions
 from ib_trader.config.context import AppContext
 from ib_trader.data.repository import (
-    TradeRepository, OrderRepository, RepriceEventRepository,
+    TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
@@ -110,13 +110,11 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
 
         alerts = ctx.alerts.get_open()
 
-        # Build basic stats from orders
-        from ib_trader.data.models import OrderStatus
-        all_orders = ctx.orders.get_all_open()
-        filled_orders = ctx.orders.get_in_states([OrderStatus.FILLED])
-        canceled_orders = ctx.orders.get_in_states([OrderStatus.CANCELED])
-        abandoned_orders = ctx.orders.get_in_states([OrderStatus.ABANDONED])
-        ext_closed = ctx.orders.get_in_states([OrderStatus.CLOSED_EXTERNAL])
+        # Build basic stats from transactions and trade groups
+        all_open_orders = ctx.transactions.get_open_orders()
+        all_trades = ctx.trades.get_all()
+        open_trades = [t for t in all_trades if t.status.value == "OPEN"]
+        closed_trades = [t for t in all_trades if t.status.value == "CLOSED"]
 
         recon_display = "never"
         if last_recon_time:
@@ -136,12 +134,10 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
             "recon_changes": last_recon_changes,
             "alerts": alerts,
             "stats": {
-                "placed": len(all_orders) + len(filled_orders) + len(canceled_orders),
-                "filled": len(filled_orders),
-                "canceled": len(canceled_orders),
-                "open_now": len(all_orders),
-                "abandoned": len(abandoned_orders),
-                "ext_closed": len(ext_closed),
+                "open_orders": len(all_open_orders),
+                "open_trades": len(open_trades),
+                "closed_trades": len(closed_trades),
+                "total_trades": len(all_trades),
                 "pnl": Decimal("0"),      # TODO: aggregate from metrics
                 "commission": Decimal("0"),
             },
@@ -158,7 +154,7 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
             last_recon_changes = result["changes"]
 
         elif cmd == "orders":
-            open_orders = ctx.orders.get_all_open()
+            open_orders = ctx.transactions.get_open_orders()
             logger.info('{"event": "DAEMON_ORDERS_CMD", "count": %d}', len(open_orders))
 
         elif cmd == "stats":
@@ -338,7 +334,6 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool, 
     ctx = AppContext(
         ib=ib_client,
         trades=TradeRepository(session_factory),
-        orders=OrderRepository(session_factory),
         reprice_events=RepriceEventRepository(session_factory),
         contracts=ContractRepository(session_factory),
         heartbeats=HeartbeatRepository(session_factory),
