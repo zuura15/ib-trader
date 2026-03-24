@@ -182,29 +182,28 @@ class _ChannelState:
 
 def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
     """Fetch current data for a channel from SQLite."""
-    # Get a session and ensure it sees the latest committed data by ending
-    # any stale read transaction. Close the session after use to return the
-    # connection to the pool — without this, the QueuePool exhausts after
-    # a few minutes of polling.
-    session = sf()
+    # Each poll must get a fresh session, query, and fully release the
+    # connection back to the pool.  scoped_session.remove() does this —
+    # it closes the session AND removes it from the thread-local registry
+    # so the next sf() call gets a brand-new session.  Without this,
+    # concurrent async coroutines on the same thread accumulate sessions
+    # and exhaust the QueuePool.
     try:
+        session = sf()
         session.rollback()
 
         if channel == "trades":
-            repo = TradeRepository(sf)
-            return [_serialize_trade(t) for t in repo.get_all()]
+            return [_serialize_trade(t) for t in TradeRepository(sf).get_all()]
 
         elif channel == "orders":
-            repo = OrderRepository(sf)
-            return [_serialize_order(o) for o in repo.get_all_open()]
+            return [_serialize_order(o) for o in OrderRepository(sf).get_all_open()]
 
         elif channel == "alerts":
-            repo = AlertRepository(sf)
-            return [_serialize_alert(a) for a in repo.get_open()]
+            return [_serialize_alert(a) for a in AlertRepository(sf).get_open()]
 
         elif channel == "commands":
-            repo = PendingCommandRepository(sf)
-            return [_serialize_command(c) for c in repo.get_by_source("api", limit=50)]
+            return [_serialize_command(c)
+                    for c in PendingCommandRepository(sf).get_by_source("api", limit=50)]
 
         elif channel == "heartbeats":
             repo = HeartbeatRepository(sf)
@@ -217,7 +216,7 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
 
         return []
     finally:
-        session.close()
+        sf.remove()
 
 
 _VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats"}

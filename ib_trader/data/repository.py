@@ -31,7 +31,17 @@ def create_db_engine(db_url: str):
     Returns:
         Configured SQLAlchemy engine.
     """
-    engine = create_engine(db_url, echo=False)
+    engine = create_engine(
+        db_url,
+        echo=False,
+        # SQLite is a local file — connections are cheap. Use a larger pool
+        # to avoid QueuePool exhaustion from concurrent WebSocket polling,
+        # REST endpoints, and the engine service all sharing the same DB.
+        pool_size=20,
+        max_overflow=30,
+        pool_timeout=10,
+        pool_recycle=300,
+    )
 
     if db_url.startswith("sqlite"):
         @sa_event.listens_for(engine, "connect")
