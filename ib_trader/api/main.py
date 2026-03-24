@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 @click.option("--env", default=".env", help="Environment file path")
 @click.option("--settings", "settings_path", default="config/settings.yaml",
               help="Settings YAML path")
-@click.option("--host", default="127.0.0.1", help="API server bind host")
+@click.option("--host", default="0.0.0.0", help="API server bind host")
 @click.option("--port", default=8000, type=int, help="API server port")
 def main(db: str, env: str, settings_path: str, host: str, port: int):
     """IB Trader API Server — REST API for the trading platform."""

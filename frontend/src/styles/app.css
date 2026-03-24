@@ -359,3 +359,35 @@ html, body, #root {
 .panel-content input {
   cursor: pointer !important;
 }
+
+/* Hide horizontal scrollbar on the mobile swipe container */
+.mobile-swipe-container::-webkit-scrollbar {
+  display: none;
+}
+
+/* Pulsing animation for the microphone button while recording */
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ---- Mobile overrides ---- */
+@media (max-width: 767px) {
+  /* ~2x bump for phone readability */
+  .data-table { font-size: 18px; }
+  .data-table th { font-size: 16px; padding: 10px 8px; white-space: nowrap; }
+  .data-table td { padding: 10px 8px; }
+
+  /* Panel headers */
+  .panel-title { font-size: 18px; }
+  .panel-header { padding: 10px 12px; }
+
+  /* Console / monospace text */
+  .font-mono { font-size: 16px; }
+
+  /* Tighter panel chrome */
+  .panel-content { padding: 0; }
+
+  /* Full-width panels — no rounded corners or side borders */
+  .panel-shell { border-radius: 0; border-left: none; border-right: none; }
+}

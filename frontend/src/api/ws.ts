@@ -26,7 +26,10 @@ type DiffHandler = (channel: Channel, diff: WSDiff) => void;
 type SnapshotHandler = (data: WSSnapshot['data']) => void;
 type StatusHandler = (connected: boolean) => void;
 
-const WS_BASE = import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
+// Use wss:// when the page is served over HTTPS (e.g. LAN access via basic-ssl).
+// Browsers block mixed-content ws:// from an https:// page.
+const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_BASE = import.meta.env.VITE_WS_URL || `${wsProto}//${window.location.host}/ws`;
 const WS_TOKEN = import.meta.env.VITE_API_TOKEN || '';
 const WS_URL = WS_TOKEN ? `${WS_BASE}?token=${WS_TOKEN}` : WS_BASE;
 const CHANNELS: Channel[] = ['trades', 'orders', 'alerts', 'commands', 'heartbeats'];

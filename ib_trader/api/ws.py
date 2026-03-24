@@ -182,41 +182,42 @@ class _ChannelState:
 
 def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
     """Fetch current data for a channel from SQLite."""
-    # End any open transaction so the next query sees the latest committed
-    # data.  Without this, SQLite's DEFERRED isolation keeps returning the
-    # snapshot from the first read in this long-lived session.
+    # Get a session and ensure it sees the latest committed data by ending
+    # any stale read transaction. Close the session after use to return the
+    # connection to the pool — without this, the QueuePool exhausts after
+    # a few minutes of polling.
+    session = sf()
     try:
-        sf().rollback()
-    except Exception:
-        pass
+        session.rollback()
 
-    if channel == "trades":
-        repo = TradeRepository(sf)
-        return [_serialize_trade(t) for t in repo.get_all()]
+        if channel == "trades":
+            repo = TradeRepository(sf)
+            return [_serialize_trade(t) for t in repo.get_all()]
 
-    elif channel == "orders":
-        repo = OrderRepository(sf)
-        return [_serialize_order(o) for o in repo.get_all_open()]
+        elif channel == "orders":
+            repo = OrderRepository(sf)
+            return [_serialize_order(o) for o in repo.get_all_open()]
 
-    elif channel == "alerts":
-        repo = AlertRepository(sf)
-        return [_serialize_alert(a) for a in repo.get_open()]
+        elif channel == "alerts":
+            repo = AlertRepository(sf)
+            return [_serialize_alert(a) for a in repo.get_open()]
 
-    elif channel == "commands":
-        repo = PendingCommandRepository(sf)
-        # Return recent commands (last 50)
-        return [_serialize_command(c) for c in repo.get_by_source("api", limit=50)]
+        elif channel == "commands":
+            repo = PendingCommandRepository(sf)
+            return [_serialize_command(c) for c in repo.get_by_source("api", limit=50)]
 
-    elif channel == "heartbeats":
-        repo = HeartbeatRepository(sf)
-        results = []
-        for process_name in ("REPL", "DAEMON", "ENGINE", "API", "BOT_RUNNER"):
-            hb = repo.get(process_name)
-            if hb:
-                results.append(_serialize_heartbeat(hb))
-        return results
+        elif channel == "heartbeats":
+            repo = HeartbeatRepository(sf)
+            results = []
+            for process_name in ("REPL", "DAEMON", "ENGINE", "API", "BOT_RUNNER"):
+                hb = repo.get(process_name)
+                if hb:
+                    results.append(_serialize_heartbeat(hb))
+            return results
 
-    return []
+        return []
+    finally:
+        session.close()
 
 
 _VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats"}
