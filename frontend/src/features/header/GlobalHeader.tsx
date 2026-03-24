@@ -1,6 +1,14 @@
 import { useStore } from '../../data/store';
 import { formatCurrency, formatDuration } from '../../utils/format';
-import type { LayoutVariant } from '../../types';
+import type { LayoutVariant, ThemeMode } from '../../types';
+
+const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
+  { id: 'dark',     label: 'Midnight', icon: '🌑' },
+  { id: 'charcoal', label: 'Charcoal', icon: '◼' },
+  { id: 'navy',     label: 'Navy',     icon: '🔵' },
+  { id: 'mocha',    label: 'Mocha',    icon: '☕' },
+  { id: 'light',    label: 'Light',    icon: '☀' },
+];
 
 const variantLabels: Record<LayoutVariant, string> = {
   A: 'Classic',
@@ -10,7 +18,7 @@ const variantLabels: Record<LayoutVariant, string> = {
 };
 
 export function GlobalHeader() {
-  const { global, activeVariant, setVariant, theme, toggleTheme, dataMode, wsConnected } = useStore();
+  const { global, activeVariant, setVariant, theme, setTheme, dataMode, wsConnected } = useStore();
   const { connectionStatus, accountMode, serviceHealth, realizedPnl, sessionUptime } = global;
 
   const healthyCount = Object.values(serviceHealth).filter(Boolean).length;
@@ -94,11 +102,30 @@ export function GlobalHeader() {
           </div>
         )}
 
-        {/* Theme toggle */}
-        <button onClick={toggleTheme} className="theme-toggle">
-          <span style={{ fontSize: 14 }}>{theme === 'dark' ? '☀' : '☾'}</span>
-          <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>
-        </button>
+        {/* Theme picker */}
+        <div className="rounded border p-1" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
+          <div style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4, paddingLeft: 8 }}>
+            Theme
+          </div>
+          <div className="flex gap-1">
+            {THEMES.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setTheme(t.id)}
+                title={t.label}
+                className="rounded px-2 py-1.5 text-xs font-medium cursor-pointer transition-colors"
+                style={{
+                  background: theme === t.id ? 'var(--accent-blue)' : 'var(--bg-secondary)',
+                  color: theme === t.id ? (theme === 'light' ? '#fff' : '#090b0f') : 'var(--text-secondary)',
+                  border: 'none',
+                  fontSize: 11,
+                }}
+              >
+                <span style={{ marginRight: 3 }}>{t.icon}</span>{t.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         {/* Variant switcher */}
         <div className="rounded border p-1" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>

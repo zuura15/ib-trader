@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from 'react';
+import { useRef, useState, useEffect, useCallback, type PointerEvent as RPointerEvent } from 'react';
 import { MobileHeader } from '../features/header/MobileHeader';
 import { CommandConsole } from '../features/console/CommandConsole';
 import { PositionsPanel } from '../features/positions/PositionsPanel';
@@ -7,6 +7,50 @@ import { TradesPanel } from '../features/trades/TradesPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { LogStream } from '../features/logs/LogStream';
 const TABS = ['Trade', 'Orders', 'Logs'] as const;
+
+// ---------------------------------------------------------------------------
+// Vertical resize handle for the mobile Trade tab split
+// ---------------------------------------------------------------------------
+
+const CONSOLE_MIN_H = 80;
+const CONSOLE_MAX_RATIO = 0.6; // never more than 60% of viewport
+
+function useVerticalResize(initialVh: number) {
+  const [height, setHeight] = useState<number | null>(null);
+  const startY = useRef(0);
+  const startH = useRef(0);
+
+  const initHeight = () => {
+    if (height === null) return (window.innerHeight * initialVh) / 100;
+    return height;
+  };
+
+  // Attach move/up listeners on window so dragging works even when the
+  // finger moves outside the narrow handle strip.
+  const onPointerDown = useCallback((e: RPointerEvent) => {
+    e.preventDefault();
+    startY.current = e.clientY;
+    startH.current = height ?? (window.innerHeight * initialVh) / 100;
+
+    const onMove = (ev: globalThis.PointerEvent) => {
+      const delta = ev.clientY - startY.current;
+      const maxH = window.innerHeight * CONSOLE_MAX_RATIO;
+      setHeight(Math.max(CONSOLE_MIN_H, Math.min(maxH, startH.current + delta)));
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }, [height, initialVh]);
+
+  return { height: initHeight(), onPointerDown };
+}
 type Tab = (typeof TABS)[number];
 
 /**
@@ -29,6 +73,7 @@ function isIOSSafari(): boolean {
 export function MobileLayout() {
   // Data initialization (WS / mock) is handled by App.tsx — not duplicated here.
 
+  const resize = useVerticalResize(30);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTab] = useState<Tab>('Trade');
   const [unsupported] = useState(isIOSSafari);
@@ -177,17 +222,43 @@ export function MobileLayout() {
           scrollbarWidth: 'none',       /* Firefox */
         }}
       >
-        {/* Tab 1: Trade — order entry + positions */}
+        {/* Tab 1: Trade — order entry + positions, vertically resizable */}
         <div
           id="tabpanel-Trade"
           role="tabpanel"
           aria-labelledby="tab-Trade"
-          className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
-          style={{ scrollSnapAlign: 'start' }}
+          className="flex flex-col shrink-0 w-screen h-full"
+          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
         >
-          <div style={{ maxHeight: '30vh', minHeight: 80, overflow: 'hidden' }}>
+          <div style={{ height: resize.height, minHeight: CONSOLE_MIN_H, overflow: 'hidden' }}>
             <CommandConsole compact />
           </div>
+
+          {/* Drag handle + separator */}
+          <div
+            onPointerDown={resize.onPointerDown}
+            style={{
+              height: 40,
+              flexShrink: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'row-resize',
+              touchAction: 'none',
+              background: 'var(--bg-root)',
+              borderTop: '1px solid var(--border-default)',
+              borderBottom: '1px solid var(--border-default)',
+            }}
+          >
+            <div style={{
+              width: 48,
+              height: 5,
+              borderRadius: 3,
+              background: 'var(--text-muted)',
+              opacity: 0.5,
+            }} />
+          </div>
+
           <div className="flex-1 overflow-y-auto">
             <PositionsPanel compact />
           </div>

@@ -34,7 +34,7 @@ interface AppStore {
 
   // Theme
   theme: ThemeMode;
-  toggleTheme: () => void;
+  setTheme: (t: ThemeMode) => void;
 
   // Global state
   global: GlobalState;
@@ -105,13 +105,12 @@ export const useStore = create<AppStore>((set, get) => ({
   activeVariant: 'A',
   setVariant: (v) => set({ activeVariant: v }),
 
-  theme: (localStorage.getItem('ib-theme') as 'dark' | 'light') || 'dark',
-  toggleTheme: () => set((s) => {
-    const next = s.theme === 'dark' ? 'light' : 'dark';
+  theme: (localStorage.getItem('ib-theme') as ThemeMode) || 'dark',
+  setTheme: (next: ThemeMode) => {
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('ib-theme', next);
-    return { theme: next };
-  }),
+    set({ theme: next });
+  },
 
   global: {
     connectionStatus: 'connected',

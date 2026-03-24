@@ -48,6 +48,7 @@
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
   --row-hover: rgba(255, 255, 255, 0.02);
   --panel-shadow: 0 0 0 1px rgba(148, 163, 184, 0.08), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --panel-gradient: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%);
   /* flexlayout */
   --fl-base: #10141b;
   --fl-1: #131922;
@@ -60,6 +61,120 @@
   --fl-border-bg: #0b0f14;
   --fl-tab-selected-bg: #18212d;
   --fl-tab-unselected-bg: #131922;
+}
+
+/* ======================== CHARCOAL THEME ======================== */
+html[data-theme="charcoal"] {
+  color-scheme: dark;
+  --bg-root: #141414;
+  --bg-primary: #1c1c1e;
+  --bg-secondary: #232326;
+  --bg-tertiary: #2c2c30;
+  --bg-hover: #38383c;
+  --border-default: rgba(255, 255, 255, 0.08);
+  --border-muted: rgba(255, 255, 255, 0.05);
+  --text-primary: #e5e5e7;
+  --text-secondary: #a1a1a6;
+  --text-muted: #6e6e73;
+  --text-heading: #d1d1d6;
+  --accent-green: #30d158;
+  --accent-red: #ff453a;
+  --accent-yellow: #ffd60a;
+  --accent-blue: #64d2ff;
+  --accent-purple: #bf5af2;
+  --accent-orange: #ff9f0a;
+  --badge-green-bg: rgba(48, 209, 88, 0.15);
+  --badge-red-bg: rgba(255, 69, 58, 0.15);
+  --badge-yellow-bg: rgba(255, 214, 10, 0.12);
+  --badge-blue-bg: rgba(100, 210, 255, 0.12);
+  --badge-purple-bg: rgba(191, 90, 242, 0.12);
+  --badge-orange-bg: rgba(255, 159, 10, 0.12);
+  --badge-gray-bg: rgba(142, 142, 147, 0.12);
+  --scrollbar-thumb: rgba(255, 255, 255, 0.12);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+  --row-hover: rgba(255, 255, 255, 0.03);
+  --panel-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px rgba(0,0,0,0.4);
+  --panel-gradient: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%);
+  --fl-base: #1c1c1e; --fl-1: #232326; --fl-2: #2c2c30; --fl-3: #38383c;
+  --fl-4: #64d2ff; --fl-5: #141414; --fl-6: #48484a;
+  --fl-splitter: #0a0a0a; --fl-border-bg: #141414;
+  --fl-tab-selected-bg: #2c2c30; --fl-tab-unselected-bg: #232326;
+}
+
+/* ======================== NAVY THEME ======================== */
+html[data-theme="navy"] {
+  color-scheme: dark;
+  --bg-root: #0a0e1a;
+  --bg-primary: #0f1526;
+  --bg-secondary: #141c32;
+  --bg-tertiary: #1a243e;
+  --bg-hover: #222e4e;
+  --border-default: rgba(130, 170, 255, 0.08);
+  --border-muted: rgba(130, 170, 255, 0.05);
+  --text-primary: #d8e0f0;
+  --text-secondary: #8898bf;
+  --text-muted: #5a6a8f;
+  --text-heading: #b8c8e8;
+  --accent-green: #3ee8a0;
+  --accent-red: #f76c6c;
+  --accent-yellow: #f0c040;
+  --accent-blue: #5c9eff;
+  --accent-purple: #a07eff;
+  --accent-orange: #e8883e;
+  --badge-green-bg: rgba(62, 232, 160, 0.12);
+  --badge-red-bg: rgba(247, 108, 108, 0.12);
+  --badge-yellow-bg: rgba(240, 192, 64, 0.12);
+  --badge-blue-bg: rgba(92, 158, 255, 0.12);
+  --badge-purple-bg: rgba(160, 126, 255, 0.12);
+  --badge-orange-bg: rgba(232, 136, 62, 0.12);
+  --badge-gray-bg: rgba(136, 152, 191, 0.1);
+  --scrollbar-thumb: rgba(130, 170, 255, 0.12);
+  --scrollbar-thumb-hover: rgba(130, 170, 255, 0.2);
+  --row-hover: rgba(130, 170, 255, 0.03);
+  --panel-shadow: 0 1px 0 rgba(130,170,255,0.04) inset, 0 8px 24px rgba(0,0,0,0.5);
+  --panel-gradient: linear-gradient(180deg, rgba(92,158,255,0.04) 0%, transparent 100%);
+  --fl-base: #0f1526; --fl-1: #141c32; --fl-2: #1a243e; --fl-3: #222e4e;
+  --fl-4: #5c9eff; --fl-5: #0a0e1a; --fl-6: #3a4a6e;
+  --fl-splitter: #060a14; --fl-border-bg: #0a0e1a;
+  --fl-tab-selected-bg: #1a243e; --fl-tab-unselected-bg: #141c32;
+}
+
+/* ======================== MOCHA THEME ======================== */
+html[data-theme="mocha"] {
+  color-scheme: dark;
+  --bg-root: #141010;
+  --bg-primary: #1c1614;
+  --bg-secondary: #241c1a;
+  --bg-tertiary: #2e2420;
+  --bg-hover: #3c302a;
+  --border-default: rgba(210, 170, 140, 0.1);
+  --border-muted: rgba(210, 170, 140, 0.06);
+  --text-primary: #e8ddd4;
+  --text-secondary: #b09888;
+  --text-muted: #7a6858;
+  --text-heading: #d4c4b4;
+  --accent-green: #6ecf8e;
+  --accent-red: #e86060;
+  --accent-yellow: #e8c060;
+  --accent-blue: #70b0e0;
+  --accent-purple: #b490d0;
+  --accent-orange: #e09050;
+  --badge-green-bg: rgba(110, 207, 142, 0.12);
+  --badge-red-bg: rgba(232, 96, 96, 0.12);
+  --badge-yellow-bg: rgba(232, 192, 96, 0.12);
+  --badge-blue-bg: rgba(112, 176, 224, 0.12);
+  --badge-purple-bg: rgba(180, 144, 208, 0.12);
+  --badge-orange-bg: rgba(224, 144, 80, 0.12);
+  --badge-gray-bg: rgba(176, 152, 136, 0.1);
+  --scrollbar-thumb: rgba(210, 170, 140, 0.12);
+  --scrollbar-thumb-hover: rgba(210, 170, 140, 0.2);
+  --row-hover: rgba(210, 170, 140, 0.03);
+  --panel-shadow: 0 1px 0 rgba(210,170,140,0.04) inset, 0 8px 24px rgba(0,0,0,0.45);
+  --panel-gradient: linear-gradient(180deg, rgba(210,170,140,0.03) 0%, transparent 100%);
+  --fl-base: #1c1614; --fl-1: #241c1a; --fl-2: #2e2420; --fl-3: #3c302a;
+  --fl-4: #e09050; --fl-5: #141010; --fl-6: #5a4a3e;
+  --fl-splitter: #0c0808; --fl-border-bg: #141010;
+  --fl-tab-selected-bg: #2e2420; --fl-tab-unselected-bg: #241c1a;
 }
 
 /* ======================== LIGHT THEME ======================== */
@@ -93,6 +208,7 @@ html[data-theme="light"] {
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
   --row-hover: rgba(0, 0, 0, 0.02);
   --panel-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.08);
+  --panel-gradient: linear-gradient(180deg, rgba(255,255,255,0.4) 0%, transparent 100%);
   /* flexlayout */
   --fl-base: #ffffff;
   --fl-1: #f8f9fb;
@@ -222,6 +338,7 @@ html, body, #root {
   border-radius: 6px;
   border: 1px solid var(--border-default);
   background: var(--bg-primary);
+  background-image: var(--panel-gradient);
   box-shadow: var(--panel-shadow);
 }
 
@@ -232,6 +349,7 @@ html, body, #root {
   padding: 6px 10px;
   border-bottom: 1px solid var(--border-default);
   background: var(--bg-secondary);
+  background-image: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%);
 }
 
 .panel-header .accent-dot {

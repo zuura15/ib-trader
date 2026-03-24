@@ -7,7 +7,7 @@ export type CommandStatus = 'queued' | 'running' | 'success' | 'failure';
 export type BotStatus = 'running' | 'stopped' | 'error' | 'paused';
 export type AlertSeverity = 'catastrophic' | 'warning';
 export type LayoutVariant = 'A' | 'B' | 'C' | 'D';
-export type ThemeMode = 'dark' | 'light';
+export type ThemeMode = 'dark' | 'charcoal' | 'navy' | 'mocha' | 'light';
 
 export interface OrderTemplate {
   id: string;

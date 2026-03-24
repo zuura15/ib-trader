@@ -1,4 +1,10 @@
 import { useStore } from '../../data/store';
+import type { ThemeMode } from '../../types';
+
+const THEME_CYCLE: ThemeMode[] = ['dark', 'charcoal', 'navy', 'mocha', 'light'];
+const THEME_ICONS: Record<ThemeMode, string> = {
+  dark: '🌑', charcoal: '◼', navy: '🔵', mocha: '☕', light: '☀',
+};
 
 /**
  * Condensed header for the mobile layout.
@@ -7,7 +13,7 @@ import { useStore } from '../../data/store';
  * connection status, account mode (paper vs live), and data freshness.
  */
 export function MobileHeader() {
-  const { global, dataMode, wsConnected, theme, toggleTheme } = useStore();
+  const { global, dataMode, wsConnected, theme, setTheme } = useStore();
   const { connectionStatus, accountMode } = global;
 
   const dataFresh = dataMode === 'mock' ? true : wsConnected;
@@ -66,14 +72,17 @@ export function MobileHeader() {
         </span>
       </div>
 
-      {/* Right: theme toggle */}
+      {/* Right: theme cycler */}
       <button
-        onClick={toggleTheme}
+        onClick={() => {
+          const idx = THEME_CYCLE.indexOf(theme);
+          setTheme(THEME_CYCLE[(idx + 1) % THEME_CYCLE.length]);
+        }}
         className="border-none cursor-pointer rounded"
-        style={{ background: 'transparent', color: 'var(--text-muted)', fontSize: 14, minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-        aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+        style={{ background: 'transparent', color: 'var(--text-muted)', fontSize: 16, minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+        aria-label="Cycle theme"
       >
-        {theme === 'dark' ? '☀' : '☾'}
+        <span>{THEME_ICONS[theme]}</span>
       </button>
     </div>
   );
