@@ -80,6 +80,42 @@ export function MobileLayout() {
   const [unsupported] = useState(isIOSSafari);
   const programmaticScrollRef = useRef(false);
 
+  // Disable tab swiping when touch starts inside a horizontally-scrollable
+  // child (e.g. data tables). Without this, scroll-snap on the outer
+  // container hijacks horizontal gestures meant for table scrolling.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+
+    const onTouchStart = (e: TouchEvent) => {
+      let el = e.target as HTMLElement | null;
+      while (el && el !== container) {
+        if (el.scrollWidth > el.clientWidth + 1) {
+          // Touch started inside a horizontally-scrollable element.
+          // Temporarily disable scroll-snap so the inner element scrolls.
+          container.style.scrollSnapType = 'none';
+          container.style.overflowX = 'hidden';
+          return;
+        }
+        el = el.parentElement;
+      }
+    };
+
+    const onTouchEnd = () => {
+      container.style.scrollSnapType = 'x mandatory';
+      container.style.overflowX = 'auto';
+    };
+
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    return () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchend', onTouchEnd);
+      container.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, []);
+
   // Sync tab indicator with scroll position via scroll event.
   // More reliable than IntersectionObserver during fast swipes —
   // simply compute which page is closest to the scroll offset.

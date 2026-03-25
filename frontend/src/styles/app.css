@@ -522,4 +522,35 @@ html, body, #root {
 
   /* Full-width panels — no rounded corners or side borders */
   .panel-shell { border-radius: 0; border-left: none; border-right: none; }
+
+  /* Tables scroll horizontally within their panel. The wrapper div
+     (h-full overflow-auto) inside panel-content handles the actual scroll.
+     overscroll-behavior-x: contain prevents horizontal scroll from
+     propagating to the tab swipe container. */
+  .panel-content > div {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Let tables extend beyond viewport width for horizontal scroll */
+  .data-table {
+    width: max-content;
+    min-width: 100%;
+  }
+
+  /* Pin the first column (symbol) when scrolling horizontally */
+  .data-table th:first-child,
+  .data-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: var(--bg-primary);
+    border-right: 1px solid var(--border-default);
+  }
+
+  .data-table th:first-child {
+    z-index: 3;  /* above both sticky-top and sticky-left */
+    background: var(--header-bg);
+  }
 }
