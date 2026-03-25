@@ -439,6 +439,21 @@ html, body, #root {
   background: var(--row-hover);
 }
 
+/* Pin the first column (symbol) when scrolling horizontally */
+.data-table th:first-child,
+.data-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--bg-primary);
+  border-right: 1px solid var(--border-default);
+}
+
+.data-table th:first-child {
+  z-index: 3;
+  background: var(--header-bg);
+}
+
 /* Monospace for code/numbers */
 .font-mono {
   font-family: 'IBM Plex Mono', ui-monospace, monospace !important;
@@ -540,18 +555,4 @@ html, body, #root {
     min-width: 100%;
   }
 
-  /* Pin the first column (symbol) when scrolling horizontally */
-  .data-table th:first-child,
-  .data-table td:first-child {
-    position: sticky;
-    left: 0;
-    z-index: 2;
-    background: var(--bg-primary);
-    border-right: 1px solid var(--border-default);
-  }
-
-  .data-table th:first-child {
-    z-index: 3;  /* above both sticky-top and sticky-left */
-    background: var(--header-bg);
-  }
 }
