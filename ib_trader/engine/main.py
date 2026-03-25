@@ -135,9 +135,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
     print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
 
-    # Start heartbeat + position cache loops
+    # Start heartbeat + position cache + watchlist loops
     heartbeat_task = asyncio.create_task(_heartbeat_loop(ctx, pid))
     position_task = asyncio.create_task(_position_cache_loop(ctx))
+    watchlist_task = asyncio.create_task(_watchlist_cache_loop(ctx))
 
     try:
         from ib_trader.engine.service import engine_loop
@@ -150,6 +151,7 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
     finally:
         heartbeat_task.cancel()
         position_task.cancel()
+        watchlist_task.cancel()
         ctx.heartbeats.delete("ENGINE")
         await ctx.ib.disconnect()
         print("[ENGINE] Stopped.")
@@ -198,15 +200,11 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
 
 
 async def _position_cache_loop(ctx: AppContext) -> None:
-    """Periodically fetch positions from IB, read live streaming prices, and
-    write to run/positions.json.
+    """Periodically fetch positions from IB, read live streaming prices via
+    the abstraction layer, and write to run/positions.json.
 
-    Market data subscriptions are kept alive persistently — we subscribe once
-    per contract and just read the latest ticker values each cycle.  This
-    avoids the stale-ticker bug where reqMktData + cancelMktData reuses a
-    recycled Ticker object with old values.
-
-    The API server reads run/positions.json directly (no SQLite).
+    Uses ctx.ib.subscribe_market_data (ref-counted) so subscriptions are
+    shared with the watchlist loop without collision.
     """
     import json as _json
     from decimal import Decimal
@@ -220,73 +218,47 @@ async def _position_cache_loop(ctx: AppContext) -> None:
                 return str(o)
             return super().default(o)
 
-    # Get the raw ib_async IB object for positions() and reqMktData()
+    # Get the raw ib_async IB object for positions() only (no market data calls)
     ib_obj = None
-    if hasattr(ctx.ib, '_insync') and hasattr(ctx.ib._insync, '_ib'):
-        ib_obj = ctx.ib._insync._ib
-    elif hasattr(ctx.ib, '_ib'):
+    if hasattr(ctx.ib, '_ib'):
         ib_obj = ctx.ib._ib
 
     if ib_obj is None:
         logger.warning('{"event": "POSITION_CACHE_NO_IB_OBJ"}')
         return
 
-    # Persistent streaming subscriptions: con_id → Ticker
-    streaming_tickers: dict[int, object] = {}
+    # Track which con_ids we've subscribed for positions
+    subscribed_con_ids: set[int] = set()
 
-    # Initial delay to let connection stabilize
     await asyncio.sleep(5)
 
     while True:
         try:
-            # Refresh positions from IB
             try:
                 await ib_obj.reqPositionsAsync()
             except Exception:
                 logger.debug('{"event": "REQ_POSITIONS_FAILED"}')
             raw_positions = ib_obj.positions()
 
-            # Ensure we have streaming subscriptions for all position contracts
             current_con_ids = set()
             for p in raw_positions:
                 con_id = p.contract.conId
                 current_con_ids.add(con_id)
-                if con_id not in streaming_tickers:
+                if con_id not in subscribed_con_ids:
                     try:
-                        from ib_async import Contract
-                        # Get qualified contract from the cache or build one
-                        contract = (
-                            ctx.ib._contract_cache.get(con_id)
-                            if hasattr(ctx.ib, '_contract_cache')
-                            else None
-                        ) or Contract(
-                            conId=con_id,
-                            symbol=p.contract.symbol,
-                            secType=p.contract.secType,
-                            exchange=p.contract.exchange or "SMART",
-                            currency=p.contract.currency or "USD",
-                        )
-                        ticker = ib_obj.reqMktData(contract, "", False, False)
-                        streaming_tickers[con_id] = ticker
-                        logger.info(
-                            '{"event": "STREAMING_SUB_ADDED", "symbol": "%s", "con_id": %d}',
-                            p.contract.symbol, con_id,
-                        )
+                        await ctx.ib.subscribe_market_data(con_id, p.contract.symbol)
+                        subscribed_con_ids.add(con_id)
                     except Exception:
                         logger.debug(
-                            '{"event": "STREAMING_SUB_FAILED", "con_id": %d}',
-                            con_id,
+                            '{"event": "POSITION_SUB_FAILED", "con_id": %d}', con_id,
                         )
 
-            # Cancel subscriptions for positions we no longer hold
-            for gone_id in list(streaming_tickers.keys() - current_con_ids):
-                try:
-                    ib_obj.cancelMktData(streaming_tickers[gone_id].contract)
-                except Exception:
-                    pass
-                del streaming_tickers[gone_id]
+            # Unsubscribe positions we no longer hold
+            for gone_id in list(subscribed_con_ids - current_con_ids):
+                await ctx.ib.unsubscribe_market_data(gone_id)
+                subscribed_con_ids.discard(gone_id)
 
-            # Build output — read latest values from streaming tickers (instant)
+            # Build output using the abstraction layer's get_ticker
             positions = []
             for idx, p in enumerate(raw_positions):
                 sym = p.contract.symbol
@@ -294,18 +266,14 @@ async def _position_cache_loop(ctx: AppContext) -> None:
                 con_id = p.contract.conId
 
                 mkt_price = None
-                ticker = streaming_tickers.get(con_id)
+                ticker = ctx.ib.get_ticker(con_id)
                 if ticker is not None:
-                    bid = getattr(ticker, 'bid', None)
-                    ask = getattr(ticker, 'ask', None)
-                    last = getattr(ticker, 'last', None)
-
-                    # Use bid/ask midpoint (updates continuously).
-                    # Fall back to last trade price.
-                    if (bid and bid == bid and bid > 0
-                            and ask and ask == ask and ask > 0):
+                    bid = ticker.get("bid")
+                    ask = ticker.get("ask")
+                    last = ticker.get("last")
+                    if bid and ask:
                         mkt_price = (bid + ask) / 2
-                    elif last and last == last and last > 0:
+                    elif last:
                         mkt_price = last
 
                 positions.append({
@@ -319,29 +287,175 @@ async def _position_cache_loop(ctx: AppContext) -> None:
                     "broker": "ib",
                 })
 
-            # Atomic write
             tmp_path = positions_path.with_suffix(".tmp")
-            tmp_path.write_text(
-                _json.dumps(positions, cls=_Enc),
-                encoding="utf-8",
-            )
+            tmp_path.write_text(_json.dumps(positions, cls=_Enc), encoding="utf-8")
             tmp_path.rename(positions_path)
-
-            logger.debug(
-                '{"event": "POSITION_FILE_WRITTEN", "count": %d}',
-                len(positions),
-            )
+            logger.debug('{"event": "POSITION_FILE_WRITTEN", "count": %d}', len(positions))
 
         except Exception:
             logger.exception('{"event": "POSITION_CACHE_ERROR"}')
 
-        # Wait up to 2s, or wake immediately if a command completed.
-        # With streaming data, reading tickers is free — we can refresh fast.
         try:
             await asyncio.wait_for(position_refresh_event.wait(), timeout=2)
             position_refresh_event.clear()
         except asyncio.TimeoutError:
             pass
+
+
+async def _watchlist_cache_loop(ctx: AppContext) -> None:
+    """Stream market data for watchlist symbols and write to run/watchlist.json.
+
+    Re-reads config/watchlist.yaml each cycle to pick up changes from the API.
+    Uses ref-counted streaming subscriptions shared with the position cache loop.
+    Paces new subscriptions (max 5 per cycle) to avoid IB rate limits.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from ib_trader.config.loader import load_watchlist
+
+    watchlist_path = Path("run/watchlist.json")
+    watchlist_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # symbol → con_id mapping for active subscriptions
+    active: dict[str, int] = {}
+    # symbol → {next_retry: float, attempts: int} for failed qualifications
+    failed: dict[str, dict] = {}
+
+    _MAX_NEW_PER_CYCLE = 5
+    _WATCHLIST_YAML = "config/watchlist.yaml"
+    _CYCLE_SECONDS = 5
+
+    prev_symbols: list[str] = []
+
+    await asyncio.sleep(8)  # let positions loop start first
+    logger.info('{"event": "WATCHLIST_LOOP_STARTED"}')
+
+    while True:
+        try:
+            # Read current watchlist (fault-tolerant)
+            symbols = load_watchlist(_WATCHLIST_YAML)
+            if not symbols:
+                symbols = prev_symbols  # retain previous on read failure
+            else:
+                if symbols != prev_symbols:
+                    logger.info(
+                        '{"event": "WATCHLIST_CONFIG_RELOADED", "count": %d}',
+                        len(symbols),
+                    )
+                prev_symbols = symbols
+
+            wanted = set(symbols)
+            current = set(active.keys())
+
+            # Unsubscribe removed symbols
+            for sym in current - wanted:
+                con_id = active.pop(sym)
+                await ctx.ib.unsubscribe_market_data(con_id)
+                logger.info(
+                    '{"event": "WATCHLIST_SUB_CANCELLED", "symbol": "%s"}', sym,
+                )
+
+            # Subscribe new symbols (paced)
+            added = 0
+            for sym in wanted - current:
+                if added >= _MAX_NEW_PER_CYCLE:
+                    break
+
+                # Check retry backoff for previously failed symbols
+                fail_info = failed.get(sym)
+                if fail_info and asyncio.get_event_loop().time() < fail_info["next_retry"]:
+                    continue
+
+                try:
+                    info = await ctx.ib.qualify_contract(sym)
+                    con_id = info["con_id"]
+                    await ctx.ib.subscribe_market_data(con_id, sym)
+                    active[sym] = con_id
+                    failed.pop(sym, None)
+                    added += 1
+                except Exception as e:
+                    attempts = (fail_info["attempts"] + 1) if fail_info else 1
+                    delay = min(30 * (2 ** (attempts - 1)), 300)  # 30s → 300s cap
+                    failed[sym] = {
+                        "next_retry": asyncio.get_event_loop().time() + delay,
+                        "attempts": attempts,
+                    }
+                    logger.warning(
+                        '{"event": "WATCHLIST_QUALIFY_FAILED", "symbol": "%s", '
+                        '"attempt": %d, "next_retry_s": %d, "error": "%s"}',
+                        sym, attempts, delay, str(e),
+                    )
+
+            # Build watchlist JSON
+            now = datetime.now(timezone.utc).isoformat()
+            items = []
+            for sym in symbols:
+                con_id = active.get(sym)
+                if con_id is None:
+                    # Not yet subscribed or failed
+                    fail_info = failed.get(sym)
+                    items.append({
+                        "symbol": sym,
+                        "last": None, "change": None, "change_pct": None,
+                        "volume": None, "avg_volume": None,
+                        "high": None, "low": None,
+                        "high_52w": None, "low_52w": None,
+                        "error": "qualification_failed" if fail_info and fail_info["attempts"] >= 5 else None,
+                    })
+                    continue
+
+                ticker = ctx.ib.get_ticker(con_id)
+                if ticker is None:
+                    items.append({
+                        "symbol": sym,
+                        "last": None, "change": None, "change_pct": None,
+                        "volume": None, "avg_volume": None,
+                        "high": None, "low": None,
+                        "high_52w": None, "low_52w": None,
+                        "error": None,
+                    })
+                    continue
+
+                last = ticker.get("last")
+                close = ticker.get("close")
+                change = None
+                change_pct = None
+                if last is not None and close is not None and close > 0:
+                    change = round(last - close, 4)
+                    change_pct = round((change / close) * 100, 2)
+
+                def _fmt(v):
+                    return str(v) if v is not None else None
+
+                def _fmt_int(v):
+                    return str(int(v)) if v is not None else None
+
+                items.append({
+                    "symbol": sym,
+                    "last": _fmt(last),
+                    "change": _fmt(change),
+                    "change_pct": _fmt(change_pct),
+                    "volume": _fmt_int(ticker.get("volume")),
+                    "avg_volume": _fmt_int(ticker.get("avg_volume")),
+                    "high": _fmt(ticker.get("high")),
+                    "low": _fmt(ticker.get("low")),
+                    "high_52w": _fmt(ticker.get("high_52w")),
+                    "low_52w": _fmt(ticker.get("low_52w")),
+                    "error": None,
+                })
+
+            output = {"generated_at": now, "items": items}
+            tmp = watchlist_path.with_suffix(".tmp")
+            tmp.write_text(_json.dumps(output), encoding="utf-8")
+            tmp.rename(watchlist_path)
+            logger.debug('{"event": "WATCHLIST_FILE_WRITTEN", "count": %d}', len(items))
+
+        except Exception:
+            logger.exception('{"event": "WATCHLIST_CACHE_ERROR"}')
+
+        await asyncio.sleep(_CYCLE_SECONDS)
 
 
 if __name__ == "__main__":

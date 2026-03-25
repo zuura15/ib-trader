@@ -28,16 +28,18 @@ export function App() {
   const dataMode = useStore((s) => s.dataMode);
   const tickSimulation = useStore((s) => s.tickSimulation);
   const initWebSocket = useStore((s) => s.initWebSocket);
+  const initWatchlistPolling = useStore((s) => s.initWatchlistPolling);
   const isMobile = useIsMobile();
 
   useEffect(() => {
     if (dataMode === 'live') {
       initWebSocket();
+      initWatchlistPolling();
     } else {
       const interval = setInterval(tickSimulation, 2000);
       return () => clearInterval(interval);
     }
-  }, [dataMode, tickSimulation, initWebSocket]);
+  }, [dataMode, tickSimulation, initWebSocket, initWatchlistPolling]);
 
   if (isMobile) {
     return <MobileLayout />;

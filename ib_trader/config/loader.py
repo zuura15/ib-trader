@@ -141,6 +141,61 @@ def load_symbols(symbols_path: str = "config/symbols.yaml") -> list[str]:
     return symbols
 
 
+def load_watchlist(watchlist_path: str = "config/watchlist.yaml") -> list[str]:
+    """Load the watchlist symbol list from YAML.
+
+    Returns an empty list if the file is missing or invalid (non-fatal).
+    Same flat-list format as symbols.yaml.
+
+    Args:
+        watchlist_path: Path to watchlist.yaml.
+
+    Returns:
+        List of uppercase symbol strings.
+    """
+    path = Path(watchlist_path)
+    if not path.exists():
+        return []
+
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        logger.warning(
+            '{"event": "WATCHLIST_YAML_ERROR", "error": "%s"}', str(e),
+        )
+        return []
+
+    if not data or not isinstance(data, list):
+        return []
+
+    return [str(s).upper() for s in data if s]
+
+
+def save_watchlist(watchlist_path: str, symbols: list[str]) -> None:
+    """Write the watchlist symbol list to YAML atomically.
+
+    Uses write-to-tmp + os.replace for atomic update, preventing
+    partial reads by concurrent processes.
+
+    Args:
+        watchlist_path: Path to watchlist.yaml.
+        symbols: List of symbol strings to write.
+    """
+    path = Path(watchlist_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    content = yaml.dump(
+        [s.upper() for s in symbols],
+        default_flow_style=False,
+    )
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    logger.info(
+        '{"event": "WATCHLIST_SAVED", "count": %d}', len(symbols),
+    )
+
+
 def check_file_permissions(path: str, required_mode: int, label: str) -> None:
     """Verify a file has the required Unix permissions.
 

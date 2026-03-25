@@ -1,7 +1,27 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useStore } from '../../data/store';
 import { formatPrice, formatCurrency, pnlClass } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
+
+function RefreshCountdown({ interval }: { interval: number }) {
+  const [sec, setSec] = useState(interval);
+  const ref = useRef(0);
+  useEffect(() => {
+    ref.current = interval;
+    setSec(interval);
+    const timer = setInterval(() => {
+      ref.current -= 1;
+      if (ref.current <= 0) ref.current = interval;
+      setSec(ref.current);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [interval]);
+  return (
+    <span style={{ fontSize: 10, color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
+      ↻ {sec}s
+    </span>
+  );
+}
 
 interface BrokerPosition {
   id: string;
@@ -202,6 +222,7 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   return (
     <PanelShell title="Positions" accent="blue" right={
       <div className="flex items-center gap-2">
+        <RefreshCountdown interval={REFRESH_INTERVAL} />
         <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{filtered.length}/{positions.length}</span>
         <div className="flex gap-1">
           {([

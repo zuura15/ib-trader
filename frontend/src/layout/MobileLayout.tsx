@@ -3,10 +3,11 @@ import { MobileHeader } from '../features/header/MobileHeader';
 import { CommandConsole } from '../features/console/CommandConsole';
 import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
+import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
 import { TradesPanel } from '../features/trades/TradesPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { LogStream } from '../features/logs/LogStream';
-const TABS = ['Trade', 'Orders', 'Logs'] as const;
+const TABS = ['Trade', 'Watch', 'Orders', 'Logs'] as const;
 
 // ---------------------------------------------------------------------------
 // Vertical resize handle for the mobile Trade tab split
@@ -264,7 +265,18 @@ export function MobileLayout() {
           </div>
         </div>
 
-        {/* Tab 2: Orders — trades + open orders */}
+        {/* Tab 2: Watch — watchlist */}
+        <div
+          id="tabpanel-Watch"
+          role="tabpanel"
+          aria-labelledby="tab-Watch"
+          className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
+          style={{ scrollSnapAlign: 'start' }}
+        >
+          <WatchlistPanel compact />
+        </div>
+
+        {/* Tab 3: Orders — trades + open orders */}
         <div
           id="tabpanel-Orders"
           role="tabpanel"

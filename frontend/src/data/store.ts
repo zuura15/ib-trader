@@ -3,7 +3,7 @@ import { v4 as uuid } from 'uuid';
 import type {
   GlobalState, LogEntry, Order, Position, Bot, Alert,
   CommandEntry, LayoutVariant, ScenarioName, CommandStatus, ThemeMode,
-  OrderTemplate, TradeGroup,
+  OrderTemplate, TradeGroup, WatchlistItem,
 } from '../types';
 import {
   mockPositions, mockOrders, mockBots, mockAlerts, mockCommands,
@@ -84,6 +84,12 @@ interface AppStore {
   addTemplate: (t: OrderTemplate) => void;
   removeTemplate: (id: string) => void;
   loadTemplatesFromAPI: () => void;
+
+  // Watchlist
+  watchlist: WatchlistItem[];
+  watchlistGeneratedAt: string | null;
+  setWatchlist: (items: WatchlistItem[], generatedAt: string | null) => void;
+  initWatchlistPolling: () => void;
 
   // Scenarios (mock mode only)
   activeScenario: ScenarioName;
@@ -324,6 +330,30 @@ export const useStore = create<AppStore>((set, get) => ({
   updateCommand: (id, partial) => set((s) => ({
     commands: s.commands.map((c) => c.id === id ? { ...c, ...partial } : c),
   })),
+
+  watchlist: [],
+  watchlistGeneratedAt: null,
+  setWatchlist: (items, generatedAt) => set({ watchlist: items, watchlistGeneratedAt: generatedAt }),
+  initWatchlistPolling: () => {
+    if (DATA_MODE !== 'live') return;
+    const poll = () => {
+      fetch(`/api/watchlist?_t=${Date.now()}`, { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : { items: [], generated_at: null })
+        .then((data: { items: WatchlistItem[]; generated_at: string | null }) => {
+          get().setWatchlist(data.items || [], data.generated_at || null);
+        })
+        .catch(() => {});
+    };
+    poll();
+    let timer = setInterval(poll, 5000);
+    document.addEventListener('visibilitychange', () => {
+      clearInterval(timer);
+      if (!document.hidden) {
+        poll();
+        timer = setInterval(poll, 5000);
+      }
+    });
+  },
 
   activeScenario: 'healthy',
   applyScenario: (name) => {

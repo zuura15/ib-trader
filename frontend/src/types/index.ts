@@ -9,6 +9,20 @@ export type AlertSeverity = 'catastrophic' | 'warning';
 export type LayoutVariant = 'A' | 'B' | 'C' | 'D';
 export type ThemeMode = 'dark' | 'charcoal' | 'navy' | 'mocha' | 'light';
 
+export interface WatchlistItem {
+  symbol: string;
+  last: string | null;
+  change: string | null;
+  change_pct: string | null;
+  volume: string | null;
+  avg_volume: string | null;
+  high: string | null;
+  low: string | null;
+  high_52w: string | null;
+  low_52w: string | null;
+  error: string | null;
+}
+
 export interface OrderTemplate {
   id: string;
   symbol: string;

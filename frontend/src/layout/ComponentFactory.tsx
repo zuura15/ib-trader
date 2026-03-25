@@ -9,6 +9,7 @@ import { TradesPanel } from '../features/trades/TradesPanel';
 import { OrderTemplatesPanel } from '../features/templates/OrderTemplatesPanel';
 import { ScenarioPanel } from '../features/scenarios/ScenarioPanel';
 import { HelpPanel } from '../features/help/HelpPanel';
+import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
 
 export function componentFactory(node: TabNode) {
   const component = node.getComponent();
@@ -35,6 +36,8 @@ export function componentFactory(node: TabNode) {
       return <ScenarioPanel />;
     case 'help':
       return <HelpPanel />;
+    case 'watchlist':
+      return <WatchlistPanel compact={config.compact} />;
     default:
       return <div className="p-4 text-xs" style={{ color: 'var(--text-muted)' }}>Unknown component: {component}</div>;
   }

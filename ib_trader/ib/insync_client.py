@@ -94,6 +94,9 @@ class InsyncClient(IBClientBase):
         # validation problem.  110 = price doesn't conform to min tick.
         # 200-299 = order/account-level errors (201=rejected, 203=no shorting…).
         self._order_error_codes: frozenset[int] = frozenset({110}) | frozenset(range(200, 300))
+        # Ref-counted streaming market data subscriptions.
+        # Key: con_id, Value: {"ticker": Ticker, "refs": int, "contract": Contract}
+        self._streaming: dict[int, dict] = {}
 
     async def connect(self) -> None:
         """Connect to TWS or IB Gateway."""
@@ -537,6 +540,96 @@ class InsyncClient(IBClientBase):
         if trade is None:
             return None
         return trade.orderStatus.status or None
+
+    async def subscribe_market_data(self, con_id: int, symbol: str) -> None:
+        """Subscribe to streaming market data (ref-counted)."""
+        _GENERIC_TICKS = "165"  # Misc Stats: avVolume, 52-week high/low
+
+        if con_id in self._streaming:
+            entry = self._streaming[con_id]
+            entry["refs"] += 1
+
+            # If the existing subscription was created without enriched ticks
+            # (e.g. by position loop before watchlist loop), upgrade it by
+            # cancelling and re-subscribing with generic ticks.
+            if not entry.get("enriched"):
+                try:
+                    self._ib.cancelMktData(entry["contract"])
+                except Exception:
+                    pass
+                ticker = self._ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
+                entry["ticker"] = ticker
+                entry["enriched"] = True
+                logger.info(
+                    '{"event": "STREAMING_SUB_UPGRADED", "con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+
+            logger.debug(
+                '{"event": "STREAMING_REF_INC", "con_id": %d, "symbol": "%s", "refs": %d}',
+                con_id, symbol, entry["refs"],
+            )
+            return
+
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, symbol=symbol, secType="STK",
+            exchange="SMART", currency="USD",
+        )
+        ticker = self._ib.reqMktData(contract, _GENERIC_TICKS, False, False)
+        self._streaming[con_id] = {"ticker": ticker, "refs": 1, "contract": contract, "enriched": True}
+        logger.info(
+            '{"event": "STREAMING_SUB_ADDED", "con_id": %d, "symbol": "%s"}',
+            con_id, symbol,
+        )
+
+    async def unsubscribe_market_data(self, con_id: int) -> None:
+        """Unsubscribe from streaming market data (ref-counted)."""
+        entry = self._streaming.get(con_id)
+        if entry is None:
+            return
+        entry["refs"] -= 1
+        if entry["refs"] <= 0:
+            try:
+                self._ib.cancelMktData(entry["contract"])
+            except Exception:
+                pass
+            del self._streaming[con_id]
+            logger.info(
+                '{"event": "STREAMING_SUB_CANCELLED", "con_id": %d}', con_id,
+            )
+        else:
+            logger.debug(
+                '{"event": "STREAMING_REF_DEC", "con_id": %d, "refs": %d}',
+                con_id, entry["refs"],
+            )
+
+    def get_ticker(self, con_id: int) -> dict | None:
+        """Return current streaming ticker data, or None."""
+        entry = self._streaming.get(con_id)
+        if entry is None:
+            return None
+        t = entry["ticker"]
+
+        def _val(v):
+            """Return float if valid, else None. NaN check: v != v."""
+            if v is None or v != v or v <= 0:
+                return None
+            return float(v)
+
+        return {
+            "bid": _val(t.bid),
+            "ask": _val(t.ask),
+            "last": _val(t.last),
+            "open": _val(t.open),
+            "high": _val(t.high),
+            "low": _val(t.low),
+            "close": _val(t.close),
+            "volume": _val(t.volume),
+            "avg_volume": _val(getattr(t, 'avVolume', None)),
+            "high_52w": _val(getattr(t, 'high52week', None)),
+            "low_52w": _val(getattr(t, 'low52week', None)),
+        }
 
     def has_contract_cached(self, con_id: int) -> bool:
         """Return True if the in-memory contract cache has a fully-specified

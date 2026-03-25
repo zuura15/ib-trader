@@ -122,6 +122,15 @@ class MockIBClient(IBClientBase):
     def get_order_error(self, ib_order_id: str) -> str | None:
         return None  # Mock never injects IB errors by default
 
+    async def subscribe_market_data(self, con_id: int, symbol: str) -> None:
+        pass  # No-op in mock
+
+    async def unsubscribe_market_data(self, con_id: int) -> None:
+        pass  # No-op in mock
+
+    def get_ticker(self, con_id: int) -> dict | None:
+        return None  # No streaming data in mock
+
     def has_contract_cached(self, con_id: int) -> bool:
         return True  # Mock always reports cache hit to skip re-qualification
 

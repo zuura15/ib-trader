@@ -223,6 +223,48 @@ class IBClientBase(ABC):
         """
         return None
 
+    # ------------------------------------------------------------------
+    # Streaming market data (ref-counted)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def subscribe_market_data(self, con_id: int, symbol: str) -> None:
+        """Subscribe to streaming market data for a contract.
+
+        Ref-counted: calling twice for the same con_id increments the
+        reference count without creating a duplicate IB subscription.
+        Call unsubscribe_market_data to decrement.
+
+        Args:
+            con_id: IB contract ID.
+            symbol: Ticker symbol (for logging and contract lookup).
+        """
+        ...
+
+    @abstractmethod
+    async def unsubscribe_market_data(self, con_id: int) -> None:
+        """Unsubscribe from streaming market data for a contract.
+
+        Ref-counted: only cancels the IB subscription when the reference
+        count reaches zero.
+
+        Args:
+            con_id: IB contract ID.
+        """
+        ...
+
+    @abstractmethod
+    def get_ticker(self, con_id: int) -> dict | None:
+        """Return current streaming ticker data for a contract, or None.
+
+        Returns:
+            dict with keys: bid, ask, last, open, high, low, close,
+                volume, avg_volume, high_52w, low_52w.
+            All values are floats or None if unavailable.
+            Returns None if no subscription exists for this con_id.
+        """
+        ...
+
     @abstractmethod
     def has_contract_cached(self, con_id: int) -> bool:
         """Return True if the in-memory contract cache has a fully-specified
