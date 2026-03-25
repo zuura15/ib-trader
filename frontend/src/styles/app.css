@@ -523,12 +523,13 @@ html, body, #root {
   /* Full-width panels — no rounded corners or side borders */
   .panel-shell { border-radius: 0; border-left: none; border-right: none; }
 
-  /* Tables scroll horizontally within their panel. The wrapper div
-     (h-full overflow-auto) inside panel-content handles the actual scroll.
-     overscroll-behavior-x: contain prevents horizontal scroll from
-     propagating to the tab swipe container. */
+  /* Panel content wrapper must allow horizontal overflow so tables
+     can scroll independently of the tab swipe container. */
+  .panel-content {
+    overflow: hidden !important;
+  }
   .panel-content > div {
-    overflow-x: auto;
+    overflow: auto !important;
     overscroll-behavior-x: contain;
     -webkit-overflow-scrolling: touch;
   }

@@ -80,37 +80,76 @@ export function MobileLayout() {
   const [unsupported] = useState(isIOSSafari);
   const programmaticScrollRef = useRef(false);
 
-  // Disable tab swiping when touch starts inside a horizontally-scrollable
-  // child (e.g. data tables). Without this, scroll-snap on the outer
-  // container hijacks horizontal gestures meant for table scrolling.
+  // Directional gesture locking: when a touch starts inside a data table,
+  // detect whether the initial movement is horizontal or vertical.
+  // If horizontal → lock out the tab swipe container so the table scrolls.
+  // If vertical → let the tab/page scroll normally.
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
 
-    const onTouchStart = (e: TouchEvent) => {
-      let el = e.target as HTMLElement | null;
+    let startX = 0;
+    let startY = 0;
+    let locked: 'none' | 'horizontal' | 'vertical' = 'none';
+
+    const isInsideTable = (target: EventTarget | null): boolean => {
+      let el = target as HTMLElement | null;
       while (el && el !== container) {
-        if (el.scrollWidth > el.clientWidth + 1) {
-          // Touch started inside a horizontally-scrollable element.
-          // Temporarily disable scroll-snap so the inner element scrolls.
-          container.style.scrollSnapType = 'none';
-          container.style.overflowX = 'hidden';
-          return;
-        }
+        if (el.classList.contains('data-table') || el.closest('.data-table')) return true;
         el = el.parentElement;
+      }
+      return false;
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      locked = 'none';
+      if (!isInsideTable(e.target)) return;
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (locked !== 'none') {
+        if (locked === 'horizontal') {
+          // Already locked horizontal — keep blocking tab swipe
+          container.style.overflowX = 'hidden';
+          container.style.scrollSnapType = 'none';
+        }
+        return;
+      }
+      if (!isInsideTable(e.target)) return;
+
+      const dx = Math.abs(e.touches[0].clientX - startX);
+      const dy = Math.abs(e.touches[0].clientY - startY);
+
+      // Need at least 8px of movement to decide direction
+      if (dx < 8 && dy < 8) return;
+
+      if (dx > dy) {
+        // Horizontal swipe inside table — lock out tab container
+        locked = 'horizontal';
+        container.style.overflowX = 'hidden';
+        container.style.scrollSnapType = 'none';
+      } else {
+        locked = 'vertical';
       }
     };
 
     const onTouchEnd = () => {
-      container.style.scrollSnapType = 'x mandatory';
-      container.style.overflowX = 'auto';
+      if (locked === 'horizontal') {
+        container.style.overflowX = 'auto';
+        container.style.scrollSnapType = 'x mandatory';
+      }
+      locked = 'none';
     };
 
     container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     return () => {
       container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
       container.removeEventListener('touchcancel', onTouchEnd);
     };
@@ -297,7 +336,7 @@ export function MobileLayout() {
           </div>
 
           <div className="flex-1 overflow-y-auto">
-            <PositionsPanel compact />
+            <PositionsPanel />
           </div>
         </div>
 
@@ -309,7 +348,7 @@ export function MobileLayout() {
           className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
           style={{ scrollSnapAlign: 'start' }}
         >
-          <WatchlistPanel compact />
+          <WatchlistPanel />
         </div>
 
         {/* Tab 3: Orders — trades + open orders */}
