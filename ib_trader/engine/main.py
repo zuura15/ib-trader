@@ -324,6 +324,8 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
     failed: dict[str, dict] = {}
     # symbol → float for cached previous close (fetched once via historical data)
     cached_close: dict[str, float] = {}
+    # symbol → int count of consecutive cycles with no last price (stale detection)
+    stale_cycles: dict[str, int] = {}
 
     _MAX_NEW_PER_CYCLE = 5
     _WATCHLIST_YAML = "config/watchlist.yaml"
@@ -409,6 +411,24 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
                     continue
 
                 ticker = ctx.ib.get_ticker(con_id)
+
+                # Detect stale tickers: if last is None for 3+ consecutive
+                # cycles but we have a valid subscription, cancel and
+                # re-subscribe to get a fresh Ticker object from ib_async.
+                t_last = ticker.get("last") if ticker else None
+                if t_last is None:
+                    stale_cycles[sym] = stale_cycles.get(sym, 0) + 1
+                    if stale_cycles[sym] >= 3 and con_id in active:
+                        logger.warning(
+                            '{"event": "WATCHLIST_STALE_RESUB", "symbol": "%s", "cycles": %d}',
+                            sym, stale_cycles[sym],
+                        )
+                        await ctx.ib.unsubscribe_market_data(con_id)
+                        await ctx.ib.subscribe_market_data(con_id, sym)
+                        stale_cycles[sym] = 0
+                else:
+                    stale_cycles.pop(sym, None)
+
                 if ticker is None:
                     items.append({
                         "symbol": sym,
