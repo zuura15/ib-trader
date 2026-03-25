@@ -617,14 +617,32 @@ class InsyncClient(IBClientBase):
                 return None
             return float(v)
 
+        last = _val(t.last)
+        close = _val(t.close)
+
+        # IB often doesn't stream previous close for ETFs (QQQ, GLD, SPY)
+        # outside regular hours. Fall back to prevClose or halted last price
+        # from the ticker's misc fields, then to cached close from previous
+        # successful reads.
+        if close is None:
+            close = _val(getattr(t, 'prevClose', None))
+        if close is None and last is not None:
+            # Store and reuse the first valid close we ever compute.
+            # Once we see a close, it stays valid for the session.
+            cached_close = entry.get("_cached_close")
+            if cached_close is not None:
+                close = cached_close
+        if close is not None:
+            entry["_cached_close"] = close
+
         return {
             "bid": _val(t.bid),
             "ask": _val(t.ask),
-            "last": _val(t.last),
+            "last": last,
             "open": _val(t.open),
             "high": _val(t.high),
             "low": _val(t.low),
-            "close": _val(t.close),
+            "close": close,
             "volume": _val(t.volume),
             "avg_volume": _val(getattr(t, 'avVolume', None)),
             "high_52w": _val(getattr(t, 'high52week', None)),

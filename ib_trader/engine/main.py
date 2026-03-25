@@ -322,6 +322,8 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
     active: dict[str, int] = {}
     # symbol → {next_retry: float, attempts: int} for failed qualifications
     failed: dict[str, dict] = {}
+    # symbol → float for cached previous close (fetched once via historical data)
+    cached_close: dict[str, float] = {}
 
     _MAX_NEW_PER_CYCLE = 5
     _WATCHLIST_YAML = "config/watchlist.yaml"
@@ -420,6 +422,24 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
 
                 last = ticker.get("last")
                 close = ticker.get("close")
+
+                # IB often doesn't provide previous close for ETFs outside
+                # regular hours. Fall back to a one-time historical lookup.
+                if close is None and last is not None and sym not in cached_close:
+                    try:
+                        snap = await ctx.ib.get_market_snapshot(con_id)
+                        ref = float(snap.get("last", 0) or 0)
+                        if ref > 0:
+                            cached_close[sym] = ref
+                            logger.debug(
+                                '{"event": "WATCHLIST_CLOSE_FETCHED", "symbol": "%s", "close": %s}',
+                                sym, ref,
+                            )
+                    except Exception:
+                        pass
+                if close is None:
+                    close = cached_close.get(sym)
+
                 change = None
                 change_pct = None
                 if last is not None and close is not None and close > 0:
