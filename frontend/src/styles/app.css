@@ -439,6 +439,10 @@ html, body, #root {
   background: var(--row-hover);
 }
 
+.data-table tr:hover td:first-child {
+  background: var(--bg-hover);
+}
+
 /* Pin the first column (symbol) when scrolling horizontally */
 .data-table th:first-child,
 .data-table td:first-child {
