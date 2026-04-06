@@ -635,6 +635,10 @@ class InsyncClient(IBClientBase):
         if close is not None:
             entry["_cached_close"] = close
 
+        # Expose the ticker's last-update timestamp so callers can detect
+        # stale data (Ticker.time stops advancing when IB stops pushing).
+        ticker_time = getattr(t, 'time', None)
+
         return {
             "bid": _val(t.bid),
             "ask": _val(t.ask),
@@ -647,6 +651,7 @@ class InsyncClient(IBClientBase):
             "avg_volume": _val(getattr(t, 'avVolume', None)),
             "high_52w": _val(getattr(t, 'high52week', None)),
             "low_52w": _val(getattr(t, 'low52week', None)),
+            "ticker_time": ticker_time,
         }
 
     def has_contract_cached(self, con_id: int) -> bool:

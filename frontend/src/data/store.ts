@@ -108,8 +108,11 @@ export const useStore = create<AppStore>((set, get) => ({
   dataMode: DATA_MODE,
   wsConnected: false,
 
-  activeVariant: 'A',
-  setVariant: (v) => set({ activeVariant: v }),
+  activeVariant: (localStorage.getItem('ib-layout-variant') as LayoutVariant) || 'A',
+  setVariant: (v) => {
+    localStorage.setItem('ib-layout-variant', v);
+    set({ activeVariant: v });
+  },
 
   theme: (localStorage.getItem('ib-theme') as ThemeMode) || 'dark',
   setTheme: (next: ThemeMode) => {

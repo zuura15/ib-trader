@@ -326,10 +326,15 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
     cached_close: dict[str, float] = {}
     # symbol → int count of consecutive cycles with no last price (stale detection)
     stale_cycles: dict[str, int] = {}
+    # symbol → int count of consecutive cycles where ticker_time hasn't advanced
+    time_stale_cycles: dict[str, int] = {}
+    # symbol → last seen ticker_time for time-based stale detection
+    last_ticker_time: dict[str, object] = {}
 
     _MAX_NEW_PER_CYCLE = 5
     _WATCHLIST_YAML = "config/watchlist.yaml"
     _CYCLE_SECONDS = 5
+    _TIME_STALE_THRESHOLD = 12  # 12 cycles × 5s = 60s without a tick update
 
     prev_symbols: list[str] = []
 
@@ -357,6 +362,10 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
             for sym in current - wanted:
                 con_id = active.pop(sym)
                 await ctx.ib.unsubscribe_market_data(con_id)
+                stale_cycles.pop(sym, None)
+                time_stale_cycles.pop(sym, None)
+                last_ticker_time.pop(sym, None)
+                cached_close.pop(sym, None)
                 logger.info(
                     '{"event": "WATCHLIST_SUB_CANCELLED", "symbol": "%s"}', sym,
                 )
@@ -412,22 +421,48 @@ async def _watchlist_cache_loop(ctx: AppContext) -> None:
 
                 ticker = ctx.ib.get_ticker(con_id)
 
-                # Detect stale tickers: if last is None for 3+ consecutive
-                # cycles but we have a valid subscription, cancel and
-                # re-subscribe to get a fresh Ticker object from ib_async.
+                # Detect stale tickers via two strategies:
+                # 1. last is None for 3+ consecutive cycles (original check)
+                # 2. ticker_time hasn't advanced for _TIME_STALE_THRESHOLD
+                #    cycles — catches tickers that return cached non-None
+                #    values after IB stops pushing updates (GLD, ETFs).
                 t_last = ticker.get("last") if ticker else None
+                needs_resub = False
+
                 if t_last is None:
                     stale_cycles[sym] = stale_cycles.get(sym, 0) + 1
-                    if stale_cycles[sym] >= 3 and con_id in active:
-                        logger.warning(
-                            '{"event": "WATCHLIST_STALE_RESUB", "symbol": "%s", "cycles": %d}',
-                            sym, stale_cycles[sym],
-                        )
-                        await ctx.ib.unsubscribe_market_data(con_id)
-                        await ctx.ib.subscribe_market_data(con_id, sym)
-                        stale_cycles[sym] = 0
+                    if stale_cycles[sym] >= 3:
+                        needs_resub = True
                 else:
                     stale_cycles.pop(sym, None)
+
+                # Time-based staleness: if ticker_time stops advancing,
+                # the Ticker object is returning cached data.
+                t_time = ticker.get("ticker_time") if ticker else None
+                if t_time is not None:
+                    prev_time = last_ticker_time.get(sym)
+                    if prev_time is not None and t_time == prev_time:
+                        time_stale_cycles[sym] = time_stale_cycles.get(sym, 0) + 1
+                        if time_stale_cycles[sym] >= _TIME_STALE_THRESHOLD:
+                            needs_resub = True
+                    else:
+                        time_stale_cycles.pop(sym, None)
+                    last_ticker_time[sym] = t_time
+
+                if needs_resub and con_id in active:
+                    reason = "no_last" if t_last is None else "time_frozen"
+                    logger.warning(
+                        '{"event": "WATCHLIST_STALE_RESUB", "symbol": "%s", '
+                        '"reason": "%s", "null_cycles": %d, "time_cycles": %d}',
+                        sym, reason,
+                        stale_cycles.get(sym, 0),
+                        time_stale_cycles.get(sym, 0),
+                    )
+                    await ctx.ib.unsubscribe_market_data(con_id)
+                    await ctx.ib.subscribe_market_data(con_id, sym)
+                    stale_cycles.pop(sym, None)
+                    time_stale_cycles.pop(sym, None)
+                    last_ticker_time.pop(sym, None)
 
                 if ticker is None:
                     items.append({
