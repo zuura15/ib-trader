@@ -8,7 +8,7 @@
 *.db-shm
 
 # Logs
-logs/
+/logs/
 
 # Python
 __pycache__/
