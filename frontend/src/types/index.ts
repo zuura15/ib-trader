@@ -36,6 +36,7 @@ export interface OrderTemplate {
 export interface GlobalState {
   connectionStatus: ConnectionStatus;
   accountMode: AccountMode;
+  accountId: string;
   serviceHealth: Record<string, boolean>;
   staleData: boolean;
   dailyPnl: number;

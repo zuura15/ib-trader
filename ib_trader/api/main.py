@@ -70,8 +70,11 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
 
     try:
         uvicorn.run(app, host=host, port=port, log_level="info")
+    except (KeyboardInterrupt, SystemExit):
+        pass
     finally:
         heartbeats.delete("API")
+        print("[API] Stopped.")
         logger.info('{"event": "API_STOPPED"}')
 
 

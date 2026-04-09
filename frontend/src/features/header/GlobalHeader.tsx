@@ -19,7 +19,7 @@ const variantLabels: Record<LayoutVariant, string> = {
 
 export function GlobalHeader() {
   const { global, activeVariant, setVariant, theme, setTheme, dataMode, wsConnected } = useStore();
-  const { connectionStatus, accountMode, serviceHealth, realizedPnl, sessionUptime } = global;
+  const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, sessionUptime } = global;
 
   const healthyCount = Object.values(serviceHealth).filter(Boolean).length;
   const totalServices = Object.keys(serviceHealth).length;
@@ -62,6 +62,11 @@ export function GlobalHeader() {
             <span style={{ fontSize: 12, fontWeight: 500, color: accountMode === 'live' ? 'var(--accent-red)' : accountMode === 'paper' ? 'var(--accent-blue)' : 'var(--text-muted)', textTransform: 'capitalize' }}>
               {accountMode}
             </span>
+            {accountId && (
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 6 }}>
+                {accountId}
+              </span>
+            )}
           </div>
 
           {/* Services */}

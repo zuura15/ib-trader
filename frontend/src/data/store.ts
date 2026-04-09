@@ -124,6 +124,7 @@ export const useStore = create<AppStore>((set, get) => ({
   global: {
     connectionStatus: 'connected',
     accountMode: 'paper',
+    accountId: '',
     serviceHealth: { ib_gateway: true, market_data: true, order_router: true, reconciler: true },
     staleData: false,
     dailyPnl: 1667.00,
@@ -366,6 +367,7 @@ export const useStore = create<AppStore>((set, get) => ({
     store.updateGlobal({
       connectionStatus: 'connected',
       accountMode: 'paper',
+      accountId: '',
       staleData: false,
       serviceHealth: { ib_gateway: true, market_data: true, order_router: true, reconciler: true },
     });
@@ -430,6 +432,7 @@ export const useStore = create<AppStore>((set, get) => ({
           store.updateGlobal({
             connectionStatus: status.connection_status || 'disconnected',
             accountMode: status.account_mode || 'unknown',
+            accountId: status.account_id || '',
             serviceHealth: status.service_health || {},
             staleData: false,
             realizedPnl: status.realized_pnl || 0,
