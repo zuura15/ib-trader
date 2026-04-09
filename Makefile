@@ -20,7 +20,7 @@ typecheck:
 
 dev:
 	@echo "Starting all services... (Ctrl+C to stop all)"
-	@trap 'kill 0; exit' INT TERM; \
+	@trap 'trap "" INT TERM; kill -TERM 0; wait; exit 0' INT TERM; \
 	uv run ib-engine & \
 	uv run ib-api & \
 	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
