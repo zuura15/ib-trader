@@ -76,7 +76,14 @@ export function MobileLayout() {
 
   const resize = useVerticalResize(30);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [activeTab, setActiveTab] = useState<Tab>('Trade');
+  const [activeTab, setActiveTabRaw] = useState<Tab>(() => {
+    const saved = localStorage.getItem('ib-mobile-tab');
+    return saved && TABS.includes(saved as Tab) ? (saved as Tab) : 'Trade';
+  });
+  const setActiveTab = useCallback((tab: Tab) => {
+    localStorage.setItem('ib-mobile-tab', tab);
+    setActiveTabRaw(tab);
+  }, []);
   const [unsupported] = useState(isIOSSafari);
   const programmaticScrollRef = useRef(false);
 
