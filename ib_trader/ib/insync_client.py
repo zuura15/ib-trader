@@ -97,6 +97,24 @@ class InsyncClient(IBClientBase):
         # Ref-counted streaming market data subscriptions.
         # Key: con_id, Value: {"ticker": Ticker, "refs": int, "contract": Contract}
         self._streaming: dict[int, dict] = {}
+        # Disconnect handling. _expected_disconnect is set True before we
+        # intentionally call disconnect() so the disconnectedEvent handler
+        # knows not to scream about it. _on_unexpected_disconnect is an
+        # optional callback the engine wires up to write a CATASTROPHIC
+        # alert when the IB Gateway dies under us. Decoupled this way so
+        # InsyncClient stays free of repository imports.
+        self._expected_disconnect: bool = False
+        self._on_unexpected_disconnect = None  # type: ignore[assignment]
+
+    def set_disconnect_callback(self, cb) -> None:
+        """Register a callback fired on unexpected IB disconnect.
+
+        The callback receives no arguments and is called synchronously from
+        the ib_async event loop. It MUST be fast and non-blocking — schedule
+        any DB work via asyncio.create_task or call repository methods that
+        complete quickly.
+        """
+        self._on_unexpected_disconnect = cb
 
     async def connect(self) -> None:
         """Connect to TWS or IB Gateway."""
@@ -125,8 +143,15 @@ class InsyncClient(IBClientBase):
 
     async def disconnect(self) -> None:
         """Disconnect from TWS or IB Gateway."""
+        # Mark this as an intentional disconnect so _on_disconnected does
+        # not raise a CATASTROPHIC alert during normal shutdown.
+        self._expected_disconnect = True
         self._ib.disconnect()
         logger.info('{"event": "IB_DISCONNECTED"}')
+
+    def is_connected(self) -> bool:
+        """Return True if the underlying IB connection is alive."""
+        return self._ib.isConnected()
 
     async def qualify_contract(
         self,
@@ -748,8 +773,30 @@ class InsyncClient(IBClientBase):
             )
 
     def _on_disconnected(self) -> None:
-        """Handle IB disconnect event."""
+        """Handle IB disconnect event.
+
+        ib_async fires this for BOTH intentional shutdowns (we called
+        ``disconnect()``) and unexpected drops (Gateway killed, network
+        died, TWS crashed). We distinguish the two via ``_expected_disconnect``
+        and only escalate the unexpected case to the engine via the
+        registered callback.
+        """
+        if self._expected_disconnect:
+            logger.info('{"event": "IB_DISCONNECTED", "expected": true}')
+            return
+        # Print to stdout so it shows up in `make dev` output even when
+        # nobody is tailing the JSON log file.
+        print(
+            "[ENGINE] CATASTROPHIC: IB Gateway connection lost. "
+            "The engine cannot place or track orders until the Gateway is restarted.",
+            flush=True,
+        )
         logger.error('{"event": "IB_DISCONNECTED", "unexpected": true}')
+        if self._on_unexpected_disconnect is not None:
+            try:
+                self._on_unexpected_disconnect()
+            except Exception:
+                logger.exception('{"event": "IB_DISCONNECT_CALLBACK_FAILED"}')
 
     # Terminal IB order statuses — callbacks are auto-removed after dispatch.
     # ApiCancelled is used by some IB Gateway versions as an alternative to Cancelled.

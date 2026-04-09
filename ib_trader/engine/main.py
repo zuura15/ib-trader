@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import logging
 import os
+import signal
 from pathlib import Path
 
 # Module-level event signaling that a command completed and positions should refresh.
@@ -121,39 +122,72 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
     logger.info('{"event": "ENGINE_STARTED", "pid": %d}', pid)
     print(f"[ENGINE] Started (pid={pid}). Connecting to IB Gateway...")
 
-    # Connect to IB with retry loop
-    await _connect_with_retry(ctx, retry_interval)
+    # Graceful shutdown: cancel only the main task (not all tasks) so
+    # CancelledError propagates through whatever await is active and the
+    # finally block runs. Idempotent guard prevents duplicate signals
+    # from re-cancelling during cleanup.
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    shutting_down = False
 
-    print("[ENGINE] Connected to IB Gateway.")
+    def request_shutdown():
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+        print("[ENGINE] Shutting down gracefully...")
+        logger.info('{"event": "SHUTDOWN_REQUESTED"}')
+        main_task.cancel()
 
-    # Warm contract cache
-    for symbol in symbols:
-        try:
-            await ctx.ib.qualify_contract(symbol)
-        except Exception:
-            logger.warning('{"event": "CONTRACT_WARM_FAILED", "symbol": "%s"}', symbol)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        loop.add_signal_handler(sig, request_shutdown)
 
-    print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
-
-    # Start heartbeat + position cache + watchlist loops
-    heartbeat_task = asyncio.create_task(_heartbeat_loop(ctx, pid))
-    position_task = asyncio.create_task(_position_cache_loop(ctx))
-    watchlist_task = asyncio.create_task(_watchlist_cache_loop(ctx))
-
+    bg_tasks: list[asyncio.Task] = []
     try:
+        # Connect to IB with retry loop
+        await _connect_with_retry(ctx, retry_interval)
+
+        # Wire the IB-disconnect callback so a dead Gateway is surfaced
+        # as a CATASTROPHIC alert (visible in the frontend Alerts pane and
+        # console pane via the existing WebSocket alerts channel).
+        if hasattr(ctx.ib, "set_disconnect_callback"):
+            ctx.ib.set_disconnect_callback(lambda: _raise_ib_disconnect_alert(ctx))
+
+        print("[ENGINE] Connected to IB Gateway.")
+
+        # Warm contract cache
+        for symbol in symbols:
+            try:
+                await ctx.ib.qualify_contract(symbol)
+            except Exception:
+                logger.warning('{"event": "CONTRACT_WARM_FAILED", "symbol": "%s"}', symbol)
+
+        print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
+
+        # Start heartbeat + position cache + watchlist loops
+        bg_tasks = [
+            asyncio.create_task(_heartbeat_loop(ctx, pid)),
+            asyncio.create_task(_position_cache_loop(ctx)),
+            asyncio.create_task(_watchlist_cache_loop(ctx)),
+        ]
+
         from ib_trader.engine.service import engine_loop
         max_concurrent = ctx.settings.get("engine_max_concurrent", 5)
         poll_interval = ctx.settings.get("engine_poll_interval", 0.1)
         await engine_loop(ctx, max_concurrent=max_concurrent,
                           poll_interval=poll_interval)
-    except KeyboardInterrupt:
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        heartbeat_task.cancel()
-        position_task.cancel()
-        watchlist_task.cancel()
+        for t in bg_tasks:
+            t.cancel()
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
         ctx.heartbeats.delete("ENGINE")
-        await ctx.ib.disconnect()
+        try:
+            await asyncio.shield(ctx.ib.disconnect())
+        except Exception:
+            pass  # IB may already be dead — don't crash during cleanup
         print("[ENGINE] Stopped.")
         logger.info('{"event": "ENGINE_STOPPED"}')
 
@@ -173,6 +207,8 @@ async def _connect_with_retry(ctx: AppContext, retry_interval: int = 10) -> None
             await ctx.ib.connect()
             logger.info('{"event": "IB_CONNECTED", "attempt": %d}', attempt)
             return
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise  # Let shutdown propagate — don't retry on deliberate stop
         except Exception as e:
             msg = (
                 f"[ENGINE] IB Gateway not reachable at {host}:{port} "
@@ -186,6 +222,39 @@ async def _connect_with_retry(ctx: AppContext, retry_interval: int = 10) -> None
                 attempt, host, port, str(e),
             )
             await asyncio.sleep(retry_interval)
+
+
+def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
+    """Write a CATASTROPHIC alert when the IB Gateway connection drops.
+
+    Called from the ib_async event-loop callback in InsyncClient. Must be
+    fast and non-blocking — we only do a single SQLite insert. Dedupe by
+    checking for an existing open alert with the same trigger so a flapping
+    connection doesn't spam the alerts table.
+    """
+    from datetime import datetime, timezone
+    from ib_trader.data.models import AlertSeverity, SystemAlert
+    try:
+        existing_open = ctx.alerts.get_open()
+        if any(a.trigger == "IB_GATEWAY_DISCONNECTED" for a in existing_open):
+            return
+        alert = SystemAlert(
+            severity=AlertSeverity.CATASTROPHIC,
+            trigger="IB_GATEWAY_DISCONNECTED",
+            message=(
+                "IB Gateway connection lost. The engine cannot place or "
+                "track orders. Restart IB Gateway / TWS, then restart the "
+                "engine to reconnect."
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+        ctx.alerts.create(alert)
+        logger.error(
+            '{"event": "SYSTEM_ALERT_RAISED", "severity": "CATASTROPHIC", '
+            '"trigger": "IB_GATEWAY_DISCONNECTED"}'
+        )
+    except Exception:
+        logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
@@ -234,10 +303,36 @@ async def _position_cache_loop(ctx: AppContext) -> None:
 
     while True:
         try:
+            # Detect a dead Gateway eagerly. is_connected() flips false the
+            # moment ib_async sees the socket close, BEFORE the next IB call
+            # would hang or raise. Surface it as a CATASTROPHIC alert and
+            # skip this iteration so we don't write stale positions.
+            if hasattr(ctx.ib, "is_connected") and not ctx.ib.is_connected():
+                _raise_ib_disconnect_alert(ctx)
+                logger.error('{"event": "POSITION_CACHE_IB_DEAD"}')
+                await asyncio.sleep(2)
+                continue
             try:
-                await ib_obj.reqPositionsAsync()
+                # Wrap in a timeout so a zombie Gateway (process dead but
+                # socket still open) cannot hang the loop forever.
+                await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.error('{"event": "REQ_POSITIONS_TIMEOUT"}')
+                _raise_ib_disconnect_alert(ctx)
+                await asyncio.sleep(2)
+                continue
+            except (ConnectionError, OSError, BrokenPipeError) as e:
+                logger.error(
+                    '{"event": "REQ_POSITIONS_CONN_ERROR", "error": "%s"}',
+                    str(e),
+                )
+                _raise_ib_disconnect_alert(ctx)
+                await asyncio.sleep(2)
+                continue
             except Exception:
-                logger.debug('{"event": "REQ_POSITIONS_FAILED"}')
+                # Anything else: log loud and keep going. Promoted from
+                # DEBUG so we don't lose visibility on real failures.
+                logger.warning('{"event": "REQ_POSITIONS_FAILED"}', exc_info=True)
             raw_positions = ib_obj.positions()
 
             current_con_ids = set()
