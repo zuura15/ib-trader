@@ -5,10 +5,24 @@ No exceptions. Treat these as team-level non-negotiables.
 
 ## Data & State
 - NEVER use `float` for monetary values. Always use `Decimal` or integer cents.
-- NEVER store order state, trade state, or position state in memory.
-- ALL state lives in SQLite. If it's not in the DB, it doesn't exist.
-- Every operation follows: do the thing in IB → write result to SQLite → proceed.
-- Never proceed to the next step if the previous write to SQLite failed.
+- **IB is the source of truth for all broker-held state** — orders, fills, positions,
+  average cost, account balances. Never duplicate, cache, or mirror these into SQLite
+  as live state. If IB has it, read it from IB.
+- **Live state lives in memory**, not SQLite. SQLite is NOT in the critical path for
+  any live transaction. The app's in-process memory (and eventually a lightweight
+  persistent memory backend such as Redis) is the single authoritative store for
+  our own runtime state — bot strategy state, pending commands, reconciler view of
+  IB, etc.
+- **SQLite is for archival / activity storage only**: audit logs, transaction
+  history, closed trade records, bot event history, raw IB API responses. Nothing
+  on the hot path reads or writes SQLite to make a live decision.
+- Every live operation follows: do the thing in IB → update in-memory state → log
+  the activity to SQLite for audit. The SQLite write is observational, not gating.
+- The future direction is a **persistent-memory backend** (e.g. lightweight Redis)
+  where persistence is invisible to application code — the app reads and writes as
+  if to memory, and the backend handles durability. Until that is in place,
+  in-process memory is the store, and crash recovery is handled by re-querying IB
+  plus replaying from archival SQLite where needed.
 
 ## IB API
 - ALL IB API calls must go through the abstraction layer in `ib/base.py`.
@@ -69,10 +83,21 @@ No exceptions. Treat these as team-level non-negotiables.
 - Pricing logic must remain pluggable per security type.
 - Symbol validation must remain extendable to option symbology.
 
-## Zero Memory State
-- The app must be able to crash at any point and restart with full context from SQLite alone.
-- The ONLY acceptable data loss on crash is the current reprice step or a pending retry.
-- On startup, always check for ABANDONED orders and handle them explicitly.
+## Crash Recovery
+<!-- This section was previously "Zero Memory State" and required that all live
+     state be reconstructible from SQLite alone. That rule has been reversed: live
+     state lives in memory, SQLite is archival only. See "Data & State" above. -->
+- On crash, live state is reconstructed from **IB** (the source of truth) for
+  anything the broker holds — open orders, positions, average cost, fills.
+- For our own state that IB does not hold (bot strategy state such as trailing
+  stop HWM, signal cooldowns, reconciler caches), the current interim behavior is
+  that this state may be lost on crash. The longer-term path is a persistent
+  in-memory backend (e.g. lightweight Redis) that makes this transparent.
+- On startup, always query IB for any orders/positions tagged as ours (via the
+  broker's custom tagging — see "Order Tagging" below) and rebuild in-memory
+  state before accepting new commands.
+- Orphan orders found on IB that do not match any in-memory owner must be
+  surfaced as a WARNING, never silently cancelled.
 
 ## Alert Severity
 - Only two severity levels exist: CATASTROPHIC and WARNING.
@@ -83,8 +108,13 @@ No exceptions. Treat these as team-level non-negotiables.
 
 ## Process Isolation
 - REPL and daemon are fully independent processes.
-- They communicate ONLY through SQLite — no sockets, pipes, or shared memory.
-- Daemon TUI reads ONLY from SQLite — it never calls IB directly.
+- They communicate through the **shared state layer** — currently a durable
+  command queue plus in-memory state per process, transitioning to a shared
+  persistent-memory backend (e.g. Redis) as the state management redesign lands.
+  SQLite is no longer the IPC channel of record; it remains only for archival
+  writes.
+- Daemon TUI reads live state from the shared state layer (and from IB directly
+  when needed for broker-held data) — never from SQLite as a live-decision input.
 - REPL warns if daemon is absent but never blocks trading because of it.
 - Daemon alerts on stale REPL heartbeat but never attempts to restart the REPL.
 
