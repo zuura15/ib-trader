@@ -5,6 +5,8 @@ import { OrdersPanel } from '../features/orders/OrdersPanel';
 import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { BotsPanel } from '../features/bots/BotsPanel';
+import { BotLogStream } from '../features/bots/BotLogStream';
+import { BotActivity } from '../features/bots/BotActivity';
 import { TradesPanel } from '../features/trades/TradesPanel';
 import { OrderTemplatesPanel } from '../features/templates/OrderTemplatesPanel';
 import { ScenarioPanel } from '../features/scenarios/ScenarioPanel';
@@ -32,6 +34,10 @@ export function componentFactory(node: TabNode) {
       return <OrderTemplatesPanel />;
     case 'bots':
       return <BotsPanel large={config.large} />;
+    case 'bot-log':
+      return <BotLogStream maxLines={config.maxLines} />;
+    case 'bot-activity':
+      return <BotActivity maxLines={config.maxLines} />;
     case 'scenarios':
       return <ScenarioPanel />;
     case 'help':

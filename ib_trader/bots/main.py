@@ -57,7 +57,10 @@ def _import_strategies():
         import ib_trader.bots.examples.mean_revert  # noqa: F401
     except ImportError:
         pass
-    # Add more strategy imports here as they are created
+    try:
+        import ib_trader.bots.runtime  # noqa: F401  — registers strategy_bot
+    except ImportError:
+        pass
 
 
 async def run(session_factory) -> None:

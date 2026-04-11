@@ -173,6 +173,15 @@ class BotBase(ABC):
         """Update this bot's last_action in the bots table."""
         self._bots.update_action(self.bot_id, action)
 
+    def read_last_action(self) -> str | None:
+        """Read this bot's last_action from the bots table."""
+        bot = self._bots.get(self.bot_id)
+        return bot.last_action if bot else None
+
+    def clear_last_action(self) -> None:
+        """Clear this bot's last_action (set to None)."""
+        self._bots.update_action_raw(self.bot_id, None)
+
     def update_heartbeat(self) -> None:
         """Update this bot's heartbeat timestamp."""
         self._bots.update_heartbeat(self.bot_id)

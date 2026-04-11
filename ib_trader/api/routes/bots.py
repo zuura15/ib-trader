@@ -2,14 +2,15 @@
 
 GET /api/bots — list all bots
 GET /api/bots/{bot_id} — get a single bot
+GET /api/bots/{bot_id}/events — get bot events (audit trail)
 POST /api/bots/{bot_id}/start — start a bot
 POST /api/bots/{bot_id}/stop — stop a bot
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ib_trader.api.deps import get_session_factory
 from ib_trader.data.models import BotStatus
-from ib_trader.data.repositories.bot_repository import BotRepository
+from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
 
 router = APIRouter(prefix="/api/bots", tags=["bots"])
 
@@ -79,3 +80,81 @@ def stop_bot(bot_id: str, sf=Depends(get_session_factory)):
         return {"bot_id": bot_id, "status": "STOPPED", "message": "already stopped"}
     repo.update_status(bot_id, BotStatus.STOPPED)
     return {"bot_id": bot_id, "status": "STOPPED"}
+
+
+@router.get("/{bot_id}/state")
+def get_bot_state(bot_id: str, sf=Depends(get_session_factory)):
+    """Return the bot's live position state from its JSON state file."""
+    import json
+    from pathlib import Path
+
+    repo = BotRepository(sf)
+    b = repo.get(bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    # Read the JSON state file
+    config = json.loads(b.config_json) if b.config_json else {}
+    symbol = config.get("symbol", "")
+    state_dir = Path.home() / ".ib-trader" / "bot-state"
+    state_file = state_dir / f"{bot_id}-{symbol}.json"
+
+    if not state_file.exists():
+        return {"position_state": "FLAT"}
+
+    try:
+        return json.loads(state_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"position_state": "FLAT"}
+
+
+@router.post("/{bot_id}/force-buy", status_code=202)
+def force_buy(bot_id: str, sf=Depends(get_session_factory)):
+    """Signal a running bot to place a forced buy on its next tick.
+
+    Only works when bot is RUNNING. The bot checks last_action at
+    the top of each tick and clears the flag immediately.
+    """
+    repo = BotRepository(sf)
+    b = repo.get(bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    if b.status != BotStatus.RUNNING:
+        raise HTTPException(status_code=409, detail="Bot is not running")
+    repo.update_action(bot_id, "FORCE_BUY")
+    return {"bot_id": bot_id, "action": "FORCE_BUY"}
+
+
+@router.get("/{bot_id}/events")
+def get_bot_events(
+    bot_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    event_type: str | None = Query(None),
+    sf=Depends(get_session_factory),
+):
+    """Return recent bot events (audit trail).
+
+    Optional filter by event_type (BAR, SKIP, SIGNAL, ORDER, FILL, etc.).
+    """
+    repo = BotRepository(sf)
+    b = repo.get(bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    events_repo = BotEventRepository(sf)
+    if event_type:
+        events = events_repo.get_by_type(bot_id, event_type, limit=limit)
+    else:
+        events = events_repo.get_for_bot(bot_id, limit=limit)
+
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "message": e.message,
+            "payload": e.payload_json,
+            "trade_serial": e.trade_serial,
+            "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+        }
+        for e in events
+    ]

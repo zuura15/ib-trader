@@ -90,6 +90,15 @@ class BotRepository:
             bot.updated_at = _now_utc()
             s.commit()
 
+    def update_action_raw(self, bot_id: str, action: str | None) -> None:
+        """Set last_action to an arbitrary value (including None) without updating last_action_at."""
+        s = self._session()
+        bot = s.query(Bot).filter(Bot.id == bot_id).first()
+        if bot:
+            bot.last_action = action
+            bot.updated_at = _now_utc()
+            s.commit()
+
     def increment_trades(self, bot_id: str) -> None:
         """Atomically increment trades_total and trades_today counters.
 
@@ -155,6 +164,16 @@ class BotEventRepository:
             self._session()
             .query(BotEvent)
             .filter(BotEvent.bot_id == bot_id, BotEvent.event_type == event_type)
+            .order_by(BotEvent.recorded_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+    def get_recent(self, limit: int = 50) -> list[BotEvent]:
+        """Return recent events across all bots, newest first."""
+        return (
+            self._session()
+            .query(BotEvent)
             .order_by(BotEvent.recorded_at.desc())
             .limit(limit)
             .all()

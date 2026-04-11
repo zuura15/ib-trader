@@ -112,6 +112,9 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
     if verb == "refresh":
         return "Refresh triggered."
 
+    # subscribe_bars and unsubscribe_bars are handled in _execute_single_command
+    # since they need async context.
+
     return verb
 
 
@@ -150,6 +153,35 @@ async def _execute_single_command(cmd_row, ctx: AppContext,
         print(f"[ENGINE] EXEC  {cmd_row.command_text!r} (source={cmd_row.source}, broker={cmd_row.broker})")
 
         try:
+            # Handle bar subscription commands before normal parsing
+            cmd_text = cmd_row.command_text.strip()
+            if cmd_text.startswith("subscribe_bars "):
+                symbol = cmd_text.split(maxsplit=1)[1].strip()
+                output = await _handle_subscribe_bars(symbol, cmd_ctx)
+                cmd_ctx.pending_commands.complete(
+                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
+                )
+                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
+                return
+            if cmd_text.startswith("warmup_bars "):
+                parts = cmd_text.split()
+                symbol = parts[1]
+                duration = int(parts[2]) if len(parts) > 2 else 7200
+                output = await _handle_warmup_bars(symbol, duration, cmd_ctx)
+                cmd_ctx.pending_commands.complete(
+                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
+                )
+                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
+                return
+            if cmd_text.startswith("unsubscribe_bars "):
+                symbol = cmd_text.split(maxsplit=1)[1].strip()
+                output = await _handle_unsubscribe_bars(symbol, cmd_ctx)
+                cmd_ctx.pending_commands.complete(
+                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
+                )
+                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
+                return
+
             parsed = parse_command(cmd_row.command_text, router=cmd_router)
 
             if parsed is None:
@@ -249,6 +281,238 @@ async def recover_stale_commands(ctx: AppContext) -> int:
             "source": cmd_row.source,
         }))
     return len(stale)
+
+
+# Active bar subscriptions: {symbol: con_id}
+_bar_subscriptions: dict[str, int] = {}
+
+
+async def _handle_subscribe_bars(symbol: str, ctx: AppContext) -> str:
+    """Subscribe to bar data and streaming quotes for a symbol.
+
+    Two background tasks:
+    1. Bar poller: fetches 5-sec bars via reqHistoricalData every 30 seconds
+    2. Quote writer: reads streaming ticker every 2 seconds, writes to market_quotes
+    """
+    from ib_trader.data.models import MarketBar, MarketQuote
+    from datetime import datetime, timezone
+
+    if symbol in _bar_subscriptions:
+        return f"Already subscribed to bars for {symbol}"
+
+    # Ensure tables exist
+    db_engine = ctx.pending_commands._session().get_bind()
+    MarketBar.__table__.create(bind=db_engine, checkfirst=True)
+    MarketQuote.__table__.create(bind=db_engine, checkfirst=True)
+
+    # Qualify the contract
+    contract_info = await ctx.ib.qualify_contract(symbol)
+    con_id = contract_info["con_id"]
+
+    session_factory = ctx.pending_commands._session_factory
+    _bar_subscriptions[symbol] = con_id
+
+    # Start a background polling task
+    async def _poll_bars():
+        """Poll IB for recent 5-sec bars every 30 seconds."""
+        last_bar_time = None
+        while symbol in _bar_subscriptions:
+            try:
+                await ctx.ib._throttle()
+                contract = ctx.ib._contract_cache.get(con_id)
+                if contract is None:
+                    logger.warning('{"event": "BAR_POLL_NO_CONTRACT", "symbol": "%s"}', symbol)
+                    await asyncio.sleep(30)
+                    continue
+
+                bars = await ctx.ib._ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr="120 S",
+                    barSizeSetting="5 secs",
+                    whatToShow="TRADES",
+                    useRTH=False,
+                    formatDate=2,
+                )
+
+                if bars:
+                    session = session_factory()
+                    new_count = 0
+                    for bar in bars:
+                        bar_time = bar.date
+                        if last_bar_time and bar_time <= last_bar_time:
+                            continue
+                        bar_row = MarketBar(
+                            symbol=symbol,
+                            bar_seconds=5,
+                            timestamp_utc=bar_time,
+                            open=bar.open,
+                            high=bar.high,
+                            low=bar.low,
+                            close=bar.close,
+                            volume=int(bar.volume),
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        session.add(bar_row)
+                        new_count += 1
+                    if new_count > 0:
+                        session.commit()
+                        last_bar_time = bars[-1].date
+                        logger.debug(
+                            '{"event": "BARS_POLLED", "symbol": "%s", "new": %d, "total_in_batch": %d}',
+                            symbol, new_count, len(bars),
+                        )
+                    else:
+                        session.rollback()
+
+                    # Purge old bars (keep last 24h)
+                    try:
+                        from datetime import timedelta
+                        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                        session.execute(
+                            __import__("sqlalchemy").text(
+                                "DELETE FROM market_bars WHERE symbol = :s AND timestamp_utc < :c"
+                            ),
+                            {"s": symbol, "c": cutoff},
+                        )
+                        session.commit()
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                logger.warning('{"event": "BAR_POLL_ERROR", "symbol": "%s", "error": "%s"}',
+                               symbol, exc)
+                try:
+                    session_factory().rollback()
+                except Exception:
+                    pass
+
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_poll_bars())
+
+    # Also subscribe to streaming market data for real-time quotes
+    await ctx.ib.subscribe_market_data(con_id, symbol)
+
+    async def _poll_quotes():
+        """Write latest streaming ticker to market_quotes every 2 seconds."""
+        while symbol in _bar_subscriptions:
+            try:
+                ticker = ctx.ib.get_ticker(con_id)
+                if ticker:
+                    bid = ticker.get("bid")
+                    ask = ticker.get("ask")
+                    last = ticker.get("last")
+                    vol = ticker.get("volume")
+
+                    # Only write if we have at least one valid price
+                    if bid or ask or last:
+                        session = session_factory()
+                        from ib_trader.data.models import MarketQuote
+                        # Upsert: update if exists, insert if not
+                        existing = session.query(MarketQuote).filter(
+                            MarketQuote.symbol == symbol
+                        ).first()
+                        now = datetime.now(timezone.utc)
+                        if existing:
+                            if bid: existing.bid = bid
+                            if ask: existing.ask = ask
+                            if last: existing.last = last
+                            if vol: existing.volume = int(vol)
+                            existing.updated_at = now
+                        else:
+                            session.add(MarketQuote(
+                                symbol=symbol,
+                                bid=bid, ask=ask, last=last,
+                                volume=int(vol) if vol else None,
+                                updated_at=now,
+                            ))
+                        session.commit()
+            except Exception as exc:
+                logger.debug('{"event": "QUOTE_WRITE_ERROR", "symbol": "%s", "error": "%s"}',
+                             symbol, exc)
+                try:
+                    session_factory().rollback()
+                except Exception:
+                    pass
+            await asyncio.sleep(2)
+
+    asyncio.create_task(_poll_quotes())
+
+    logger.info(json.dumps({
+        "event": "BARS_SUBSCRIBED", "symbol": symbol, "con_id": con_id,
+        "method": "historical_polling + streaming_quotes",
+    }))
+    return f"Subscribed to bars + quotes for {symbol} (con_id={con_id})"
+
+
+async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContext) -> str:
+    """Fetch historical 5-sec bars and write to market_bars for bot warmup."""
+    from ib_trader.data.models import MarketBar
+    from datetime import datetime, timezone
+
+    db_engine = ctx.pending_commands._session().get_bind()
+    MarketBar.__table__.create(bind=db_engine, checkfirst=True)
+
+    contract_info = await ctx.ib.qualify_contract(symbol)
+    con_id = contract_info["con_id"]
+    contract = ctx.ib._contract_cache.get(con_id)
+
+    if contract is None:
+        return f"No cached contract for {symbol}"
+
+    await ctx.ib._throttle()
+    bars = await ctx.ib._ib.reqHistoricalDataAsync(
+        contract,
+        endDateTime="",
+        durationStr=f"{duration_seconds} S",
+        barSizeSetting="5 secs",
+        whatToShow="TRADES",
+        useRTH=False,
+        formatDate=2,
+    )
+
+    if not bars:
+        return f"No historical bars returned for {symbol}"
+
+    session_factory = ctx.pending_commands._session_factory
+    session = session_factory()
+    count = 0
+    for bar in bars:
+        bar_row = MarketBar(
+            symbol=symbol,
+            bar_seconds=5,
+            timestamp_utc=bar.date,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=int(bar.volume),
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(bar_row)
+        count += 1
+    session.commit()
+
+    logger.info(json.dumps({
+        "event": "WARMUP_BARS_LOADED", "symbol": symbol,
+        "count": count, "duration_s": duration_seconds,
+    }))
+    return f"Loaded {count} warmup bars for {symbol} ({duration_seconds}s of history)"
+
+
+async def _handle_unsubscribe_bars(symbol: str, ctx: AppContext) -> str:
+    """Unsubscribe from bars and streaming quotes for a symbol."""
+    con_id = _bar_subscriptions.pop(symbol, None)
+    if con_id is None:
+        return f"No active bar subscription for {symbol}"
+
+    await ctx.ib.unsubscribe_realtime_bars(con_id)
+    await ctx.ib.unsubscribe_market_data(con_id)
+    logger.info(json.dumps({
+        "event": "BARS_UNSUBSCRIBED", "symbol": symbol, "con_id": con_id,
+    }))
+    return f"Unsubscribed from bars + quotes for {symbol}"
 
 
 async def engine_loop(ctx: AppContext,

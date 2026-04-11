@@ -147,6 +147,12 @@ class MockIBClient(IBClientBase):
         self.fill_callbacks.pop(ib_order_id, None)
         self.status_callbacks.pop(ib_order_id, None)
 
+    async def subscribe_realtime_bars(self, con_id, symbol, what_to_show="TRADES", callback=None):
+        pass  # No-op in mock
+
+    async def unsubscribe_realtime_bars(self, con_id):
+        pass  # No-op in mock
+
     async def simulate_fill(self, ib_order_id: str, qty: Decimal, price: Decimal,
                             commission: Decimal = Decimal("1.00")) -> None:
         """Simulate a fill event for testing."""

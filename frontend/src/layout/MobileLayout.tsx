@@ -7,7 +7,10 @@ import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
 import { TradesPanel } from '../features/trades/TradesPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { LogStream } from '../features/logs/LogStream';
-const TABS = ['Trade', 'Watch', 'Orders', 'Logs'] as const;
+import { BotsPanel } from '../features/bots/BotsPanel';
+import { BotLogStream } from '../features/bots/BotLogStream';
+import { BotActivity } from '../features/bots/BotActivity';
+const TABS = ['Trade', 'Watch', 'Orders', 'Bots', 'Activity', 'Logs'] as const;
 
 // ---------------------------------------------------------------------------
 // Vertical resize handle for the mobile Trade tab split
@@ -374,7 +377,34 @@ export function MobileLayout() {
           </div>
         </div>
 
-        {/* Tab 3: Logs — alerts + log stream */}
+        {/* Tab 4: Bots — bot controls + bot log */}
+        <div
+          id="tabpanel-Bots"
+          role="tabpanel"
+          aria-labelledby="tab-Bots"
+          className="flex flex-col shrink-0 w-screen h-full"
+          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
+        >
+          <div style={{ maxHeight: '30%', overflow: 'auto' }}>
+            <BotsPanel />
+          </div>
+          <div className="flex-1 overflow-hidden">
+            <BotLogStream maxLines={200} />
+          </div>
+        </div>
+
+        {/* Tab 5: Activity — bot buys, sells, starts, stops, errors */}
+        <div
+          id="tabpanel-Activity"
+          role="tabpanel"
+          aria-labelledby="tab-Activity"
+          className="flex flex-col shrink-0 w-screen h-full overflow-hidden"
+          style={{ scrollSnapAlign: 'start' }}
+        >
+          <BotActivity maxLines={200} />
+        </div>
+
+        {/* Tab 6: Logs — alerts + log stream */}
         <div
           id="tabpanel-Logs"
           role="tabpanel"

@@ -146,6 +146,7 @@ _CHANNEL_KEYS: dict[str, str] = {
     "alerts": "id",
     "commands": "id",
     "heartbeats": "process",
+    "bot_events": "id",
 }
 
 
@@ -206,12 +207,28 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
                     results.append(_serialize_heartbeat(hb))
             return results
 
+        elif channel == "bot_events":
+            from ib_trader.data.repositories.bot_repository import BotEventRepository
+            events = BotEventRepository(sf).get_recent(limit=50)
+            return [
+                {
+                    "id": e.id,
+                    "bot_id": e.bot_id,
+                    "event_type": e.event_type,
+                    "message": e.message,
+                    "payload": e.payload_json,
+                    "trade_serial": e.trade_serial,
+                    "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+                }
+                for e in events
+            ]
+
         return []
     finally:
         sf.remove()
 
 
-_VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats"}
+_VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats", "bot_events"}
 
 
 @router.websocket("/ws")

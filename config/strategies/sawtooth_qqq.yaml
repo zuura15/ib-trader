@@ -1,0 +1,44 @@
+# Sawtooth RSI Reversal Strategy Configuration
+# Buys intraday dips within confirmed sawtooth uptrends on 3-minute bars.
+
+name: sawtooth_rsi_reversal
+version: "1.0"
+
+# Symbol and sizing
+symbol: QQQ
+max_position_value: 10000     # $10K max per trade
+max_shares: 20                # hard cap regardless of price
+order_strategy: mid           # limit at midpoint for entry
+
+# Bar configuration
+bar_size_seconds: 180         # 3-minute bars
+lookback_bars: 20             # ~60 min of 3-min bars, prefilled on startup
+
+# Entry conditions (ALL must be true)
+entry:
+  sawtooth_trend_swings: 2    # min ascending swing pairs (2 = short trend)
+  swing_window: 3             # bars each side for swing confirmation (3 = faster detection)
+  max_bars_since_swing_low: 5 # must be near a recent swing low
+  max_rsi: 60                 # RSI(14) must be below this
+  swing_proximity_pct: 0.001  # 0.1% price proximity to swing low
+
+# Exit rules
+exit:
+  hard_stop_loss_pct: 0.001       # -0.1% from entry, always active
+  trail_activation_pct: 0.0005    # +0.05% gain before trail activates
+  trail_width_pct: 0.0015         # 0.15% below high-water mark
+  time_stop_minutes: 108          # keyed from fill timestamp
+  entry_timeout_seconds: 30       # cancel unfilled entry after this
+  exit_price: bid                 # which quote field triggers stops
+
+# Session filters
+session_filter:
+  skip_close_transition: true     # skip 1:00-2:00 PM PT
+  skip_turn_minutes: 5            # skip 5 min before/after hour/half-hour
+
+# Risk controls
+risk:
+  max_daily_loss_pct: 0.02        # 2% of account ($200)
+  max_concurrent_positions: 1
+  max_trades_per_day: 10
+  account_value: "10000"

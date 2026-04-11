@@ -319,3 +319,37 @@ class IBClientBase(ABC):
             ib_order_id: IB order ID whose callbacks should be removed.
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Real-time bars (5-second streaming)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def subscribe_realtime_bars(
+        self, con_id: int, symbol: str,
+        what_to_show: str = "TRADES",
+        callback=None,
+    ) -> None:
+        """Subscribe to 5-second real-time bars for a contract.
+
+        Ref-counted: calling twice increments count without duplicating.
+
+        Args:
+            con_id: IB contract ID.
+            symbol: Ticker symbol (for logging).
+            what_to_show: Data type (TRADES, MIDPOINT, BID, ASK).
+            callback: async callable(bar_data: dict) invoked on each bar.
+                      bar_data keys: time, open, high, low, close, volume.
+        """
+        ...
+
+    @abstractmethod
+    async def unsubscribe_realtime_bars(self, con_id: int) -> None:
+        """Cancel real-time bar subscription.
+
+        Ref-counted: only cancels when count reaches zero.
+
+        Args:
+            con_id: IB contract ID.
+        """
+        ...

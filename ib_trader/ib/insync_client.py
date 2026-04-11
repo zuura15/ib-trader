@@ -97,6 +97,8 @@ class InsyncClient(IBClientBase):
         # Ref-counted streaming market data subscriptions.
         # Key: con_id, Value: {"ticker": Ticker, "refs": int, "contract": Contract}
         self._streaming: dict[int, dict] = {}
+        # Ref-counted 5-second real-time bar subscriptions.
+        self._realtime_bars: dict[int, dict] = {}
         # Disconnect handling. _expected_disconnect is set True before we
         # intentionally call disconnect() so the disconnectedEvent handler
         # knows not to scream about it. _on_unexpected_disconnect is an
@@ -724,6 +726,95 @@ class InsyncClient(IBClientBase):
             logger.debug(
                 '{"event": "CALLBACKS_UNREGISTERED", "ib_order_id": "%s"}',
                 ib_order_id,
+            )
+
+    # ------------------------------------------------------------------
+    # Real-time bars (5-second streaming)
+    # ------------------------------------------------------------------
+
+    async def subscribe_realtime_bars(
+        self, con_id: int, symbol: str,
+        what_to_show: str = "TRADES",
+        callback=None,
+    ) -> None:
+        """Subscribe to 5-second real-time bars (ref-counted)."""
+        if con_id in self._realtime_bars:
+            entry = self._realtime_bars[con_id]
+            entry["refs"] += 1
+            if callback and callback not in entry["callbacks"]:
+                entry["callbacks"].append(callback)
+            logger.debug(
+                '{"event": "RT_BARS_REF_INC", "con_id": %d, "symbol": "%s", "refs": %d}',
+                con_id, symbol, entry["refs"],
+            )
+            return
+
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, symbol=symbol, secType="STK",
+            exchange="SMART", currency="USD",
+        )
+        bars = self._ib.reqRealTimeBars(
+            contract, barSize=5, whatToShow=what_to_show, useRTH=False,
+        )
+        callbacks = [callback] if callback else []
+        self._realtime_bars[con_id] = {
+            "bars": bars, "refs": 1, "contract": contract,
+            "callbacks": callbacks, "symbol": symbol,
+        }
+
+        # Register update handler
+        def on_bar_update(bars, has_new_bar):
+            if has_new_bar and bars:
+                bar = bars[-1]
+                bar_data = {
+                    "time": bar.time,
+                    "open": float(bar.open_),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": int(bar.volume),
+                }
+                entry = self._realtime_bars.get(con_id)
+                if entry:
+                    for cb in entry["callbacks"]:
+                        try:
+                            import asyncio
+                            if asyncio.iscoroutinefunction(cb):
+                                asyncio.ensure_future(cb(bar_data))
+                            else:
+                                cb(bar_data)
+                        except Exception as exc:
+                            logger.warning(
+                                '{"event": "RT_BAR_CALLBACK_ERROR", "error": "%s"}',
+                                exc,
+                            )
+
+        bars.updateEvent += on_bar_update
+        logger.info(
+            '{"event": "RT_BARS_SUBSCRIBED", "con_id": %d, "symbol": "%s", "what": "%s"}',
+            con_id, symbol, what_to_show,
+        )
+
+    async def unsubscribe_realtime_bars(self, con_id: int) -> None:
+        """Cancel real-time bar subscription (ref-counted)."""
+        entry = self._realtime_bars.get(con_id)
+        if entry is None:
+            return
+        entry["refs"] -= 1
+        if entry["refs"] <= 0:
+            try:
+                self._ib.cancelRealTimeBars(entry["bars"])
+            except Exception:
+                pass
+            del self._realtime_bars[con_id]
+            logger.info(
+                '{"event": "RT_BARS_CANCELLED", "con_id": %d}', con_id,
+            )
+        else:
+            logger.debug(
+                '{"event": "RT_BARS_REF_DEC", "con_id": %d, "refs": %d}',
+                con_id, entry["refs"],
             )
 
     # IB codes that are purely informational — connectivity/farm status notices.

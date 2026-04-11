@@ -332,3 +332,39 @@ class OrderTemplate(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
+class MarketBar(Base):
+    """Raw 5-second bars streamed from IB for bot consumption.
+
+    Written by the engine's subscribe_bars command. Read by bot runtime.
+    Auto-purged after 24 hours.
+    """
+
+    __tablename__ = "market_bars"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    symbol        = Column(String(20), nullable=False, index=True)
+    bar_seconds   = Column(Integer, nullable=False, default=5)
+    timestamp_utc = Column(DateTime, nullable=False, index=True)
+    open          = Column(Numeric(18, 8), nullable=False)
+    high          = Column(Numeric(18, 8), nullable=False)
+    low           = Column(Numeric(18, 8), nullable=False)
+    close         = Column(Numeric(18, 8), nullable=False)
+    volume        = Column(Integer, nullable=False, default=0)
+    created_at    = Column(DateTime, nullable=False)
+
+
+class MarketQuote(Base):
+    """Latest streaming quote per symbol. One row per symbol, updated in place.
+
+    Written by the engine every ~2 seconds from reqMktData streaming ticker.
+    Read by bot runtime for near-real-time exit monitoring.
+    """
+
+    __tablename__ = "market_quotes"
+
+    symbol        = Column(String(20), primary_key=True)
+    bid           = Column(Numeric(18, 8), nullable=True)
+    ask           = Column(Numeric(18, 8), nullable=True)
+    last          = Column(Numeric(18, 8), nullable=True)
+    volume        = Column(Integer, nullable=True)
+    updated_at    = Column(DateTime, nullable=False)

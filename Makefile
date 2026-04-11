@@ -23,6 +23,7 @@ dev:
 	@trap 'trap "" INT TERM; kill -TERM 0; wait; exit 0' INT TERM; \
 	uv run ib-engine & \
 	uv run ib-api & \
+	uv run ib-bots & \
 	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
 	wait
 
