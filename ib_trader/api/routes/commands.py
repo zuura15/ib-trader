@@ -26,6 +26,11 @@ async def submit_command(body: CommandRequest):
     Forwards to the engine's internal API for immediate execution.
     No polling — the engine processes synchronously and returns the result.
     """
+    # SAFETY: never forward in test environments
+    import os
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TESTING"):
+        raise HTTPException(status_code=503, detail="Command forwarding disabled in test environment")
+
     settings = load_settings("config/settings.yaml")
     engine_port = settings.get("engine_internal_port", 8081)
     engine_url = f"http://127.0.0.1:{engine_port}"

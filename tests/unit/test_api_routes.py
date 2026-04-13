@@ -56,11 +56,11 @@ def _now():
 class TestCommandRoutes:
     """POST /api/commands and GET /api/commands/{id}."""
 
-    def test_submit_forwards_to_engine(self, client):
-        """Commands forward to engine HTTP API — returns 202 accepted."""
-        resp = client.post("/api/commands", json={"command": "buy AAPL 10 mid"})
-        # The async forward runs in background; we just check it's accepted
-        assert resp.status_code in (202, 500, 503)
+    def test_submit_blocked_in_test_env(self, client):
+        """Commands are blocked in test environment to prevent live order placement."""
+        resp = client.post("/api/commands", json={"command": "status"})
+        # PYTEST_CURRENT_TEST env var is set by pytest — commands are blocked
+        assert resp.status_code == 503
 
     def test_get_nonexistent_command_404(self, client):
         resp = client.get("/api/commands/nonexistent-id")
