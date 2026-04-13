@@ -249,8 +249,10 @@ class ExecutionMiddleware:
         }
         if order.price is not None:
             payload["price"] = str(order.price)
-        if order.profit is not None:
-            payload["profit"] = str(order.profit)
+        if order.params.get("profit_target") is not None:
+            payload["profit"] = str(order.params["profit_target"])
+        if order.params.get("stop_loss") is not None:
+            payload["stop_loss"] = str(order.params["stop_loss"])
 
         # Use close endpoint for SELL orders with a serial
         if order.side == "SELL" and serial:
