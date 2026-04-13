@@ -64,19 +64,34 @@ function forceBuy(botId: string) {
 
 function PositionLine({ botId, symbol }: { botId: string; symbol: string }) {
   const [state, setState] = useState<BotPositionState>({});
+  const [livePrice, setLivePrice] = useState<number>(0);
 
   useEffect(() => {
-    const fetchState = () => {
-      fetch(`/api/bots/${botId}/state`)
-        .then((r) => r.ok ? r.json() : {})
-        .then((data: BotPositionState) => setState(data))
-        .catch(() => {});
+    const fetchAll = async () => {
+      // Bot strategy state (entry, qty, hwm, etc.)
+      try {
+        const r = await fetch(`/api/bots/${botId}/state`);
+        if (r.ok) setState(await r.json());
+      } catch {}
+
+      // Live quote from watchlist (real-time bid/ask/last)
+      try {
+        const r = await fetch(`/api/watchlist`);
+        if (r.ok) {
+          const data = await r.json();
+          const item = data.items?.find((i: any) => i.symbol === symbol);
+          if (item) {
+            const last = parseFloat(item.last) || 0;
+            if (last > 0) setLivePrice(last);
+          }
+        }
+      } catch {}
     };
-    fetchState();
+    fetchAll();
     // Poll every 2 seconds for responsive P&L updates
-    const interval = setInterval(fetchState, 2000);
+    const interval = setInterval(fetchAll, 2000);
     return () => clearInterval(interval);
-  }, [botId]);
+  }, [botId, symbol]);
 
   if (!state.position_state || state.position_state === 'FLAT') return null;
 
@@ -84,11 +99,12 @@ function PositionLine({ botId, symbol }: { botId: string; symbol: string }) {
   const qty = state.qty ? parseFloat(state.qty) : 0;
   const hwm = state.high_water_mark ? parseFloat(state.high_water_mark) : 0;
   const stop = state.current_stop ? parseFloat(state.current_stop) : 0;
-  const lastPrice = state.last_price ? parseFloat(state.last_price) : 0;
-  // last_price is the actual bid, updated every ~5s. Fall back to hwm then entry.
-  const price = lastPrice > 0 ? lastPrice : (hwm > 0 ? hwm : entry);
+  const botLastPrice = state.last_price ? parseFloat(state.last_price) : 0;
+  // Prefer live quote (always fresh); fall back to bot's tracked price.
+  const price = livePrice > 0 ? livePrice : (botLastPrice > 0 ? botLastPrice : (hwm > 0 ? hwm : entry));
+  // P&L: long position = (price - entry) * qty; short position = (entry - price) * |qty|
   const pnl = entry > 0 && price > 0 ? (price - entry) * qty : 0;
-  const pnlPct = entry > 0 ? ((price - entry) / entry) * 100 : 0;
+  const pnlPct = entry > 0 ? ((price - entry) / entry) * 100 * (qty >= 0 ? 1 : -1) : 0;
 
   return (
     <div className="ml-4 mt-1 px-2 py-1 rounded text-[11px] font-mono"
