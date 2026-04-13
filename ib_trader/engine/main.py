@@ -411,6 +411,34 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             serial = ref.serial if ref else 0
             side = ref.side if ref else ""
 
+            # If this fill is NOT from a bot (no orderRef), check if any bot
+            # holds positions in this symbol — they need to know about the
+            # external manipulation
+            if not ref and hasattr(ctx.ib, '_active_trades'):
+                trade = ctx.ib._active_trades.get(ib_order_id)
+                if trade and hasattr(trade, 'contract'):
+                    ext_symbol = trade.contract.symbol
+                    ext_side = trade.order.action if hasattr(trade, 'order') else ""
+                    # Find any bots tracking this symbol and notify them
+                    async for key in redis.scan_iter(match=f"pos:*:{ext_symbol}"):
+                        parts = key.split(":")
+                        if len(parts) == 3:
+                            affected_bot_ref = parts[1]
+                            ext_writer = StreamWriter(redis, StreamNames.fill(affected_bot_ref), maxlen=500)
+                            await ext_writer.add({
+                                "type": "EXTERNAL_FILL",
+                                "symbol": ext_symbol,
+                                "side": ext_side,
+                                "qty": str(qty_filled),
+                                "price": str(avg_price),
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                            })
+                            logger.info(
+                                '{"event": "EXTERNAL_FILL_DETECTED", "symbol": "%s", '
+                                '"bot_ref": "%s", "side": "%s", "qty": "%s"}',
+                                ext_symbol, affected_bot_ref, ext_side, qty_filled,
+                            )
+
             # Publish to fill stream
             writer = StreamWriter(redis, StreamNames.fill(bot_ref), maxlen=500)
             await writer.add({
@@ -591,34 +619,11 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
-        # If position went to zero, find the specific bot that owned it.
-        # Only flatten the FIRST matching key to avoid multi-bot collision
-        # when two bots trade the same symbol.
-        if qty == 0:
-            state = StateStore(redis)
-            async for key in redis.scan_iter(match=f"pos:*:{symbol}"):
-                current = await state.get(key)
-                if current and current.get("state") in ("OPEN", "EXITING"):
-                    bot_ref = key.split(":")[1]
-                    prev_state = current["state"]
-                    current["state"] = "FLAT"
-                    current["qty"] = "0"
-                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    await state.set(key, current)
-
-                    # Notify the bot
-                    fill_writer = StreamWriter(redis, StreamNames.fill(bot_ref), maxlen=500)
-                    await fill_writer.add({
-                        "type": "POSITION_CLOSED_EXTERNALLY",
-                        "symbol": symbol,
-                        "prev_state": prev_state,
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                    })
-                    logger.info(
-                        '{"event": "EXTERNAL_CLOSE_DETECTED", "symbol": "%s", "bot_ref": "%s"}',
-                        symbol, bot_ref,
-                    )
-                    break  # Only flatten ONE bot's key per position close
+        # NOTE: do NOT touch pos:{bot_ref}:{symbol} keys here.
+        # IB's net position can be 0 while a bot still owns shares (offset by
+        # manual positions on the same symbol). Bot positions are tracked
+        # SOLELY by orderRef-tagged fills via the on_fill callback.
+        # External manipulation only affects ibpos:* keys (IB's net view).
 
     except Exception:
         logger.exception('{"event": "POSITION_EVENT_ERROR"}')
