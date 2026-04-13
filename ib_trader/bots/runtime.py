@@ -213,16 +213,28 @@ class StrategyBotRunner(BotBase):
         ])
         self._risk_mw = risk_mw
 
-        # Subscribe to bars via engine HTTP API
+        # Subscribe to bars via engine HTTP API (retry — engine may not be ready yet)
         symbol = self.strategy_config["symbol"]
         import httpx
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{engine_url}/engine/subscribe-bars",
-                json={"symbol": symbol},
-            )
-            resp.raise_for_status()
-            logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
+        for attempt in range(10):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        f"{engine_url}/engine/subscribe-bars",
+                        json={"symbol": symbol},
+                    )
+                    resp.raise_for_status()
+                    logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
+                    break
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt < 9:
+                    logger.info(
+                        '{"event": "ENGINE_NOT_READY", "attempt": %d, "symbol": "%s"}',
+                        attempt + 1, symbol,
+                    )
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning('{"event": "ENGINE_CONNECT_GAVE_UP", "symbol": "%s"}', symbol)
 
         # Warmup: prefetch historical 3-min bars to fill the aggregator immediately
         await self._warmup_from_history(symbol)
