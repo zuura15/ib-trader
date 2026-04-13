@@ -26,25 +26,15 @@ _MAX_SYMBOLS = 50
 
 @router.get("")
 async def get_watchlist(redis=Depends(get_redis)):
-    """Return live watchlist data.
+    """Return live watchlist data from Redis."""
+    if redis is None:
+        return JSONResponse(
+            content={"error": "Redis not available"},
+            status_code=503,
+        )
 
-    Primary: reads from Redis quote keys (real-time).
-    Fallback: reads from run/watchlist.json (5s stale).
-    """
-    if redis is not None:
-        try:
-            data = await _watchlist_from_redis(redis)
-            if data:
-                return JSONResponse(
-                    content=data,
-                    headers={"Cache-Control": "no-store, max-age=0"},
-                )
-        except Exception:
-            logger.exception('{"event": "REDIS_WATCHLIST_ERROR"}')
-
-    try:
-        data = json.loads(_WATCHLIST_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    data = await _watchlist_from_redis(redis)
+    if data is None:
         data = {"generated_at": None, "items": []}
 
     return JSONResponse(

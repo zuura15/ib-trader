@@ -170,55 +170,43 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
         print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
 
-        # --- Redis setup ---
+        # --- Redis setup (required) ---
         redis_url = ctx.settings.get("redis_url", "redis://localhost:6379/0")
-        try:
-            from ib_trader.redis.client import get_redis
-            redis = await get_redis(redis_url)
-            ctx.redis = redis
-            print("[ENGINE] Connected to Redis.")
-        except Exception as e:
-            logger.warning(
-                '{"event": "REDIS_CONNECT_FAILED", "error": "%s"}', str(e),
-            )
-            print(f"[ENGINE] WARNING: Redis not available ({e}). Running without Redis.")
-            redis = None
+        from ib_trader.redis.client import get_redis
+        redis = await get_redis(redis_url)
+        ctx.redis = redis
+        print("[ENGINE] Connected to Redis.")
 
         # --- Start background tasks ---
         bg_tasks = [
             asyncio.create_task(_heartbeat_loop(ctx, pid)),
-            # Legacy position/watchlist loops kept as dual-write safety net
-            asyncio.create_task(_position_cache_loop(ctx)),
-            asyncio.create_task(_watchlist_cache_loop(ctx)),
-        ]
 
-        # Redis-dependent tasks
-        if redis:
             # Event relay: IB callbacks → Redis streams + keys
-            bg_tasks.append(asyncio.create_task(_event_relay_loop(ctx)))
+            asyncio.create_task(_event_relay_loop(ctx)),
 
             # Tick publisher: streaming ticks → Redis
-            bg_tasks.append(asyncio.create_task(_tick_publisher_loop(ctx)))
+            asyncio.create_task(_tick_publisher_loop(ctx)),
+        ]
 
-            # Reconciler: startup recovery + sanity checks
-            from ib_trader.engine.reconciler import Reconciler
-            reconciler = Reconciler(
-                ctx.ib, redis,
-                sanity_interval=ctx.settings.get("reconciler_sanity_interval", 60),
-            )
-            await reconciler.startup_reconcile()
-            bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
-            print("[ENGINE] Reconciler started.")
+        # Reconciler: startup recovery + sanity checks
+        from ib_trader.engine.reconciler import Reconciler
+        reconciler = Reconciler(
+            ctx.ib, redis,
+            sanity_interval=ctx.settings.get("reconciler_sanity_interval", 60),
+        )
+        await reconciler.startup_reconcile()
+        bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
+        print("[ENGINE] Reconciler started.")
 
-            # Internal HTTP API
-            from ib_trader.engine.internal_api import start_internal_api
-            internal_port = ctx.settings.get("engine_internal_port", 8081)
-            api_task = await start_internal_api(ctx, port=internal_port)
-            bg_tasks.append(api_task)
-            print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
+        # Internal HTTP API
+        from ib_trader.engine.internal_api import start_internal_api
+        internal_port = ctx.settings.get("engine_internal_port", 8081)
+        api_task = await start_internal_api(ctx, port=internal_port)
+        bg_tasks.append(api_task)
+        print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
 
-        # Legacy engine loop (polls pending_commands) — kept for REPL/API
-        # commands during dual-write transition. Will be removed in Phase 5.
+        # Engine loop — handles commands from REPL/API via pending_commands.
+        # Bot commands go through the HTTP API directly.
         from ib_trader.engine.service import engine_loop
         max_concurrent = ctx.settings.get("engine_max_concurrent", 5)
         poll_interval = ctx.settings.get("engine_poll_interval", 0.1)
@@ -605,366 +593,6 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
         except Exception:
             logger.exception('{"event": "HEARTBEAT_WRITE_FAILED"}')
         await asyncio.sleep(interval)
-
-
-async def _position_cache_loop(ctx: AppContext) -> None:
-    """Periodically fetch positions from IB, read live streaming prices via
-    the abstraction layer, and write to run/positions.json.
-
-    Uses ctx.ib.subscribe_market_data (ref-counted) so subscriptions are
-    shared with the watchlist loop without collision.
-    """
-    import json as _json
-    from decimal import Decimal
-
-    positions_path = Path("run/positions.json")
-    positions_path.parent.mkdir(parents=True, exist_ok=True)
-
-    class _Enc(_json.JSONEncoder):
-        def default(self, o):
-            if isinstance(o, Decimal):
-                return str(o)
-            return super().default(o)
-
-    # Get the raw ib_async IB object for positions() only (no market data calls)
-    ib_obj = None
-    if hasattr(ctx.ib, '_ib'):
-        ib_obj = ctx.ib._ib
-
-    if ib_obj is None:
-        logger.warning('{"event": "POSITION_CACHE_NO_IB_OBJ"}')
-        return
-
-    # Track which con_ids we've subscribed for positions
-    subscribed_con_ids: set[int] = set()
-
-    await asyncio.sleep(5)
-
-    while True:
-        try:
-            # Detect a dead Gateway eagerly. is_connected() flips false the
-            # moment ib_async sees the socket close, BEFORE the next IB call
-            # would hang or raise. Surface it as a CATASTROPHIC alert and
-            # skip this iteration so we don't write stale positions.
-            if hasattr(ctx.ib, "is_connected") and not ctx.ib.is_connected():
-                _raise_ib_disconnect_alert(ctx)
-                logger.error('{"event": "POSITION_CACHE_IB_DEAD"}')
-                await asyncio.sleep(2)
-                continue
-            try:
-                # Wrap in a timeout so a zombie Gateway (process dead but
-                # socket still open) cannot hang the loop forever.
-                await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
-            except asyncio.TimeoutError:
-                logger.error('{"event": "REQ_POSITIONS_TIMEOUT"}')
-                _raise_ib_disconnect_alert(ctx)
-                await asyncio.sleep(2)
-                continue
-            except (ConnectionError, OSError, BrokenPipeError) as e:
-                logger.error(
-                    '{"event": "REQ_POSITIONS_CONN_ERROR", "error": "%s"}',
-                    str(e),
-                )
-                _raise_ib_disconnect_alert(ctx)
-                await asyncio.sleep(2)
-                continue
-            except Exception:
-                # Anything else: log loud and keep going. Promoted from
-                # DEBUG so we don't lose visibility on real failures.
-                logger.warning('{"event": "REQ_POSITIONS_FAILED"}', exc_info=True)
-            raw_positions = ib_obj.positions()
-
-            current_con_ids = set()
-            for p in raw_positions:
-                con_id = p.contract.conId
-                current_con_ids.add(con_id)
-                if con_id not in subscribed_con_ids:
-                    try:
-                        await ctx.ib.subscribe_market_data(con_id, p.contract.symbol)
-                        subscribed_con_ids.add(con_id)
-                    except Exception:
-                        logger.debug(
-                            '{"event": "POSITION_SUB_FAILED", "con_id": %d}', con_id,
-                        )
-
-            # Unsubscribe positions we no longer hold
-            for gone_id in list(subscribed_con_ids - current_con_ids):
-                await ctx.ib.unsubscribe_market_data(gone_id)
-                subscribed_con_ids.discard(gone_id)
-
-            # Build output using the abstraction layer's get_ticker
-            positions = []
-            for idx, p in enumerate(raw_positions):
-                sym = p.contract.symbol
-                sec = p.contract.secType
-                con_id = p.contract.conId
-
-                mkt_price = None
-                ticker = ctx.ib.get_ticker(con_id)
-                if ticker is not None:
-                    bid = ticker.get("bid")
-                    ask = ticker.get("ask")
-                    last = ticker.get("last")
-                    if bid and ask:
-                        mkt_price = (bid + ask) / 2
-                    elif last:
-                        mkt_price = last
-
-                positions.append({
-                    "id": f"{sym}_{sec}_{idx}",
-                    "account_id": p.account,
-                    "symbol": sym,
-                    "sec_type": sec,
-                    "quantity": str(p.position),
-                    "avg_cost": str(p.avgCost),
-                    "market_price": f"{mkt_price:.4f}" if mkt_price is not None else None,
-                    "broker": "ib",
-                })
-
-            tmp_path = positions_path.with_suffix(".tmp")
-            tmp_path.write_text(_json.dumps(positions, cls=_Enc), encoding="utf-8")
-            tmp_path.rename(positions_path)
-            logger.debug('{"event": "POSITION_FILE_WRITTEN", "count": %d}', len(positions))
-
-        except Exception:
-            logger.exception('{"event": "POSITION_CACHE_ERROR"}')
-
-        try:
-            await asyncio.wait_for(position_refresh_event.wait(), timeout=2)
-            position_refresh_event.clear()
-        except asyncio.TimeoutError:
-            pass
-
-
-async def _watchlist_cache_loop(ctx: AppContext) -> None:
-    """Stream market data for watchlist symbols and write to run/watchlist.json.
-
-    Re-reads config/watchlist.yaml each cycle to pick up changes from the API.
-    Uses ref-counted streaming subscriptions shared with the position cache loop.
-    Paces new subscriptions (max 5 per cycle) to avoid IB rate limits.
-    """
-    import json as _json
-    from datetime import datetime, timezone
-    from decimal import Decimal
-
-    from ib_trader.config.loader import load_watchlist
-
-    watchlist_path = Path("run/watchlist.json")
-    watchlist_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # symbol → con_id mapping for active subscriptions
-    active: dict[str, int] = {}
-    # symbol → {next_retry: float, attempts: int} for failed qualifications
-    failed: dict[str, dict] = {}
-    # symbol → float for cached previous close (fetched once via historical data)
-    cached_close: dict[str, float] = {}
-    # symbol → int count of consecutive cycles with no last price (stale detection)
-    stale_cycles: dict[str, int] = {}
-    # symbol → int count of consecutive cycles where ticker_time hasn't advanced
-    time_stale_cycles: dict[str, int] = {}
-    # symbol → last seen ticker_time for time-based stale detection
-    last_ticker_time: dict[str, object] = {}
-
-    _MAX_NEW_PER_CYCLE = 5
-    _WATCHLIST_YAML = "config/watchlist.yaml"
-    _CYCLE_SECONDS = 5
-    _TIME_STALE_THRESHOLD = 12  # 12 cycles × 5s = 60s without a tick update
-
-    prev_symbols: list[str] = []
-
-    await asyncio.sleep(8)  # let positions loop start first
-    logger.info('{"event": "WATCHLIST_LOOP_STARTED"}')
-
-    while True:
-        try:
-            # Read current watchlist (fault-tolerant)
-            symbols = load_watchlist(_WATCHLIST_YAML)
-            if not symbols:
-                symbols = prev_symbols  # retain previous on read failure
-            else:
-                if symbols != prev_symbols:
-                    logger.info(
-                        '{"event": "WATCHLIST_CONFIG_RELOADED", "count": %d}',
-                        len(symbols),
-                    )
-                prev_symbols = symbols
-
-            wanted = set(symbols)
-            current = set(active.keys())
-
-            # Unsubscribe removed symbols
-            for sym in current - wanted:
-                con_id = active.pop(sym)
-                await ctx.ib.unsubscribe_market_data(con_id)
-                stale_cycles.pop(sym, None)
-                time_stale_cycles.pop(sym, None)
-                last_ticker_time.pop(sym, None)
-                cached_close.pop(sym, None)
-                logger.info(
-                    '{"event": "WATCHLIST_SUB_CANCELLED", "symbol": "%s"}', sym,
-                )
-
-            # Subscribe new symbols (paced)
-            added = 0
-            for sym in wanted - current:
-                if added >= _MAX_NEW_PER_CYCLE:
-                    break
-
-                # Check retry backoff for previously failed symbols
-                fail_info = failed.get(sym)
-                if fail_info and asyncio.get_event_loop().time() < fail_info["next_retry"]:
-                    continue
-
-                try:
-                    info = await ctx.ib.qualify_contract(sym)
-                    con_id = info["con_id"]
-                    await ctx.ib.subscribe_market_data(con_id, sym)
-                    active[sym] = con_id
-                    failed.pop(sym, None)
-                    added += 1
-                except Exception as e:
-                    attempts = (fail_info["attempts"] + 1) if fail_info else 1
-                    delay = min(30 * (2 ** (attempts - 1)), 300)  # 30s → 300s cap
-                    failed[sym] = {
-                        "next_retry": asyncio.get_event_loop().time() + delay,
-                        "attempts": attempts,
-                    }
-                    logger.warning(
-                        '{"event": "WATCHLIST_QUALIFY_FAILED", "symbol": "%s", '
-                        '"attempt": %d, "next_retry_s": %d, "error": "%s"}',
-                        sym, attempts, delay, str(e),
-                    )
-
-            # Build watchlist JSON
-            now = datetime.now(timezone.utc).isoformat()
-            items = []
-            for sym in symbols:
-                con_id = active.get(sym)
-                if con_id is None:
-                    # Not yet subscribed or failed
-                    fail_info = failed.get(sym)
-                    items.append({
-                        "symbol": sym,
-                        "last": None, "change": None, "change_pct": None,
-                        "volume": None, "avg_volume": None,
-                        "high": None, "low": None,
-                        "high_52w": None, "low_52w": None,
-                        "error": "qualification_failed" if fail_info and fail_info["attempts"] >= 5 else None,
-                    })
-                    continue
-
-                ticker = ctx.ib.get_ticker(con_id)
-
-                # Detect stale tickers via two strategies:
-                # 1. last is None for 3+ consecutive cycles (original check)
-                # 2. ticker_time hasn't advanced for _TIME_STALE_THRESHOLD
-                #    cycles — catches tickers that return cached non-None
-                #    values after IB stops pushing updates (GLD, ETFs).
-                t_last = ticker.get("last") if ticker else None
-                needs_resub = False
-
-                if t_last is None:
-                    stale_cycles[sym] = stale_cycles.get(sym, 0) + 1
-                    if stale_cycles[sym] >= 3:
-                        needs_resub = True
-                else:
-                    stale_cycles.pop(sym, None)
-
-                # Time-based staleness: if ticker_time stops advancing,
-                # the Ticker object is returning cached data.
-                t_time = ticker.get("ticker_time") if ticker else None
-                if t_time is not None:
-                    prev_time = last_ticker_time.get(sym)
-                    if prev_time is not None and t_time == prev_time:
-                        time_stale_cycles[sym] = time_stale_cycles.get(sym, 0) + 1
-                        if time_stale_cycles[sym] >= _TIME_STALE_THRESHOLD:
-                            needs_resub = True
-                    else:
-                        time_stale_cycles.pop(sym, None)
-                    last_ticker_time[sym] = t_time
-
-                if needs_resub and con_id in active:
-                    reason = "no_last" if t_last is None else "time_frozen"
-                    logger.warning(
-                        '{"event": "WATCHLIST_STALE_RESUB", "symbol": "%s", '
-                        '"reason": "%s", "null_cycles": %d, "time_cycles": %d}',
-                        sym, reason,
-                        stale_cycles.get(sym, 0),
-                        time_stale_cycles.get(sym, 0),
-                    )
-                    await ctx.ib.unsubscribe_market_data(con_id)
-                    await ctx.ib.subscribe_market_data(con_id, sym)
-                    stale_cycles.pop(sym, None)
-                    time_stale_cycles.pop(sym, None)
-                    last_ticker_time.pop(sym, None)
-
-                if ticker is None:
-                    items.append({
-                        "symbol": sym,
-                        "last": None, "change": None, "change_pct": None,
-                        "volume": None, "avg_volume": None,
-                        "high": None, "low": None,
-                        "high_52w": None, "low_52w": None,
-                        "error": None,
-                    })
-                    continue
-
-                last = ticker.get("last")
-                close = ticker.get("close")
-
-                # IB often doesn't provide previous close for ETFs outside
-                # regular hours. Fall back to a one-time historical lookup.
-                if close is None and last is not None and sym not in cached_close:
-                    try:
-                        snap = await ctx.ib.get_market_snapshot(con_id)
-                        ref = float(snap.get("last", 0) or 0)
-                        if ref > 0:
-                            cached_close[sym] = ref
-                            logger.debug(
-                                '{"event": "WATCHLIST_CLOSE_FETCHED", "symbol": "%s", "close": %s}',
-                                sym, ref,
-                            )
-                    except Exception:
-                        pass
-                if close is None:
-                    close = cached_close.get(sym)
-
-                change = None
-                change_pct = None
-                if last is not None and close is not None and close > 0:
-                    change = round(last - close, 4)
-                    change_pct = round((change / close) * 100, 2)
-
-                def _fmt(v):
-                    return str(v) if v is not None else None
-
-                def _fmt_int(v):
-                    return str(int(v)) if v is not None else None
-
-                items.append({
-                    "symbol": sym,
-                    "last": _fmt(last),
-                    "change": _fmt(change),
-                    "change_pct": _fmt(change_pct),
-                    "volume": _fmt_int(ticker.get("volume")),
-                    "avg_volume": _fmt_int(ticker.get("avg_volume")),
-                    "high": _fmt(ticker.get("high")),
-                    "low": _fmt(ticker.get("low")),
-                    "high_52w": _fmt(ticker.get("high_52w")),
-                    "low_52w": _fmt(ticker.get("low_52w")),
-                    "error": None,
-                })
-
-            output = {"generated_at": now, "items": items}
-            tmp = watchlist_path.with_suffix(".tmp")
-            tmp.write_text(_json.dumps(output), encoding="utf-8")
-            tmp.rename(watchlist_path)
-            logger.debug('{"event": "WATCHLIST_FILE_WRITTEN", "count": %d}', len(items))
-
-        except Exception:
-            logger.exception('{"event": "WATCHLIST_CACHE_ERROR"}')
-
-        await asyncio.sleep(_CYCLE_SECONDS)
 
 
 if __name__ == "__main__":

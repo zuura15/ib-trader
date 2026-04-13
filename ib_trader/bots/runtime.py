@@ -148,17 +148,20 @@ class StrategyBotRunner(BotBase):
         if self.strategy is None:
             raise ValueError(f"Unknown strategy: {strategy_name}")
 
-        # Restore or initialize state: try Redis first, then JSON file, then reconcile
+        # Restore or initialize state from Redis
         symbol = self.strategy_config["symbol"]
         redis = self.config.get("_redis")
         engine_url = self.config.get("_engine_url")
         bot_ref = self.strategy_config.get("ref_id", self.bot_id)
 
-        state = None
-        if redis:
-            state = await self._load_state_from_redis(redis, bot_ref, symbol)
+        if redis is None:
+            raise RuntimeError("Redis not available — bot cannot start without Redis")
+        if engine_url is None:
+            raise RuntimeError("Engine URL not configured — bot cannot start without engine HTTP API")
+
+        state = await self._load_state_from_redis(redis, bot_ref, symbol)
         if state is None:
-            state = _load_persisted_state(self.bot_id, symbol)
+            state = {"position_state": "FLAT"}
         state = _reconcile_state(state, open_positions, symbol, self.bot_id)
 
         self.ctx = StrategyContext(
@@ -210,34 +213,16 @@ class StrategyBotRunner(BotBase):
         ])
         self._risk_mw = risk_mw
 
-        # Subscribe to bars via engine
+        # Subscribe to bars via engine HTTP API
         symbol = self.strategy_config["symbol"]
-        if engine_url:
-            import httpx
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.post(
-                        f"{engine_url}/engine/subscribe-bars",
-                        json={"symbol": symbol},
-                    )
-                    resp.raise_for_status()
-                    logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
-            except Exception:
-                logger.exception('{"event": "BARS_SUBSCRIBE_HTTP_FAILED", "symbol": "%s"}', symbol)
-                # Fallback to pending_commands
-                cmd = PendingCommand(
-                    source=f"bot:{self.bot_id}", broker="ib",
-                    command_text=f"subscribe_bars {symbol}",
-                    submitted_at=datetime.now(timezone.utc),
-                )
-                self._pending_commands.insert(cmd)
-        else:
-            cmd = PendingCommand(
-                source=f"bot:{self.bot_id}", broker="ib",
-                command_text=f"subscribe_bars {symbol}",
-                submitted_at=datetime.now(timezone.utc),
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{engine_url}/engine/subscribe-bars",
+                json={"symbol": symbol},
             )
-            self._pending_commands.insert(cmd)
+            resp.raise_for_status()
+            logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
 
         # Warmup: prefetch historical 3-min bars to fill the aggregator immediately
         await self._warmup_from_history(symbol)

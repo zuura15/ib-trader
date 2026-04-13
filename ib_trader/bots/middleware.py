@@ -182,28 +182,21 @@ class PersistenceMiddleware:
         return actions
 
     def _flush(self, state: dict) -> None:
-        """Write state to Redis key (primary) and JSON file (fallback)."""
-        # Redis primary path
-        if self._redis is not None:
-            import asyncio
-            from ib_trader.redis.state import StateStore, StateKeys
-            store = StateStore(self._redis)
-            key = StateKeys.strategy(self._bot_ref, self.symbol)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(store.set(key, state))
-                else:
-                    loop.run_until_complete(store.set(key, state))
-            except Exception:
-                logger.exception('{"event": "REDIS_STATE_FLUSH_ERROR", "bot_ref": "%s"}', self._bot_ref)
+        """Write state to Redis key. Fails loud if Redis is unavailable."""
+        if self._redis is None:
+            raise RuntimeError(
+                f"Redis not available — cannot persist strategy state for {self._bot_ref}:{self.symbol}"
+            )
 
-        # JSON file fallback (kept during dual-write phase)
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        path = self.state_dir / f"{self.bot_id}-{self.symbol}.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, default=str))
-        tmp.replace(path)
+        import asyncio
+        from ib_trader.redis.state import StateStore, StateKeys
+        store = StateStore(self._redis)
+        key = StateKeys.strategy(self._bot_ref, self.symbol)
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(store.set(key, state))
+        else:
+            loop.run_until_complete(store.set(key, state))
 
 
 # ---------------------------------------------------------------------------
@@ -230,25 +223,15 @@ class ExecutionMiddleware:
         self.last_serial: int | None = None
 
     def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Convert PlaceOrder/CancelOrder to engine orders."""
+        """Convert PlaceOrder/CancelOrder to engine HTTP orders."""
+        if not self._engine_url:
+            raise RuntimeError("Engine URL not configured — cannot place orders")
+
         for action in actions:
             if isinstance(action, PlaceOrder):
-                if self._engine_url:
-                    self._submit_via_http(action, ctx)
-                else:
-                    self._submit_via_pending_commands(action, ctx)
-
+                self._submit_via_http(action, ctx)
             elif isinstance(action, CancelOrder):
-                if self._engine_url:
-                    self._cancel_via_http(action)
-                else:
-                    cmd = PendingCommand(
-                        source=f"bot:{self.bot_id}",
-                        broker="ib",
-                        command_text=f"cancel {action.trade_serial}",
-                        submitted_at=_now_utc(),
-                    )
-                    self._commands.insert(cmd)
+                self._cancel_via_http(action)
 
         return actions
 
@@ -298,8 +281,7 @@ class ExecutionMiddleware:
                 '{"event": "BOT_ORDER_HTTP_FAILED", "bot_id": "%s", "symbol": "%s"}',
                 self.bot_id, order.symbol,
             )
-            # Fall back to pending_commands
-            self._submit_via_pending_commands(order, ctx)
+            raise
 
     def _cancel_via_http(self, action: CancelOrder) -> None:
         """Cancel order via HTTP POST to engine."""
@@ -314,20 +296,6 @@ class ExecutionMiddleware:
         except Exception:
             logger.exception('{"event": "BOT_CANCEL_HTTP_FAILED"}')
 
-    def _submit_via_pending_commands(self, order: PlaceOrder, ctx: StrategyContext) -> None:
-        """Fallback: submit via pending_commands table."""
-        cmd_text = self._build_order_command(order, ctx)
-        cmd = PendingCommand(
-            source=f"bot:{self.bot_id}",
-            broker="ib",
-            command_text=cmd_text,
-            submitted_at=_now_utc(),
-        )
-        self._commands.insert(cmd)
-        self.last_cmd_id = cmd.id
-        logger.info('{"event": "BOT_ORDER_SUBMITTED", "bot_id": "%s", '
-                    '"command": "%s", "cmd_id": "%s"}',
-                    self.bot_id, cmd_text, cmd.id)
 
         return actions
 

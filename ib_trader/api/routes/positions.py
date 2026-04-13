@@ -5,10 +5,7 @@ GET /api/positions — returns current positions.
 Primary: reads from Redis keys (pos:* and quote:*:latest) for real-time data.
 Fallback: reads from run/positions.json (engine writes every 10s).
 """
-import asyncio
-import json
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -19,34 +16,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
-_POSITIONS_FILE = Path("run/positions.json")
-
 
 @router.get("")
 async def list_positions(redis=Depends(get_redis)):
-    """Return current broker positions.
+    """Return current broker positions from Redis."""
+    if redis is None:
+        return JSONResponse(
+            content={"error": "Redis not available"},
+            status_code=503,
+        )
 
-    Tries Redis first (real-time), falls back to JSON file (10s stale).
-    """
-    if redis is not None:
-        try:
-            positions = await _positions_from_redis(redis)
-            if positions:
-                return JSONResponse(
-                    content=positions,
-                    headers={"Cache-Control": "no-store, max-age=0"},
-                )
-        except Exception:
-            logger.exception('{"event": "REDIS_POSITIONS_ERROR"}')
-
-    # Fallback: JSON file
-    try:
-        data = json.loads(_POSITIONS_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = []
-
+    positions = await _positions_from_redis(redis)
     return JSONResponse(
-        content=data,
+        content=positions,
         headers={"Cache-Control": "no-store, max-age=0"},
     )
 
