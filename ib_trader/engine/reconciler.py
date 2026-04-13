@@ -160,6 +160,16 @@ class Reconciler:
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     await self._state.set(key, current)
 
+                    # Also update the strategy state key so the bot picks up
+                    # the state change even if it's not consuming streams yet
+                    from ib_trader.redis.state import StateKeys
+                    strat_key = StateKeys.strategy(bot_ref, symbol)
+                    strat = await self._state.get(strat_key)
+                    if strat:
+                        strat["position_state"] = FLAT
+                        strat["updated_at"] = current["updated_at"]
+                        await self._state.set(strat_key, strat)
+
                     # Publish state change
                     writer = StreamWriter(self._redis, StreamNames.fill(bot_ref), maxlen=500)
                     await writer.add({

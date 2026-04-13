@@ -198,11 +198,13 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
         print("[ENGINE] Reconciler started.")
 
-        # Internal HTTP API
+        # Internal HTTP API — wait for the socket to bind before proceeding
         from ib_trader.engine.internal_api import start_internal_api
         internal_port = ctx.settings.get("engine_internal_port", 8081)
         api_task = await start_internal_api(ctx, port=internal_port)
         bg_tasks.append(api_task)
+        # Give uvicorn time to bind the socket before bots try to connect
+        await asyncio.sleep(1)
         print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
 
         # Engine loop — handles commands from REPL/API via pending_commands.
@@ -352,24 +354,41 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
 
-            # Update position state key
+            # Update position state key — handle partial fills correctly
             if ref:
                 pos_key = StateKeys.position(bot_ref, symbol)
-                new_state = "OPEN" if side == "B" else "FLAT"
-                pos_data = {
-                    "state": new_state,
-                    "qty": str(qty_filled) if new_state == "OPEN" else "0",
-                    "avg_price": str(avg_price),
-                    "serial": serial,
-                    "entry_price": str(avg_price) if side == "B" else None,
-                    "entry_time": datetime.now(timezone.utc).isoformat() if side == "B" else None,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-                # Merge with existing data (keep fields like entry_price on sell)
-                existing = await state.get(pos_key)
-                if existing and side == "S":
-                    pos_data["entry_price"] = existing.get("entry_price")
-                    pos_data["entry_time"] = existing.get("entry_time")
+                existing = await state.get(pos_key) or {}
+                existing_qty = Decimal(existing.get("qty", "0"))
+
+                if side == "B":
+                    # BUY fill: accumulate quantity (handles partial fills)
+                    new_qty = existing_qty + qty_filled
+                    pos_data = {
+                        "state": "OPEN",
+                        "qty": str(new_qty),
+                        "avg_price": str(avg_price),  # IB avg_price is already cumulative
+                        "serial": serial,
+                        "entry_price": str(avg_price),
+                        "entry_time": existing.get("entry_time") or datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                else:
+                    # SELL fill: subtract from position, only FLAT when qty reaches 0
+                    new_qty = existing_qty - qty_filled
+                    if new_qty <= 0:
+                        new_state = "FLAT"
+                        new_qty = Decimal("0")
+                    else:
+                        new_state = "EXITING"  # Partial exit — still have shares
+                    pos_data = {
+                        "state": new_state,
+                        "qty": str(new_qty),
+                        "avg_price": str(avg_price),
+                        "serial": serial,
+                        "entry_price": existing.get("entry_price"),
+                        "entry_time": existing.get("entry_time"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
                 await state.set(pos_key, pos_data)
 
             logger.info(
@@ -548,6 +567,10 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                 bid = ticker.get("bid")
                 ask = ticker.get("ask")
                 last = ticker.get("last")
+
+                # Skip if no price data at all
+                if bid is None and ask is None and last is None:
+                    continue
 
                 # Skip if nothing has changed
                 current = (bid, ask, last)

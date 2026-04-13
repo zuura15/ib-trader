@@ -32,11 +32,13 @@ class _ListRenderer:
     """OutputRouter renderer that collects messages into a list.
 
     Used by the engine service to capture command output for writing
-    back to the pending_commands table.
+    back to the pending_commands table. Also captures structured metadata
+    (trade serial, order_ref) for the internal HTTP API.
     """
 
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.metadata: dict = {}  # Structured data: serial, order_ref, etc.
 
     def write_log(self, message: str, severity=None) -> None:
         self.messages.append(message)
@@ -45,7 +47,9 @@ class _ListRenderer:
         self.messages.append(message)
 
     def update_order_row(self, serial, data) -> None:
-        pass
+        # Capture the serial when the order row is updated
+        if serial is not None:
+            self.metadata["serial"] = serial
 
     def update_header(self, **kwargs) -> None:
         pass
@@ -612,31 +616,20 @@ async def execute_single_command(
         if audit_id:
             ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
 
-        # Extract serial and order_ref from output messages
+        # Use structured metadata from the renderer (set by update_order_row
+        # and execute_order) instead of parsing output text
         result = {"status": "SUCCESS", "output": output}
-        for msg in renderer.messages:
-            if "Order #" in msg:
-                try:
-                    # "Order #42 — BUY 20 QQQ ..."
-                    serial_str = msg.split("Order #")[1].split()[0].strip("—").strip()
-                    result["serial"] = int(serial_str)
-                except (ValueError, IndexError):
-                    pass
-            if "Serial:" in msg:
-                try:
-                    serial_str = msg.split("Serial:")[1].split()[0].strip("#").strip()
-                    result["serial"] = int(serial_str)
-                except (ValueError, IndexError):
-                    pass
+        result.update(renderer.metadata)
 
-        # Build order_ref from bot_ref + extracted serial
+        # Build order_ref from bot_ref + the engine-allocated serial
         if bot_ref and "serial" in result:
             from ib_trader.engine.order_ref import encode as encode_ref
-            side_code = "B" if "buy" in command_text.lower().split()[0] else "S"
-            symbol = command_text.split()[1] if len(command_text.split()) > 1 else ""
+            side_code = "B" if isinstance(parsed, BuyCommand) else "S"
             try:
-                result["order_ref"] = encode_ref(bot_ref, symbol, side_code, result["serial"])
-            except ValueError:
+                result["order_ref"] = encode_ref(
+                    bot_ref, parsed.symbol, side_code, result["serial"],
+                )
+            except (ValueError, AttributeError):
                 pass
 
         return result

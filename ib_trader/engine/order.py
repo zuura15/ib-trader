@@ -222,6 +222,9 @@ async def execute_order(
     direction = "LONG" if side == "BUY" else "SHORT"
     correlation_id = str(uuid.uuid4())
 
+    # Expose the serial to the renderer for structured API responses
+    ctx.router.update_order_row(serial, {"symbol": cmd.symbol, "side": side})
+
     # Build trade_config JSON with profit taker / stop loss parameters
     _trade_cfg: dict = {}
     if cmd.profit_amount is not None:
@@ -512,7 +515,8 @@ async def _execute_mid_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, mid, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, mid, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
@@ -882,7 +886,8 @@ async def _execute_bid_ask_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
@@ -1049,6 +1054,7 @@ async def _execute_market_order(
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, cmd.symbol, side, qty, aggressive_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=order_ctx.order_ref,
         )
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                    qty, limit_price=aggressive_price,
@@ -1062,7 +1068,10 @@ async def _execute_market_order(
                    qty, trade_serial=trade_group.serial_number,
                    trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                    correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
-        ib_order_id = await ctx.ib.place_market_order(con_id, cmd.symbol, side, qty, outside_rth=True)
+        ib_order_id = await ctx.ib.place_market_order(
+            con_id, cmd.symbol, side, qty, outside_rth=True,
+            order_ref=order_ctx.order_ref,
+        )
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "MARKET",
                    qty, ib_order_id=_safe_int(ib_order_id),
                    trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),

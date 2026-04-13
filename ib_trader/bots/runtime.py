@@ -132,9 +132,9 @@ class StrategyBotRunner(BotBase):
             logger.exception('{"event": "REDIS_STATE_LOAD_ERROR", "bot_ref": "%s"}', bot_ref)
         return None
 
-    def _run_pipeline(self, actions: list, ctx=None) -> None:
+    async def _run_pipeline(self, actions: list, ctx=None) -> None:
         """Run actions through pipeline and capture any submitted command ID."""
-        self.pipeline.process(actions, ctx or self.ctx)
+        await self.pipeline.process(actions, ctx or self.ctx)
         if self.pipeline.last_cmd_id:
             self._pending_cmd_id = self.pipeline.last_cmd_id
             self.pipeline.last_cmd_id = None
@@ -232,7 +232,7 @@ class StrategyBotRunner(BotBase):
         # Run strategy startup
         actions = await self.strategy.on_start(self.ctx)
         if actions:
-            self._run_pipeline(actions)
+            await self._run_pipeline(actions)
 
         logger.info('{"event": "STRATEGY_BOT_STARTED", "bot_id": "%s", '
                      '"strategy": "%s", "symbol": "%s", "position": "%s"}',
@@ -264,7 +264,7 @@ class StrategyBotRunner(BotBase):
                     event_type="RISK",
                     message=f"FORCE_BUY ignored — position state is {pos.value}, not FLAT",
                 )]
-                self._run_pipeline(actions)
+                await self._run_pipeline(actions)
 
         # 0b. Check entry timeout every tick (not just on bar completion)
         if pos == PositionState.ENTERING:
@@ -286,7 +286,7 @@ class StrategyBotRunner(BotBase):
                             "entry_command_id": None,
                         }),
                     ]
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                     return
 
         # 0c. Check for failed SELL in EXITING — return to OPEN for continued monitoring
@@ -304,7 +304,7 @@ class StrategyBotRunner(BotBase):
                         ),
                         UpdateState({"position_state": PositionState.OPEN.value}),
                     ]
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                     break
 
         # 1. Read new 5-sec bars from market_bars table
@@ -327,7 +327,7 @@ class StrategyBotRunner(BotBase):
                          "buffered_bars": agg_bars,
                          "lookback_needed": lookback},
             )]
-            self._run_pipeline(actions)
+            await self._run_pipeline(actions)
 
         if new_bars and self.aggregator:
             completed = self.aggregator.add_bars(new_bars)
@@ -340,7 +340,7 @@ class StrategyBotRunner(BotBase):
                              f"buffered={self.aggregator.buffered_bars}/"
                              f"{self.aggregator.lookback_bars}"),
                 )]
-                self._run_pipeline(actions)
+                await self._run_pipeline(actions)
 
             # Only evaluate the LAST completed bar in a batch.
             # When warmup or catch-up produces multiple bars at once,
@@ -354,7 +354,7 @@ class StrategyBotRunner(BotBase):
                         event_type="EVAL",
                         message=f"Signal cooldown active ({cooldown - time.monotonic():.0f}s remaining) — skipping entry evaluation",
                     )]
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                 elif self.aggregator.get_bar_window():
                     window = self.aggregator.get_bar_window()
                     event = BarCompleted(
@@ -365,7 +365,7 @@ class StrategyBotRunner(BotBase):
                     )
                     actions = await self.strategy.on_event(event, self.ctx)
                     if actions:
-                        self._run_pipeline(actions)
+                        await self._run_pipeline(actions)
                 else:
                     needed = self.aggregator.lookback_bars
                     have = self.aggregator.buffered_bars
@@ -373,7 +373,7 @@ class StrategyBotRunner(BotBase):
                         event_type="EVAL",
                         message=f"Bar completed but window not ready ({have}/{needed} bars buffered)",
                     )]
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
 
         # 2. Check for fills on pending commands
         await self._check_pending_fills()
@@ -390,13 +390,13 @@ class StrategyBotRunner(BotBase):
                     self._quote_stale_logged = False
                     actions = await self.strategy.on_event(quote, self.ctx)
                     if actions:
-                        self._run_pipeline(actions)
+                        await self._run_pipeline(actions)
                 else:
                     # Data exists but is stale — still run exit check with
                     # stale data (better to exit on old data than not at all)
                     actions = await self.strategy.on_event(quote, self.ctx)
                     if actions:
-                        self._run_pipeline(actions)
+                        await self._run_pipeline(actions)
 
                     elapsed = time.monotonic() - self._last_quote_time
                     if elapsed > _STALE_QUOTE_HALT_SECONDS and not self._quote_stale_logged:
@@ -406,7 +406,7 @@ class StrategyBotRunner(BotBase):
                             message=f"Quote data stale ({quote_age:.0f}s old, no fresh data for {elapsed:.0f}s) — halting bot",
                             payload={"quote_age_s": quote_age, "no_fresh_data_s": elapsed},
                         )]
-                        self._run_pipeline(actions)
+                        await self._run_pipeline(actions)
                         self._bots.update_status(self.bot_id, "ERROR",
                                                   error_message="STALE_QUOTES")
                     elif elapsed > _STALE_QUOTE_WARN_SECONDS and not self._quote_stale_logged:
@@ -421,7 +421,7 @@ class StrategyBotRunner(BotBase):
                         event_type="ERROR",
                         message=f"No quote data for {elapsed:.0f}s — halting bot",
                     )]
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                     self._bots.update_status(self.bot_id, "ERROR",
                                               error_message="STALE_QUOTES")
 
@@ -430,7 +430,7 @@ class StrategyBotRunner(BotBase):
         if self.strategy and self.ctx:
             actions = await self.strategy.on_stop(self.ctx)
             if actions and self.pipeline:
-                self._run_pipeline(actions)
+                await self._run_pipeline(actions)
 
         # Unsubscribe bars
         symbol = self.strategy_config.get("symbol", "")
@@ -492,7 +492,7 @@ class StrategyBotRunner(BotBase):
                 "entry_time": datetime.now(timezone.utc).isoformat(),
             }),
         ]
-        self._run_pipeline(actions)
+        await self._run_pipeline(actions)
 
     async def _warmup_from_history(self, symbol: str) -> None:
         """Prefetch historical 3-min bars from the engine to fill the aggregator.
@@ -541,14 +541,14 @@ class StrategyBotRunner(BotBase):
                     payload={"raw_bars": len(bars), "completed_bars": len(completed),
                              "buffered": self.aggregator.buffered_bars},
                 )]
-                self._run_pipeline(actions)
+                await self._run_pipeline(actions)
         else:
             if self.pipeline and self.ctx:
                 actions = [LogSignal(
                     event_type="STATE",
                     message="Warmup: no historical bars available, starting cold",
                 )]
-                self._run_pipeline(actions)
+                await self._run_pipeline(actions)
 
     def _read_new_bars(self, symbol: str) -> list[dict]:
         """Read new 5-second bars from market_bars table since last read.
@@ -709,7 +709,7 @@ class StrategyBotRunner(BotBase):
                     )
                     actions = await self.strategy.on_event(event, self.ctx)
                     if actions:
-                        self._run_pipeline(actions)
+                        await self._run_pipeline(actions)
                 self._pending_cmd_id = None
 
             elif cmd.status == PendingCommandStatus.FAILURE:
@@ -721,7 +721,7 @@ class StrategyBotRunner(BotBase):
                 )
                 actions = await self.strategy.on_event(event, self.ctx)
                 if actions:
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                 self._pending_cmd_id = None
 
         elif pos == PositionState.EXITING:
@@ -746,7 +746,7 @@ class StrategyBotRunner(BotBase):
                 )
                 actions = await self.strategy.on_event(event, self.ctx)
                 if actions:
-                    self._run_pipeline(actions)
+                    await self._run_pipeline(actions)
                     if entry_price > 0 and fill_price > 0:
                         pnl = (fill_price - entry_price) * fill_qty
                         self._risk_mw.record_pnl(pnl)

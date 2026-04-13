@@ -80,10 +80,14 @@ class StateKeys:
 
     @staticmethod
     def position(bot_ref: str, symbol: str) -> str:
+        if ":" in bot_ref:
+            raise ValueError(f"bot_ref must not contain ':': {bot_ref!r}")
         return f"pos:{bot_ref}:{symbol}"
 
     @staticmethod
     def strategy(bot_ref: str, symbol: str) -> str:
+        if ":" in bot_ref:
+            raise ValueError(f"bot_ref must not contain ':': {bot_ref!r}")
         return f"strat:{bot_ref}:{symbol}"
 
     @staticmethod

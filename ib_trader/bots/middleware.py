@@ -173,46 +173,29 @@ class PersistenceMiddleware:
         self._redis = redis
         self._bot_ref = bot_ref or bot_id
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Apply UpdateState actions to ctx.state and flush to Redis + disk."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Apply UpdateState actions to ctx.state and flush to Redis.
+
+        Async: awaits the Redis write to ensure state is persisted BEFORE
+        the next middleware (ExecutionMiddleware) places any orders.
+        """
         for action in actions:
             if isinstance(action, UpdateState):
                 ctx.state.update(action.state)
-                self._flush(ctx.state)
+                await self._flush(ctx.state)
         return actions
 
-    def _flush(self, state: dict) -> None:
-        """Write state to Redis key. Fails loud if Redis is unavailable.
-
-        Uses a tracked asyncio task to ensure Redis errors are surfaced,
-        not silently dropped.
-        """
+    async def _flush(self, state: dict) -> None:
+        """Write state to Redis key. Awaited — completes before returning."""
         if self._redis is None:
             raise RuntimeError(
                 f"Redis not available — cannot persist strategy state for {self._bot_ref}:{self.symbol}"
             )
 
-        import asyncio
         from ib_trader.redis.state import StateStore, StateKeys
         store = StateStore(self._redis)
         key = StateKeys.strategy(self._bot_ref, self.symbol)
-
-        async def _do_set():
-            try:
-                await store.set(key, state)
-            except Exception:
-                logger.exception(
-                    '{"event": "REDIS_STATE_FLUSH_FAILED", "key": "%s"}', key,
-                )
-                raise  # Surface the error — don't swallow it
-
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            task = asyncio.ensure_future(_do_set())
-            # Add error callback so the exception is not silently ignored
-            task.add_done_callback(lambda t: t.result() if not t.cancelled() and t.exception() else None)
-        else:
-            loop.run_until_complete(_do_set())
+        await store.set(key, state)
 
 
 # ---------------------------------------------------------------------------
@@ -238,21 +221,21 @@ class ExecutionMiddleware:
         self.last_order_ref: str | None = None
         self.last_serial: int | None = None
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Convert PlaceOrder/CancelOrder to engine HTTP orders."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Convert PlaceOrder/CancelOrder to engine HTTP orders (async)."""
         if not self._engine_url:
             raise RuntimeError("Engine URL not configured — cannot place orders")
 
         for action in actions:
             if isinstance(action, PlaceOrder):
-                self._submit_via_http(action, ctx)
+                await self._submit_via_http(action, ctx)
             elif isinstance(action, CancelOrder):
-                self._cancel_via_http(action)
+                await self._cancel_via_http(action)
 
         return actions
 
-    def _submit_via_http(self, order: PlaceOrder, ctx: StrategyContext) -> None:
-        """Submit order via HTTP POST to engine internal API."""
+    async def _submit_via_http(self, order: PlaceOrder, ctx: StrategyContext) -> None:
+        """Submit order via async HTTP POST to engine internal API."""
         import httpx
 
         serial = ctx.state.get("trade_serial", 0)
@@ -279,39 +262,28 @@ class ExecutionMiddleware:
         else:
             url = f"{self._engine_url}/engine/orders"
 
-        try:
-            with httpx.Client(timeout=30) as client:
-                resp = client.post(url, json=payload)
-                resp.raise_for_status()
-                result = resp.json()
-                self.last_cmd_id = result.get("ib_order_id")
-                self.last_order_ref = result.get("order_ref")
-                self.last_serial = result.get("serial", serial)
-                logger.info(
-                    '{"event": "BOT_ORDER_HTTP", "bot_id": "%s", "symbol": "%s", '
-                    '"side": "%s", "order_ref": "%s"}',
-                    self.bot_id, order.symbol, order.side, self.last_order_ref,
-                )
-        except Exception:
-            logger.exception(
-                '{"event": "BOT_ORDER_HTTP_FAILED", "bot_id": "%s", "symbol": "%s"}',
-                self.bot_id, order.symbol,
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+            self.last_cmd_id = result.get("ib_order_id")
+            self.last_order_ref = result.get("order_ref")
+            self.last_serial = result.get("serial", serial)
+            logger.info(
+                '{"event": "BOT_ORDER_HTTP", "bot_id": "%s", "symbol": "%s", '
+                '"side": "%s", "order_ref": "%s"}',
+                self.bot_id, order.symbol, order.side, self.last_order_ref,
             )
-            raise
 
-    def _cancel_via_http(self, action: CancelOrder) -> None:
-        """Cancel order via HTTP POST to engine."""
+    async def _cancel_via_http(self, action: CancelOrder) -> None:
+        """Cancel order via async HTTP POST to engine."""
         import httpx
-        try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.post(
-                    f"{self._engine_url}/engine/close",
-                    json={"serial": action.trade_serial, "strategy": "market"},
-                )
-                resp.raise_for_status()
-        except Exception:
-            logger.exception('{"event": "BOT_CANCEL_HTTP_FAILED"}')
-            raise
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{self._engine_url}/engine/close",
+                json={"serial": action.trade_serial, "strategy": "market"},
+            )
+            resp.raise_for_status()
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +297,18 @@ class MiddlewarePipeline:
         self._middlewares = middlewares
         self.last_cmd_id: str | None = None
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Pass actions through each middleware sequentially."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Pass actions through each middleware sequentially.
+
+        Supports both sync and async middleware process() methods.
+        """
+        import asyncio
         for mw in self._middlewares:
-            actions = mw.process(actions, ctx)
+            result = mw.process(actions, ctx)
+            if asyncio.iscoroutine(result):
+                actions = await result
+            else:
+                actions = result
             # Capture command ID if execution middleware submitted an order
             if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id:
                 self.last_cmd_id = mw.last_cmd_id
