@@ -6,6 +6,8 @@ GET /api/bots/{bot_id}/events — get bot events (audit trail)
 POST /api/bots/{bot_id}/start — start a bot
 POST /api/bots/{bot_id}/stop — stop a bot
 """
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ib_trader.api.deps import get_session_factory, get_redis
@@ -37,17 +39,23 @@ def _serialize_bot(b) -> dict:
 
 @router.get("")
 def list_bots(sf=Depends(get_session_factory)):
-    repo = BotRepository(sf)
-    return [_serialize_bot(b) for b in repo.get_all()]
+    try:
+        repo = BotRepository(sf)
+        return [_serialize_bot(b) for b in repo.get_all()]
+    finally:
+        sf.remove()
 
 
 @router.get("/{bot_id}")
 def get_bot(bot_id: str, sf=Depends(get_session_factory)):
-    repo = BotRepository(sf)
-    b = repo.get(bot_id)
-    if b is None:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    return _serialize_bot(b)
+    try:
+        repo = BotRepository(sf)
+        b = repo.get(bot_id)
+        if b is None:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        return _serialize_bot(b)
+    finally:
+        sf.remove()
 
 
 @router.post("/{bot_id}/start", status_code=202)
@@ -89,29 +97,32 @@ async def stop_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(g
 
 
 @router.get("/{bot_id}/state")
-def get_bot_state(bot_id: str, sf=Depends(get_session_factory)):
-    """Return the bot's live position state from its JSON state file."""
-    import json
-    from pathlib import Path
-
-    repo = BotRepository(sf)
-    b = repo.get(bot_id)
-    if b is None:
-        raise HTTPException(status_code=404, detail="Bot not found")
-
-    # Read the JSON state file
-    config = json.loads(b.config_json) if b.config_json else {}
-    symbol = config.get("symbol", "")
-    state_dir = Path.home() / ".ib-trader" / "bot-state"
-    state_file = state_dir / f"{bot_id}-{symbol}.json"
-
-    if not state_file.exists():
-        return {"position_state": "FLAT"}
-
+async def get_bot_state(bot_id: str, sf=Depends(get_session_factory), redis=Depends(get_redis)):
+    """Return the bot's live position state from Redis."""
     try:
-        return json.loads(state_file.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {"position_state": "FLAT"}
+        repo = BotRepository(sf)
+        b = repo.get(bot_id)
+        if b is None:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+        config = json.loads(b.config_json) if b.config_json else {}
+        symbol = config.get("symbol", "")
+        ref_id = config.get("ref_id", bot_id)
+    finally:
+        sf.remove()
+
+    # Read from Redis
+    if redis:
+        from ib_trader.redis.state import StateStore, StateKeys
+        store = StateStore(redis)
+        strat = await store.get(StateKeys.strategy(ref_id, symbol))
+        if strat:
+            return strat
+        pos = await store.get(StateKeys.position(ref_id, symbol))
+        if pos:
+            return pos
+
+    return {"position_state": "FLAT"}
 
 
 @router.post("/{bot_id}/force-buy", status_code=202)
@@ -148,25 +159,28 @@ def get_bot_events(
 
     Optional filter by event_type (BAR, SKIP, SIGNAL, ORDER, FILL, etc.).
     """
-    repo = BotRepository(sf)
-    b = repo.get(bot_id)
-    if b is None:
-        raise HTTPException(status_code=404, detail="Bot not found")
+    try:
+        repo = BotRepository(sf)
+        b = repo.get(bot_id)
+        if b is None:
+            raise HTTPException(status_code=404, detail="Bot not found")
 
-    events_repo = BotEventRepository(sf)
-    if event_type:
-        events = events_repo.get_by_type(bot_id, event_type, limit=limit)
-    else:
-        events = events_repo.get_for_bot(bot_id, limit=limit)
+        events_repo = BotEventRepository(sf)
+        if event_type:
+            events = events_repo.get_by_type(bot_id, event_type, limit=limit)
+        else:
+            events = events_repo.get_for_bot(bot_id, limit=limit)
 
-    return [
-        {
-            "id": e.id,
-            "event_type": e.event_type,
-            "message": e.message,
-            "payload": e.payload_json,
-            "trade_serial": e.trade_serial,
-            "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
-        }
-        for e in events
-    ]
+        return [
+            {
+                "id": e.id,
+                "event_type": e.event_type,
+                "message": e.message,
+                "payload": e.payload_json,
+                "trade_serial": e.trade_serial,
+                "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+            }
+            for e in events
+        ]
+    finally:
+        sf.remove()  # Release connection back to pool
