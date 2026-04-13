@@ -39,10 +39,33 @@ async def submit_command(body: CommandRequest):
     parts = cmd_text.split()
     verb = parts[0].lower() if parts else ""
 
+    # Read-only commands — handle locally, no engine forwarding
+    if verb in ("orders", "status", "stats", "help"):
+        from ib_trader.api.deps import get_session_factory
+        sf = get_session_factory()
+        try:
+            if verb == "orders":
+                from ib_trader.data.repositories.transaction_repository import TransactionRepository
+                open_orders = TransactionRepository(sf).get_open_orders()
+                output = "\n".join(
+                    f"  #{o.trade_serial or '-':>3} {o.symbol:5} {o.side:4} @ {o.limit_price or 'MKT'}"
+                    for o in open_orders
+                ) if open_orders else "No open orders."
+            elif verb in ("status", "stats"):
+                from ib_trader.data.repository import TradeRepository
+                all_trades = TradeRepository(sf).get_all()
+                closed = [t for t in all_trades if t.status.value == "CLOSED" and t.realized_pnl is not None]
+                total_pnl = sum(float(t.realized_pnl) for t in closed)
+                output = f"Trades: {len(all_trades)} total ({len(closed)} closed), P&L: ${total_pnl:+.2f}"
+            else:
+                output = "Commands: buy, sell, close, orders, status, help"
+            return CommandResponse(command_id="", status=output)
+        finally:
+            sf.remove()
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             if verb in ("buy", "sell"):
-                # Parse into structured request
                 symbol = parts[1] if len(parts) > 1 else ""
                 qty = parts[2] if len(parts) > 2 else "1"
                 order_type = parts[3] if len(parts) > 3 else "mid"
@@ -62,14 +85,7 @@ async def submit_command(body: CommandRequest):
                     "strategy": strategy,
                 })
             else:
-                # For non-order commands (status, orders, help), still use
-                # the engine's execute_single_command via a generic endpoint
-                resp = await client.post(f"{engine_url}/engine/orders", json={
-                    "symbol": "",
-                    "side": "BUY",
-                    "qty": "0",
-                    "order_type": cmd_text,
-                })
+                raise HTTPException(status_code=400, detail=f"Unknown command: {verb}")
 
             if resp.status_code == 200:
                 result = resp.json()

@@ -250,6 +250,8 @@ class StrategyBotRunner(BotBase):
             return
 
         symbol = self.strategy_config["symbol"]
+        redis = self.config.get("_redis")
+        bot_ref = self.strategy_config.get("ref_id", self.bot_id)
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
 
         # 0. Check for force-buy override
@@ -289,26 +291,24 @@ class StrategyBotRunner(BotBase):
                     await self._run_pipeline(actions)
                     return
 
-        # 0c. Check for failed SELL in EXITING — return to OPEN for continued monitoring
-        if pos == PositionState.EXITING:
-            bot_source = f"bot:{self.bot_id}"
-            recent_cmds = self._pending_commands.get_by_source(bot_source, limit=5)
-            for cmd in recent_cmds:
-                cmd_text = (cmd.command_text or "").lower()
-                if cmd.status == PendingCommandStatus.FAILURE and ("sell" in cmd_text or "close" in cmd_text):
-                    actions = [
-                        LogSignal(
-                            event_type="ERROR",
-                            message=f"Exit order FAILED: {cmd.error} — returning to OPEN for continued monitoring",
-                            payload={"command": cmd.command_text, "error": cmd.error},
-                        ),
-                        UpdateState({"position_state": PositionState.OPEN.value}),
-                    ]
-                    await self._run_pipeline(actions)
-                    break
+        # 0c. Check for failed SELL in EXITING — read Redis position key
+        if pos == PositionState.EXITING and redis:
+            from ib_trader.redis.state import StateStore, StateKeys
+            store = StateStore(redis)
+            redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
+            if redis_pos and redis_pos.get("state") == "OPEN":
+                # Exit was cancelled or failed — back to OPEN
+                actions = [
+                    LogSignal(
+                        event_type="ERROR",
+                        message="Exit order failed or cancelled — returning to OPEN for continued monitoring",
+                    ),
+                    UpdateState({"position_state": PositionState.OPEN.value}),
+                ]
+                await self._run_pipeline(actions)
 
-        # 1. Read new 5-sec bars from market_bars table
-        new_bars = self._read_new_bars(symbol)
+        # 1. Read new bars from Redis stream
+        new_bars = await self._read_new_bars(symbol)
 
         # Log tick status periodically (every 12 ticks = ~60 seconds)
         self._tick_count = getattr(self, "_tick_count", 0) + 1
@@ -381,7 +381,7 @@ class StrategyBotRunner(BotBase):
         # 3. Exit monitoring via quotes (if in OPEN state)
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
         if pos == PositionState.OPEN:
-            quote = self._get_latest_quote(symbol)
+            quote = await self._get_latest_quote(symbol)
             if quote:
                 # Check if quote data is actually fresh (not just that a row exists)
                 quote_age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()
@@ -447,21 +447,16 @@ class StrategyBotRunner(BotBase):
         config = self.strategy_config
         close_price = Decimal("0")
 
-        # Get latest price from market_bars
-        try:
-            session = self._session_factory()
-            result = session.execute(
-                __import__("sqlalchemy").text(
-                    "SELECT close FROM market_bars WHERE symbol = :s "
-                    "ORDER BY timestamp_utc DESC LIMIT 1"
-                ),
-                {"s": symbol},
-            )
-            row = result.fetchone()
-            if row:
-                close_price = Decimal(str(row[0]))
-        except Exception:
-            pass
+        # Get latest price from Redis quote key
+        redis = self.config.get("_redis")
+        if redis:
+            from ib_trader.redis.state import StateStore, StateKeys
+            store = StateStore(redis)
+            quote = await store.get(StateKeys.quote_latest(symbol))
+            if quote:
+                last = quote.get("last")
+                if last:
+                    close_price = Decimal(str(last))
 
         # Calculate quantity
         max_value = Decimal(str(config.get("max_position_value", "10000")))
@@ -498,38 +493,34 @@ class StrategyBotRunner(BotBase):
         """Prefetch historical 3-min bars from the engine to fill the aggregator.
 
         Submits a warmup command that the engine processes by fetching
-        historical bars and writing them to market_bars. Then reads them
-        into the aggregator so the strategy can evaluate immediately.
+        historical bars via the engine's HTTP API. Bars are written to the
+        Redis bar stream, which the bot then reads for warmup.
         """
         if not self.aggregator:
             return
 
         lookback = self.strategy_config.get("lookback_bars", 20)
         bar_seconds = self.strategy_config.get("bar_size_seconds", 180)
-        # Request enough 5-sec bars to fill lookback target bars
-        # Each target bar = bar_seconds/5 five-sec bars
         total_5sec_bars = lookback * (bar_seconds // 5)
-        duration_seconds = total_5sec_bars * 5 + 60  # small buffer
+        duration_seconds = total_5sec_bars * 5 + 60
 
-        # Submit warmup command to engine
-        cmd = PendingCommand(
-            source=f"bot:{self.bot_id}",
-            broker="ib",
-            command_text=f"warmup_bars {symbol} {duration_seconds}",
-            submitted_at=datetime.now(timezone.utc),
-        )
-        self._pending_commands.insert(cmd)
+        engine_url = self.config.get("_engine_url")
+        if engine_url:
+            # Request warmup via engine HTTP API (synchronous)
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        f"{engine_url}/engine/orders",
+                        json={"symbol": symbol, "side": "BUY", "qty": "0",
+                              "order_type": f"warmup_bars {symbol} {duration_seconds}"},
+                    )
+                    # Even if this fails, we continue — bars will arrive via stream
+            except Exception:
+                logger.debug('{"event": "WARMUP_HTTP_FAILED", "symbol": "%s"}', symbol)
 
-        # Wait for the command to complete (engine writes bars to market_bars)
-        deadline = time.monotonic() + 30  # 30 second timeout
-        while time.monotonic() < deadline:
-            refreshed = self._pending_commands.get(cmd.id)
-            if refreshed and refreshed.status.value in ("SUCCESS", "FAILURE"):
-                break
-            await asyncio.sleep(0.5)
-
-        # Now read the historical bars from market_bars
-        bars = self._read_new_bars(symbol)
+        # Read whatever bars are in the Redis stream
+        bars = await self._read_new_bars(symbol)
         if bars and self.aggregator:
             completed = self.aggregator.add_bars(bars)
             if self.pipeline and self.ctx:
@@ -551,126 +542,95 @@ class StrategyBotRunner(BotBase):
                 await self._run_pipeline(actions)
 
     def _read_new_bars(self, symbol: str) -> list[dict]:
-        """Read new 5-second bars from market_bars table since last read.
+        """Read new bars from the Redis bar stream.
 
-        For v1, reads from the market_bars table that the engine populates.
-        Falls back to empty list if table doesn't exist yet.
+        The engine publishes 5-second bars to bar:{symbol}:5s via
+        reqRealTimeBars push callbacks.
         """
+        redis = self.config.get("_redis")
+        if not redis:
+            return []
+
+        from ib_trader.redis.streams import StreamReader, StreamNames
+
+        stream = StreamNames.bar(symbol, "5s")
+        last_id = getattr(self, '_last_bar_stream_id', "0")
+
         try:
-            session = self._session_factory()
-            query = (
-                "SELECT timestamp_utc, open, high, low, close, volume "
-                "FROM market_bars WHERE symbol = :symbol"
-            )
-            params = {"symbol": symbol}
-
-            if self._last_bar_ts:
-                query += " AND timestamp_utc > :since"
-                # Use space separator to match SQLite's text format
-                params["since"] = str(self._last_bar_ts).replace("T", " ")
-
-            query += " ORDER BY timestamp_utc ASC LIMIT 500"
-
-            result = session.execute(
-                __import__("sqlalchemy").text(query), params,
-            )
-            rows = result.fetchall()
-
-            if not rows:
+            results = await redis.xread({stream: last_id}, count=500)
+            if not results:
                 return []
 
             bars = []
-            for row in rows:
-                bars.append({
-                    "timestamp_utc": row[0],
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": int(row[5]),
-                })
-                raw_ts = datetime.fromisoformat(str(row[0])) if isinstance(row[0], str) else row[0]
-                if raw_ts and raw_ts.tzinfo is None:
-                    raw_ts = raw_ts.replace(tzinfo=timezone.utc)
-                self._last_bar_ts = raw_ts
+            for stream_name, entries in results:
+                for entry_id, raw_data in entries:
+                    self._last_bar_stream_id = entry_id
+                    # Deserialize JSON-encoded values
+                    import json as _json
+                    data = {}
+                    for k, v in raw_data.items():
+                        try:
+                            data[k] = _json.loads(v)
+                        except (ValueError, TypeError):
+                            data[k] = v
 
+                    bars.append({
+                        "timestamp_utc": data.get("ts", ""),
+                        "open": float(data.get("o", 0)),
+                        "high": float(data.get("h", 0)),
+                        "low": float(data.get("l", 0)),
+                        "close": float(data.get("c", 0)),
+                        "volume": int(data.get("v", 0)),
+                    })
             return bars
 
         except Exception as exc:
-            # Table may not exist yet if engine hasn't created it
-            logger.debug('{"event": "MARKET_BARS_READ_ERROR", "error": "%s"}', exc)
-            try:
-                self._session_factory().rollback()
-            except Exception:
-                pass
+            logger.debug('{"event": "REDIS_BARS_READ_ERROR", "error": "%s"}', exc)
             return []
 
-    def _get_latest_quote(self, symbol: str) -> QuoteUpdate | None:
-        """Read the latest streaming quote from market_quotes table.
+    async def _get_latest_quote(self, symbol: str):
+        """Read the latest quote from Redis key.
 
-        The engine writes streaming ticker data every ~2 seconds.
-        Falls back to market_bars if market_quotes is not available.
+        The engine's tick publisher writes to quote:{symbol}:latest
+        on every streaming tick from IB.
         """
+        redis = self.config.get("_redis")
+        if not redis:
+            return None
+
+        from ib_trader.redis.state import StateStore, StateKeys
+
         try:
-            session = self._session_factory()
-
-            # Try streaming quotes first (updated every ~2s)
-            result = session.execute(
-                __import__("sqlalchemy").text(
-                    "SELECT bid, ask, last, updated_at "
-                    "FROM market_quotes WHERE symbol = :symbol"
-                ),
-                {"symbol": symbol},
-            )
-            row = result.fetchone()
-            if row and (row[0] or row[1] or row[2]):
-                bid = Decimal(str(row[0])) if row[0] else Decimal("0")
-                ask = Decimal(str(row[1])) if row[1] else Decimal("0")
-                last = Decimal(str(row[2])) if row[2] else Decimal("0")
-
-                ts = row[3]
-                if isinstance(ts, str):
-                    ts = datetime.fromisoformat(ts)
-                if ts and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-
-                return QuoteUpdate(
-                    symbol=symbol,
-                    bid=bid if bid > 0 else last,
-                    ask=ask if ask > 0 else last,
-                    last=last,
-                    timestamp=ts or datetime.now(timezone.utc),
-                )
-
-            # Fallback to market_bars
-            result = session.execute(
-                __import__("sqlalchemy").text(
-                    "SELECT timestamp_utc, close "
-                    "FROM market_bars WHERE symbol = :symbol "
-                    "ORDER BY timestamp_utc DESC LIMIT 1"
-                ),
-                {"symbol": symbol},
-            )
-            row = result.fetchone()
-            if not row:
+            store = StateStore(redis)
+            quote = await store.get(StateKeys.quote_latest(symbol))
+            if not quote:
                 return None
 
-            close = Decimal(str(row[1]))
-            spread = close * Decimal("0.0002")
-            ts = row[0]
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts)
-            if ts and ts.tzinfo is None:
+            bid_str = quote.get("bid")
+            ask_str = quote.get("ask")
+            last_str = quote.get("last")
+
+            if not bid_str and not ask_str and not last_str:
+                return None
+
+            bid = Decimal(str(bid_str)) if bid_str else Decimal("0")
+            ask = Decimal(str(ask_str)) if ask_str else Decimal("0")
+            last = Decimal(str(last_str)) if last_str else Decimal("0")
+
+            ts_str = quote.get("ts")
+            ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now(timezone.utc)
+            if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
 
             return QuoteUpdate(
                 symbol=symbol,
-                bid=close - spread / 2,
-                ask=close + spread / 2,
-                last=close,
-                timestamp=ts or datetime.now(timezone.utc),
+                bid=bid if bid > 0 else last,
+                ask=ask if ask > 0 else last,
+                last=last,
+                timestamp=ts,
             )
         except Exception:
+            logger.debug('{"event": "REDIS_QUOTE_READ_ERROR", "symbol": "%s"}', symbol)
             return None
 
     async def _check_pending_fills(self) -> None:
