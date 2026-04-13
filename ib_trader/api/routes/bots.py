@@ -139,11 +139,12 @@ async def force_buy(bot_id: str, sf=Depends(get_session_factory), redis=Depends(
         raise HTTPException(status_code=404, detail="Bot not found")
     if b.status != BotStatus.RUNNING:
         raise HTTPException(status_code=409, detail="Bot is not running")
-    # Publish to global control stream — forwarded to bot immediately
     if redis:
+        # Set a key (persists until bot reads it — survives even if bot isn't listening yet)
+        await redis.set(f"bot:{bot_id}:force_buy", "1")
+        # Also publish to stream for immediate wake-up if bot IS listening
         await redis.xadd("bot:control:global", {"action": "FORCE_BUY", "bot_id": bot_id}, maxlen=100)
     else:
-        # Fallback: write to DB (bot checks on next tick)
         repo.update_action(bot_id, "FORCE_BUY")
     return {"bot_id": bot_id, "action": "FORCE_BUY"}
 

@@ -144,7 +144,7 @@ async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> No
             await asyncio.sleep(1)
             continue
 
-        # Process control events
+        # Process control events from stream
         if results:
             for stream_name, entries in results:
                 for entry_id, data in entries:
@@ -156,6 +156,15 @@ async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> No
                     elif action == "FORCE_BUY":
                         logger.info('{"event": "FORCE_BUY_VIA_STREAM", "bot_id": "%s"}', bot_row.id)
                         bot.update_action("FORCE_BUY")
+
+        # Also check force-buy key (persists even if bot wasn't listening when published)
+        if redis:
+            force_key = f"bot:{bot_row.id}:force_buy"
+            force_val = await redis.get(force_key)
+            if force_val:
+                await redis.delete(force_key)
+                logger.info('{"event": "FORCE_BUY_VIA_KEY", "bot_id": "%s"}', bot_row.id)
+                bot.update_action("FORCE_BUY")
 
         # Update heartbeat
         bot.update_heartbeat()
