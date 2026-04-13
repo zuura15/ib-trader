@@ -4,6 +4,7 @@ The API server is a thin read layer + command submitter.
 It has NO broker connection — all order execution goes through
 the engine service via the pending_commands SQLite table.
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -56,7 +57,10 @@ def create_app(
             logger.warning('{"event": "API_REDIS_FAILED", "error": "%s"}', str(e))
 
         logger.info('{"event": "API_SERVER_STARTED"}')
-        yield
+        try:
+            yield
+        except asyncio.CancelledError:
+            pass  # Graceful shutdown via Ctrl+C
         try:
             from ib_trader.redis.client import close_redis
             await close_redis()
