@@ -69,7 +69,7 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
     app = create_app(session_factory, cors_origins=cors_origins)
 
     try:
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
