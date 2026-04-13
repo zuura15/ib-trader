@@ -41,3 +41,19 @@ def get_alerts() -> AlertRepository:
 
 def get_pending_commands() -> PendingCommandRepository:
     return PendingCommandRepository(get_session_factory())
+
+
+# --- Redis dependency ---
+
+_redis = None
+
+
+def set_redis(redis) -> None:
+    """Called once at app startup to wire the Redis connection."""
+    global _redis
+    _redis = redis
+
+
+def get_redis():
+    """FastAPI dependency: returns the async Redis client, or None."""
+    return _redis

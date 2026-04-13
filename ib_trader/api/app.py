@@ -41,8 +41,27 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         set_session_factory(session_factory)
+
+        # Connect to Redis for real-time data
+        try:
+            from ib_trader.config.loader import load_settings
+            settings = load_settings("config/settings.yaml")
+            redis_url = settings.get("redis_url", "redis://localhost:6379/0")
+            from ib_trader.redis.client import get_redis
+            redis = await get_redis(redis_url)
+            from ib_trader.api.deps import set_redis
+            set_redis(redis)
+            logger.info('{"event": "API_REDIS_CONNECTED"}')
+        except Exception as e:
+            logger.warning('{"event": "API_REDIS_FAILED", "error": "%s"}', str(e))
+
         logger.info('{"event": "API_SERVER_STARTED"}')
         yield
+        try:
+            from ib_trader.redis.client import close_redis
+            await close_redis()
+        except Exception:
+            pass
         logger.info('{"event": "API_SERVER_STOPPED"}')
 
     app = FastAPI(

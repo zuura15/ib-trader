@@ -8,10 +8,11 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ib_trader.api.deps import get_redis
 from ib_trader.config.loader import load_watchlist, save_watchlist
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,23 @@ _MAX_SYMBOLS = 50
 
 
 @router.get("")
-def get_watchlist():
-    """Return live watchlist data from the engine's JSON cache."""
+async def get_watchlist(redis=Depends(get_redis)):
+    """Return live watchlist data.
+
+    Primary: reads from Redis quote keys (real-time).
+    Fallback: reads from run/watchlist.json (5s stale).
+    """
+    if redis is not None:
+        try:
+            data = await _watchlist_from_redis(redis)
+            if data:
+                return JSONResponse(
+                    content=data,
+                    headers={"Cache-Control": "no-store, max-age=0"},
+                )
+        except Exception:
+            logger.exception('{"event": "REDIS_WATCHLIST_ERROR"}')
+
     try:
         data = json.loads(_WATCHLIST_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -33,11 +49,49 @@ def get_watchlist():
 
     return JSONResponse(
         content=data,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-        },
+        headers={"Cache-Control": "no-store, max-age=0"},
     )
+
+
+async def _watchlist_from_redis(redis) -> dict | None:
+    """Read watchlist quotes from Redis keys."""
+    from datetime import datetime, timezone
+    from ib_trader.redis.state import StateStore
+    from ib_trader.config.loader import load_watchlist
+
+    symbols = load_watchlist(_WATCHLIST_YAML)
+    if not symbols:
+        return None
+
+    store = StateStore(redis)
+    items = []
+    for sym in symbols:
+        quote = await store.get(f"quote:{sym}:latest")
+        if quote:
+            items.append({
+                "symbol": sym,
+                "last": quote.get("last"),
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "volume": quote.get("volume"),
+                "change": None,
+                "change_pct": None,
+                "error": None,
+            })
+        else:
+            items.append({
+                "symbol": sym,
+                "last": None,
+                "change": None,
+                "change_pct": None,
+                "volume": None,
+                "error": None,
+            })
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
 
 
 @router.get("/symbols")
