@@ -98,6 +98,40 @@ class StrategyBotRunner(BotBase):
         self._bot_events_repo = BotEventRepository(session_factory)
         self._session_factory = session_factory
 
+    async def _load_state_from_redis(self, redis, bot_ref: str, symbol: str) -> dict | None:
+        """Load strategy state from Redis key.
+
+        Returns the state dict if found, None otherwise.
+        """
+        from ib_trader.redis.state import StateStore, StateKeys
+        try:
+            store = StateStore(redis)
+            # Try strategy state key first
+            strat_state = await store.get(StateKeys.strategy(bot_ref, symbol))
+            if strat_state:
+                logger.info(
+                    '{"event": "STATE_LOADED_REDIS", "bot_ref": "%s", "symbol": "%s"}',
+                    bot_ref, symbol,
+                )
+                return strat_state
+
+            # Try position state key
+            pos_state = await store.get(StateKeys.position(bot_ref, symbol))
+            if pos_state:
+                logger.info(
+                    '{"event": "POSITION_LOADED_REDIS", "bot_ref": "%s", "symbol": "%s", "state": "%s"}',
+                    bot_ref, symbol, pos_state.get("state"),
+                )
+                return {
+                    "position_state": pos_state.get("state", "FLAT"),
+                    "entry_price": pos_state.get("entry_price"),
+                    "entry_time": pos_state.get("entry_time"),
+                    "trade_serial": pos_state.get("serial", 0),
+                }
+        except Exception:
+            logger.exception('{"event": "REDIS_STATE_LOAD_ERROR", "bot_ref": "%s"}', bot_ref)
+        return None
+
     def _run_pipeline(self, actions: list, ctx=None) -> None:
         """Run actions through pipeline and capture any submitted command ID."""
         self.pipeline.process(actions, ctx or self.ctx)
@@ -114,9 +148,17 @@ class StrategyBotRunner(BotBase):
         if self.strategy is None:
             raise ValueError(f"Unknown strategy: {strategy_name}")
 
-        # Restore or initialize state, with reconciliation against open positions
+        # Restore or initialize state: try Redis first, then JSON file, then reconcile
         symbol = self.strategy_config["symbol"]
-        state = _load_persisted_state(self.bot_id, symbol)
+        redis = self.config.get("_redis")
+        engine_url = self.config.get("_engine_url")
+        bot_ref = self.strategy_config.get("ref_id", self.bot_id)
+
+        state = None
+        if redis:
+            state = await self._load_state_from_redis(redis, bot_ref, symbol)
+        if state is None:
+            state = _load_persisted_state(self.bot_id, symbol)
         state = _reconcile_state(state, open_positions, symbol, self.bot_id)
 
         self.ctx = StrategyContext(
@@ -155,8 +197,12 @@ class StrategyBotRunner(BotBase):
         logging_mw = LoggingMiddleware(self.bot_id, self._bot_events_repo)
         persistence_mw = PersistenceMiddleware(
             self.bot_id, self.strategy_config["symbol"], STATE_DIR,
+            redis=redis, bot_ref=bot_ref,
         )
-        execution_mw = ExecutionMiddleware(self.bot_id, self._pending_commands)
+        execution_mw = ExecutionMiddleware(
+            self.bot_id, self._pending_commands,
+            engine_url=engine_url, bot_ref=bot_ref,
+        )
         self._execution_mw = execution_mw
 
         self.pipeline = MiddlewarePipeline([
@@ -164,15 +210,34 @@ class StrategyBotRunner(BotBase):
         ])
         self._risk_mw = risk_mw
 
-        # Submit subscribe_bars command to engine
+        # Subscribe to bars via engine
         symbol = self.strategy_config["symbol"]
-        cmd = PendingCommand(
-            source=f"bot:{self.bot_id}",
-            broker="ib",
-            command_text=f"subscribe_bars {symbol}",
-            submitted_at=datetime.now(timezone.utc),
-        )
-        self._pending_commands.insert(cmd)
+        if engine_url:
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        f"{engine_url}/engine/subscribe-bars",
+                        json={"symbol": symbol},
+                    )
+                    resp.raise_for_status()
+                    logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
+            except Exception:
+                logger.exception('{"event": "BARS_SUBSCRIBE_HTTP_FAILED", "symbol": "%s"}', symbol)
+                # Fallback to pending_commands
+                cmd = PendingCommand(
+                    source=f"bot:{self.bot_id}", broker="ib",
+                    command_text=f"subscribe_bars {symbol}",
+                    submitted_at=datetime.now(timezone.utc),
+                )
+                self._pending_commands.insert(cmd)
+        else:
+            cmd = PendingCommand(
+                source=f"bot:{self.bot_id}", broker="ib",
+                command_text=f"subscribe_bars {symbol}",
+                submitted_at=datetime.now(timezone.utc),
+            )
+            self._pending_commands.insert(cmd)
 
         # Warmup: prefetch historical 3-min bars to fill the aggregator immediately
         await self._warmup_from_history(symbol)

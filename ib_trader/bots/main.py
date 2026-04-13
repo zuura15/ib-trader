@@ -66,11 +66,25 @@ def _import_strategies():
 async def run(session_factory) -> None:
     """Main bot runner coroutine."""
     pid = os.getpid()
+    settings = load_settings("config/settings.yaml")
 
     heartbeats = HeartbeatRepository(session_factory)
     heartbeats.upsert("BOT_RUNNER", pid)
     logger.info('{"event": "BOT_RUNNER_STARTED", "pid": %d}', pid)
-    print(f"[BOTS] Started (pid={pid}). No broker connection needed. Watching bots table...")
+    print(f"[BOTS] Started (pid={pid}). No broker connection needed.")
+
+    # Connect to Redis
+    redis = None
+    redis_url = settings.get("redis_url", "redis://localhost:6379/0")
+    try:
+        from ib_trader.redis.client import get_redis
+        redis = await get_redis(redis_url)
+        print("[BOTS] Connected to Redis.")
+    except Exception as e:
+        logger.warning('{"event": "REDIS_CONNECT_FAILED", "error": "%s"}', str(e))
+        print(f"[BOTS] WARNING: Redis not available ({e}). Using SQLite fallback.")
+
+    engine_url = f"http://127.0.0.1:{settings.get('engine_internal_port', 8081)}"
 
     # Start heartbeat loop
     heartbeat_task = asyncio.create_task(
@@ -79,12 +93,17 @@ async def run(session_factory) -> None:
 
     try:
         from ib_trader.bots.runner import run_bot_runner
-        await run_bot_runner(session_factory)
+        await run_bot_runner(session_factory, redis=redis, engine_url=engine_url)
     except KeyboardInterrupt:
         pass
     finally:
         heartbeat_task.cancel()
         heartbeats.delete("BOT_RUNNER")
+        try:
+            from ib_trader.redis.client import close_redis
+            await close_redis()
+        except Exception:
+            pass
         logger.info('{"event": "BOT_RUNNER_STOPPED"}')
 
 

@@ -163,15 +163,18 @@ class LoggingMiddleware:
 # ---------------------------------------------------------------------------
 
 class PersistenceMiddleware:
-    """Persists UpdateState actions to a JSON file."""
+    """Persists UpdateState actions to Redis key (primary) and JSON file (fallback)."""
 
-    def __init__(self, bot_id: str, symbol: str, state_dir: Path) -> None:
+    def __init__(self, bot_id: str, symbol: str, state_dir: Path,
+                 redis=None, bot_ref: str | None = None) -> None:
         self.bot_id = bot_id
         self.symbol = symbol
         self.state_dir = state_dir
+        self._redis = redis
+        self._bot_ref = bot_ref or bot_id
 
     def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Apply UpdateState actions to ctx.state and flush to disk."""
+        """Apply UpdateState actions to ctx.state and flush to Redis + disk."""
         for action in actions:
             if isinstance(action, UpdateState):
                 ctx.state.update(action.state)
@@ -179,7 +182,23 @@ class PersistenceMiddleware:
         return actions
 
     def _flush(self, state: dict) -> None:
-        """Atomic write to JSON file."""
+        """Write state to Redis key (primary) and JSON file (fallback)."""
+        # Redis primary path
+        if self._redis is not None:
+            import asyncio
+            from ib_trader.redis.state import StateStore, StateKeys
+            store = StateStore(self._redis)
+            key = StateKeys.strategy(self._bot_ref, self.symbol)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(store.set(key, state))
+                else:
+                    loop.run_until_complete(store.set(key, state))
+            except Exception:
+                logger.exception('{"event": "REDIS_STATE_FLUSH_ERROR", "bot_ref": "%s"}', self._bot_ref)
+
+        # JSON file fallback (kept during dual-write phase)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         path = self.state_dir / f"{self.bot_id}-{self.symbol}.json"
         tmp = path.with_suffix(".tmp")
@@ -192,39 +211,123 @@ class PersistenceMiddleware:
 # ---------------------------------------------------------------------------
 
 class ExecutionMiddleware:
-    """Submits PlaceOrder and CancelOrder actions to the engine."""
+    """Submits PlaceOrder and CancelOrder actions to the engine.
+
+    Primary path: HTTP POST to engine's internal API (synchronous).
+    Fallback path: pending_commands SQLite table (polling-based).
+    """
 
     def __init__(self, bot_id: str,
-                 pending_commands_repo: PendingCommandRepository) -> None:
+                 pending_commands_repo: PendingCommandRepository,
+                 engine_url: str | None = None,
+                 bot_ref: str | None = None) -> None:
         self.bot_id = bot_id
         self._commands = pending_commands_repo
-        self.last_cmd_id: str | None = None  # ID of the last submitted command
+        self._engine_url = engine_url  # e.g., "http://127.0.0.1:8081"
+        self._bot_ref = bot_ref
+        self.last_cmd_id: str | None = None
+        self.last_order_ref: str | None = None
+        self.last_serial: int | None = None
 
     def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Convert PlaceOrder/CancelOrder to pending_commands rows."""
+        """Convert PlaceOrder/CancelOrder to engine orders."""
         for action in actions:
             if isinstance(action, PlaceOrder):
-                cmd_text = self._build_order_command(action, ctx)
-                cmd = PendingCommand(
-                    source=f"bot:{self.bot_id}",
-                    broker="ib",
-                    command_text=cmd_text,
-                    submitted_at=_now_utc(),
-                )
-                self._commands.insert(cmd)
-                self.last_cmd_id = cmd.id
-                logger.info('{"event": "BOT_ORDER_SUBMITTED", "bot_id": "%s", '
-                            '"command": "%s", "cmd_id": "%s"}',
-                            self.bot_id, cmd_text, cmd.id)
+                if self._engine_url:
+                    self._submit_via_http(action, ctx)
+                else:
+                    self._submit_via_pending_commands(action, ctx)
 
             elif isinstance(action, CancelOrder):
-                cmd = PendingCommand(
-                    source=f"bot:{self.bot_id}",
-                    broker="ib",
-                    command_text=f"cancel {action.trade_serial}",
-                    submitted_at=_now_utc(),
+                if self._engine_url:
+                    self._cancel_via_http(action)
+                else:
+                    cmd = PendingCommand(
+                        source=f"bot:{self.bot_id}",
+                        broker="ib",
+                        command_text=f"cancel {action.trade_serial}",
+                        submitted_at=_now_utc(),
+                    )
+                    self._commands.insert(cmd)
+
+        return actions
+
+    def _submit_via_http(self, order: PlaceOrder, ctx: StrategyContext) -> None:
+        """Submit order via HTTP POST to engine internal API."""
+        import httpx
+
+        serial = ctx.state.get("trade_serial", 0)
+        payload = {
+            "symbol": order.symbol,
+            "side": order.side,
+            "qty": str(order.qty),
+            "order_type": order.order_type,
+            "bot_ref": self._bot_ref,
+            "serial": serial,
+        }
+        if order.price is not None:
+            payload["price"] = str(order.price)
+        if order.profit is not None:
+            payload["profit"] = str(order.profit)
+
+        # Use close endpoint for SELL orders with a serial
+        if order.side == "SELL" and serial:
+            url = f"{self._engine_url}/engine/close"
+            payload = {
+                "serial": serial,
+                "strategy": order.order_type,
+            }
+        else:
+            url = f"{self._engine_url}/engine/orders"
+
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(url, json=payload)
+                resp.raise_for_status()
+                result = resp.json()
+                self.last_cmd_id = result.get("ib_order_id")
+                self.last_order_ref = result.get("order_ref")
+                self.last_serial = result.get("serial", serial)
+                logger.info(
+                    '{"event": "BOT_ORDER_HTTP", "bot_id": "%s", "symbol": "%s", '
+                    '"side": "%s", "order_ref": "%s"}',
+                    self.bot_id, order.symbol, order.side, self.last_order_ref,
                 )
-                self._commands.insert(cmd)
+        except Exception:
+            logger.exception(
+                '{"event": "BOT_ORDER_HTTP_FAILED", "bot_id": "%s", "symbol": "%s"}',
+                self.bot_id, order.symbol,
+            )
+            # Fall back to pending_commands
+            self._submit_via_pending_commands(order, ctx)
+
+    def _cancel_via_http(self, action: CancelOrder) -> None:
+        """Cancel order via HTTP POST to engine."""
+        import httpx
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.post(
+                    f"{self._engine_url}/engine/close",
+                    json={"serial": action.trade_serial, "strategy": "market"},
+                )
+                resp.raise_for_status()
+        except Exception:
+            logger.exception('{"event": "BOT_CANCEL_HTTP_FAILED"}')
+
+    def _submit_via_pending_commands(self, order: PlaceOrder, ctx: StrategyContext) -> None:
+        """Fallback: submit via pending_commands table."""
+        cmd_text = self._build_order_command(order, ctx)
+        cmd = PendingCommand(
+            source=f"bot:{self.bot_id}",
+            broker="ib",
+            command_text=cmd_text,
+            submitted_at=_now_utc(),
+        )
+        self._commands.insert(cmd)
+        self.last_cmd_id = cmd.id
+        logger.info('{"event": "BOT_ORDER_SUBMITTED", "bot_id": "%s", '
+                    '"command": "%s", "cmd_id": "%s"}',
+                    self.bot_id, cmd_text, cmd.id)
 
         return actions
 

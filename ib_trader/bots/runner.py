@@ -29,7 +29,8 @@ def _now_utc() -> datetime:
 
 
 async def _run_single_bot(bot_row, session_factory: scoped_session,
-                           recover: bool = False) -> None:
+                           recover: bool = False,
+                           redis=None, engine_url: str | None = None) -> None:
     """Run a single bot's tick loop until stopped or crashed.
 
     Args:
@@ -54,6 +55,8 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
 
     config = json.loads(bot_row.config_json) if bot_row.config_json else {}
     config["tick_interval_seconds"] = bot_row.tick_interval_seconds
+    config["_redis"] = redis
+    config["_engine_url"] = engine_url
     bot = strategy_cls(bot_row.id, config, session_factory)
 
     events_repo = BotEventRepository(session_factory)
@@ -127,7 +130,8 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
         ))
 
 
-async def run_bot_runner(session_factory: scoped_session) -> None:
+async def run_bot_runner(session_factory: scoped_session,
+                         redis=None, engine_url: str | None = None) -> None:
     """Main bot runner loop. Manages bot lifecycle as asyncio tasks.
 
     Polls the bots table every second for status changes.
@@ -169,7 +173,8 @@ async def run_bot_runner(session_factory: scoped_session) -> None:
                         continue
 
                     task = asyncio.create_task(
-                        _run_single_bot(bot_row, session_factory, recover=True),
+                        _run_single_bot(bot_row, session_factory, recover=True,
+                                        redis=redis, engine_url=engine_url),
                     )
                     running_tasks[bot_row.id] = task
                     print(f"[BOTS] START  '{bot_row.name}' (strategy={bot_row.strategy}, tick={bot_row.tick_interval_seconds}s)")
