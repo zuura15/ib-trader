@@ -106,15 +106,8 @@ class Reconciler:
             await self._state.set(pos_key, pos_data)
             reconciled += 1
 
-        # Check for positions without matching orders (manual or completed trades)
-        for symbol, pos_info in our_positions.items():
-            # Check if any bot_ref claims this position
-            already_handled = any(s == symbol for (_, s) in our_orders.keys())
-            if not already_handled:
-                logger.warning(
-                    '{"event": "RECONCILER_UNTAGGED_POSITION", "symbol": "%s", "qty": "%s"}',
-                    symbol, pos_info["qty"],
-                )
+        # Positions without matching orderRef tags are manual/external —
+        # silently skip them. The reconciler only manages bot-tagged positions.
 
         logger.info(
             '{"event": "RECONCILER_STARTUP_COMPLETE", "orders": %d, "positions": %d, "reconciled": %d}',
