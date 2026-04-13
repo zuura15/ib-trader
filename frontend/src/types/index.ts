@@ -108,6 +108,7 @@ export interface Bot {
   tradesToday: number;
   pnlToday: number;
   symbols: string[];
+  refId?: string;
   uptime: number;
 }
 

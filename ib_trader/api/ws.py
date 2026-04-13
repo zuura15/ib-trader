@@ -231,39 +231,101 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
 _VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats", "bot_events"}
 
 
+async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
+    """Push live quote updates from Redis stream to WebSocket client."""
+    stream = f"quote:{symbol}"
+    last_id = "$"
+    while True:
+        try:
+            results = await redis.xread({stream: last_id}, block=10000)
+            if not results:
+                continue
+            for stream_name, entries in results:
+                for entry_id, raw_data in entries:
+                    last_id = entry_id
+                    data = {}
+                    for k, v in raw_data.items():
+                        try:
+                            data[k] = json.loads(v)
+                        except (ValueError, TypeError):
+                            data[k] = v
+                    await websocket.send_text(_json_dumps({
+                        "type": "quote",
+                        "symbol": symbol,
+                        "data": data,
+                    }))
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            return
+        except Exception:
+            logger.exception('{"event": "WS_QUOTE_STREAM_ERROR", "symbol": "%s"}', symbol)
+            await asyncio.sleep(1)
+
+
+async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, symbol: str) -> None:
+    """Push bot position/strategy state updates to WebSocket on every fill."""
+    from ib_trader.redis.streams import StreamNames
+    stream = StreamNames.fill(bot_ref)
+    last_id = "$"
+    while True:
+        try:
+            results = await redis.xread({stream: last_id}, block=10000)
+            if not results:
+                continue
+            for stream_name, entries in results:
+                for entry_id, raw_data in entries:
+                    last_id = entry_id
+                    # On any fill event, push the current strategy + position state
+                    from ib_trader.redis.state import StateStore, StateKeys
+                    store = StateStore(redis)
+                    strat = await store.get(StateKeys.strategy(bot_ref, symbol))
+                    pos = await store.get(StateKeys.position(bot_ref, symbol))
+                    await websocket.send_text(_json_dumps({
+                        "type": "bot_state",
+                        "bot_ref": bot_ref,
+                        "symbol": symbol,
+                        "strategy": strat,
+                        "position": pos,
+                    }))
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            return
+        except Exception:
+            logger.exception('{"event": "WS_BOT_STATE_STREAM_ERROR"}')
+            await asyncio.sleep(1)
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time data updates."""
     await websocket.accept()
 
-    # Get session factory from deps module
-    from ib_trader.api.deps import get_session_factory
+    from ib_trader.api.deps import get_session_factory, get_redis
     try:
         sf = get_session_factory()
     except RuntimeError:
         await websocket.close(code=1011, reason="Server not ready")
         return
 
+    redis = get_redis()
     subscribed_channels: set[str] = set()
     channel_states: dict[str, _ChannelState] = {}
+    stream_tasks: list[asyncio.Task] = []
 
     try:
         while True:
-            # Check for incoming messages (non-blocking with timeout)
             try:
                 raw = await asyncio.wait_for(
                     websocket.receive_text(), timeout=_POLL_INTERVAL_S,
                 )
                 msg = json.loads(raw)
+                msg_type = msg.get("type")
 
-                if msg.get("type") == "subscribe":
+                if msg_type == "subscribe":
                     channels = msg.get("channels", [])
                     subscribed_channels = {
                         c for c in channels if c in _VALID_CHANNELS
                     }
                     channel_states = {c: _ChannelState(c) for c in subscribed_channels}
 
-                    # Send initial snapshot
                     snapshot_data = {}
                     for ch in subscribed_channels:
                         data = _fetch_channel_data(ch, sf)
@@ -275,13 +337,30 @@ async def websocket_endpoint(websocket: WebSocket):
                         "data": snapshot_data,
                     }))
 
-                elif msg.get("type") == "ping":
+                elif msg_type == "subscribe_quote" and redis:
+                    # Subscribe to a symbol's live quote stream
+                    symbol = msg.get("symbol", "")
+                    if symbol:
+                        task = asyncio.create_task(_stream_quote_to_ws(websocket, redis, symbol))
+                        stream_tasks.append(task)
+
+                elif msg_type == "subscribe_bot" and redis:
+                    # Subscribe to a bot's state changes
+                    bot_ref = msg.get("bot_ref", "")
+                    symbol = msg.get("symbol", "")
+                    if bot_ref and symbol:
+                        task = asyncio.create_task(
+                            _stream_bot_state_to_ws(websocket, redis, bot_ref, symbol)
+                        )
+                        stream_tasks.append(task)
+
+                elif msg_type == "ping":
                     await websocket.send_text(_json_dumps({"type": "pong"}))
 
             except asyncio.TimeoutError:
-                pass  # No message received — proceed to poll
+                pass
 
-            # Poll and send diffs for subscribed channels
+            # Poll SQLite-backed channels (legacy diff path)
             if subscribed_channels:
                 for ch in subscribed_channels:
                     data = _fetch_channel_data(ch, sf)
@@ -301,3 +380,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+    finally:
+        for t in stream_tasks:
+            t.cancel()

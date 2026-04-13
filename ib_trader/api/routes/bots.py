@@ -18,6 +18,19 @@ router = APIRouter(prefix="/api/bots", tags=["bots"])
 
 
 def _serialize_bot(b) -> dict:
+    # Extract ref_id from the strategy config YAML for orderRef-based matching
+    ref_id = None
+    try:
+        cfg = json.loads(b.config_json) if b.config_json else {}
+        strategy_config_path = cfg.get("strategy_config")
+        if strategy_config_path:
+            import yaml
+            with open(strategy_config_path) as f:
+                strat = yaml.safe_load(f)
+                ref_id = strat.get("ref_id")
+    except Exception:
+        pass
+
     return {
         "id": b.id,
         "name": b.name,
@@ -34,6 +47,7 @@ def _serialize_bot(b) -> dict:
         "trades_today": b.trades_today,
         "pnl_today": str(b.pnl_today),
         "symbols_json": b.symbols_json,
+        "ref_id": ref_id,
     }
 
 

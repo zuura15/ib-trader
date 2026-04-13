@@ -37,6 +37,7 @@ function mapApiBot(b: any): Bot {
     tradesToday: b.trades_today || 0,
     pnlToday: parseFloat(b.pnl_today) || 0,
     symbols: b.symbols_json ? JSON.parse(b.symbols_json) : [],
+    refId: b.ref_id,
     uptime: 0,
   };
 }
@@ -62,36 +63,43 @@ function forceBuy(botId: string) {
     .catch(() => {});
 }
 
-function PositionLine({ botId, symbol }: { botId: string; symbol: string }) {
+function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string; botRef?: string }) {
   const [state, setState] = useState<BotPositionState>({});
   const [livePrice, setLivePrice] = useState<number>(0);
 
   useEffect(() => {
-    const fetchAll = async () => {
-      // Bot strategy state (entry, qty, hwm, etc.)
-      try {
-        const r = await fetch(`/api/bots/${botId}/state`);
-        if (r.ok) setState(await r.json());
-      } catch {}
+    // Initial fetch for snapshot
+    fetch(`/api/bots/${botId}/state`)
+      .then((r) => r.ok ? r.json() : {})
+      .then(setState)
+      .catch(() => {});
 
-      // Live quote from watchlist (real-time bid/ask/last)
+    // WebSocket for live updates — quote pushes on every IB tick,
+    // bot_state pushes on every fill. No polling.
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'subscribe_quote', symbol }));
+      if (botRef) {
+        ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
+      }
+    };
+
+    ws.onmessage = (ev) => {
       try {
-        const r = await fetch(`/api/watchlist`);
-        if (r.ok) {
-          const data = await r.json();
-          const item = data.items?.find((i: any) => i.symbol === symbol);
-          if (item) {
-            const last = parseFloat(item.last) || 0;
-            if (last > 0) setLivePrice(last);
-          }
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'quote' && msg.symbol === symbol) {
+          const last = parseFloat(msg.data.last) || parseFloat(msg.data.bid) || 0;
+          if (last > 0) setLivePrice(last);
+        } else if (msg.type === 'bot_state' && msg.symbol === symbol) {
+          if (msg.strategy) setState(msg.strategy);
         }
       } catch {}
     };
-    fetchAll();
-    // Poll every 2 seconds for responsive P&L updates
-    const interval = setInterval(fetchAll, 2000);
-    return () => clearInterval(interval);
-  }, [botId, symbol]);
+
+    return () => ws.close();
+  }, [botId, symbol, botRef]);
 
   if (!state.position_state || state.position_state === 'FLAT') return null;
 
@@ -255,7 +263,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   )}
                 </div>
                 {bot.status === 'running' && (
-                  <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} />
+                  <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} botRef={bot.refId} />
                 )}
               </div>
             );
@@ -333,7 +341,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                 {bot.status === 'running' && (
                   <tr>
                     <td colSpan={8} style={{ padding: 0 }}>
-                      <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} />
+                      <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} botRef={bot.refId} />
                     </td>
                   </tr>
                 )}
