@@ -27,7 +27,7 @@ async def get_redis(url: str = "redis://localhost:6379/0") -> aioredis.Redis:
         _redis = aioredis.from_url(
             url,
             decode_responses=True,
-            max_connections=20,
+            max_connections=100,
         )
         # Verify connectivity
         await _redis.ping()

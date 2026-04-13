@@ -440,13 +440,17 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     ctx.ib.register_status_callback(on_status)
 
     # --- Position event callback ---
-    # Wire up positionEvent if the IB client supports it
+    # Wire up positionEvent if the IB client supports it.
+    # Use a semaphore to prevent connection pool exhaustion when IB fires
+    # positionEvent for all positions simultaneously on startup.
+    _position_sem = asyncio.Semaphore(5)
+
     if hasattr(ctx.ib, '_ib'):
         ib_obj = ctx.ib._ib
 
         def on_position_event(position) -> None:
             """Handle position change from IB (any source, including manual TWS closes)."""
-            asyncio.create_task(_handle_position_event(ctx, position))
+            asyncio.create_task(_handle_position_event(ctx, position, _position_sem))
 
         ib_obj.positionEvent += on_position_event
         # Subscribe to position updates
@@ -461,7 +465,7 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         await asyncio.sleep(3600)
 
 
-async def _handle_position_event(ctx, position) -> None:
+async def _handle_position_event(ctx, position, sem=None) -> None:
     """Process a positionEvent from IB and publish to Redis."""
     from decimal import Decimal
     from datetime import datetime, timezone
@@ -472,6 +476,8 @@ async def _handle_position_event(ctx, position) -> None:
     if redis is None:
         return
 
+    if sem:
+        await sem.acquire()
     try:
         symbol = position.contract.symbol
         qty = Decimal(str(position.position))
@@ -519,6 +525,9 @@ async def _handle_position_event(ctx, position) -> None:
 
     except Exception:
         logger.exception('{"event": "POSITION_EVENT_ERROR"}')
+    finally:
+        if sem:
+            sem.release()
 
 
 async def _tick_publisher_loop(ctx: AppContext) -> None:

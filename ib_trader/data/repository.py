@@ -72,7 +72,7 @@ def init_db(engine) -> None:
     In production this is superseded by Alembic migrations.
     Used for in-memory SQLite in tests.
     """
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(engine, checkfirst=True)
 
 
 def _now_utc() -> datetime:
