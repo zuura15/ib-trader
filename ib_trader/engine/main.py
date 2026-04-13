@@ -432,26 +432,32 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 existing = await state.get(pos_key) or {}
                 existing_qty = Decimal(existing.get("qty", "0"))
 
+                # Accumulate ONLY within the same trade serial — fresh trade resets.
+                # This prevents stale qty from previous trades polluting the new one.
+                same_trade = (existing.get("serial") == serial)
+
                 if side == "B":
-                    # BUY fill: accumulate quantity (handles partial fills)
-                    new_qty = existing_qty + qty_filled
+                    # BUY fill: accumulate within same trade
+                    base_qty = existing_qty if same_trade else Decimal("0")
+                    new_qty = base_qty + qty_filled
                     pos_data = {
                         "state": "OPEN",
                         "qty": str(new_qty),
-                        "avg_price": str(avg_price),  # IB avg_price is already cumulative
+                        "avg_price": str(avg_price),
                         "serial": serial,
                         "entry_price": str(avg_price),
-                        "entry_time": existing.get("entry_time") or datetime.now(timezone.utc).isoformat(),
+                        "entry_time": existing.get("entry_time") if same_trade else datetime.now(timezone.utc).isoformat(),
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
                 else:
-                    # SELL fill: subtract from position, only FLAT when qty reaches 0
-                    new_qty = existing_qty - qty_filled
+                    # SELL fill: subtract from position
+                    base_qty = existing_qty if same_trade else qty_filled  # If different trade, treat as full close
+                    new_qty = base_qty - qty_filled if same_trade else Decimal("0")
                     if new_qty <= 0:
                         new_state = "FLAT"
                         new_qty = Decimal("0")
                     else:
-                        new_state = "EXITING"  # Partial exit — still have shares
+                        new_state = "EXITING"
                     pos_data = {
                         "state": new_state,
                         "qty": str(new_qty),

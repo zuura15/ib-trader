@@ -92,10 +92,14 @@ class Reconciler:
                 has_position=has_position,
             )
 
+            # The bot's pos:* key tracks the bot's own position from its fills.
+            # Don't pollute it with IB's total position (which includes manual
+            # positions). Preserve existing qty/avg_price if we have them;
+            # otherwise leave at 0 — fill callbacks will populate them.
             pos_data = {
                 "state": new_state,
-                "qty": str(our_positions[symbol]["qty"]) if has_position else "0",
-                "avg_price": str(our_positions[symbol].get("avg_price", 0)) if has_position else "0",
+                "qty": current.get("qty", "0") if current else "0",
+                "avg_price": current.get("avg_price", "0") if current else "0",
                 "serial": order_info["serial"],
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
