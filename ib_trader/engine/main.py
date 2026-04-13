@@ -361,11 +361,13 @@ async def _publish_ib_positions_to_redis(ctx: AppContext) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
-        # Subscribe to market data for live quotes
-        try:
-            await ctx.ib.subscribe_market_data(con_id, sym)
-        except Exception:
-            pass
+        # Subscribe to market data for equities only — option/futures quotes
+        # are different instruments and would overwrite equity quote keys
+        if sec_type == "STK":
+            try:
+                await ctx.ib.subscribe_market_data(con_id, sym)
+            except Exception:
+                pass
 
         count += 1
 
