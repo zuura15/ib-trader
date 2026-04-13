@@ -26,7 +26,15 @@ async def list_positions(redis=Depends(get_redis)):
             status_code=503,
         )
 
-    positions = await _positions_from_redis(redis)
+    try:
+        positions = await _positions_from_redis(redis)
+    except Exception:
+        logger.exception('{"event": "REDIS_POSITIONS_ERROR"}')
+        return JSONResponse(
+            content={"error": "Redis read failed"},
+            status_code=503,
+        )
+
     return JSONResponse(
         content=positions,
         headers={"Cache-Control": "no-store, max-age=0"},

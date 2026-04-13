@@ -28,9 +28,9 @@ class _ImmediateRejectMock:
     """Mixin: marks every placed order as Cancelled before the poll loop runs."""
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         ib_id = await super().place_limit_order(
-            con_id, symbol, side, qty, price, outside_rth, tif
+            con_id, symbol, side, qty, price, outside_rth, tif, order_ref=order_ref
         )
         # Simulate IB immediately rejecting the order.
         self._order_statuses[ib_id] = {
@@ -46,9 +46,9 @@ class _PreSubmittedMock:
     """Mixin: marks every placed order as PreSubmitted (market closed simulation)."""
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         ib_id = await super().place_limit_order(
-            con_id, symbol, side, qty, price, outside_rth, tif
+            con_id, symbol, side, qty, price, outside_rth, tif, order_ref=order_ref
         )
         self._order_statuses[ib_id] = {
             "status": "PreSubmitted",

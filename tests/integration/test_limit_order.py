@@ -100,8 +100,8 @@ class TestLimitOrderPlacement:
         # Set up mock to report fill immediately
         original_place = ctx.ib.place_limit_order
 
-        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             # Simulate immediate fill
             ctx.ib._order_statuses[ib_id] = {
                 "status": "Filled",
@@ -136,8 +136,8 @@ class TestLimitOrderPlacement:
         # Make orders rejected immediately
         original_place = ctx.ib.place_limit_order
 
-        async def place_rejected(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_rejected(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             ctx.ib._order_statuses[ib_id]["status"] = "Cancelled"
             return ib_id
 
@@ -177,8 +177,8 @@ class TestLimitOrderPlacement:
         """Limit order with immediate fill should place profit taker."""
         original_place = ctx.ib.place_limit_order
 
-        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             ctx.ib._order_statuses[ib_id] = {
                 "status": "Filled",
                 "qty_filled": qty,

@@ -73,16 +73,11 @@ async def run(session_factory) -> None:
     logger.info('{"event": "BOT_RUNNER_STARTED", "pid": %d}', pid)
     print(f"[BOTS] Started (pid={pid}). No broker connection needed.")
 
-    # Connect to Redis
-    redis = None
+    # Connect to Redis (required)
     redis_url = settings.get("redis_url", "redis://localhost:6379/0")
-    try:
-        from ib_trader.redis.client import get_redis
-        redis = await get_redis(redis_url)
-        print("[BOTS] Connected to Redis.")
-    except Exception as e:
-        logger.warning('{"event": "REDIS_CONNECT_FAILED", "error": "%s"}', str(e))
-        print(f"[BOTS] WARNING: Redis not available ({e}). Using SQLite fallback.")
+    from ib_trader.redis.client import get_redis
+    redis = await get_redis(redis_url)
+    print("[BOTS] Connected to Redis.")
 
     engine_url = f"http://127.0.0.1:{settings.get('engine_internal_port', 8081)}"
 

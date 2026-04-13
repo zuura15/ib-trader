@@ -469,13 +469,16 @@ async def _handle_position_event(ctx, position) -> None:
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
-        # If position went to zero, check if any bot had this symbol open
+        # If position went to zero, find the specific bot that owned it.
+        # Only flatten the FIRST matching key to avoid multi-bot collision
+        # when two bots trade the same symbol.
         if qty == 0:
             state = StateStore(redis)
             async for key in redis.scan_iter(match=f"pos:*:{symbol}"):
                 current = await state.get(key)
                 if current and current.get("state") in ("OPEN", "EXITING"):
                     bot_ref = key.split(":")[1]
+                    prev_state = current["state"]
                     current["state"] = "FLAT"
                     current["qty"] = "0"
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -486,13 +489,14 @@ async def _handle_position_event(ctx, position) -> None:
                     await fill_writer.add({
                         "type": "POSITION_CLOSED_EXTERNALLY",
                         "symbol": symbol,
-                        "prev_state": "OPEN",
+                        "prev_state": prev_state,
                         "ts": datetime.now(timezone.utc).isoformat(),
                     })
                     logger.info(
                         '{"event": "EXTERNAL_CLOSE_DETECTED", "symbol": "%s", "bot_ref": "%s"}',
                         symbol, bot_ref,
                     )
+                    break  # Only flatten ONE bot's key per position close
 
     except Exception:
         logger.exception('{"event": "POSITION_EVENT_ERROR"}')

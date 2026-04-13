@@ -182,7 +182,11 @@ class PersistenceMiddleware:
         return actions
 
     def _flush(self, state: dict) -> None:
-        """Write state to Redis key. Fails loud if Redis is unavailable."""
+        """Write state to Redis key. Fails loud if Redis is unavailable.
+
+        Uses a tracked asyncio task to ensure Redis errors are surfaced,
+        not silently dropped.
+        """
         if self._redis is None:
             raise RuntimeError(
                 f"Redis not available — cannot persist strategy state for {self._bot_ref}:{self.symbol}"
@@ -192,11 +196,23 @@ class PersistenceMiddleware:
         from ib_trader.redis.state import StateStore, StateKeys
         store = StateStore(self._redis)
         key = StateKeys.strategy(self._bot_ref, self.symbol)
+
+        async def _do_set():
+            try:
+                await store.set(key, state)
+            except Exception:
+                logger.exception(
+                    '{"event": "REDIS_STATE_FLUSH_FAILED", "key": "%s"}', key,
+                )
+                raise  # Surface the error — don't swallow it
+
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(store.set(key, state))
+            task = asyncio.ensure_future(_do_set())
+            # Add error callback so the exception is not silently ignored
+            task.add_done_callback(lambda t: t.result() if not t.cancelled() and t.exception() else None)
         else:
-            loop.run_until_complete(store.set(key, state))
+            loop.run_until_complete(_do_set())
 
 
 # ---------------------------------------------------------------------------
@@ -295,37 +311,7 @@ class ExecutionMiddleware:
                 resp.raise_for_status()
         except Exception:
             logger.exception('{"event": "BOT_CANCEL_HTTP_FAILED"}')
-
-
-        return actions
-
-    def _build_order_command(self, order: PlaceOrder, ctx: StrategyContext) -> str:
-        """Convert a PlaceOrder action to a command string.
-
-        SELL orders use 'close SERIAL STRATEGY' format to properly close
-        an existing position. BUY orders use 'buy SYMBOL QTY STRATEGY'.
-        """
-        if order.side == "SELL":
-            # Use close command with the active trade serial
-            serial = ctx.state.get("trade_serial")
-            if serial:
-                return f"close {serial} {order.order_type}"
-            # Fallback: sell directly (shouldn't happen)
-            return f"sell {order.symbol} {order.qty} {order.order_type}"
-
-        # BUY order
-        parts = ["buy", order.symbol, str(order.qty), order.order_type]
-
-        if order.order_type == "limit" and order.price is not None:
-            parts.append(str(order.price))
-
-        for key, value in order.params.items():
-            if key == "profit_target" and value is not None:
-                parts.extend(["--profit", str(value)])
-            elif key == "stop_loss" and value is not None:
-                parts.extend(["--stop-loss", str(value)])
-
-        return " ".join(parts)
+            raise
 
 
 # ---------------------------------------------------------------------------

@@ -33,9 +33,16 @@ async def get_watchlist(redis=Depends(get_redis)):
             status_code=503,
         )
 
-    data = await _watchlist_from_redis(redis)
-    if data is None:
-        data = {"generated_at": None, "items": []}
+    try:
+        data = await _watchlist_from_redis(redis)
+        if data is None:
+            data = {"generated_at": None, "items": []}
+    except Exception:
+        logger.exception('{"event": "REDIS_WATCHLIST_ERROR"}')
+        return JSONResponse(
+            content={"error": "Redis read failed"},
+            status_code=503,
+        )
 
     return JSONResponse(
         content=data,

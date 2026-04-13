@@ -23,13 +23,17 @@ logger = logging.getLogger(__name__)
 _ctx = None
 
 
+_VALID_SIDES = {"BUY", "SELL"}
+_VALID_ORDER_TYPES = {"mid", "market", "bid", "ask", "limit"}
+
+
 class OrderRequest(BaseModel):
     """Request body for placing an order."""
 
     symbol: str
     side: str = Field(description="BUY or SELL")
     qty: str = Field(description="Order quantity as string (Decimal-safe)")
-    order_type: str = Field(default="mid", description="Order strategy: mid, limit, market")
+    order_type: str = Field(default="mid", description="Order strategy: mid, limit, market, bid, ask")
     price: Optional[str] = Field(default=None, description="Limit price (required for limit orders)")
     bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
     serial: Optional[int] = Field(default=None, description="Trade serial number")
@@ -91,8 +95,15 @@ async def place_order(req: OrderRequest):
     from ib_trader.repl.commands import parse_command
     from ib_trader.engine.service import execute_single_command
 
+    # Validate inputs
+    side_upper = req.side.upper()
+    if side_upper not in _VALID_SIDES:
+        raise HTTPException(status_code=422, detail=f"Invalid side: {req.side!r}. Must be BUY or SELL.")
+    if req.order_type not in _VALID_ORDER_TYPES:
+        raise HTTPException(status_code=422, detail=f"Invalid order_type: {req.order_type!r}. Must be one of {_VALID_ORDER_TYPES}.")
+
     # Build command text from request
-    side_cmd = "buy" if req.side.upper() == "BUY" else "sell"
+    side_cmd = "buy" if side_upper == "BUY" else "sell"
     cmd_text = f"{side_cmd} {req.symbol} {req.qty} {req.order_type}"
     if req.profit:
         cmd_text += f" --profit {req.profit}"
@@ -101,23 +112,18 @@ async def place_order(req: OrderRequest):
     if req.price:
         cmd_text += f" --price {req.price}"
 
-    # Build orderRef if bot_ref is provided
-    order_ref = None
-    if req.bot_ref and req.serial is not None:
-        from ib_trader.engine.order_ref import encode
-        side_code = "B" if req.side.upper() == "BUY" else "S"
-        order_ref = encode(req.bot_ref, req.symbol, side_code, req.serial)
-
+    # Pass bot_ref through to execute_single_command — the engine encodes
+    # orderRef AFTER allocating the real trade serial (not the bot's stale one).
     try:
         result = await execute_single_command(
             _ctx, cmd_text,
             source=f"bot:{req.bot_ref}" if req.bot_ref else "api",
-            order_ref=order_ref,
+            bot_ref=req.bot_ref,
         )
         return OrderResponse(
             ib_order_id=result.get("ib_order_id", ""),
-            serial=result.get("serial", req.serial or 0),
-            order_ref=order_ref,
+            serial=result.get("serial", 0),
+            order_ref=result.get("order_ref"),
             status=result.get("status", "SUBMITTED"),
         )
     except Exception as e:

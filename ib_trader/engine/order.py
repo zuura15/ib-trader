@@ -43,6 +43,7 @@ class _OrderContext:
     strike: Decimal | None = None
     right: str | None = None
     ib_order_id: str | None = None
+    order_ref: str | None = None  # IB orderRef tag (IBT:{bot_ref}:{symbol}:{side}:{serial})
 
 
 def _session_tif() -> str:
@@ -240,6 +241,13 @@ async def execute_order(
     )
     trade_group = ctx.trades.create(trade_group)
 
+    # Encode orderRef AFTER serial allocation (bot_ref comes from the command)
+    order_ref = None
+    if hasattr(cmd, 'bot_ref') and cmd.bot_ref:
+        from ib_trader.engine.order_ref import encode as encode_order_ref
+        side_code = "B" if side == "BUY" else "S"
+        order_ref = encode_order_ref(cmd.bot_ref, cmd.symbol, side_code, serial)
+
     order_ctx = _OrderContext(
         trade_id=trade_group.id,
         trade_serial=serial,
@@ -250,6 +258,7 @@ async def execute_order(
         leg_type=LegType.ENTRY,
         correlation_id=correlation_id,
         security_type="STK",
+        order_ref=order_ref,
     )
 
     if cmd.stop_loss:
@@ -348,7 +357,8 @@ async def _execute_limit_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
@@ -361,6 +371,7 @@ async def _execute_limit_order(
                price_placed=price,
                raw_response=json.dumps({
                    "ib_order_id": ib_order_id, "price": str(price), "strategy": "limit",
+                   "order_ref": order_ctx.order_ref,
                }))
 
     # Register fill/status callbacks so SQLite gets updated on fill

@@ -519,7 +519,7 @@ async def execute_single_command(
     ctx: AppContext,
     command_text: str,
     source: str = "api",
-    order_ref: str | None = None,
+    bot_ref: str | None = None,
 ) -> dict:
     """Execute a command directly (for the internal HTTP API).
 
@@ -531,10 +531,11 @@ async def execute_single_command(
         ctx: AppContext with broker connection.
         command_text: Raw command string (e.g., "buy QQQ 20 mid").
         source: Command source identifier (e.g., "bot:saw-rsi", "api").
-        order_ref: Optional orderRef to tag on the IB order.
+        bot_ref: Optional bot reference ID for orderRef tagging. The engine
+                 encodes the full orderRef after allocating the trade serial.
 
     Returns:
-        Dict with keys: status, output, ib_order_id, serial.
+        Dict with keys: status, output, serial, order_ref.
     """
     renderer = _ListRenderer()
     cmd_router = OutputRouter()
@@ -599,9 +600,9 @@ async def execute_single_command(
 
         if isinstance(parsed, (BuyCommand, SellCommand)):
             from ib_trader.engine.order import execute_order
-            # Pass order_ref through the command if provided
-            if order_ref and hasattr(parsed, '__dict__'):
-                parsed = dataclasses.replace(parsed, order_ref=order_ref) if hasattr(parsed, 'order_ref') else parsed
+            # Inject bot_ref so execute_order can encode orderRef after serial allocation
+            if bot_ref:
+                parsed = dataclasses.replace(parsed, bot_ref=bot_ref)
             await execute_order(parsed, cmd_ctx)
         elif isinstance(parsed, CloseCommand):
             from ib_trader.engine.order import execute_close
@@ -611,17 +612,32 @@ async def execute_single_command(
         if audit_id:
             ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
 
-        # Extract serial and ib_order_id from output
+        # Extract serial and order_ref from output messages
         result = {"status": "SUCCESS", "output": output}
         for msg in renderer.messages:
+            if "Order #" in msg:
+                try:
+                    # "Order #42 — BUY 20 QQQ ..."
+                    serial_str = msg.split("Order #")[1].split()[0].strip("—").strip()
+                    result["serial"] = int(serial_str)
+                except (ValueError, IndexError):
+                    pass
             if "Serial:" in msg:
                 try:
                     serial_str = msg.split("Serial:")[1].split()[0].strip("#").strip()
                     result["serial"] = int(serial_str)
                 except (ValueError, IndexError):
                     pass
-            if "ib_order_id=" in msg or "FILLED:" in msg:
-                result["ib_order_id"] = ""  # Filled orders have been tracked
+
+        # Build order_ref from bot_ref + extracted serial
+        if bot_ref and "serial" in result:
+            from ib_trader.engine.order_ref import encode as encode_ref
+            side_code = "B" if "buy" in command_text.lower().split()[0] else "S"
+            symbol = command_text.split()[1] if len(command_text.split()) > 1 else ""
+            try:
+                result["order_ref"] = encode_ref(bot_ref, symbol, side_code, result["serial"])
+            except ValueError:
+                pass
 
         return result
 

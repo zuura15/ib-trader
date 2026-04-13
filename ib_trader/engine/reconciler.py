@@ -178,6 +178,22 @@ class Reconciler:
                         '"ib": "HAS_POSITION", "qty": "%s"}',
                         key, ib_pos["qty"],
                     )
+                    # Repair: set to OPEN to match IB
+                    current["state"] = OPEN
+                    current["qty"] = str(ib_pos["qty"])
+                    current["avg_price"] = str(ib_pos.get("avg_price", 0))
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    await self._state.set(key, current)
+
+                    writer = StreamWriter(self._redis, StreamNames.fill(bot_ref), maxlen=500)
+                    await writer.add({
+                        "type": "RECONCILED",
+                        "symbol": symbol,
+                        "prev_state": FLAT,
+                        "new_state": OPEN,
+                        "reason": "position_found_in_ib",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    })
 
         except Exception:
             logger.exception('{"event": "RECONCILER_SANITY_ERROR"}')
@@ -232,7 +248,17 @@ class Reconciler:
 
         if current_state == FLAT:
             if has_order:
-                logger.warning('{"event": "RECONCILER_ORPHAN_ORDER", "side": "%s"}', order_side)
+                # Repair: FLAT but IB has our order — update to match IB
+                new_state = ENTERING if order_side == "B" else EXITING
+                logger.warning(
+                    '{"event": "RECONCILER_FLAT_REPAIRED", "side": "%s", "new_state": "%s"}',
+                    order_side, new_state,
+                )
+                return new_state
+            if has_position:
+                # Repair: FLAT but IB has a position — must be OPEN
+                logger.warning('{"event": "RECONCILER_FLAT_HAS_POSITION"}')
+                return OPEN
             return FLAT
 
         return current_state

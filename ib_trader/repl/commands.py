@@ -42,6 +42,7 @@ class BuyCommand:
     take_profit_price: Decimal | None
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
+    bot_ref: str | None = None  # Bot reference for orderRef tagging
 
 
 @dataclass
@@ -55,6 +56,7 @@ class SellCommand:
     take_profit_price: Decimal | None
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
+    bot_ref: str | None = None  # Bot reference for orderRef tagging
 
 
 @dataclass
