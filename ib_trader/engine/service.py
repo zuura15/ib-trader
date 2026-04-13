@@ -515,6 +515,123 @@ async def _handle_unsubscribe_bars(symbol: str, ctx: AppContext) -> str:
     return f"Unsubscribed from bars + quotes for {symbol}"
 
 
+async def execute_single_command(
+    ctx: AppContext,
+    command_text: str,
+    source: str = "api",
+    order_ref: str | None = None,
+) -> dict:
+    """Execute a command directly (for the internal HTTP API).
+
+    Unlike the polling-based _execute_single_command which takes a DB row,
+    this function takes raw command text and returns the result as a dict.
+    Used by the internal API to bypass the pending_commands table.
+
+    Args:
+        ctx: AppContext with broker connection.
+        command_text: Raw command string (e.g., "buy QQQ 20 mid").
+        source: Command source identifier (e.g., "bot:saw-rsi", "api").
+        order_ref: Optional orderRef to tag on the IB order.
+
+    Returns:
+        Dict with keys: status, output, ib_order_id, serial.
+    """
+    renderer = _ListRenderer()
+    cmd_router = OutputRouter()
+    cmd_router.set_renderer(renderer)
+    cmd_ctx = dataclasses.replace(ctx, router=cmd_router)
+
+    # Write audit log to pending_commands (write-only, never read on hot path)
+    audit_id = None
+    if ctx.pending_commands:
+        from ib_trader.data.models import PendingCommand
+        import uuid
+        audit_id = str(uuid.uuid4())
+        cmd = PendingCommand(
+            id=audit_id,
+            source=source,
+            command_text=command_text,
+            status=PendingCommandStatus.RUNNING,
+        )
+        ctx.pending_commands._session().add(cmd)
+        ctx.pending_commands._session().commit()
+
+    try:
+        cmd_text = command_text.strip()
+
+        # Handle bar subscription commands
+        if cmd_text.startswith("subscribe_bars "):
+            symbol = cmd_text.split(maxsplit=1)[1].strip()
+            output = await _handle_subscribe_bars(symbol, cmd_ctx)
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+            return {"status": "SUCCESS", "output": output}
+
+        if cmd_text.startswith("warmup_bars "):
+            parts = cmd_text.split()
+            symbol = parts[1]
+            duration = int(parts[2]) if len(parts) > 2 else 7200
+            output = await _handle_warmup_bars(symbol, duration, cmd_ctx)
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+            return {"status": "SUCCESS", "output": output}
+
+        if cmd_text.startswith("unsubscribe_bars "):
+            symbol = cmd_text.split(maxsplit=1)[1].strip()
+            output = await _handle_unsubscribe_bars(symbol, cmd_ctx)
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+            return {"status": "SUCCESS", "output": output}
+
+        parsed = parse_command(command_text, router=cmd_router)
+
+        if parsed is None:
+            error = f"Unknown command: {command_text}"
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
+            return {"status": "FAILURE", "output": error}
+
+        if isinstance(parsed, str):
+            output = _handle_builtin(parsed, cmd_ctx)
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+            return {"status": "SUCCESS", "output": output}
+
+        if isinstance(parsed, (BuyCommand, SellCommand)):
+            from ib_trader.engine.order import execute_order
+            # Pass order_ref through the command if provided
+            if order_ref and hasattr(parsed, '__dict__'):
+                parsed = dataclasses.replace(parsed, order_ref=order_ref) if hasattr(parsed, 'order_ref') else parsed
+            await execute_order(parsed, cmd_ctx)
+        elif isinstance(parsed, CloseCommand):
+            from ib_trader.engine.order import execute_close
+            await execute_close(parsed, cmd_ctx)
+
+        output = "\n".join(renderer.messages) if renderer.messages else ""
+        if audit_id:
+            ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+
+        # Extract serial and ib_order_id from output
+        result = {"status": "SUCCESS", "output": output}
+        for msg in renderer.messages:
+            if "Serial:" in msg:
+                try:
+                    serial_str = msg.split("Serial:")[1].split()[0].strip("#").strip()
+                    result["serial"] = int(serial_str)
+                except (ValueError, IndexError):
+                    pass
+            if "ib_order_id=" in msg or "FILLED:" in msg:
+                result["ib_order_id"] = ""  # Filled orders have been tracked
+
+        return result
+
+    except Exception as e:
+        error = str(e)
+        if audit_id:
+            ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
+        raise
+
+
 async def engine_loop(ctx: AppContext,
                        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
                        poll_interval: float = _DEFAULT_POLL_INTERVAL_S,

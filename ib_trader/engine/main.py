@@ -1,9 +1,15 @@
 """Engine service CLI entry point.
 
-The engine service is the sole process with broker connections. It polls
-pending_commands from SQLite, executes them via the trading engine, and
-writes results back. All other processes (REPL, API, bots) submit commands
-by inserting rows into the pending_commands table.
+The engine is the sole process with an IB broker connection. All other
+processes (bot runner, API, REPL) communicate via Redis streams/keys
+and the engine's internal HTTP API.
+
+The engine:
+  1. Receives IB push callbacks (ticks, fills, status, positions)
+  2. Publishes to Redis streams + sets Redis keys (immediate)
+  3. Writes to SQLite for audit (observational, not gating)
+  4. Runs the reconciler for startup recovery and sanity checks
+  5. Hosts the internal HTTP API for order placement
 
 Usage:
     ib-engine                # defaults, IB broker
@@ -164,13 +170,55 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
         print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
 
-        # Start heartbeat + position cache + watchlist loops
+        # --- Redis setup ---
+        redis_url = ctx.settings.get("redis_url", "redis://localhost:6379/0")
+        try:
+            from ib_trader.redis.client import get_redis
+            redis = await get_redis(redis_url)
+            ctx.redis = redis
+            print("[ENGINE] Connected to Redis.")
+        except Exception as e:
+            logger.warning(
+                '{"event": "REDIS_CONNECT_FAILED", "error": "%s"}', str(e),
+            )
+            print(f"[ENGINE] WARNING: Redis not available ({e}). Running without Redis.")
+            redis = None
+
+        # --- Start background tasks ---
         bg_tasks = [
             asyncio.create_task(_heartbeat_loop(ctx, pid)),
+            # Legacy position/watchlist loops kept as dual-write safety net
             asyncio.create_task(_position_cache_loop(ctx)),
             asyncio.create_task(_watchlist_cache_loop(ctx)),
         ]
 
+        # Redis-dependent tasks
+        if redis:
+            # Event relay: IB callbacks → Redis streams + keys
+            bg_tasks.append(asyncio.create_task(_event_relay_loop(ctx)))
+
+            # Tick publisher: streaming ticks → Redis
+            bg_tasks.append(asyncio.create_task(_tick_publisher_loop(ctx)))
+
+            # Reconciler: startup recovery + sanity checks
+            from ib_trader.engine.reconciler import Reconciler
+            reconciler = Reconciler(
+                ctx.ib, redis,
+                sanity_interval=ctx.settings.get("reconciler_sanity_interval", 60),
+            )
+            await reconciler.startup_reconcile()
+            bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
+            print("[ENGINE] Reconciler started.")
+
+            # Internal HTTP API
+            from ib_trader.engine.internal_api import start_internal_api
+            internal_port = ctx.settings.get("engine_internal_port", 8081)
+            api_task = await start_internal_api(ctx, port=internal_port)
+            bg_tasks.append(api_task)
+            print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
+
+        # Legacy engine loop (polls pending_commands) — kept for REPL/API
+        # commands during dual-write transition. Will be removed in Phase 5.
         from ib_trader.engine.service import engine_loop
         max_concurrent = ctx.settings.get("engine_max_concurrent", 5)
         poll_interval = ctx.settings.get("engine_poll_interval", 0.1)
@@ -188,6 +236,11 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             await asyncio.shield(ctx.ib.disconnect())
         except Exception:
             pass  # IB may already be dead — don't crash during cleanup
+        try:
+            from ib_trader.redis.client import close_redis
+            await close_redis()
+        except Exception:
+            pass
         print("[ENGINE] Stopped.")
         logger.info('{"event": "ENGINE_STOPPED"}')
 
@@ -255,6 +308,292 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
         )
     except Exception:
         logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
+
+
+async def _event_relay_loop(ctx: AppContext) -> None:
+    """Relay IB fill/status/position events to Redis streams and keys.
+
+    Registers global callbacks on the IB client. When IB fires an event,
+    the callback publishes to the appropriate Redis stream and updates
+    the Redis position state key.
+
+    This is the PRIMARY update path — the reconciler is just a safety net.
+    """
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    from ib_trader.redis.streams import StreamWriter, StreamNames
+    from ib_trader.redis.state import StateStore, StateKeys
+    from ib_trader.engine.order_ref import decode as decode_ref
+
+    redis = ctx.redis
+    if redis is None:
+        return
+
+    state = StateStore(redis)
+
+    # --- Global fill callback ---
+    async def on_fill(ib_order_id: str, qty_filled: Decimal,
+                      avg_price: Decimal, commission: Decimal) -> None:
+        """Handle fill from IB — publish to Redis stream + update state key."""
+        try:
+            # Get orderRef from the active trade
+            order_ref_str = ""
+            if hasattr(ctx.ib, '_active_trades'):
+                trade = ctx.ib._active_trades.get(ib_order_id)
+                if trade and hasattr(trade, 'order') and hasattr(trade.order, 'orderRef'):
+                    order_ref_str = trade.order.orderRef or ""
+
+            ref = decode_ref(order_ref_str)
+            bot_ref = ref.bot_ref if ref else "unknown"
+            symbol = ref.symbol if ref else ""
+            serial = ref.serial if ref else 0
+            side = ref.side if ref else ""
+
+            # Publish to fill stream
+            writer = StreamWriter(redis, StreamNames.fill(bot_ref), maxlen=500)
+            await writer.add({
+                "type": "FILL",
+                "ib_order_id": ib_order_id,
+                "orderRef": order_ref_str,
+                "symbol": symbol,
+                "side": side,
+                "qty": str(qty_filled),
+                "price": str(avg_price),
+                "commission": str(commission),
+                "serial": serial,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
+            # Update position state key
+            if ref:
+                pos_key = StateKeys.position(bot_ref, symbol)
+                new_state = "OPEN" if side == "B" else "FLAT"
+                pos_data = {
+                    "state": new_state,
+                    "qty": str(qty_filled) if new_state == "OPEN" else "0",
+                    "avg_price": str(avg_price),
+                    "serial": serial,
+                    "entry_price": str(avg_price) if side == "B" else None,
+                    "entry_time": datetime.now(timezone.utc).isoformat() if side == "B" else None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                # Merge with existing data (keep fields like entry_price on sell)
+                existing = await state.get(pos_key)
+                if existing and side == "S":
+                    pos_data["entry_price"] = existing.get("entry_price")
+                    pos_data["entry_time"] = existing.get("entry_time")
+                await state.set(pos_key, pos_data)
+
+            logger.info(
+                '{"event": "FILL_RELAYED", "ib_order_id": "%s", "bot_ref": "%s", '
+                '"symbol": "%s", "qty": "%s", "price": "%s"}',
+                ib_order_id, bot_ref, symbol, qty_filled, avg_price,
+            )
+        except Exception:
+            logger.exception('{"event": "FILL_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
+
+    # --- Global status callback ---
+    async def on_status(ib_order_id: str, status: str) -> None:
+        """Handle order status change from IB — publish to Redis stream."""
+        try:
+            order_ref_str = ""
+            if hasattr(ctx.ib, '_active_trades'):
+                trade = ctx.ib._active_trades.get(ib_order_id)
+                if trade and hasattr(trade, 'order') and hasattr(trade.order, 'orderRef'):
+                    order_ref_str = trade.order.orderRef or ""
+
+            ref = decode_ref(order_ref_str)
+            bot_ref = ref.bot_ref if ref else "unknown"
+
+            writer = StreamWriter(redis, StreamNames.fill(bot_ref), maxlen=500)
+            await writer.add({
+                "type": "STATUS",
+                "ib_order_id": ib_order_id,
+                "orderRef": order_ref_str,
+                "status": status,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
+            # On cancellation, update position state
+            if ref and status in ("Cancelled", "Inactive", "ApiCancelled"):
+                pos_key = StateKeys.position(ref.bot_ref, ref.symbol)
+                existing = await state.get(pos_key)
+                if existing and existing.get("state") in ("ENTERING", "EXITING"):
+                    # Revert: ENTERING → FLAT, EXITING → OPEN
+                    new_state = "FLAT" if existing["state"] == "ENTERING" else "OPEN"
+                    existing["state"] = new_state
+                    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    await state.set(pos_key, existing)
+
+        except Exception:
+            logger.exception('{"event": "STATUS_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
+
+    # Register global callbacks (fire for ALL orders)
+    ctx.ib.register_fill_callback(on_fill)
+    ctx.ib.register_status_callback(on_status)
+
+    # --- Position event callback ---
+    # Wire up positionEvent if the IB client supports it
+    if hasattr(ctx.ib, '_ib'):
+        ib_obj = ctx.ib._ib
+
+        def on_position_event(position) -> None:
+            """Handle position change from IB (any source, including manual TWS closes)."""
+            asyncio.create_task(_handle_position_event(ctx, position))
+
+        ib_obj.positionEvent += on_position_event
+        # Subscribe to position updates
+        try:
+            await ib_obj.reqPositionsAsync()
+        except Exception:
+            pass
+        logger.info('{"event": "POSITION_EVENT_WIRED"}')
+
+    # Keep the task alive
+    while True:
+        await asyncio.sleep(3600)
+
+
+async def _handle_position_event(ctx, position) -> None:
+    """Process a positionEvent from IB and publish to Redis."""
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    from ib_trader.redis.streams import StreamWriter, StreamNames
+    from ib_trader.redis.state import StateStore, StateKeys
+
+    redis = ctx.redis
+    if redis is None:
+        return
+
+    try:
+        symbol = position.contract.symbol
+        qty = Decimal(str(position.position))
+        avg_price = Decimal(str(position.avgCost))
+
+        # Publish position change to stream
+        writer = StreamWriter(redis, StreamNames.position_changes(), maxlen=1000)
+        await writer.add({
+            "symbol": symbol,
+            "qty": str(qty),
+            "avg_price": str(avg_price),
+            "con_id": position.contract.conId,
+            "account": position.account,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # If position went to zero, check if any bot had this symbol open
+        if qty == 0:
+            state = StateStore(redis)
+            async for key in redis.scan_iter(match=f"pos:*:{symbol}"):
+                current = await state.get(key)
+                if current and current.get("state") in ("OPEN", "EXITING"):
+                    bot_ref = key.split(":")[1]
+                    current["state"] = "FLAT"
+                    current["qty"] = "0"
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    await state.set(key, current)
+
+                    # Notify the bot
+                    fill_writer = StreamWriter(redis, StreamNames.fill(bot_ref), maxlen=500)
+                    await fill_writer.add({
+                        "type": "POSITION_CLOSED_EXTERNALLY",
+                        "symbol": symbol,
+                        "prev_state": "OPEN",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    })
+                    logger.info(
+                        '{"event": "EXTERNAL_CLOSE_DETECTED", "symbol": "%s", "bot_ref": "%s"}',
+                        symbol, bot_ref,
+                    )
+
+    except Exception:
+        logger.exception('{"event": "POSITION_EVENT_ERROR"}')
+
+
+async def _tick_publisher_loop(ctx: AppContext) -> None:
+    """Publish streaming tick data from IB to Redis.
+
+    Reads from the IB client's in-memory ticker cache and publishes to
+    Redis streams + keys. Runs every 200ms to balance freshness and load.
+
+    This is a transitional approach — ideally we'd hook directly into
+    ib_async's ticker update callback, but the current abstraction layer
+    exposes get_ticker() as the read interface.
+    """
+    from datetime import datetime, timezone
+    from ib_trader.redis.streams import StreamWriter, StreamNames
+    from ib_trader.redis.state import StateStore, StateKeys
+
+    redis = ctx.redis
+    if redis is None:
+        return
+
+    state = StateStore(redis)
+
+    # Track which symbols we've created writers for
+    writers: dict[str, StreamWriter] = {}
+    last_values: dict[str, tuple] = {}  # symbol → (bid, ask, last) to avoid duplicate publishes
+
+    while True:
+        try:
+            if not hasattr(ctx.ib, '_streaming'):
+                await asyncio.sleep(1)
+                continue
+
+            for con_id, entry in list(ctx.ib._streaming.items()):
+                ticker = ctx.ib.get_ticker(con_id)
+                if ticker is None:
+                    continue
+
+                symbol = entry.get("contract", None)
+                if symbol and hasattr(symbol, "symbol"):
+                    symbol = symbol.symbol
+                elif isinstance(entry.get("symbol"), str):
+                    symbol = entry["symbol"]
+                else:
+                    continue
+
+                bid = ticker.get("bid")
+                ask = ticker.get("ask")
+                last = ticker.get("last")
+
+                # Skip if nothing has changed
+                current = (bid, ask, last)
+                if current == last_values.get(symbol):
+                    continue
+                last_values[symbol] = current
+
+                if symbol not in writers:
+                    writers[symbol] = StreamWriter(redis, StreamNames.quote(symbol), maxlen=5000)
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                # Publish to stream
+                await writers[symbol].add({
+                    "bid": str(bid) if bid else None,
+                    "ask": str(ask) if ask else None,
+                    "last": str(last) if last else None,
+                    "volume": ticker.get("volume"),
+                    "ts": now,
+                })
+
+                # Update latest key with TTL
+                await state.set(
+                    StateKeys.quote_latest(symbol),
+                    {
+                        "bid": str(bid) if bid else None,
+                        "ask": str(ask) if ask else None,
+                        "last": str(last) if last else None,
+                        "volume": ticker.get("volume"),
+                        "ts": now,
+                    },
+                    ttl=StateKeys.QUOTE_TTL,
+                )
+
+        except Exception:
+            logger.exception('{"event": "TICK_PUBLISHER_ERROR"}')
+
+        await asyncio.sleep(0.2)  # 200ms — 5 publishes/second per symbol max
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
