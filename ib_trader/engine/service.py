@@ -551,12 +551,14 @@ async def execute_single_command(
     if ctx.pending_commands:
         from ib_trader.data.models import PendingCommand
         import uuid
+        from datetime import datetime as _dt, timezone as _tz
         audit_id = str(uuid.uuid4())
         cmd = PendingCommand(
             id=audit_id,
             source=source,
             command_text=command_text,
             status=PendingCommandStatus.RUNNING,
+            submitted_at=_dt.now(_tz.utc),
         )
         ctx.pending_commands._session().add(cmd)
         ctx.pending_commands._session().commit()
