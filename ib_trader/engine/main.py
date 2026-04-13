@@ -655,16 +655,21 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                 continue
 
             for con_id, entry in list(ctx.ib._streaming.items()):
+                # Only publish equity (STK) quotes — option/futures tickers
+                # share the same symbol as the underlying and would overwrite
+                contract = entry.get("contract")
+                if contract and hasattr(contract, "secType"):
+                    if contract.secType != "STK":
+                        continue
+
                 ticker = ctx.ib.get_ticker(con_id)
                 if ticker is None:
                     continue
 
-                symbol = entry.get("contract", None)
-                if symbol and hasattr(symbol, "symbol"):
-                    symbol = symbol.symbol
-                elif isinstance(entry.get("symbol"), str):
-                    symbol = entry["symbol"]
-                else:
+                symbol = None
+                if contract and hasattr(contract, "symbol"):
+                    symbol = contract.symbol
+                if not symbol:
                     continue
 
                 bid = ticker.get("bid")
@@ -686,25 +691,37 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
 
                 now = datetime.now(timezone.utc).isoformat()
 
-                # Publish to stream
-                await writers[symbol].add({
+                # Build full quote data including derived fields
+                close = ticker.get("close")
+                change = None
+                change_pct = None
+                if last is not None and close is not None and close > 0:
+                    change = round(last - close, 4)
+                    change_pct = round((change / close) * 100, 2)
+
+                quote_data = {
                     "bid": str(bid) if bid else None,
                     "ask": str(ask) if ask else None,
                     "last": str(last) if last else None,
                     "volume": ticker.get("volume"),
+                    "avg_volume": ticker.get("avg_volume"),
+                    "high": ticker.get("high"),
+                    "low": ticker.get("low"),
+                    "close": close,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "high_52w": ticker.get("high_52w"),
+                    "low_52w": ticker.get("low_52w"),
                     "ts": now,
-                })
+                }
+
+                # Publish to stream
+                await writers[symbol].add(quote_data)
 
                 # Update latest key with TTL
                 await state.set(
                     StateKeys.quote_latest(symbol),
-                    {
-                        "bid": str(bid) if bid else None,
-                        "ask": str(ask) if ask else None,
-                        "last": str(last) if last else None,
-                        "volume": ticker.get("volume"),
-                        "ts": now,
-                    },
+                    quote_data,
                     ttl=StateKeys.QUOTE_TTL,
                 )
 

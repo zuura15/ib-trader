@@ -65,23 +65,31 @@ async def _watchlist_from_redis(redis) -> dict | None:
     for sym in symbols:
         quote = await store.get(f"quote:{sym}:latest")
         if quote:
+            def _fmt(v):
+                return str(v) if v is not None else None
+            def _fmt_int(v):
+                return str(int(v)) if v is not None else None
+
             items.append({
                 "symbol": sym,
-                "last": quote.get("last"),
-                "bid": quote.get("bid"),
-                "ask": quote.get("ask"),
-                "volume": quote.get("volume"),
-                "change": None,
-                "change_pct": None,
+                "last": _fmt(quote.get("last")),
+                "change": _fmt(quote.get("change")),
+                "change_pct": _fmt(quote.get("change_pct")),
+                "volume": _fmt_int(quote.get("volume")),
+                "avg_volume": _fmt_int(quote.get("avg_volume")),
+                "high": _fmt(quote.get("high")),
+                "low": _fmt(quote.get("low")),
+                "high_52w": _fmt(quote.get("high_52w")),
+                "low_52w": _fmt(quote.get("low_52w")),
                 "error": None,
             })
         else:
             items.append({
                 "symbol": sym,
-                "last": None,
-                "change": None,
-                "change_pct": None,
-                "volume": None,
+                "last": None, "change": None, "change_pct": None,
+                "volume": None, "avg_volume": None,
+                "high": None, "low": None,
+                "high_52w": None, "low_52w": None,
                 "error": None,
             })
 
