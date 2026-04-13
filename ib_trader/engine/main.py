@@ -223,13 +223,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         await asyncio.sleep(1)
         print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
 
-        # Engine loop — handles commands from REPL/API via pending_commands.
-        # Bot commands go through the HTTP API directly.
-        from ib_trader.engine.service import engine_loop
-        max_concurrent = ctx.settings.get("engine_max_concurrent", 5)
-        poll_interval = ctx.settings.get("engine_poll_interval", 0.1)
-        await engine_loop(ctx, max_concurrent=max_concurrent,
-                          poll_interval=poll_interval)
+        # All command producers (bots, API, REPL) use the HTTP API.
+        # No more polling loop. Keep the engine alive.
+        print("[ENGINE] Ready. All commands via HTTP API.")
+        await asyncio.Event().wait()  # Block forever until cancelled
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass

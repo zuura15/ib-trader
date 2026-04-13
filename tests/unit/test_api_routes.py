@@ -56,31 +56,11 @@ def _now():
 class TestCommandRoutes:
     """POST /api/commands and GET /api/commands/{id}."""
 
-    def test_submit_returns_202(self, client):
+    def test_submit_returns_503_without_engine(self, client):
+        """Commands forward to engine HTTP API — returns 503 if engine is down."""
         resp = client.post("/api/commands", json={"command": "status"})
-        assert resp.status_code == 202
-        data = resp.json()
-        assert data["status"] == "pending"
-        assert "command_id" in data
-
-    def test_submit_with_broker(self, client):
-        resp = client.post("/api/commands",
-                           json={"command": "buy AAPL 10 mid", "broker": "alpaca"})
-        assert resp.status_code == 202
-
-    def test_get_command_status(self, client):
-        # Submit first
-        resp = client.post("/api/commands", json={"command": "status"})
-        cmd_id = resp.json()["command_id"]
-
-        # Get status
-        resp = client.get(f"/api/commands/{cmd_id}")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["command_id"] == cmd_id
-        assert data["status"] == "PENDING"
-        assert data["command_text"] == "status"
-        assert data["source"] == "api"
+        # Engine is not running in tests, so we expect 503
+        assert resp.status_code == 503
 
     def test_get_nonexistent_command_404(self, client):
         resp = client.get("/api/commands/nonexistent-id")

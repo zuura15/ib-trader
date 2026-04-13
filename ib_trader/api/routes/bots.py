@@ -8,7 +8,7 @@ POST /api/bots/{bot_id}/stop — stop a bot
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ib_trader.api.deps import get_session_factory
+from ib_trader.api.deps import get_session_factory, get_redis
 from ib_trader.data.models import BotStatus
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
 
@@ -51,10 +51,10 @@ def get_bot(bot_id: str, sf=Depends(get_session_factory)):
 
 
 @router.post("/{bot_id}/start", status_code=202)
-def start_bot(bot_id: str, sf=Depends(get_session_factory)):
-    """Set bot status to RUNNING. The bot runner will pick it up.
+async def start_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(get_redis)):
+    """Start a bot. Publishes START to the global control stream.
 
-    Idempotent: if already RUNNING, returns 200 with no-op.
+    The bot runner wakes immediately via XREAD BLOCK — no polling delay.
     """
     repo = BotRepository(sf)
     b = repo.get(bot_id)
@@ -63,14 +63,17 @@ def start_bot(bot_id: str, sf=Depends(get_session_factory)):
     if b.status == BotStatus.RUNNING:
         return {"bot_id": bot_id, "status": "RUNNING", "message": "already running"}
     repo.update_status(bot_id, BotStatus.RUNNING)
+    # Publish to global control stream — runner wakes immediately
+    if redis:
+        await redis.xadd("bot:control:global", {"action": "START", "bot_id": bot_id}, maxlen=100)
     return {"bot_id": bot_id, "status": "RUNNING"}
 
 
 @router.post("/{bot_id}/stop", status_code=202)
-def stop_bot(bot_id: str, sf=Depends(get_session_factory)):
-    """Set bot status to STOPPED. The bot runner will stop the task.
+async def stop_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(get_redis)):
+    """Stop a bot. Publishes STOP to the global control stream.
 
-    Idempotent: if already STOPPED, returns 200 with no-op.
+    The bot runner and the bot itself wake immediately — no polling delay.
     """
     repo = BotRepository(sf)
     b = repo.get(bot_id)
@@ -79,6 +82,9 @@ def stop_bot(bot_id: str, sf=Depends(get_session_factory)):
     if b.status == BotStatus.STOPPED:
         return {"bot_id": bot_id, "status": "STOPPED", "message": "already stopped"}
     repo.update_status(bot_id, BotStatus.STOPPED)
+    # Publish to global control stream — runner wakes immediately
+    if redis:
+        await redis.xadd("bot:control:global", {"action": "STOP", "bot_id": bot_id}, maxlen=100)
     return {"bot_id": bot_id, "status": "STOPPED"}
 
 
@@ -109,11 +115,12 @@ def get_bot_state(bot_id: str, sf=Depends(get_session_factory)):
 
 
 @router.post("/{bot_id}/force-buy", status_code=202)
-def force_buy(bot_id: str, sf=Depends(get_session_factory)):
-    """Signal a running bot to place a forced buy on its next tick.
+async def force_buy(bot_id: str, sf=Depends(get_session_factory), redis=Depends(get_redis)):
+    """Signal a running bot to place a forced buy immediately.
 
-    Only works when bot is RUNNING. The bot checks last_action at
-    the top of each tick and clears the flag immediately.
+    Publishes FORCE_BUY to the global control stream. The bot runner
+    forwards it to the bot's control stream. The bot wakes from XREAD
+    BLOCK and executes the force-buy — no waiting for next tick.
     """
     repo = BotRepository(sf)
     b = repo.get(bot_id)
@@ -121,7 +128,12 @@ def force_buy(bot_id: str, sf=Depends(get_session_factory)):
         raise HTTPException(status_code=404, detail="Bot not found")
     if b.status != BotStatus.RUNNING:
         raise HTTPException(status_code=409, detail="Bot is not running")
-    repo.update_action(bot_id, "FORCE_BUY")
+    # Publish to global control stream — forwarded to bot immediately
+    if redis:
+        await redis.xadd("bot:control:global", {"action": "FORCE_BUY", "bot_id": bot_id}, maxlen=100)
+    else:
+        # Fallback: write to DB (bot checks on next tick)
+        repo.update_action(bot_id, "FORCE_BUY")
     return {"bot_id": bot_id, "action": "FORCE_BUY"}
 
 
