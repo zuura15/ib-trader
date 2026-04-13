@@ -177,6 +177,22 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         ctx.redis = redis
         print("[ENGINE] Connected to Redis.")
 
+        # --- Subscribe to watchlist symbols for tick publishing ---
+        from ib_trader.config.loader import load_watchlist
+        watchlist_symbols = load_watchlist("config/watchlist.yaml")
+        watchlist_subscribed = 0
+        for sym in watchlist_symbols:
+            try:
+                info = await ctx.ib.qualify_contract(sym)
+                await ctx.ib.subscribe_market_data(info["con_id"], sym)
+                watchlist_subscribed += 1
+            except Exception:
+                logger.warning('{"event": "WATCHLIST_SUB_FAILED", "symbol": "%s"}', sym)
+        print(f"[ENGINE] Subscribed to {watchlist_subscribed} watchlist symbols.")
+
+        # --- Publish current IB positions to Redis ---
+        await _publish_ib_positions_to_redis(ctx)
+
         # --- Start background tasks ---
         bg_tasks = [
             asyncio.create_task(_heartbeat_loop(ctx, pid)),
@@ -298,6 +314,63 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
         )
     except Exception:
         logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
+
+
+async def _publish_ib_positions_to_redis(ctx: AppContext) -> None:
+    """Fetch current IB positions and publish to Redis for the API.
+
+    Writes each position as a Redis key so the positions endpoint can
+    serve them. Also subscribes to market data for position symbols
+    so the tick publisher sends live quotes.
+    """
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    from ib_trader.redis.state import StateStore
+
+    redis = ctx.redis
+    if redis is None or not hasattr(ctx.ib, '_ib'):
+        return
+
+    state = StateStore(redis)
+    ib_obj = ctx.ib._ib
+
+    try:
+        await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
+    except Exception:
+        logger.exception('{"event": "PUBLISH_POSITIONS_FAILED"}')
+        return
+
+    count = 0
+    for p in ib_obj.positions():
+        sym = p.contract.symbol
+        qty = Decimal(str(p.position))
+        avg_cost = Decimal(str(p.avgCost))
+        con_id = p.contract.conId
+        sec_type = p.contract.secType
+
+        # Write to Redis — use "ib" as bot_ref for manual/untagged positions
+        pos_key = f"ibpos:{sym}:{sec_type}:{con_id}"
+        await state.set(pos_key, {
+            "symbol": sym,
+            "sec_type": sec_type,
+            "quantity": str(qty),
+            "avg_cost": str(avg_cost),
+            "con_id": con_id,
+            "account": p.account,
+            "broker": "ib",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # Subscribe to market data for live quotes
+        try:
+            await ctx.ib.subscribe_market_data(con_id, sym)
+        except Exception:
+            pass
+
+        count += 1
+
+    logger.info('{"event": "IB_POSITIONS_PUBLISHED", "count": %d}', count)
+    print(f"[ENGINE] Published {count} IB positions to Redis.")
 
 
 async def _event_relay_loop(ctx: AppContext) -> None:
@@ -482,6 +555,25 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
         symbol = position.contract.symbol
         qty = Decimal(str(position.position))
         avg_price = Decimal(str(position.avgCost))
+        con_id = position.contract.conId
+        sec_type = position.contract.secType
+
+        # Update the ibpos key for the API positions endpoint
+        state = StateStore(redis)
+        ibpos_key = f"ibpos:{symbol}:{sec_type}:{con_id}"
+        if qty == 0:
+            await state.delete(ibpos_key)
+        else:
+            await state.set(ibpos_key, {
+                "symbol": symbol,
+                "sec_type": sec_type,
+                "quantity": str(qty),
+                "avg_cost": str(avg_price),
+                "con_id": con_id,
+                "account": position.account,
+                "broker": "ib",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
 
         # Publish position change to stream
         writer = StreamWriter(redis, StreamNames.position_changes(), maxlen=1000)
