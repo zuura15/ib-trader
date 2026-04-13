@@ -20,7 +20,15 @@ typecheck:
 
 dev:
 	@echo "Starting all services... (Ctrl+C to stop all)"
-	@trap 'trap "" INT TERM; kill -TERM 0; wait; exit 0' INT TERM; \
+	@mkdir -p run/redis-data logs
+	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
+		echo "[DEV] Redis already running."; \
+	else \
+		echo "[DEV] Starting Redis..."; \
+		.local/bin/redis-server config/redis.conf --daemonize yes; \
+		sleep 0.5; \
+	fi
+	@trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' INT TERM; \
 	uv run ib-engine & \
 	uv run ib-api & \
 	uv run ib-bots & \

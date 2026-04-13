@@ -52,6 +52,9 @@ site/
 run/
 *.pid
 
+# Local tooling (Redis binaries, etc.)
+.local/
+
 # Node modules (frontend prototypes)
 node_modules/
 
