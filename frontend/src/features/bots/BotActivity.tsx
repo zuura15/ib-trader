@@ -77,7 +77,7 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
           seen.add(e.id);
           return true;
         });
-        unique.sort((a, b) => (a.recorded_at || '').localeCompare(b.recorded_at || ''));
+        unique.sort((a, b) => (b.recorded_at || '').localeCompare(a.recorded_at || ''));
         setEntries(unique.slice(0, maxLines));
       });
     };
@@ -87,11 +87,11 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
     return () => clearInterval(interval);
   }, [bots, maxLines]);
 
-  // Auto-scroll to bottom (newest at bottom)
-  const lastEntryId = entries.length > 0 ? entries[entries.length - 1]?.id : 0;
+  // Scroll to top (newest first)
+  const lastEntryId = entries.length > 0 ? entries[0]?.id : 0;
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTop = 0;
     }
   }, [lastEntryId]);
 

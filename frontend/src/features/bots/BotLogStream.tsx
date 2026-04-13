@@ -99,9 +99,9 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
         });
         Promise.all(promises).then((results) => {
           const merged = results.flat();
-          // Sort by recorded_at ascending
-          merged.sort((a, b) => (a.recorded_at || '').localeCompare(b.recorded_at || ''));
-          setLogs(merged.slice(-maxLines));
+          // Sort by recorded_at descending (newest first)
+          merged.sort((a, b) => (b.recorded_at || '').localeCompare(a.recorded_at || ''));
+          setLogs(merged.slice(0, maxLines));
         });
       } else {
         const params = new URLSearchParams({ limit: String(maxLines) });
@@ -121,11 +121,11 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
     return () => clearInterval(interval);
   }, [selectedBotId, filterType, maxLines, bots]);
 
-  // Auto-scroll to bottom (newest) — use last event id as trigger
-  const lastLogId = logs.length > 0 ? logs[logs.length - 1]?.id : 0;
+  // Scroll to top (newest first)
+  const lastLogId = logs.length > 0 ? logs[0]?.id : 0;
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTop = 0;
     }
   }, [lastLogId]);
 
