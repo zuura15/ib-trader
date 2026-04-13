@@ -331,6 +331,7 @@ class InsyncClient(IBClientBase):
         price: Decimal,
         outside_rth: bool = True,
         tif: str = "GTC",
+        order_ref: str | None = None,
     ) -> str:
         """Place a limit order. Returns IB order ID as string."""
         await self._throttle()
@@ -341,6 +342,8 @@ class InsyncClient(IBClientBase):
         order.account = self._account_id
         order.outsideRth = outside_rth
         order.tif = tif
+        if order_ref:
+            order.orderRef = order_ref
         overnight = is_overnight_session()
         if overnight:
             # During overnight session (8 PM – 3:50 AM ET), set includeOvernight
@@ -377,6 +380,7 @@ class InsyncClient(IBClientBase):
         side: str,
         qty: Decimal,
         outside_rth: bool = True,
+        order_ref: str | None = None,
     ) -> str:
         """Place a market order. Returns IB order ID as string."""
         await self._throttle()
@@ -386,6 +390,8 @@ class InsyncClient(IBClientBase):
         order = MarketOrder(side, float(qty))
         order.account = self._account_id
         order.outsideRth = outside_rth
+        if order_ref:
+            order.orderRef = order_ref
         overnight = is_overnight_session()
         if overnight:
             order.includeOvernight = True
