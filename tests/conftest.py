@@ -64,13 +64,14 @@ class MockIBClient(IBClientBase):
         return self._market_snapshot
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         await self._throttle()
         ib_id = str(self._next_order_id)
         self._next_order_id += 1
         self.placed_orders.append({
             "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
             "side": side, "qty": qty, "price": price, "tif": tif,
+            "order_ref": order_ref,
         })
         self._order_statuses[ib_id] = {
             "status": "Submitted",
@@ -80,13 +81,15 @@ class MockIBClient(IBClientBase):
         }
         return ib_id
 
-    async def place_market_order(self, con_id, symbol, side, qty, outside_rth=True) -> str:
+    async def place_market_order(self, con_id, symbol, side, qty,
+                                 outside_rth=True, order_ref=None) -> str:
         await self._throttle()
         ib_id = str(self._next_order_id)
         self._next_order_id += 1
         self.placed_orders.append({
             "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
             "side": side, "qty": qty, "type": "MARKET",
+            "order_ref": order_ref,
         })
         self._order_statuses[ib_id] = {
             "status": "Submitted",

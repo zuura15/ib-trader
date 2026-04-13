@@ -2,6 +2,7 @@
 # Buys intraday dips within confirmed sawtooth uptrends on 3-minute bars.
 
 name: sawtooth_rsi_reversal
+ref_id: saw-rsi-meta
 version: "1.0"
 
 # Symbol and sizing

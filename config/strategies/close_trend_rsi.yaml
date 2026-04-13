@@ -3,6 +3,7 @@
 # More responsive than sawtooth in tight price ranges.
 
 name: close_trend_rsi_reversal
+ref_id: ctr-qqq
 version: "1.0"
 
 # Symbol and sizing

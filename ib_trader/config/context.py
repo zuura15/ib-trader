@@ -51,6 +51,7 @@ class AppContext:
     settings: dict          # Loaded from settings.yaml
     account_id: str         # From .env
     transactions: TransactionRepository
+    redis: object | None = None  # redis.asyncio.Redis — optional, None until Redis is available
     pending_commands: PendingCommandRepository | None = None
     bots: BotRepository | None = None
     bot_events: BotEventRepository | None = None

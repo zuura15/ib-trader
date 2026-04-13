@@ -16,6 +16,8 @@ ib_min_call_interval_ms: 100
 # Live accounts with real-time subscriptions should use 1.
 ib_market_data_type: 1
 cache_ttl_seconds: 86400
+redis_url: "redis://localhost:6379/0"
+engine_internal_port: 8081
 log_level: INFO
 log_file_path: logs/ib_trader.log
 log_rotation_max_bytes: 10485760

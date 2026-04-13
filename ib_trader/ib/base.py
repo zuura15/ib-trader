@@ -105,6 +105,7 @@ class IBClientBase(ABC):
         price: Decimal,
         outside_rth: bool = True,
         tif: str = "GTC",
+        order_ref: str | None = None,
     ) -> str:
         """Place a GTC limit order.
 
@@ -116,6 +117,9 @@ class IBClientBase(ABC):
             price: Limit price.
             outside_rth: If True, order works outside regular trading hours.
             tif: Time-in-force ("GTC" default).
+            order_ref: Optional orderRef tag for IB order identification.
+                       Format: "IBT:{bot_ref}:{symbol}:{side}:{serial}".
+                       Set on the IB Order object before placement.
 
         Returns:
             IB order ID as a string. Write to SQLite immediately on return.
@@ -130,6 +134,7 @@ class IBClientBase(ABC):
         side: str,
         qty: Decimal,
         outside_rth: bool = True,
+        order_ref: str | None = None,
     ) -> str:
         """Place a market order.
 
@@ -139,6 +144,8 @@ class IBClientBase(ABC):
             side: "BUY" or "SELL".
             qty: Order quantity.
             outside_rth: If True, order works outside regular trading hours.
+            order_ref: Optional orderRef tag for IB order identification.
+                       Format: "IBT:{bot_ref}:{symbol}:{side}:{serial}".
 
         Returns:
             IB order ID as a string. Write to SQLite immediately on return.
