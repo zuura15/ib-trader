@@ -75,8 +75,11 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """FastAPI lifespan — no startup/shutdown work needed."""
-    yield
+    """FastAPI lifespan — catch CancelledError for clean shutdown."""
+    try:
+        yield
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(title="IB Trader Engine Internal API", lifespan=_lifespan)
