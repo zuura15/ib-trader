@@ -541,7 +541,7 @@ class StrategyBotRunner(BotBase):
                 )]
                 await self._run_pipeline(actions)
 
-    def _read_new_bars(self, symbol: str) -> list[dict]:
+    async def _read_new_bars(self, symbol: str) -> list[dict]:
         """Read new bars from the Redis bar stream.
 
         The engine publishes 5-second bars to bar:{symbol}:5s via
