@@ -674,66 +674,75 @@ class StrategyBotRunner(BotBase):
             return None
 
     async def _check_pending_fills(self) -> None:
-        """Check for fills on the specific command we submitted.
+        """Check for fills by reading the Redis position state key.
 
-        Tracks _pending_cmd_id so we only check our own command,
-        not stale commands from previous bot/engine instances.
+        The engine's fill relay updates pos:{bot_ref}:{symbol} on every
+        IB fill callback. If the position transitioned to a different state
+        than what the bot expects, we process the fill/cancellation.
         """
-        if not self._pending_cmd_id:
-            return
-
-        cmd = self._pending_commands.get(self._pending_cmd_id)
-        if not cmd:
-            return
-
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
         symbol = self.strategy_config["symbol"]
+        redis = self.config.get("_redis")
+        bot_ref = self.strategy_config.get("ref_id", self.bot_id)
 
-        # Still running — wait
-        if cmd.status == PendingCommandStatus.PENDING or cmd.status == PendingCommandStatus.RUNNING:
+        if not redis:
             return
 
-        if pos == PositionState.ENTERING:
-            if cmd.status == PendingCommandStatus.SUCCESS:
-                output = cmd.output or ""
-                parsed = _parse_fill_from_output(output, symbol)
-                if parsed:
-                    event = OrderFilled(
-                        trade_serial=parsed["serial"],
-                        symbol=symbol,
-                        side="BUY",
-                        fill_price=parsed["fill_price"],
-                        qty=parsed["qty"],
-                        commission=parsed["commission"],
-                        ib_order_id="",
-                    )
-                    actions = await self.strategy.on_event(event, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
-                self._pending_cmd_id = None
+        from ib_trader.redis.state import StateStore, StateKeys
+        store = StateStore(redis)
+        redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
 
-            elif cmd.status == PendingCommandStatus.FAILURE:
+        if not redis_pos:
+            return
+
+        redis_state = redis_pos.get("state", "FLAT")
+
+        # ENTERING → check if IB filled (OPEN) or cancelled (FLAT)
+        if pos == PositionState.ENTERING:
+            if redis_state == "OPEN":
+                fill_price = Decimal(redis_pos.get("entry_price") or "0")
+                fill_qty = Decimal(redis_pos.get("qty") or "0")
+                serial = redis_pos.get("serial", 0)
+
+                event = OrderFilled(
+                    trade_serial=serial,
+                    symbol=symbol,
+                    side="BUY",
+                    fill_price=fill_price,
+                    qty=fill_qty,
+                    commission=Decimal("0"),
+                    ib_order_id="",
+                )
+                actions = await self.strategy.on_event(event, self.ctx)
+                if actions:
+                    await self._run_pipeline(actions)
+                self._pending_cmd_id = None
+                logger.info(
+                    '{"event": "FILL_DETECTED_REDIS", "bot_ref": "%s", "symbol": "%s", '
+                    '"qty": "%s", "price": "%s"}',
+                    bot_ref, symbol, fill_qty, fill_price,
+                )
+
+            elif redis_state == "FLAT":
+                # Order was cancelled/rejected
                 event = OrderRejected(
                     trade_serial=None,
                     symbol=symbol,
-                    reason=cmd.error or "Unknown failure",
-                    command_id=cmd.id,
+                    reason="Order cancelled or rejected (detected via Redis)",
+                    command_id="",
                 )
                 actions = await self.strategy.on_event(event, self.ctx)
                 if actions:
                     await self._run_pipeline(actions)
                 self._pending_cmd_id = None
 
+        # EXITING → check if IB completed the exit (FLAT) or cancelled (OPEN)
         elif pos == PositionState.EXITING:
-            if cmd.status == PendingCommandStatus.SUCCESS:
-                output = cmd.output or ""
+            if redis_state == "FLAT":
                 entry_price_str = self.ctx.state.get("entry_price")
                 entry_price = Decimal(str(entry_price_str)) if entry_price_str else Decimal("0")
-                parsed = _parse_fill_from_output(output, symbol)
-
-                fill_price = parsed["fill_price"] if parsed else Decimal("0")
-                fill_qty = parsed["qty"] if parsed else Decimal("0")
-                fill_commission = parsed["commission"] if parsed else Decimal("0")
+                fill_price = Decimal(redis_pos.get("avg_price") or "0")
+                fill_qty = Decimal(redis_pos.get("qty") or "0")
 
                 event = OrderFilled(
                     trade_serial=self.ctx.state.get("trade_serial") or 0,
@@ -741,7 +750,7 @@ class StrategyBotRunner(BotBase):
                     side="SELL",
                     fill_price=fill_price,
                     qty=fill_qty,
-                    commission=fill_commission,
+                    commission=Decimal("0"),
                     ib_order_id="",
                 )
                 actions = await self.strategy.on_event(event, self.ctx)
@@ -752,9 +761,13 @@ class StrategyBotRunner(BotBase):
                         self._risk_mw.record_pnl(pnl)
                     self._risk_mw.record_trade()
                 self._pending_cmd_id = None
+                logger.info(
+                    '{"event": "EXIT_FILL_DETECTED_REDIS", "bot_ref": "%s", "symbol": "%s"}',
+                    bot_ref, symbol,
+                )
 
-            elif cmd.status == PendingCommandStatus.FAILURE:
-                # Failed exit — handled by the EXITING recovery in on_tick
+            elif redis_state == "OPEN":
+                # Exit was cancelled — back to OPEN
                 self._pending_cmd_id = None
 
 

@@ -902,10 +902,15 @@ class InsyncClient(IBClientBase):
     })
 
     def _on_exec_details(self, trade: Trade, fill: Fill) -> None:
-        """Handle fill event from IB and dispatch to registered callbacks."""
+        """Handle fill event from IB and dispatch to registered callbacks.
+
+        Uses fill.execution data (this specific fill) rather than
+        trade.orderStatus (cumulative, lags behind on partial fills).
+        """
         ib_order_id = str(trade.order.orderId)
-        qty_filled = Decimal(str(trade.orderStatus.filled))
-        avg_price = Decimal(str(trade.orderStatus.avgFillPrice))
+        # Use fill-level data — orderStatus.filled/avgFillPrice lag behind
+        qty_filled = Decimal(str(fill.execution.shares))
+        avg_price = Decimal(str(fill.execution.price))
         commission = Decimal("0")
         if fill.commissionReport:
             commission = Decimal(str(fill.commissionReport.commission))
