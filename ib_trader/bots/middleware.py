@@ -303,14 +303,35 @@ class MiddlewarePipeline:
         """Pass actions through each middleware sequentially.
 
         Supports both sync and async middleware process() methods.
+        If ExecutionMiddleware fails, rolls back any state changes made
+        by PersistenceMiddleware to prevent stuck ENTERING/EXITING states.
         """
         import asyncio
+        state_snapshot = dict(ctx.state)  # Snapshot before pipeline runs
+
         for mw in self._middlewares:
-            result = mw.process(actions, ctx)
-            if asyncio.iscoroutine(result):
-                actions = await result
-            else:
-                actions = result
+            try:
+                result = mw.process(actions, ctx)
+                if asyncio.iscoroutine(result):
+                    actions = await result
+                else:
+                    actions = result
+            except Exception:
+                # If execution failed, rollback state to pre-pipeline snapshot
+                if isinstance(mw, ExecutionMiddleware):
+                    ctx.state.update(state_snapshot)
+                    # Persist the rollback to Redis
+                    for prev_mw in self._middlewares:
+                        if isinstance(prev_mw, PersistenceMiddleware):
+                            try:
+                                await prev_mw._flush(ctx.state)
+                            except Exception:
+                                pass
+                    logger.warning(
+                        '{"event": "PIPELINE_STATE_ROLLBACK", "reason": "execution_failed"}'
+                    )
+                raise
+
             # Capture command ID if execution middleware submitted an order
             if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id:
                 self.last_cmd_id = mw.last_cmd_id
