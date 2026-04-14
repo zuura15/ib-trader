@@ -251,191 +251,354 @@ class StrategyBotRunner(BotBase):
                      self.bot_id, self.strategy.manifest.name, symbol,
                      self.ctx.state.get("position_state", "FLAT"))
 
-    async def on_tick(self) -> None:
-        """Called every tick_interval_seconds by the bot runner.
+    async def run_event_loop(self) -> None:
+        """Drive the bot purely from Redis stream events.
 
-        Reads new bars from market_bars table, aggregates them,
-        and delivers events to the strategy. Also checks streaming
-        quotes for exit monitoring.
+        Multiplexes XREAD BLOCK across:
+          - quote:{symbol}        → QuoteUpdate (every IB tick)
+          - bar:{symbol}:5s       → bar aggregation → BarCompleted
+          - fill:{bot_ref}        → OrderFilled / OrderRejected
+          - position:changes      → external close detection
+
+        The IB quote stream is the bot's clock: when no quotes arrive
+        (market closed), the bot does nothing. Supervisory tasks
+        (heartbeat, entry timeout, stale quote watchdog) run as
+        separate asyncio tasks managed by the runner.
+        """
+        if not self.strategy or not self.ctx:
+            raise RuntimeError("Bot not initialized — call on_startup() first")
+
+        symbol = self.strategy_config["symbol"]
+        bot_ref = self.strategy_config.get("ref_id", self.bot_id)
+        redis = self.config.get("_redis")
+        if redis is None:
+            raise RuntimeError("Redis required for event-driven bot")
+
+        from ib_trader.redis.streams import StreamNames
+        quote_stream = StreamNames.quote(symbol)
+        bar_stream = StreamNames.bar(symbol, "5s")
+        fill_stream = StreamNames.fill(bot_ref)
+        pos_stream = StreamNames.position_changes()
+
+        streams = {
+            quote_stream: "$",
+            bar_stream: "$",
+            fill_stream: "$",
+            pos_stream: "$",
+        }
+
+        logger.info(
+            '{"event": "BOT_EVENT_LOOP_STARTED", "bot_id": "%s", "symbol": "%s", '
+            '"streams": ["%s", "%s", "%s", "%s"]}',
+            self.bot_id, symbol, quote_stream, bar_stream, fill_stream, pos_stream,
+        )
+
+        while True:
+            try:
+                # 5s timeout = liveness floor. If Redis returns nothing for 5s,
+                # we still loop (no work to do, just wait for next event).
+                results = await redis.xread(streams, block=5000)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('{"event": "BOT_XREAD_ERROR", "bot_id": "%s"}', self.bot_id)
+                await asyncio.sleep(1)
+                continue
+
+            if not results:
+                continue
+
+            for stream_name, entries in results:
+                for entry_id, raw_data in entries:
+                    streams[stream_name] = entry_id
+                    try:
+                        await self._dispatch_event(stream_name, raw_data,
+                                                    quote_stream, bar_stream,
+                                                    fill_stream, pos_stream,
+                                                    symbol, bot_ref)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            '{"event": "BOT_DISPATCH_ERROR", "bot_id": "%s", "stream": "%s"}',
+                            self.bot_id, stream_name,
+                        )
+
+    async def _dispatch_event(self, stream_name: str, raw_data: dict,
+                               quote_stream: str, bar_stream: str,
+                               fill_stream: str, pos_stream: str,
+                               symbol: str, bot_ref: str) -> None:
+        """Route a single Redis stream entry to the strategy."""
+        import json as _json
+
+        # Deserialize JSON-encoded values
+        data = {}
+        for k, v in raw_data.items():
+            try:
+                data[k] = _json.loads(v)
+            except (ValueError, TypeError):
+                data[k] = v
+
+        # ── Quote tick ─────────────────────────────────────────────────
+        if stream_name == quote_stream:
+            pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
+            if pos != PositionState.OPEN:
+                return  # Quotes only matter for exit monitoring
+
+            bid_str = data.get("bid")
+            ask_str = data.get("ask")
+            last_str = data.get("last")
+            if not (bid_str or ask_str or last_str):
+                return
+
+            bid = Decimal(str(bid_str)) if bid_str else Decimal("0")
+            ask = Decimal(str(ask_str)) if ask_str else Decimal("0")
+            last = Decimal(str(last_str)) if last_str else Decimal("0")
+
+            ts_str = data.get("ts")
+            ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now(timezone.utc)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            quote = QuoteUpdate(
+                symbol=symbol,
+                bid=bid if bid > 0 else last,
+                ask=ask if ask > 0 else last,
+                last=last,
+                timestamp=ts,
+            )
+            self._last_quote_time = time.monotonic()
+            self._quote_stale_logged = False
+            actions = await self.strategy.on_event(quote, self.ctx)
+            if actions:
+                await self._run_pipeline(actions)
+            return
+
+        # ── Bar completion (5s raw bar from IB) ────────────────────────
+        if stream_name == bar_stream:
+            if not self.aggregator:
+                return
+
+            bar = {
+                "timestamp_utc": data.get("ts", ""),
+                "open": float(data.get("o", 0)),
+                "high": float(data.get("h", 0)),
+                "low": float(data.get("l", 0)),
+                "close": float(data.get("c", 0)),
+                "volume": int(data.get("v", 0)),
+            }
+            completed = self.aggregator.add_bars([bar])
+            if not completed:
+                return
+
+            # Skip during post-startup cooldown
+            cooldown = getattr(self, "_signal_cooldown_until", 0)
+            if time.monotonic() < cooldown:
+                return
+
+            window = self.aggregator.get_bar_window()
+            if not window:
+                return
+
+            # Only evaluate the LAST completed bar (catch-up batches → stale signals)
+            last_bar = completed[-1]
+            event = BarCompleted(
+                symbol=symbol,
+                bar=last_bar,
+                window=window,
+                bar_count=self.aggregator.bar_count,
+            )
+            actions = await self.strategy.on_event(event, self.ctx)
+            if actions:
+                await self._run_pipeline(actions)
+            return
+
+        # ── Fill / status from engine ─────────────────────────────────
+        if stream_name == fill_stream:
+            event_type = data.get("type", "")
+            pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
+
+            # Only react to FILL events that change position state
+            if event_type == "FILL":
+                redis = self.config.get("_redis")
+                from ib_trader.redis.state import StateStore, StateKeys
+                store = StateStore(redis)
+                redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
+                if not redis_pos:
+                    return
+
+                redis_state = redis_pos.get("state", "FLAT")
+                fill_qty = Decimal(redis_pos.get("qty") or "0")
+                fill_price = Decimal(redis_pos.get("avg_price") or "0")
+                serial = redis_pos.get("serial", 0)
+
+                # ENTERING → OPEN: BUY filled
+                if pos == PositionState.ENTERING and redis_state == "OPEN":
+                    fill_event = OrderFilled(
+                        trade_serial=serial,
+                        symbol=symbol,
+                        side="BUY",
+                        fill_price=fill_price,
+                        qty=fill_qty,
+                        commission=Decimal("0"),
+                        ib_order_id="",
+                    )
+                    actions = await self.strategy.on_event(fill_event, self.ctx)
+                    if actions:
+                        await self._run_pipeline(actions)
+                    return
+
+                # EXITING → FLAT: SELL filled (full close)
+                if pos == PositionState.EXITING and redis_state == "FLAT":
+                    entry_price_str = self.ctx.state.get("entry_price")
+                    entry_price = Decimal(str(entry_price_str)) if entry_price_str else Decimal("0")
+                    sell_qty = Decimal(redis_pos.get("qty") or "0")
+                    fill_event = OrderFilled(
+                        trade_serial=self.ctx.state.get("trade_serial") or 0,
+                        symbol=symbol,
+                        side="SELL",
+                        fill_price=fill_price,
+                        qty=sell_qty,
+                        commission=Decimal("0"),
+                        ib_order_id="",
+                    )
+                    actions = await self.strategy.on_event(fill_event, self.ctx)
+                    if actions:
+                        await self._run_pipeline(actions)
+                        if entry_price > 0 and fill_price > 0:
+                            pnl = (fill_price - entry_price) * sell_qty
+                            self._risk_mw.record_pnl(pnl)
+                        self._risk_mw.record_trade()
+                    return
+
+            # Cancellations / rejections
+            if event_type == "STATUS" and data.get("status") in ("Cancelled", "Inactive", "ApiCancelled"):
+                if pos == PositionState.ENTERING:
+                    rejected = OrderRejected(
+                        trade_serial=None,
+                        symbol=symbol,
+                        reason=f"Order {data.get('status', 'cancelled')}",
+                        command_id="",
+                    )
+                    actions = await self.strategy.on_event(rejected, self.ctx)
+                    if actions:
+                        await self._run_pipeline(actions)
+            return
+
+        # ── Position change (external manipulation) ────────────────────
+        if stream_name == pos_stream:
+            if data.get("symbol") != symbol:
+                return
+            qty = Decimal(str(data.get("qty", "0")))
+            if qty == 0:
+                # Could be a full close from elsewhere — log it. Bot's own
+                # position is tracked by orderRef so it's not auto-flattened
+                # (see TODO.md for "external close while bot OPEN").
+                logger.info(
+                    '{"event": "EXTERNAL_POSITION_ZERO", "bot_id": "%s", "symbol": "%s"}',
+                    self.bot_id, symbol,
+                )
+            return
+
+    async def on_tick(self) -> None:
+        """DEPRECATED — bot is event-driven via run_event_loop().
+
+        Kept as a no-op for backward compatibility. Old runners that
+        call this method will see a warning logged once and nothing
+        else.
+        """
+        if not getattr(self, '_on_tick_warned', False):
+            logger.warning(
+                '{"event": "ON_TICK_DEPRECATED", "bot_id": "%s", '
+                '"msg": "on_tick() is deprecated — use run_event_loop()"}',
+                self.bot_id,
+            )
+            self._on_tick_warned = True
+
+    async def check_entry_timeout(self) -> None:
+        """Supervisory check: cancel entry if ENTERING > entry_timeout_seconds.
+
+        Called periodically by the runner's supervisory task — not driven
+        by market events because timeout is purely time-based.
         """
         if not self.strategy or not self.ctx:
             return
+        pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
+        if pos != PositionState.ENTERING:
+            return
 
+        timeout = self.strategy_config.get("exit", {}).get("entry_timeout_seconds", 30)
+        entry_time_str = self.ctx.state.get("entry_time")
+        if not entry_time_str:
+            return
+
+        entry_time = _parse_aware_dt(entry_time_str)
+        elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds()
+        if elapsed > timeout:
+            actions = [
+                LogSignal(
+                    event_type="ORDER",
+                    message=f"Entry timeout after {elapsed:.0f}s — cancelling, returning to FLAT",
+                ),
+                UpdateState({
+                    "position_state": PositionState.FLAT.value,
+                    "trade_serial": None,
+                    "entry_time": None,
+                    "entry_command_id": None,
+                }),
+            ]
+            await self._run_pipeline(actions)
+
+    async def check_force_buy(self) -> None:
+        """Supervisory check: handle FORCE_BUY action set on the bot row.
+
+        Called by the supervisory task when it detects a control event
+        (the runner already wakes immediately on bot:control:* stream
+        events; this method just executes the action).
+        """
+        if not self.strategy or not self.ctx:
+            return
+        last_action = self.read_last_action()
+        if last_action != "FORCE_BUY":
+            return
+
+        self.clear_last_action()
         symbol = self.strategy_config["symbol"]
-        redis = self.config.get("_redis")
-        bot_ref = self.strategy_config.get("ref_id", self.bot_id)
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
 
-        # 0. Check for force-buy override
-        last_action = self.read_last_action()
-        if last_action == "FORCE_BUY":
-            self.clear_last_action()
-            if pos == PositionState.FLAT:
-                await self._execute_force_buy(symbol)
-                return
-            else:
-                actions = [LogSignal(
-                    event_type="RISK",
-                    message=f"FORCE_BUY ignored — position state is {pos.value}, not FLAT",
-                )]
-                await self._run_pipeline(actions)
-
-        # 0b. Check entry timeout every tick (not just on bar completion)
-        if pos == PositionState.ENTERING:
-            timeout = self.strategy_config.get("exit", {}).get("entry_timeout_seconds", 30)
-            entry_time_str = self.ctx.state.get("entry_time")
-            if entry_time_str:
-                entry_time = _parse_aware_dt(entry_time_str)
-                elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds()
-                if elapsed > timeout:
-                    actions = [
-                        LogSignal(
-                            event_type="ORDER",
-                            message=f"Entry timeout after {elapsed:.0f}s — cancelling, returning to FLAT",
-                        ),
-                        UpdateState({
-                            "position_state": PositionState.FLAT.value,
-                            "trade_serial": None,
-                            "entry_time": None,
-                            "entry_command_id": None,
-                        }),
-                    ]
-                    await self._run_pipeline(actions)
-                    return
-
-        # 0c. Check for failed SELL in EXITING — read Redis position key
-        if pos == PositionState.EXITING and redis:
-            from ib_trader.redis.state import StateStore, StateKeys
-            store = StateStore(redis)
-            redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
-            if redis_pos and redis_pos.get("state") == "OPEN":
-                # Exit was cancelled or failed — back to OPEN
-                actions = [
-                    LogSignal(
-                        event_type="ERROR",
-                        message="Exit order failed or cancelled — returning to OPEN for continued monitoring",
-                    ),
-                    UpdateState({"position_state": PositionState.OPEN.value}),
-                ]
-                await self._run_pipeline(actions)
-
-        # 1. Read new bars from Redis stream
-        new_bars = await self._read_new_bars(symbol)
-
-        # Log tick status periodically (every 12 ticks = ~60 seconds)
-        self._tick_count = getattr(self, "_tick_count", 0) + 1
-        if self._tick_count % 12 == 1:
-            agg_bars = self.aggregator.buffered_bars if self.aggregator else 0
-            agg_partial = self.aggregator.has_partial if self.aggregator else False
-            lookback = self.aggregator.lookback_bars if self.aggregator else 0
+        if pos == PositionState.FLAT:
+            await self._execute_force_buy(symbol)
+        else:
             actions = [LogSignal(
-                event_type="HEARTBEAT",
-                message=(f"tick #{self._tick_count} | state={pos.value} | "
-                         f"raw_bars={len(new_bars)} | "
-                         f"buffered={agg_bars}/{lookback} | "
-                         f"partial={'yes' if agg_partial else 'no'}"),
-                payload={"tick": self._tick_count, "position_state": pos.value,
-                         "new_raw_bars": len(new_bars),
-                         "buffered_bars": agg_bars,
-                         "lookback_needed": lookback},
+                event_type="RISK",
+                message=f"FORCE_BUY ignored — position state is {pos.value}, not FLAT",
             )]
             await self._run_pipeline(actions)
 
-        if new_bars and self.aggregator:
-            completed = self.aggregator.add_bars(new_bars)
-
-            if completed:
-                actions = [LogSignal(
-                    event_type="EVAL",
-                    message=(f"Aggregated {len(completed)} bar(s) | "
-                             f"total={self.aggregator.bar_count} | "
-                             f"buffered={self.aggregator.buffered_bars}/"
-                             f"{self.aggregator.lookback_bars}"),
-                )]
-                await self._run_pipeline(actions)
-
-            # Only evaluate the LAST completed bar in a batch.
-            # When warmup or catch-up produces multiple bars at once,
-            # evaluating each one would fire stale signals.
-            # Also skip during post-startup cooldown.
-            if completed:
-                bar = completed[-1]
-                cooldown = getattr(self, "_signal_cooldown_until", 0)
-                if time.monotonic() < cooldown:
-                    actions = [LogSignal(
-                        event_type="EVAL",
-                        message=f"Signal cooldown active ({cooldown - time.monotonic():.0f}s remaining) — skipping entry evaluation",
-                    )]
-                    await self._run_pipeline(actions)
-                elif self.aggregator.get_bar_window():
-                    window = self.aggregator.get_bar_window()
-                    event = BarCompleted(
-                        symbol=symbol,
-                        bar=bar,
-                        window=window,
-                        bar_count=self.aggregator.bar_count,
-                    )
-                    actions = await self.strategy.on_event(event, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
-                else:
-                    needed = self.aggregator.lookback_bars
-                    have = self.aggregator.buffered_bars
-                    actions = [LogSignal(
-                        event_type="EVAL",
-                        message=f"Bar completed but window not ready ({have}/{needed} bars buffered)",
-                    )]
-                    await self._run_pipeline(actions)
-
-        # 2. Check for fills on pending commands
-        await self._check_pending_fills()
-
-        # 3. Exit monitoring via quotes (if in OPEN state)
+    async def check_stale_quote(self) -> None:
+        """Supervisory check: warn / halt if no quote arrives for too long."""
+        if not self.strategy or not self.ctx:
+            return
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
-        if pos == PositionState.OPEN:
-            quote = await self._get_latest_quote(symbol)
-            if quote:
-                # Check if quote data is actually fresh (not just that a row exists)
-                quote_age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()
-                if quote_age < _STALE_QUOTE_WARN_SECONDS:
-                    self._last_quote_time = time.monotonic()
-                    self._quote_stale_logged = False
-                    actions = await self.strategy.on_event(quote, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
-                else:
-                    # Data exists but is stale — still run exit check with
-                    # stale data (better to exit on old data than not at all)
-                    actions = await self.strategy.on_event(quote, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
+        if pos != PositionState.OPEN:
+            return  # Stale quotes only matter when monitoring exits
 
-                    elapsed = time.monotonic() - self._last_quote_time
-                    if elapsed > _STALE_QUOTE_HALT_SECONDS and not self._quote_stale_logged:
-                        self._quote_stale_logged = True
-                        actions = [LogSignal(
-                            event_type="ERROR",
-                            message=f"Quote data stale ({quote_age:.0f}s old, no fresh data for {elapsed:.0f}s) — halting bot",
-                            payload={"quote_age_s": quote_age, "no_fresh_data_s": elapsed},
-                        )]
-                        await self._run_pipeline(actions)
-                        self._bots.update_status(self.bot_id, "ERROR",
-                                                  error_message="STALE_QUOTES")
-                    elif elapsed > _STALE_QUOTE_WARN_SECONDS and not self._quote_stale_logged:
-                        logger.warning('{"event": "STALE_QUOTES", "bot_id": "%s", '
-                                        '"quote_age_s": %.1f, "no_fresh_s": %.1f}',
-                                        self.bot_id, quote_age, elapsed)
-            else:
-                elapsed = time.monotonic() - self._last_quote_time
-                if elapsed > _STALE_QUOTE_HALT_SECONDS and not self._quote_stale_logged:
-                    self._quote_stale_logged = True
-                    actions = [LogSignal(
-                        event_type="ERROR",
-                        message=f"No quote data for {elapsed:.0f}s — halting bot",
-                    )]
-                    await self._run_pipeline(actions)
-                    self._bots.update_status(self.bot_id, "ERROR",
-                                              error_message="STALE_QUOTES")
+        elapsed = time.monotonic() - self._last_quote_time
+        if elapsed > _STALE_QUOTE_HALT_SECONDS and not self._quote_stale_logged:
+            self._quote_stale_logged = True
+            actions = [LogSignal(
+                event_type="ERROR",
+                message=f"No quote data for {elapsed:.0f}s — halting bot",
+                payload={"no_fresh_data_s": elapsed},
+            )]
+            await self._run_pipeline(actions)
+            self._bots.update_status(self.bot_id, "ERROR",
+                                      error_message="STALE_QUOTES")
+        elif elapsed > _STALE_QUOTE_WARN_SECONDS and not self._quote_stale_logged:
+            logger.warning(
+                '{"event": "STALE_QUOTES", "bot_id": "%s", "no_fresh_s": %.1f}',
+                self.bot_id, elapsed,
+            )
 
     async def on_stop(self) -> None:
         """Cleanup on bot stop."""

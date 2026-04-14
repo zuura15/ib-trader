@@ -262,30 +262,47 @@ async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
 
 
 async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, symbol: str) -> None:
-    """Push bot position/strategy state updates to WebSocket on every fill."""
+    """Push bot position/strategy state updates to WebSocket.
+
+    Subscribes to TWO streams:
+      - bot:state:{bot_ref}:{symbol} — emitted by PersistenceMiddleware on
+        every state write (driven by quotes, bars, fills — anything that
+        causes the strategy to update its state).
+      - fill:{bot_ref} — fill events from the engine (covers position
+        changes from the engine side, which may not have a corresponding
+        strategy state write yet).
+
+    Either trigger reads the current state snapshot from Redis keys and
+    pushes it. Stream payloads are markers; the keys are the source of truth.
+    """
     from ib_trader.redis.streams import StreamNames
-    stream = StreamNames.fill(bot_ref)
-    last_id = "$"
+    from ib_trader.redis.state import StateStore, StateKeys
+
+    bot_state_stream = StreamNames.bot_state(bot_ref, symbol)
+    fill_stream = StreamNames.fill(bot_ref)
+    streams = {bot_state_stream: "$", fill_stream: "$"}
+    store = StateStore(redis)
+
+    async def push_snapshot():
+        strat = await store.get(StateKeys.strategy(bot_ref, symbol))
+        pos = await store.get(StateKeys.position(bot_ref, symbol))
+        await websocket.send_text(_json_dumps({
+            "type": "bot_state",
+            "bot_ref": bot_ref,
+            "symbol": symbol,
+            "strategy": strat,
+            "position": pos,
+        }))
+
     while True:
         try:
-            results = await redis.xread({stream: last_id}, block=10000)
+            results = await redis.xread(streams, block=10000)
             if not results:
                 continue
             for stream_name, entries in results:
-                for entry_id, raw_data in entries:
-                    last_id = entry_id
-                    # On any fill event, push the current strategy + position state
-                    from ib_trader.redis.state import StateStore, StateKeys
-                    store = StateStore(redis)
-                    strat = await store.get(StateKeys.strategy(bot_ref, symbol))
-                    pos = await store.get(StateKeys.position(bot_ref, symbol))
-                    await websocket.send_text(_json_dumps({
-                        "type": "bot_state",
-                        "bot_ref": bot_ref,
-                        "symbol": symbol,
-                        "strategy": strat,
-                        "position": pos,
-                    }))
+                for entry_id, _raw_data in entries:
+                    streams[stream_name] = entry_id
+            await push_snapshot()
         except (WebSocketDisconnect, asyncio.CancelledError):
             return
         except Exception:

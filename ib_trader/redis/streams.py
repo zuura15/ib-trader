@@ -179,3 +179,11 @@ class StreamNames:
     @staticmethod
     def bot_control(bot_id: str) -> str:
         return f"bot:control:{bot_id}"
+
+    @staticmethod
+    def bot_state(bot_ref: str, symbol: str) -> str:
+        """Stream of 'state changed' markers — emitted whenever the bot
+        writes new strategy state to Redis. UI subscribes to this to push
+        live updates to the browser without polling.
+        """
+        return f"bot:state:{bot_ref}:{symbol}"

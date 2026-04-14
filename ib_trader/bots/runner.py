@@ -109,34 +109,67 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
 
 
 async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> None:
-    """Drive the bot via Redis stream events instead of a timer.
+    """Run the bot as parallel asyncio tasks, all event-driven.
 
-    Multiplexes XREAD BLOCK across the bot's control stream and a short
-    timeout. On each wake:
-    - Control events (STOP, FORCE_BUY) are processed immediately
-    - on_tick() is called to process any new market data
+    Spawns:
+      - bot.run_event_loop()       — strategy events from quote/bar/fill/position streams
+      - _control_consumer()        — STOP / FORCE_BUY from control streams
+      - _supervisory_loop()        — heartbeat (30s) + entry timeout + stale quote checks
 
-    The timeout ensures heartbeats and supervisory checks still run even
-    if no stream events arrive (e.g., market closed).
+    Returns when the control consumer receives STOP, when any task fails,
+    or when the parent task is cancelled. The finally block in
+    _run_single_bot handles cleanup.
+    """
+    if not redis:
+        raise RuntimeError("Redis required for event-driven bot runner")
+
+    stop_event = asyncio.Event()
+
+    event_task = asyncio.create_task(
+        bot.run_event_loop(),
+        name=f"bot-events-{bot_row.id}",
+    )
+    control_task = asyncio.create_task(
+        _control_consumer(bot, bot_row, redis, stop_event),
+        name=f"bot-control-{bot_row.id}",
+    )
+    supervisory_task = asyncio.create_task(
+        _supervisory_loop(bot, bot_row, stop_event),
+        name=f"bot-supervisor-{bot_row.id}",
+    )
+
+    tasks = [event_task, control_task, supervisory_task]
+    try:
+        # Wait for any task to finish (STOP signal, error, or cancellation)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # Surface exceptions from completed tasks (so the caller sees them)
+        for t in done:
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    raise exc
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _control_consumer(bot, bot_row, redis, stop_event: asyncio.Event) -> None:
+    """Listen on the bot's control stream for STOP / FORCE_BUY events.
+
+    Also polls the bot:{id}:force_buy fallback key every loop iteration
+    in case the stream event was missed (e.g., bot wasn't listening yet
+    when the API published).
     """
     from ib_trader.redis.streams import StreamNames
-
     control_stream = StreamNames.bot_control(bot_row.id)
-    control_last_id = "$"  # Only new events
-    tick_interval = bot.tick_interval  # Used as max wait between ticks
+    control_last_id = "$"
+    force_key = f"bot:{bot_row.id}:force_buy"
 
     while True:
-        # XREAD BLOCK with timeout = tick_interval (seconds → ms)
-        # Wakes on control stream events OR timeout
         try:
-            if redis:
-                results = await redis.xread(
-                    {control_stream: control_last_id},
-                    block=int(tick_interval * 1000),
-                )
-            else:
-                results = None
-                await asyncio.sleep(tick_interval)
+            results = await redis.xread({control_stream: control_last_id}, block=5000)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -144,36 +177,64 @@ async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> No
             await asyncio.sleep(1)
             continue
 
-        # Process control events from stream
         if results:
             for stream_name, entries in results:
                 for entry_id, data in entries:
                     control_last_id = entry_id
                     action = data.get("action", "")
                     if action == "STOP":
-                        logger.info('{"event": "BOT_STOP_VIA_STREAM", "bot_id": "%s"}', bot_row.id)
-                        return  # Exit the loop — finally block handles cleanup
+                        logger.info(
+                            '{"event": "BOT_STOP_VIA_STREAM", "bot_id": "%s"}',
+                            bot_row.id,
+                        )
+                        stop_event.set()
+                        return
                     elif action == "FORCE_BUY":
-                        logger.info('{"event": "FORCE_BUY_VIA_STREAM", "bot_id": "%s"}', bot_row.id)
+                        logger.info(
+                            '{"event": "FORCE_BUY_VIA_STREAM", "bot_id": "%s"}',
+                            bot_row.id,
+                        )
                         bot.update_action("FORCE_BUY")
+                        await bot.check_force_buy()
 
-        # Also check force-buy key (persists even if bot wasn't listening when published)
-        if redis:
-            force_key = f"bot:{bot_row.id}:force_buy"
-            force_val = await redis.get(force_key)
-            if force_val:
-                await redis.delete(force_key)
-                logger.info('{"event": "FORCE_BUY_VIA_KEY", "bot_id": "%s"}', bot_row.id)
-                bot.update_action("FORCE_BUY")
-
-        # Update heartbeat
-        bot.update_heartbeat()
-
-        # Execute tick (processes bars, quotes, fills, force-buy)
+        # Fallback: check the force-buy key (persists even if we missed
+        # the stream event during startup).
         try:
-            await bot.on_tick()
-        except Exception as tick_error:
-            raise  # Propagate to the error handler in _run_single_bot
+            if await redis.get(force_key):
+                await redis.delete(force_key)
+                logger.info(
+                    '{"event": "FORCE_BUY_VIA_KEY", "bot_id": "%s"}',
+                    bot_row.id,
+                )
+                bot.update_action("FORCE_BUY")
+                await bot.check_force_buy()
+        except Exception:
+            pass
+
+
+async def _supervisory_loop(bot, bot_row, stop_event: asyncio.Event) -> None:
+    """Periodic supervisory tasks — NOT driven by market events.
+
+    These run on their own intervals because they're time-based:
+      - Heartbeat (30s): updates bots.last_heartbeat for UI liveness
+      - Entry timeout: cancels stuck ENTERING positions after entry_timeout_seconds
+      - Stale quote check: warns/halts when no quotes arrive for too long
+    """
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=10)
+            return  # stop signalled
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            bot.update_heartbeat()
+            await bot.check_entry_timeout()
+            await bot.check_stale_quote()
+        except Exception:
+            logger.exception(
+                '{"event": "SUPERVISORY_ERROR", "bot_id": "%s"}', bot_row.id,
+            )
 
 
 async def run_bot_runner(session_factory: scoped_session,

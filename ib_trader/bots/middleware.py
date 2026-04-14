@@ -186,16 +186,34 @@ class PersistenceMiddleware:
         return actions
 
     async def _flush(self, state: dict) -> None:
-        """Write state to Redis key. Awaited — completes before returning."""
+        """Write state to Redis key, then XADD a marker to bot:state stream.
+
+        The stream marker is the "something changed" signal that the
+        WebSocket consumer uses to push the latest snapshot to the UI.
+        """
         if self._redis is None:
             raise RuntimeError(
                 f"Redis not available — cannot persist strategy state for {self._bot_ref}:{self.symbol}"
             )
 
         from ib_trader.redis.state import StateStore, StateKeys
+        from ib_trader.redis.streams import StreamWriter, StreamNames
+
         store = StateStore(self._redis)
         key = StateKeys.strategy(self._bot_ref, self.symbol)
         await store.set(key, state)
+
+        # Notify subscribers that bot state changed. Payload is minimal —
+        # the snapshot is read from the strategy key by the consumer.
+        try:
+            writer = StreamWriter(self._redis, StreamNames.bot_state(self._bot_ref, self.symbol), maxlen=200)
+            await writer.add({
+                "bot_ref": self._bot_ref,
+                "symbol": self.symbol,
+                "ts": _now_utc().isoformat(),
+            })
+        except Exception:
+            logger.debug('{"event": "BOT_STATE_NOTIFY_FAILED", "bot_ref": "%s"}', self._bot_ref)
 
 
 # ---------------------------------------------------------------------------
