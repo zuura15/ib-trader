@@ -59,7 +59,7 @@ async def submit_command(body: CommandRequest):
                 output = f"Trades: {len(all_trades)} total ({len(closed)} closed), P&L: ${total_pnl:+.2f}"
             else:
                 output = "Commands: buy, sell, close, orders, status, help"
-            return CommandResponse(command_id="", status=output)
+            return CommandResponse(command_id="local", status="completed", output=output)
         finally:
             sf.remove()
 
@@ -89,9 +89,16 @@ async def submit_command(body: CommandRequest):
 
             if resp.status_code == 200:
                 result = resp.json()
+                # Build output text from result for display
+                output = ""
+                if result.get("serial"):
+                    output = f"Order #{result['serial']} placed"
+                if result.get("order_ref"):
+                    output += f" ({result['order_ref']})"
                 return CommandResponse(
-                    command_id=result.get("ib_order_id", ""),
+                    command_id=result.get("ib_order_id") or "completed",
                     status="completed",
+                    output=output or "Order accepted",
                 )
             else:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)

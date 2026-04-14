@@ -236,7 +236,25 @@ export const useStore = create<AppStore>((set, get) => ({
       // Submit to API, then poll for completion
       submitCommand(cmd).then(async (resp) => {
         const serverId = resp.command_id;
-        console.log(`[store] Command submitted: ${cmd} → server id=${serverId}`);
+        console.log(`[store] Command submitted: ${cmd} → server id=${serverId} status=${resp.status}`);
+
+        // Synchronous response: command already done (read-only commands or
+        // immediate-fail orders). Skip polling.
+        if (resp.status === 'completed' || (resp as any).output) {
+          store.updateCommand(id, {
+            id: serverId,
+            status: 'success' as CommandStatus,
+            output: (resp as any).output,
+            completedAt: new Date(),
+          });
+          if ((resp as any).output) {
+            store.addLogMessage('info', 'command.success',
+              `${cmd}: ${(resp as any).output}`);
+          }
+          set((s) => ({ positionRefreshTick: (s as any).positionRefreshTick + 1 || 1 }));
+          return;
+        }
+
         // Update local entry to use server ID so future updates match
         set((s) => ({
           commands: s.commands.map(c =>

@@ -15,9 +15,10 @@ class CommandRequest(BaseModel):
 
 
 class CommandResponse(BaseModel):
-    """Response for command submission (202 Accepted)."""
+    """Response for command submission."""
     command_id: str
     status: str
+    output: str | None = None  # Set when synchronous (read-only commands or completed orders)
 
 
 class CommandStatusResponse(BaseModel):
