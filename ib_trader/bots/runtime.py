@@ -33,11 +33,10 @@ from ib_trader.bots.strategy import (
 from ib_trader.bots.bar_aggregator import BarAggregator, load_state_from_file
 from ib_trader.bots.middleware import (
     MiddlewarePipeline, RiskMiddleware, LoggingMiddleware,
-    PersistenceMiddleware, ExecutionMiddleware,
+    PersistenceMiddleware, ExecutionMiddleware, ManualEntryMiddleware,
 )
 from ib_trader.data.models import (
-    PendingCommand, PendingCommandStatus, BotEvent,
-    TransactionAction, LegType,
+    BotEvent, TransactionAction, LegType,
 )
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
@@ -193,11 +192,26 @@ class StrategyBotRunner(BotBase):
                        "max_position_value": self.strategy_config.get("max_position_value", "10000"),
                        "max_shares": self.strategy_config.get("max_shares", 20)}
 
+        # manual_entry_only comes from the BotDefinition (YAML) once the
+        # runner flip lands (step 5). For now, pull it from the bot's
+        # config dict if present so YAML-defined test bots already get
+        # the gate when runner reads them.
+        manual_entry_only = bool(self.config.get("manual_entry_only", False))
+        manual_entry_mw = ManualEntryMiddleware(self.bot_id, manual_entry_only)
+
+        # BotStateStore gives RiskMiddleware its fail-closed KILL_SWITCH
+        # read against Redis. When redis is None (test fixtures without
+        # Redis), the store's own fail-closed logic kicks in and BUYs
+        # are rejected — which is the safer default for tests anyway.
+        from ib_trader.bots.state import BotStateStore
+        state_store = BotStateStore(redis)
+
         risk_mw = RiskMiddleware(
             self.bot_id, risk_config,
             self._bots, self._trades,
+            state_store=state_store,
         )
-        logging_mw = LoggingMiddleware(self.bot_id, self._bot_events_repo)
+        logging_mw = LoggingMiddleware(self.bot_id, self._bot_events_repo, redis=redis)
         persistence_mw = PersistenceMiddleware(
             self.bot_id, self.strategy_config["symbol"], STATE_DIR,
             redis=redis, bot_ref=bot_ref,
@@ -208,8 +222,10 @@ class StrategyBotRunner(BotBase):
         )
         self._execution_mw = execution_mw
 
+        # ManualEntryMiddleware runs FIRST so blocked entries never
+        # count against risk limits and the audit log sees the drop.
         self.pipeline = MiddlewarePipeline([
-            risk_mw, logging_mw, persistence_mw, execution_mw,
+            manual_entry_mw, risk_mw, logging_mw, persistence_mw, execution_mw,
         ])
         self._risk_mw = risk_mw
 
@@ -280,9 +296,13 @@ class StrategyBotRunner(BotBase):
         fill_stream = StreamNames.fill(bot_ref)
         pos_stream = StreamNames.position_changes()
 
+        # Resume bar stream from the warmup cursor so no bars are dropped in
+        # the gap between warmup completion and the XREAD below. If warmup
+        # didn't run (e.g. no aggregator), start at "$" as before.
+        bar_start = getattr(self, '_last_bar_stream_id', None) or "$"
         streams = {
             quote_stream: "$",
-            bar_stream: "$",
+            bar_stream: bar_start,
             fill_stream: "$",
             pos_stream: "$",
         }
@@ -607,15 +627,21 @@ class StrategyBotRunner(BotBase):
             if actions and self.pipeline:
                 await self._run_pipeline(actions)
 
-        # Unsubscribe bars
+        # Unsubscribe bars via engine HTTP API
         symbol = self.strategy_config.get("symbol", "")
-        cmd = PendingCommand(
-            source=f"bot:{self.bot_id}",
-            broker="ib",
-            command_text=f"unsubscribe_bars {symbol}",
-            submitted_at=datetime.now(timezone.utc),
-        )
-        self._pending_commands.insert(cmd)
+        engine_url = self.config.get("_engine_url")
+        if engine_url and symbol:
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(
+                        f"{engine_url}/engine/unsubscribe-bars",
+                        json={"symbol": symbol},
+                    )
+            except Exception:
+                logger.debug(
+                    '{"event": "UNSUBSCRIBE_HTTP_FAILED", "symbol": "%s"}', symbol,
+                )
 
     async def _execute_force_buy(self, symbol: str) -> None:
         """Execute a forced buy, bypassing all entry conditions."""
@@ -665,11 +691,13 @@ class StrategyBotRunner(BotBase):
         await self._run_pipeline(actions)
 
     async def _warmup_from_history(self, symbol: str) -> None:
-        """Prefetch historical 3-min bars from the engine to fill the aggregator.
+        """Prefetch historical bars via the engine, then read them from Redis.
 
-        Submits a warmup command that the engine processes by fetching
-        historical bars via the engine's HTTP API. Bars are written to the
-        Redis bar stream, which the bot then reads for warmup.
+        Critical: snapshot the bar stream's latest entry ID BEFORE asking
+        the engine to publish warmup bars. Without that, stale entries left
+        over from prior runs are consumed instead of the freshly published
+        historical bars. The captured cursor also seeds run_event_loop so
+        live bars arriving between warmup and the event loop are not lost.
         """
         if not self.aggregator:
             return
@@ -679,23 +707,32 @@ class StrategyBotRunner(BotBase):
         total_5sec_bars = lookback * (bar_seconds // 5)
         duration_seconds = total_5sec_bars * 5 + 60
 
+        redis = self.config.get("_redis")
+        if redis is not None:
+            from ib_trader.redis.streams import StreamNames
+            stream_name = StreamNames.bar(symbol, "5s")
+            try:
+                latest = await redis.xrevrange(stream_name, count=1)
+                self._last_bar_stream_id = latest[0][0] if latest else "0"
+            except Exception:
+                self._last_bar_stream_id = "0"
+
         engine_url = self.config.get("_engine_url")
         if engine_url:
-            # Request warmup via engine HTTP API (synchronous)
             import httpx
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
-                    resp = await client.post(
-                        f"{engine_url}/engine/orders",
-                        json={"symbol": symbol, "side": "BUY", "qty": "0",
-                              "order_type": f"warmup_bars {symbol} {duration_seconds}"},
+                    await client.post(
+                        f"{engine_url}/engine/warmup-bars",
+                        json={"symbol": symbol, "duration_seconds": duration_seconds},
                     )
-                    # Even if this fails, we continue — bars will arrive via stream
             except Exception:
                 logger.debug('{"event": "WARMUP_HTTP_FAILED", "symbol": "%s"}', symbol)
 
-        # Read whatever bars are in the Redis stream
-        bars = await self._read_new_bars(symbol)
+        # Read only the warmup bars (and any live bars that landed while we
+        # were waiting). Oversize the count so a typical 20x3-min lookback
+        # (~720 raw bars) is covered with comfortable headroom.
+        bars = await self._read_new_bars(symbol, count=max(total_5sec_bars * 2, 2000))
         if bars and self.aggregator:
             completed = self.aggregator.add_bars(bars)
             if self.pipeline and self.ctx:
@@ -716,23 +753,24 @@ class StrategyBotRunner(BotBase):
                 )]
                 await self._run_pipeline(actions)
 
-    async def _read_new_bars(self, symbol: str) -> list[dict]:
+    async def _read_new_bars(self, symbol: str, count: int = 500) -> list[dict]:
         """Read new bars from the Redis bar stream.
 
         The engine publishes 5-second bars to bar:{symbol}:5s via
-        reqRealTimeBars push callbacks.
+        reqRealTimeBars push callbacks (live) and /engine/warmup-bars
+        (historical prefetch).
         """
         redis = self.config.get("_redis")
         if not redis:
             return []
 
-        from ib_trader.redis.streams import StreamReader, StreamNames
+        from ib_trader.redis.streams import StreamNames
 
         stream = StreamNames.bar(symbol, "5s")
         last_id = getattr(self, '_last_bar_stream_id', "0")
 
         try:
-            results = await redis.xread({stream: last_id}, count=500)
+            results = await redis.xread({stream: last_id}, count=count)
             if not results:
                 return []
 

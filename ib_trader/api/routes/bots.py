@@ -60,6 +60,48 @@ def list_bots(sf=Depends(get_session_factory)):
         sf.remove()
 
 
+@router.post("/reload", status_code=202)
+async def reload_bots(
+    force: bool = False,
+    sf=Depends(get_session_factory),
+    redis=Depends(get_redis),
+):
+    """Rescan ``config/bots/*.yaml`` and reconcile the SQLite table.
+
+    Semantics (codex fix F):
+      - Bots added to disk → inserted as STOPPED.
+      - Bots edited on disk:
+         - mutable fields (name, tick_interval) update in place.
+         - immutable fields (strategy, ref_id, symbol, broker) on a
+           RUNNING bot → refused (409). Stop the bot first.
+      - Bots deleted from disk:
+         - STOPPED bot → refused unless ``?force=true`` (409).
+         - RUNNING bot → refused outright; stop it first, then reload.
+
+    Reload is additive / next-start only. A bot that is currently
+    running keeps the snapshot it was started with; YAML edits take
+    effect only on the next start.
+    """
+    from ib_trader.bots.bootstrap import bootstrap_bots_from_yaml, BootstrapError
+    try:
+        report = bootstrap_bots_from_yaml(sf, force=force)
+    except BootstrapError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        sf.remove()
+
+    if redis is not None:
+        from ib_trader.redis.streams import publish_activity
+        await publish_activity(redis, "bots")
+
+    return {
+        "added": report.added,
+        "updated": report.updated,
+        "unchanged": report.unchanged,
+        "removed": report.removed,
+    }
+
+
 @router.get("/{bot_id}")
 def get_bot(bot_id: str, sf=Depends(get_session_factory)):
     try:
@@ -88,6 +130,8 @@ async def start_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(
     # Publish to global control stream — runner wakes immediately
     if redis:
         await redis.xadd("bot:control:global", {"action": "START", "bot_id": bot_id}, maxlen=100)
+        from ib_trader.redis.streams import publish_activity
+        await publish_activity(redis, "bots")
     return {"bot_id": bot_id, "status": "RUNNING"}
 
 
@@ -107,6 +151,8 @@ async def stop_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(g
     # Publish to global control stream — runner wakes immediately
     if redis:
         await redis.xadd("bot:control:global", {"action": "STOP", "bot_id": bot_id}, maxlen=100)
+        from ib_trader.redis.streams import publish_activity
+        await publish_activity(redis, "bots")
     return {"bot_id": bot_id, "status": "STOPPED"}
 
 

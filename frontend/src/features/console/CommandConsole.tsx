@@ -288,7 +288,12 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
       <div className="flex flex-col h-full" onClick={() => inputRef.current?.focus()}>
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-2 font-mono text-sm">
           {commands.map((cmd, idx) => (
-            <div key={cmd.id}>
+            <div
+              key={cmd.id}
+              data-testid="console-command"
+              data-status={cmd.status}
+              data-command={cmd.command}
+            >
               <div className="mb-1 relative">
                 {/* Command line */}
                 <div className="flex items-center gap-2">
@@ -328,9 +333,13 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
 
                 {/* Output */}
                 {(cmd.output || cmd.status === 'failure') && (!compact || cmd.status === 'failure') && (
-                  <div className="pl-6 mt-0.5 whitespace-pre-wrap" style={{
-                    color: cmd.status === 'failure' ? 'var(--accent-red)' : 'var(--text-secondary)',
-                  }}>
+                  <div
+                    className="pl-6 mt-0.5 whitespace-pre-wrap"
+                    style={{
+                      color: cmd.status === 'failure' ? 'var(--accent-red)' : 'var(--text-secondary)',
+                    }}
+                    data-testid="console-output"
+                  >
                     {cmd.output || (cmd.status === 'failure' ? 'Command failed — check engine logs' : '')}
                   </div>
                 )}
@@ -352,6 +361,7 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
           className="flex items-center gap-1 px-2 py-1 border-t"
           style={{ borderColor: 'var(--border-default)', background: 'var(--bg-secondary)' }}
           onClick={(e) => e.stopPropagation()}
+          data-testid="console-form"
         >
           <span style={{ color: 'var(--accent-blue)' }} className="text-sm font-bold font-mono">$</span>
           <input
@@ -365,6 +375,7 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
             style={{ color: 'var(--text-primary)', minHeight: 36 }}
             spellCheck={false}
             autoComplete="off"
+            data-testid="console-input"
           />
           <HistoryButton onSelect={prefillInput} disabled={voiceOpen} />
           {speechAvailable && (

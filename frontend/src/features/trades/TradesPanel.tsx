@@ -130,8 +130,14 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
               const badge = statusBadge[t.status] || defaultBadge;
               const pnl = t.realizedPnl ? parseFloat(t.realizedPnl) : null;
               return (
-                <tr key={t.id}>
-                  <td className="font-mono" style={{ color: 'var(--text-muted)' }}>#{t.serialNumber}</td>
+                <tr
+                  key={t.id}
+                  data-testid={`trade-row-${t.serialNumber}`}
+                  data-serial={t.serialNumber}
+                  data-symbol={t.symbol}
+                  data-status={t.status}
+                >
+                  <td className="font-mono" style={{ color: 'var(--text-muted)' }} data-testid={`trade-serial-${t.serialNumber}`}>#{t.serialNumber}</td>
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{t.symbol}</td>
                   <td style={{ color: t.direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                     {t.direction === 'LONG' ? 'L' : 'S'}

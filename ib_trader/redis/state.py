@@ -90,9 +90,44 @@ class StateKeys:
             raise ValueError(f"bot_ref must not contain ':': {bot_ref!r}")
         return f"strat:{bot_ref}:{symbol}"
 
+    # ---- Bot runtime state (replaces the SQLite `bots` table) ----
+    #
+    # Identity + config is authoritative on disk (config/bots/*.yaml).
+    # Everything mutable moves here so the `bots` table can be retired
+    # and the hot-path KILL_SWITCH check reads Redis, not SQLite.
+
     @staticmethod
     def bot_status(bot_id: str) -> str:
+        """RUNNING / STOPPED / ERROR / PAUSED. No TTL — persistent."""
         return f"bot:{bot_id}:status"
+
+    @staticmethod
+    def bot_heartbeat(bot_id: str) -> str:
+        """ISO timestamp of the bot's last supervisory tick.
+
+        TTL'd so a crashed bot's heartbeat expires automatically and the
+        UI can show it as stale without us chasing cleanup.
+        """
+        return f"bot:{bot_id}:heartbeat"
+
+    @staticmethod
+    def bot_last_action(bot_id: str) -> str:
+        """Dict {action, ts} — last manual override or strategy signal."""
+        return f"bot:{bot_id}:last_action"
+
+    @staticmethod
+    def bot_kill_switch(bot_id: str) -> str:
+        """Safety circuit breaker. Presence of the key == engaged.
+
+        Read on every BUY by RiskMiddleware. The reader fails CLOSED: if
+        Redis is unreachable OR the read raises, BUY is rejected. No TTL.
+        """
+        return f"bot:{bot_id}:kill_switch"
+
+    @staticmethod
+    def bot_error_message(bot_id: str) -> str:
+        """Free-form error context shown by the UI on ERROR status."""
+        return f"bot:{bot_id}:error_message"
 
     @staticmethod
     def heartbeat(process: str) -> str:
@@ -101,3 +136,6 @@ class StateKeys:
     # TTL constants
     QUOTE_TTL = 60
     HEARTBEAT_TTL = 120
+    BOT_HEARTBEAT_TTL = 300          # 5 min — bot supervisor fires every 10s
+    BOT_LAST_ACTION_TTL = 300        # 5 min — UI surface, not decision input
+    BOT_ERROR_MESSAGE_TTL = 3600     # 1 h — long enough for operator triage

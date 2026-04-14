@@ -13,6 +13,10 @@ import logging
 from datetime import datetime, date, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ib_trader.bots.state import BotStateStore
 
 from sqlalchemy.orm import scoped_session
 
@@ -33,6 +37,68 @@ def _now_utc() -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Manual-Entry Middleware
+# ---------------------------------------------------------------------------
+
+class ManualEntryMiddleware:
+    """Blocks auto-BUY entries from a bot's strategy signals.
+
+    When a bot's YAML has ``manual_entry_only: true`` this middleware
+    filters out ``PlaceOrder(side="BUY", origin="strategy")`` actions —
+    i.e. the normal "my signal says buy" path. Every other action goes
+    through untouched, so the rest of production behaviour is preserved:
+
+      - ``origin="exit"``        — trailing stops, hard stops, time stops,
+                                   strategy-emitted sell-to-close.
+      - ``origin="manual_override"`` — operator FORCE_BUY signal (which
+                                   is routed outside ``on_event`` anyway).
+      - ``side="SELL"``          — never blocked here.
+
+    The point is to let a live test bot run the FULL production strategy
+    (exits, trailing stop, P&L display, middleware pipeline) while
+    keeping auto-entries off the wire, so the only real BUYs come from
+    a deliberate operator action.
+
+    When ``manual_entry_only`` is False (the default), the middleware is
+    a no-op pass-through.
+    """
+
+    def __init__(self, bot_id: str, manual_entry_only: bool = False) -> None:
+        self.bot_id = bot_id
+        self.enabled = bool(manual_entry_only)
+
+    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        if not self.enabled:
+            return actions
+        result: list[Action] = []
+        for action in actions:
+            if (
+                isinstance(action, PlaceOrder)
+                and action.side == "BUY"
+                and getattr(action, "origin", "strategy") == "strategy"
+            ):
+                # Drop the auto-entry, leave an audit breadcrumb so it's
+                # obvious from bot_events that the bot wanted to buy but
+                # the manual-entry gate stopped it.
+                result.append(LogSignal(
+                    event_type="MANUAL_ENTRY_ONLY",
+                    message=(
+                        f"Blocked strategy BUY for {action.symbol} "
+                        f"qty={action.qty} — manual_entry_only=true"
+                    ),
+                    payload={
+                        "symbol": action.symbol,
+                        "side": action.side,
+                        "qty": str(action.qty),
+                        "origin": getattr(action, "origin", "strategy"),
+                    },
+                ))
+                continue
+            result.append(action)
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Risk Middleware
 # ---------------------------------------------------------------------------
 
@@ -41,29 +107,38 @@ class RiskMiddleware:
 
     Checks: kill switch, daily loss cap, max concurrent positions,
     max trades per day, max position value, max shares.
+
+    KILL_SWITCH source of truth is Redis via ``BotStateStore`` (hot-path
+    µs read). The check is fail-closed: if Redis is unreachable or the
+    read raises, the middleware treats the switch as engaged and
+    rejects BUYs. An optional SQLite fallback (legacy ``BotRepository``)
+    is still accepted for backwards compatibility during the migration
+    — once ``state_store`` is present, SQLite is not consulted.
     """
 
     def __init__(self, bot_id: str, risk_config: dict,
-                 bots_repo: BotRepository, trades_repo: TradeRepository) -> None:
+                 bots_repo: BotRepository, trades_repo: TradeRepository,
+                 state_store: "BotStateStore | None" = None) -> None:
         self.bot_id = bot_id
         self.config = risk_config
         self._bots = bots_repo
         self._trades = trades_repo
+        self._state = state_store
         self._trades_today: int = 0
         self._pnl_today: Decimal = Decimal("0")
         self._last_reset_date: date = date.today()
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
         """Filter actions through risk checks. Rejected PlaceOrders become LogSignals.
 
         SELL orders are NEVER blocked — exit protection is more important
         than risk limits. Only BUY orders go through risk checks.
         """
         self._maybe_reset_daily()
-        result = []
+        result: list[Action] = []
         for action in actions:
             if isinstance(action, PlaceOrder) and action.side == "BUY":
-                ok, reason = self._can_trade(action)
+                ok, reason = await self._can_trade(action)
                 if not ok:
                     result.append(LogSignal(
                         event_type="RISK",
@@ -83,12 +158,18 @@ class RiskMiddleware:
         """Update daily P&L after a close."""
         self._pnl_today += pnl
 
-    def _can_trade(self, order: PlaceOrder) -> tuple[bool, str]:
+    async def _can_trade(self, order: PlaceOrder) -> tuple[bool, str]:
         """Check all risk rules. Returns (ok, reason)."""
-        # Kill switch
-        bot = self._bots.get(self.bot_id)
-        if bot and getattr(bot, "error_message", None) == "KILL_SWITCH":
-            return False, "kill_switch_active"
+        # Kill switch — prefer Redis (hot-path, fail-closed). Fall back to
+        # SQLite only if no state_store was provided (legacy callers).
+        if self._state is not None:
+            engaged = await self._state.is_kill_switch_engaged(self.bot_id)
+            if engaged:
+                return False, "kill_switch_active"
+        else:
+            bot = self._bots.get(self.bot_id) if self._bots else None
+            if bot and getattr(bot, "error_message", None) == "KILL_SWITCH":
+                return False, "kill_switch_active"
 
         # Daily loss cap
         max_loss = Decimal(str(self.config.get("max_daily_loss_pct", 0.02)))
@@ -139,12 +220,15 @@ class RiskMiddleware:
 class LoggingMiddleware:
     """Writes LogSignal actions to the bot_events audit trail."""
 
-    def __init__(self, bot_id: str, bot_events_repo: BotEventRepository) -> None:
+    def __init__(self, bot_id: str, bot_events_repo: BotEventRepository,
+                 redis=None) -> None:
         self.bot_id = bot_id
         self._events = bot_events_repo
+        self._redis = redis
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
         """Write LogSignal actions to DB. Pass all actions through."""
+        wrote = False
         for action in actions:
             if isinstance(action, LogSignal):
                 self._events.insert(BotEvent(
@@ -155,6 +239,10 @@ class LoggingMiddleware:
                     trade_serial=action.trade_serial,
                     recorded_at=_now_utc(),
                 ))
+                wrote = True
+        if wrote and self._redis is not None:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(self._redis, "bot_events")
         return actions
 
 

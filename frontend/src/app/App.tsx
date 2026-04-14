@@ -112,18 +112,18 @@ export function App() {
   const dataMode = useStore((s) => s.dataMode);
   const tickSimulation = useStore((s) => s.tickSimulation);
   const initWebSocket = useStore((s) => s.initWebSocket);
-  const initWatchlistPolling = useStore((s) => s.initWatchlistPolling);
+  const initWatchlist = useStore((s) => s.initWatchlist);
   const isMobile = useIsMobile();
 
   useEffect(() => {
     if (dataMode === 'live') {
       initWebSocket();
-      initWatchlistPolling();
+      initWatchlist();
     } else {
       const interval = setInterval(tickSimulation, 2000);
       return () => clearInterval(interval);
     }
-  }, [dataMode, tickSimulation, initWebSocket, initWatchlistPolling]);
+  }, [dataMode, tickSimulation, initWebSocket, initWatchlist]);
 
   if (isMobile) {
     return (

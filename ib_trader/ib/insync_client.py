@@ -945,15 +945,42 @@ class InsyncClient(IBClientBase):
         status = trade.orderStatus.status
         why_held = getattr(trade.orderStatus, "whyHeld", "") or ""
         remaining = trade.orderStatus.remaining
+        perm_id = trade.order.permId
+        filled = trade.orderStatus.filled
 
         logger.debug(
             '{"event": "IB_STATUS_CHANGE", "ib_order_id": "%s", '
             '"symbol": "%s", "status": "%s", "filled": %s, '
             '"remaining": %s, "why_held": "%s", "perm_id": %s}',
             ib_order_id, trade.contract.symbol, status,
-            trade.orderStatus.filled, remaining, why_held,
-            trade.order.permId,
+            filled, remaining, why_held, perm_id,
         )
+
+        # IB sometimes fires a spurious `Cancelled` status with perm_id=0 when
+        # it rejects some order attribute (e.g. unsupported TIF combined with
+        # a destination) and re-routes the order with a corrected attribute.
+        # The resulting sequence is:
+        #   Cancelled (perm_id=0, filled=0, remaining=0, ValidationError)
+        #   → PreSubmitted → Submitted → Filled (with a real perm_id)
+        # Treating that first Cancelled as terminal removes the per-order
+        # fill callback, which then never fires on the real fill. Skip the
+        # auto-cleanup when perm_id is 0 and nothing filled — the order has
+        # not actually reached the exchange yet.
+        is_prerouting_cancel = (
+            status == "Cancelled"
+            and perm_id == 0
+            and (filled or 0) == 0
+        )
+
+        if is_prerouting_cancel:
+            # Swallow — the order has not reached the exchange yet and will be
+            # reissued momentarily. Propagating a "Cancelled" here would make
+            # status listeners mark the order dead.
+            logger.debug(
+                '{"event": "IB_PREROUTING_CANCEL_IGNORED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            return
 
         loop = asyncio.get_event_loop()
         # Dispatch to order-specific callbacks, then global callbacks.

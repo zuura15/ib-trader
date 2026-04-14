@@ -58,12 +58,20 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
     events_repo = BotEventRepository(session_factory)
     bots_repo = BotRepository(session_factory)
 
+    async def _nudge(channel: str) -> None:
+        if redis is None:
+            return
+        from ib_trader.redis.streams import publish_activity
+        await publish_activity(redis, channel)
+
     # Log start event
     events_repo.insert(BotEvent(
         bot_id=bot_row.id, event_type="STARTED",
         message=f"Bot started: {bot_row.name} ({bot_row.strategy})",
         recorded_at=_now_utc(),
     ))
+    await _nudge("bot_events")
+    await _nudge("bots")
 
     # Crash recovery: pass open positions from previous incarnation
     if recover:
@@ -94,6 +102,8 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
             bot_row.id, BotStatus.ERROR,
             error_message=str(e),
         )
+        await _nudge("bot_events")
+        await _nudge("bots")
     finally:
         try:
             await bot.on_stop()
@@ -106,6 +116,8 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
             message=f"Bot stopped: {bot_row.name}",
             recorded_at=_now_utc(),
         ))
+        await _nudge("bot_events")
+        await _nudge("bots")
 
 
 async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> None:

@@ -5,7 +5,9 @@
  * subscription, snapshot delivery, and diff dispatching.
  */
 
-export type Channel = 'trades' | 'orders' | 'alerts' | 'commands' | 'heartbeats';
+export type Channel =
+  | 'trades' | 'orders' | 'alerts' | 'commands' | 'heartbeats'
+  | 'bots' | 'status';
 
 export interface WSDiff {
   type: 'diff';
@@ -32,7 +34,9 @@ const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const WS_BASE = import.meta.env.VITE_WS_URL || `${wsProto}//${window.location.host}/ws`;
 const WS_TOKEN = import.meta.env.VITE_API_TOKEN || '';
 const WS_URL = WS_TOKEN ? `${WS_BASE}?token=${WS_TOKEN}` : WS_BASE;
-const CHANNELS: Channel[] = ['trades', 'orders', 'alerts', 'commands', 'heartbeats'];
+const CHANNELS: Channel[] = [
+  'trades', 'orders', 'alerts', 'commands', 'heartbeats', 'bots', 'status',
+];
 
 const MIN_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 30000;

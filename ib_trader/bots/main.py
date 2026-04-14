@@ -48,6 +48,20 @@ def main(db: str, settings_path: str):
     # Import all bot strategies so they register themselves
     _import_strategies()
 
+    # Bootstrap bots table from config/bots/*.yaml (YAML is authoritative).
+    # Hard-fails on foreign SQLite rows so we don't run in a drifted state.
+    from ib_trader.bots.bootstrap import bootstrap_bots_from_yaml, BootstrapError
+    try:
+        report = bootstrap_bots_from_yaml(session_factory)
+        print(
+            f"[BOTS] Bootstrap: +{len(report.added)} ~{len(report.updated)} "
+            f"={len(report.unchanged)} -{len(report.removed)}"
+        )
+    except BootstrapError as exc:
+        print(f"[BOTS] BOOTSTRAP REFUSED: {exc}")
+        logger.error('{"event": "BOT_BOOTSTRAP_REFUSED", "error": "%s"}', exc)
+        raise SystemExit(2) from exc
+
     asyncio.run(run(session_factory))
 
 

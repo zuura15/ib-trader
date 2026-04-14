@@ -1,0 +1,12 @@
+id: 6242ce32-8b88-4ac1-9cf1-2a8c2569086c
+name: "Close Trend RSI \u2014 QQQ"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/close_trend_rsi.yaml
+  symbol: QQQ
+symbols:
+- QQQ

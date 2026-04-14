@@ -146,19 +146,36 @@ MarketEvent = BarCompleted | QuoteUpdate | OrderFilled | OrderRejected | Positio
 
 @dataclass(frozen=True)
 class PlaceOrder:
-    """Submit an order to the engine."""
+    """Submit an order to the engine.
+
+    `origin` tags the producer of the action so downstream middleware can
+    distinguish automatic strategy entries from exits and manual overrides:
+
+      - "strategy"        — strategy.on_event() emitted this as part of its
+                            normal signal logic (auto-entry, auto-exit flagged
+                            by strategy intent). The default.
+      - "exit"            — trailing stop, hard stop, time stop, or any
+                            strategy-driven exit branch.
+      - "manual_override" — operator-forced action (e.g. FORCE_BUY) routed
+                            outside the normal signal path.
+
+    `ManualEntryMiddleware` uses this to block only `origin=="strategy"`
+    BUYs on test bots, so exits and manual overrides are untouched.
+    """
     symbol: str
     side: str  # "BUY" or "SELL"
     qty: Decimal
     order_type: str  # "mid", "market", "limit"
     price: Decimal | None = None  # required for limit orders
     params: dict = field(default_factory=dict)  # profit_target, stop_loss, tif, etc.
+    origin: str = "strategy"  # "strategy" | "exit" | "manual_override"
 
 
 @dataclass(frozen=True)
 class CancelOrder:
     """Cancel an existing order."""
     trade_serial: int
+    origin: str = "strategy"
 
 
 @dataclass(frozen=True)

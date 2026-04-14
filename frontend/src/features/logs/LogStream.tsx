@@ -40,45 +40,66 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
   const lastTimestamp = useRef<string>('');
   const idCounter = useRef(0);
 
-  // In live mode, poll /api/logs every 5 seconds
+  // Live mode: stream logs over the WS (backend tails the structured JSON
+  // log file). Entries arrive as {type: "log_batch", data: [...]} and are
+  // appended as they're written — no poll cadence, no ?after= cursor.
   useEffect(() => {
     if (dataMode !== 'live') return;
 
-    const fetchLogs = () => {
-      const afterParam = lastTimestamp.current
-        ? `?limit=50&after=${encodeURIComponent(lastTimestamp.current)}`
-        : '?limit=100';
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const base = import.meta.env.VITE_WS_URL || `${proto}//${window.location.host}/ws`;
+    const token = import.meta.env.VITE_API_TOKEN || '';
+    const url = token ? `${base}?token=${token}` : base;
 
-      fetch(`/api/logs${afterParam}`)
-        .then(r => r.ok ? r.json() : [])
-        .then((entries: Array<{ timestamp: string; level: string; event: string; message: string }>) => {
-          if (entries.length === 0) return;
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
 
-          const newEntries: LogEntry[] = entries.map((e) => ({
-            id: `log-${idCounter.current++}`,
-            timestamp: e.timestamp,
-            level: e.level,
-            event: e.event,
-            message: e.message,
-          }));
-
-          // Track last timestamp for incremental polling
-          const lastEntry = entries[entries.length - 1];
-          if (lastEntry?.timestamp) {
-            lastTimestamp.current = lastEntry.timestamp;
-          }
-
-          setLiveLogs(prev => {
-            const combined = [...prev, ...newEntries];
-            return combined.slice(-maxLines);
-          });
-        })
-        .catch(() => {});
+    const appendEntries = (
+      raw: Array<{ timestamp: string; level: string; event: string; message: string }>,
+    ) => {
+      if (!raw || raw.length === 0) return;
+      const newEntries: LogEntry[] = raw.map((e) => ({
+        id: `log-${idCounter.current++}`,
+        timestamp: e.timestamp,
+        level: e.level,
+        event: e.event,
+        message: e.message,
+      }));
+      const last = raw[raw.length - 1]?.timestamp;
+      if (last) lastTimestamp.current = last;
+      setLiveLogs(prev => {
+        const combined = [...prev, ...newEntries];
+        return combined.slice(-maxLines);
+      });
     };
 
-    fetchLogs();
-    const interval = setInterval(fetchLogs, 5000);
-    return () => clearInterval(interval);
+    const open = () => {
+      if (closed) return;
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        ws?.send(JSON.stringify({ type: 'subscribe_logs', backlog: maxLines }));
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'log_batch' && Array.isArray(msg.data)) {
+            appendEntries(msg.data);
+          }
+        } catch { /* ignore malformed frames */ }
+      };
+      ws.onclose = () => {
+        if (!closed) retry = setTimeout(open, 2000);
+      };
+      ws.onerror = () => { /* onclose handles reconnect */ };
+    };
+
+    open();
+    return () => {
+      closed = true;
+      if (retry) clearTimeout(retry);
+      if (ws) { ws.onclose = null; ws.close(); }
+    };
   }, [dataMode, maxLines]);
 
   const logsRaw = dataMode === 'live' ? liveLogs : mockLogs.map(l => ({
@@ -115,9 +136,16 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
           const ts = log.timestamp ? formatTime(log.timestamp) : '';
 
           return (
-            <div key={log.id} className="flex gap-2 px-1" style={{ borderRadius: 2 }}
+            <div
+              key={log.id}
+              className="flex gap-2 px-1"
+              style={{ borderRadius: 2 }}
               onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--row-hover)')}
-              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+              data-testid="log-entry"
+              data-level={lvl}
+              data-event={log.event || 'log'}
+            >
               <span style={{ color: 'var(--text-muted)' }} className="shrink-0">{ts}</span>
               <span style={{ color }} className="shrink-0 font-semibold">{label}</span>
               <span style={{ color: 'var(--text-muted)' }} className="shrink-0">[{log.event || 'log'}]</span>

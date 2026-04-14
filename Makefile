@@ -1,4 +1,4 @@
-.PHONY: install test smoke docs lint typecheck clean dev
+.PHONY: install test smoke docs lint typecheck clean dev e2e-live e2e-live-keep
 
 install:
 	uv sync
@@ -34,6 +34,12 @@ dev:
 	uv run ib-bots & \
 	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
 	wait
+
+e2e-live:
+	./scripts/e2e-live.sh
+
+e2e-live-keep:
+	IB_TRADER_E2E_KEEP_RUNNING=1 ./scripts/e2e-live.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

@@ -17,6 +17,7 @@ Usage:
     ib-engine --db trader.db
 """
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -170,6 +171,18 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
         print(f"[ENGINE] Warmed {len(symbols)} contracts. Processing commands...")
 
+        # --- Crash recovery for pending_commands audit rows ---
+        # execute_single_command writes RUNNING audit rows that would otherwise
+        # stay RUNNING forever if the engine died mid-command. Clean them up
+        # before the internal HTTP API starts accepting new commands.
+        from ib_trader.engine.service import recover_stale_commands
+        stale_count = recover_stale_commands(ctx)
+        if stale_count:
+            print(f"[ENGINE] Recovered {stale_count} stale command(s) from previous crash.")
+            logger.warning(json.dumps({
+                "event": "STALE_COMMANDS_FOUND", "count": stale_count,
+            }))
+
         # --- Redis setup (required) ---
         redis_url = ctx.settings.get("redis_url", "redis://localhost:6379/0")
         from ib_trader.redis.client import get_redis
@@ -309,6 +322,11 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
             '{"event": "SYSTEM_ALERT_RAISED", "severity": "CATASTROPHIC", '
             '"trigger": "IB_GATEWAY_DISCONNECTED"}'
         )
+        # Nudge WS consumers — without this, the CATASTROPHIC alert only
+        # reaches the UI on the 30s fallback refresh.
+        if ctx.redis is not None:
+            from ib_trader.redis.streams import publish_activity
+            asyncio.create_task(publish_activity(ctx.redis, "alerts"))
     except Exception:
         logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
 
@@ -502,6 +520,10 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 '"symbol": "%s", "qty": "%s", "price": "%s"}',
                 ib_order_id, bot_ref, symbol, qty_filled, avg_price,
             )
+            # Nudge WS consumers that orders/trades diffs are stale.
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(redis, "orders")
+            await publish_activity(redis, "trades")
         except Exception:
             logger.exception('{"event": "FILL_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
 
@@ -538,6 +560,8 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                     existing["updated_at"] = datetime.now(timezone.utc).isoformat()
                     await state.set(pos_key, existing)
 
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(redis, "orders")
         except Exception:
             logger.exception('{"event": "STATUS_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
 
@@ -632,15 +656,44 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             sem.release()
 
 
+def _make_bar_publisher(redis, symbol: str):
+    """Create an async callback that publishes 5s bars to bar:{symbol}:5s.
+
+    Returned callback matches the signature expected by
+    InsyncClient.subscribe_realtime_bars (receives bar_data dict).
+    Consumer format (short keys) matches bots.runtime._dispatch_event.
+    """
+    from ib_trader.redis.streams import StreamWriter, StreamNames
+
+    writer = StreamWriter(redis, StreamNames.bar(symbol, "5s"), maxlen=5000)
+
+    async def publish(bar_data: dict) -> None:
+        ts = bar_data.get("time")
+        ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        try:
+            await writer.add({
+                "ts": ts_str,
+                "o": bar_data.get("open", 0.0),
+                "h": bar_data.get("high", 0.0),
+                "l": bar_data.get("low", 0.0),
+                "c": bar_data.get("close", 0.0),
+                "v": bar_data.get("volume", 0),
+            })
+        except Exception:
+            logger.exception('{"event": "BAR_PUBLISH_ERROR", "symbol": "%s"}', symbol)
+
+    return publish
+
+
 async def _tick_publisher_loop(ctx: AppContext) -> None:
-    """Publish streaming tick data from IB to Redis.
+    """Publish streaming tick data from IB to Redis — event-driven.
 
-    Reads from the IB client's in-memory ticker cache and publishes to
-    Redis streams + keys. Runs every 200ms to balance freshness and load.
+    Wires into ib_async's pendingTickersEvent so publishes fire on the tick
+    itself, not on a poll interval. Quotes are the project's fundamental
+    clock; this closes the loop end-to-end.
 
-    This is a transitional approach — ideally we'd hook directly into
-    ib_async's ticker update callback, but the current abstraction layer
-    exposes get_ticker() as the read interface.
+    Stays alive (awaits forever) so caller can manage lifecycle via
+    task cancellation — the finally block unregisters the handler.
     """
     from datetime import datetime, timezone
     from ib_trader.redis.streams import StreamWriter, StreamNames
@@ -650,101 +703,107 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
     if redis is None:
         return
 
+    if not hasattr(ctx.ib, '_ib'):
+        logger.warning('{"event": "TICK_PUBLISHER_NO_IB"}')
+        return
+
     state = StateStore(redis)
-
-    # Track which symbols we've created writers for
     writers: dict[str, StreamWriter] = {}
-    last_values: dict[str, tuple] = {}  # symbol → (bid, ask, last) to avoid duplicate publishes
+    last_values: dict[str, tuple] = {}  # symbol → (bid, ask, last) dedup
 
-    while True:
+    async def _publish_one(ticker) -> None:
         try:
-            if not hasattr(ctx.ib, '_streaming'):
-                await asyncio.sleep(1)
-                continue
+            contract = getattr(ticker, "contract", None)
+            if contract is None:
+                return
+            # Only publish equities — option/futures tickers share the
+            # underlying's symbol and would overwrite the equity quote.
+            if getattr(contract, "secType", None) != "STK":
+                return
+            symbol = getattr(contract, "symbol", None)
+            con_id = getattr(contract, "conId", None)
+            if not symbol or con_id is None:
+                return
 
-            for con_id, entry in list(ctx.ib._streaming.items()):
-                # Only publish equity (STK) quotes — option/futures tickers
-                # share the same symbol as the underlying and would overwrite
-                contract = entry.get("contract")
-                if contract and hasattr(contract, "secType"):
-                    if contract.secType != "STK":
-                        continue
+            # Reuse get_ticker()'s NaN/zero cleaning + cached close fallback.
+            data = ctx.ib.get_ticker(con_id)
+            if data is None:
+                return
 
-                ticker = ctx.ib.get_ticker(con_id)
-                if ticker is None:
-                    continue
+            bid = data.get("bid")
+            ask = data.get("ask")
+            last = data.get("last")
+            if bid is None and ask is None and last is None:
+                return
 
-                symbol = None
-                if contract and hasattr(contract, "symbol"):
-                    symbol = contract.symbol
-                if not symbol:
-                    continue
+            current = (bid, ask, last)
+            if current == last_values.get(symbol):
+                return
+            last_values[symbol] = current
 
-                bid = ticker.get("bid")
-                ask = ticker.get("ask")
-                last = ticker.get("last")
-
-                # Skip if no price data at all
-                if bid is None and ask is None and last is None:
-                    continue
-
-                # Skip if nothing has changed
-                current = (bid, ask, last)
-                if current == last_values.get(symbol):
-                    continue
-                last_values[symbol] = current
-
-                if symbol not in writers:
-                    writers[symbol] = StreamWriter(redis, StreamNames.quote(symbol), maxlen=5000)
-
-                now = datetime.now(timezone.utc).isoformat()
-
-                # Build full quote data including derived fields
-                close = ticker.get("close")
-                change = None
-                change_pct = None
-                if last is not None and close is not None and close > 0:
-                    change = round(last - close, 4)
-                    change_pct = round((change / close) * 100, 2)
-
-                quote_data = {
-                    "bid": str(bid) if bid else None,
-                    "ask": str(ask) if ask else None,
-                    "last": str(last) if last else None,
-                    "volume": ticker.get("volume"),
-                    "avg_volume": ticker.get("avg_volume"),
-                    "high": ticker.get("high"),
-                    "low": ticker.get("low"),
-                    "close": close,
-                    "change": change,
-                    "change_pct": change_pct,
-                    "high_52w": ticker.get("high_52w"),
-                    "low_52w": ticker.get("low_52w"),
-                    "ts": now,
-                }
-
-                # Publish to stream
-                await writers[symbol].add(quote_data)
-
-                # Update latest key with TTL
-                await state.set(
-                    StateKeys.quote_latest(symbol),
-                    quote_data,
-                    ttl=StateKeys.QUOTE_TTL,
+            if symbol not in writers:
+                writers[symbol] = StreamWriter(
+                    redis, StreamNames.quote(symbol), maxlen=5000,
                 )
 
+            close = data.get("close")
+            change = None
+            change_pct = None
+            if last is not None and close is not None and close > 0:
+                change = round(last - close, 4)
+                change_pct = round((change / close) * 100, 2)
+
+            quote_data = {
+                "bid": str(bid) if bid else None,
+                "ask": str(ask) if ask else None,
+                "last": str(last) if last else None,
+                "volume": data.get("volume"),
+                "avg_volume": data.get("avg_volume"),
+                "high": data.get("high"),
+                "low": data.get("low"),
+                "close": close,
+                "change": change,
+                "change_pct": change_pct,
+                "high_52w": data.get("high_52w"),
+                "low_52w": data.get("low_52w"),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+
+            await writers[symbol].add(quote_data)
+            await state.set(
+                StateKeys.quote_latest(symbol),
+                quote_data,
+                ttl=StateKeys.QUOTE_TTL,
+            )
         except Exception:
             logger.exception('{"event": "TICK_PUBLISHER_ERROR"}')
 
-        await asyncio.sleep(0.2)  # 200ms — 5 publishes/second per symbol max
+    def on_pending_tickers(tickers) -> None:
+        # ib_async fires this synchronously; schedule per-ticker async work.
+        for t in tickers:
+            asyncio.create_task(_publish_one(t))
+
+    ctx.ib._ib.pendingTickersEvent += on_pending_tickers
+    logger.info('{"event": "TICK_PUBLISHER_WIRED"}')
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        try:
+            ctx.ib._ib.pendingTickersEvent -= on_pending_tickers
+        except Exception:
+            pass
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
-    """Write ENGINE heartbeat to SQLite periodically."""
+    """Write ENGINE heartbeat to SQLite periodically and nudge WS consumers."""
     interval = ctx.settings.get("heartbeat_interval_seconds", 30)
     while True:
         try:
             ctx.heartbeats.upsert("ENGINE", pid)
+            if ctx.redis is not None:
+                from ib_trader.redis.streams import publish_activity
+                await publish_activity(ctx.redis, "heartbeats")
         except Exception:
             logger.exception('{"event": "HEARTBEAT_WRITE_FAILED"}')
         await asyncio.sleep(interval)

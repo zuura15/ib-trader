@@ -42,17 +42,12 @@ function mapApiBot(b: any): Bot {
   };
 }
 
-function toggleBot(botId: string, currentStatus: BotStatus, setBots: (bots: Bot[]) => void) {
+function toggleBot(botId: string, currentStatus: BotStatus) {
+  // Fire the lifecycle POST; the store is kept in sync by the WS "bots"
+  // diff the backend publishes from start_bot / stop_bot. No refetch
+  // needed here — that was a hold-over from the pre-WS poll.
   const action = currentStatus === 'running' ? 'stop' : 'start';
-  fetch(`/api/bots/${botId}/${action}`, { method: 'POST' })
-    .then((r) => r.json())
-    .then(() => {
-      fetch('/api/bots')
-        .then((r) => r.json())
-        .then((data: any[]) => setBots(data.map(mapApiBot)))
-        .catch(() => {});
-    })
-    .catch(() => {});
+  fetch(`/api/bots/${botId}/${action}`, { method: 'POST' }).catch(() => {});
 }
 
 function forceBuy(botId: string) {
@@ -151,19 +146,6 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
 
 export function BotsPanel({ large = false }: { large?: boolean }) {
   const bots = useStore((s) => s.bots);
-  const setBots = useStore((s) => s.setBots);
-
-  useEffect(() => {
-    const fetchBots = () => {
-      fetch('/api/bots')
-        .then((r) => r.json())
-        .then((data: any[]) => setBots(data.map(mapApiBot)))
-        .catch(() => {});
-    };
-    fetchBots();
-    const interval = setInterval(fetchBots, 5000);
-    return () => clearInterval(interval);
-  }, [setBots]);
 
   if (large) {
     return (
@@ -174,13 +156,24 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
           {bots.map((bot) => {
             const cfg = statusConfig[bot.status];
             return (
-              <div key={bot.id} className="rounded border p-3"
-                style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-default)' }}>
+              <div
+                key={bot.id}
+                className="rounded border p-3"
+                style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-default)' }}
+                data-testid={`bot-row-${bot.id}`}
+                data-bot-id={bot.id}
+                data-bot-name={bot.name}
+                data-bot-status={bot.status}
+              >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <span style={{ color: cfg.var }} className="text-sm">{cfg.dot}</span>
                     <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>{bot.name}</span>
-                    <span className={`badge ${bot.status === 'running' ? 'badge-green' : bot.status === 'error' ? 'badge-red' : bot.status === 'paused' ? 'badge-yellow' : 'badge-gray'}`}>
+                    <span
+                      className={`badge ${bot.status === 'running' ? 'badge-green' : bot.status === 'error' ? 'badge-red' : bot.status === 'paused' ? 'badge-yellow' : 'badge-gray'}`}
+                      data-testid={`bot-status-${bot.id}`}
+                      data-status={bot.status}
+                    >
                       {cfg.label}
                     </span>
                   </div>
@@ -189,7 +182,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                       {bot.strategy}
                     </span>
                     <button
-                      onClick={() => toggleBot(bot.id, bot.status, setBots)}
+                      onClick={() => toggleBot(bot.id, bot.status)}
                       className="text-[10px] px-2 py-0.5 rounded font-semibold"
                       style={{
                         background: bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
@@ -197,6 +190,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         border: `1px solid ${bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
                         cursor: 'pointer',
                       }}
+                      data-testid={`bot-toggle-${bot.id}`}
                     >
                       {bot.status === 'running' ? 'STOP' : 'START'}
                     </button>
@@ -210,6 +204,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                           border: '1px solid var(--accent-yellow)',
                           cursor: 'pointer',
                         }}
+                        data-testid={`bot-force-buy-${bot.id}`}
                       >
                         FORCE BUY
                       </button>
@@ -297,7 +292,12 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
               const cfg = statusConfig[bot.status];
               return (
                 <React.Fragment key={bot.id}>
-                <tr>
+                <tr
+                  data-testid={`bot-row-${bot.id}`}
+                  data-bot-id={bot.id}
+                  data-bot-name={bot.name}
+                  data-bot-status={bot.status}
+                >
                   <td style={{ color: cfg.var }} title={cfg.label}>{cfg.dot}</td>
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{bot.name}</td>
                   <td style={{ color: 'var(--text-secondary)' }}>{bot.strategy}</td>
@@ -311,7 +311,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   </td>
                   <td>
                     <button
-                      onClick={() => toggleBot(bot.id, bot.status, setBots)}
+                      onClick={() => toggleBot(bot.id, bot.status)}
                       className="text-[10px] px-2 py-0.5 rounded font-semibold"
                       style={{
                         background: bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
@@ -319,6 +319,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         border: `1px solid ${bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
                         cursor: 'pointer',
                       }}
+                      data-testid={`bot-toggle-${bot.id}`}
                     >
                       {bot.status === 'running' ? 'STOP' : 'START'}
                     </button>
@@ -332,6 +333,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                           border: '1px solid var(--accent-yellow)',
                           cursor: 'pointer',
                         }}
+                        data-testid={`bot-force-buy-${bot.id}`}
                       >
                         FORCE
                       </button>

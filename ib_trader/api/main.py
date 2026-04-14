@@ -51,6 +51,21 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
     init_db(engine)
     session_factory = create_session_factory(engine)
 
+    # Bootstrap bots table from config/bots/*.yaml — YAML is authoritative.
+    # The API process runs the reload endpoint, so the registry must be
+    # populated here too; bot-runner does the same on its own startup.
+    from ib_trader.bots.bootstrap import bootstrap_bots_from_yaml, BootstrapError
+    try:
+        report = bootstrap_bots_from_yaml(session_factory)
+        print(
+            f"[API] Bot bootstrap: +{len(report.added)} ~{len(report.updated)} "
+            f"={len(report.unchanged)} -{len(report.removed)}"
+        )
+    except BootstrapError as exc:
+        print(f"[API] BOT BOOTSTRAP REFUSED: {exc}")
+        logger.error('{"event": "BOT_BOOTSTRAP_REFUSED", "error": "%s"}', exc)
+        raise SystemExit(2) from exc
+
     # Write API heartbeat
     pid = os.getpid()
     heartbeats = HeartbeatRepository(session_factory)

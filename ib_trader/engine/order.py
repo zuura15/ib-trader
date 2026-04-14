@@ -902,12 +902,21 @@ async def _execute_bid_ask_order(
 
     track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
-    _fill_commission: Decimal | None = None
+    # Capture fill-level data from the callback so we don't have to re-read
+    # trade.orderStatus, which lags execDetailsEvent. On a fast fill the fill
+    # callback runs well before orderStatus.filled / avgFillPrice are updated;
+    # re-reading them races and reports qty_filled=0 even though the order
+    # actually filled, which then falls through to "PreSubmitted" → NOT_ROUTED.
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
 
-    async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
-        nonlocal _fill_commission
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
-            _fill_commission = commission
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
 
     async def on_status(status_ib_id: str, status: str):
@@ -928,9 +937,15 @@ async def _execute_bid_ask_order(
 
     status = await ctx.ib.get_order_status(ib_order_id)
     ib_status = status["status"]
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = _fill_commission if _fill_commission is not None else (status["commission"] or Decimal("0"))
+    # Prefer the fill-callback values (authoritative once fill_event is set).
+    # Fall back to trade.orderStatus for the partial / no-fill paths.
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = (_fill_notional / _fill_qty) if _fill_qty > 0 else None
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+    commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty:
@@ -1082,8 +1097,19 @@ async def _execute_market_order(
 
     track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
-    async def on_fill(fill_ib_id: str, qty_filled: Decimal, avg_price: Decimal, commission: Decimal):
+    # Capture fill data directly from the callback — trade.orderStatus.filled
+    # and avgFillPrice lag the execDetailsEvent that fires this callback, so
+    # re-reading status races and reports qty_filled=0 on a fast fill.
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
+
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
 
     ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
@@ -1095,9 +1121,14 @@ async def _execute_market_order(
         pass
 
     status = await ctx.ib.get_order_status(ib_order_id)
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = status["commission"] or Decimal("0")
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = _fill_notional / _fill_qty
+        commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+        commission = status["commission"] or Decimal("0")
 
     if qty_filled >= qty:
         await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
@@ -1272,6 +1303,33 @@ async def reprice_loop(
     """
     last_sent_price: Decimal = initial_price
 
+    # Prefer the Redis quote cache (pushed by the engine's pendingTickersEvent
+    # handler) — no polling. Fall back to the IB snapshot API only when Redis
+    # is unavailable or the latest key is missing.
+    state_store = None
+    if getattr(ctx, "redis", None) is not None:
+        from ib_trader.redis.state import StateStore, StateKeys
+        state_store = StateStore(ctx.redis)
+        _quote_key = StateKeys.quote_latest(symbol)
+    else:
+        _quote_key = None
+
+    async def _get_prices() -> tuple[Decimal, Decimal, Decimal]:
+        if state_store is not None:
+            quote = await state_store.get(_quote_key)
+            if quote:
+                def _dec(v):
+                    if v in (None, "", 0, "0"):
+                        return Decimal("0")
+                    return Decimal(str(v))
+                b = _dec(quote.get("bid"))
+                a = _dec(quote.get("ask"))
+                l = _dec(quote.get("last"))
+                if b > 0 or a > 0 or l > 0:
+                    return b, a, l
+        snap = await ctx.ib.get_market_snapshot(con_id)
+        return snap["bid"], snap["ask"], snap["last"]
+
     for step in range(1, total_steps + 1):
         track = ctx.tracker.get(ib_order_id)
         if track and (track.is_filled or track.is_canceled):
@@ -1283,8 +1341,7 @@ async def reprice_loop(
         if track and (track.is_filled or track.is_canceled):
             break
 
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+        bid, ask, last = await _get_prices()
 
         if bid == 0 and ask == 0:
             ref = last if last > 0 else Decimal("0")
@@ -1780,12 +1837,18 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # ── Register tracker + callbacks ─────────────────────────────────────
     track = ctx.tracker.register(close_ctx.correlation_id, ib_order_id, entry_symbol)
-    _fill_commission: Decimal | None = None
+    # Authoritative fill values captured by the callback (trade.orderStatus
+    # lags execDetailsEvent — see engine/order.py _execute_bid_ask_order fix).
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
 
-    async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
-        nonlocal _fill_commission
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
-            _fill_commission = commission
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
 
     async def on_status(status_ib_id: str, status: str):
@@ -1834,12 +1897,14 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     if cmd.strategy == Strategy.LIMIT:
         # Check for immediate fill (aggressive limit that crossed the spread)
         status = await ctx.ib.get_order_status(ib_order_id)
-        qty_filled = status["qty_filled"]
-        avg_price = status["avg_fill_price"]
-        commission = (
-            _fill_commission if _fill_commission is not None
-            else (status["commission"] or Decimal("0"))
-        )
+        if _fill_qty > 0:
+            qty_filled = _fill_qty
+            avg_price = _fill_notional / _fill_qty
+            commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+        else:
+            qty_filled = status["qty_filled"]
+            avg_price = status["avg_fill_price"]
+            commission = status["commission"] or Decimal("0")
         if qty_filled > 0 and avg_price is not None and qty_filled >= qty_to_close:
             await _handle_close_fill(
                 close_ctx, trade_group, qty_filled,
@@ -1911,12 +1976,14 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # ── Determine outcome ────────────────────────────────────────────────
     status = await ctx.ib.get_order_status(ib_order_id)
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = (
-        _fill_commission if _fill_commission is not None
-        else (status["commission"] or Decimal("0"))
-    )
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = _fill_notional / _fill_qty
+        commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+        commission = status["commission"] or Decimal("0")
 
     # Fallback: if IB says the order is Filled but get_order_status still
     # reports 0 fills (race condition in ib_async's internal state), trust
@@ -1929,12 +1996,14 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         await asyncio.sleep(0.5)
         status = await ctx.ib.get_order_status(ib_order_id)
-        qty_filled = status["qty_filled"]
-        avg_price = status["avg_fill_price"]
-        commission = (
-            _fill_commission if _fill_commission is not None
-            else (status["commission"] or Decimal("0"))
-        )
+        if _fill_qty > 0:
+            qty_filled = _fill_qty
+            avg_price = _fill_notional / _fill_qty
+            commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+        else:
+            qty_filled = status["qty_filled"]
+            avg_price = status["avg_fill_price"]
+            commission = status["commission"] or Decimal("0")
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty_to_close:

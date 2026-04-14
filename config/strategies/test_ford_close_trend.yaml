@@ -1,0 +1,43 @@
+# Strategy config consumed by test-ford.yaml (manual_entry_only bot).
+#
+# The entry block is deliberately unreachable (max_rsi=0 means no RSI can
+# satisfy it) so the strategy never self-triggers a BUY during the test.
+# Entries come from force-buy; exits + trailing stop run at full fidelity.
+#
+# Exit params are aggressive — trail_activation_pct = 0.005 % and trail_width
+# = 0.05 % — so on F (~$12.50) the trail arms on any uptick and fires on a
+# tiny downtick, giving the UI test a realistic chance of observing the
+# trailing-stop state transition in a ~60-second window.
+name: test_ford_close_trend
+ref_id: test-ford
+version: "1.0"
+
+symbol: F
+max_position_value: 200
+max_shares: 10
+order_strategy: market
+
+bar_size_seconds: 60
+lookback_bars: 10
+
+# Entry — intentionally impossible. Tests drive entries via /force-buy.
+entry:
+  trend_detector: close_trend
+  peak_window: 2
+  trend_points: 2
+  max_valley_bars_ago: 5
+  max_rsi: 0           # no RSI value <= 0, so the entry branch never fires
+
+# Exit — aggressive trail so the UI assertion completes in seconds.
+exit:
+  hard_stop_loss_pct: 0.003      # -0.3% from entry
+  trail_activation_pct: 0.00005  # arm trail on any uptick
+  trail_width_pct: 0.0005        # stop at 0.05 % below high-water mark
+  time_stop_minutes: 60
+  entry_timeout_seconds: 30
+  exit_price: bid
+
+# Session filter — disabled so the bot runs during pre-market / after-hours.
+session_filter:
+  skip_close_transition: false
+  skip_turn_minutes: 0

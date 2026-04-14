@@ -3,7 +3,10 @@ import pytest
 from datetime import datetime
 from decimal import Decimal
 
-from ib_trader.redis.streams import StreamWriter, StreamReader, StreamNames, _serialize, _deserialize
+from ib_trader.redis.streams import (
+    StreamWriter, StreamReader, StreamNames, _serialize, _deserialize,
+    publish_activity,
+)
 from ib_trader.redis.state import StateStore, StateKeys
 
 
@@ -141,6 +144,34 @@ class TestStreamNames:
 
     def test_bot_control(self):
         assert StreamNames.bot_control("abc123") == "bot:control:abc123"
+
+    def test_activity_constant(self):
+        assert StreamNames.ACTIVITY == "events:activity"
+
+
+class TestPublishActivity:
+    """publish_activity nudges the events:activity stream for WS consumers."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_channel_name(self, fake_redis):
+        await publish_activity(fake_redis, "orders")
+        result = await StreamReader.read_latest(fake_redis, StreamNames.ACTIVITY)
+        assert result is not None
+        _, data = result
+        assert data["channel"] == "orders"
+
+    @pytest.mark.asyncio
+    async def test_no_redis_is_noop(self):
+        # Must not raise when redis is None
+        await publish_activity(None, "anything")
+
+    @pytest.mark.asyncio
+    async def test_redis_error_swallowed(self):
+        class _BrokenRedis:
+            async def xadd(self, *args, **kwargs):
+                raise RuntimeError("redis down")
+        # Should not raise — activity is observational, never gating
+        await publish_activity(_BrokenRedis(), "orders")
 
 
 class TestStateKeys:

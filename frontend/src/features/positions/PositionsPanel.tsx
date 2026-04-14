@@ -1,24 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useStore } from '../../data/store';
 import { formatPrice, formatCurrency, pnlClass } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
-function RefreshCountdown({ interval }: { interval: number }) {
-  const [sec, setSec] = useState(interval);
-  const ref = useRef(0);
-  useEffect(() => {
-    ref.current = interval;
-    setSec(interval);
-    const timer = setInterval(() => {
-      ref.current -= 1;
-      if (ref.current <= 0) ref.current = interval;
-      setSec(ref.current);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [interval]);
+function LiveIndicator({ connected }: { connected: boolean }) {
   return (
     <span style={{ fontSize: 10, color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
-      ↻ {sec}s
+      {connected ? '● live' : '○ reconnecting'}
     </span>
   );
 }
@@ -146,42 +134,56 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   }
 
   // --------------- Live mode ---------------
-  const REFRESH_INTERVAL = 2;
   const [positions, setPositions] = useState<BrokerPosition[]>([]);
+  const [wsLive, setWsLive] = useState(false);
   const [showStocks, setShowStocks] = useState(true);
   const [showOptions, setShowOptions] = useState(false);
   const [showOther, setShowOther] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('symbol');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
-  const fetchPositions = useCallback(() => {
-    fetch(`/api/positions?_t=${Date.now()}`, { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : [])
-      .then((data: BrokerPosition[]) => {
-        setPositions(data);
-      })
-      .catch(() => {});
-  }, []);
-
-  // Fetch on mount + every REFRESH_INTERVAL seconds, pause when tab is hidden
+  // Subscribe to positions via WebSocket — push-driven, no polling. The
+  // server pushes a fresh snapshot on every position:changes event plus a
+  // 30s safety-net re-push.
   useEffect(() => {
-    fetchPositions();
-    let timer = setInterval(fetchPositions, REFRESH_INTERVAL * 1000);
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const base = import.meta.env.VITE_WS_URL || `${proto}//${window.location.host}/ws`;
+    const token = import.meta.env.VITE_API_TOKEN || '';
+    const url = token ? `${base}?token=${token}` : base;
 
-    const onVisibility = () => {
-      clearInterval(timer);
-      if (!document.hidden) {
-        fetchPositions();
-        timer = setInterval(fetchPositions, REFRESH_INTERVAL * 1000);
-      }
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+
+    const open = () => {
+      if (closed) return;
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        setWsLive(true);
+        ws?.send(JSON.stringify({ type: 'subscribe_positions' }));
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'positions' && Array.isArray(msg.data)) {
+            setPositions(msg.data as BrokerPosition[]);
+          }
+        } catch { /* ignore malformed frames */ }
+      };
+      ws.onclose = () => {
+        setWsLive(false);
+        if (!closed) retry = setTimeout(open, 2000);
+      };
+      ws.onerror = () => { /* onclose handles reconnect */ };
     };
-    document.addEventListener('visibilitychange', onVisibility);
 
+    open();
     return () => {
-      clearInterval(timer);
-      document.removeEventListener('visibilitychange', onVisibility);
+      closed = true;
+      if (retry) clearTimeout(retry);
+      if (ws) { ws.onclose = null; ws.close(); }
     };
-  }, [fetchPositions]);
+  }, []);
 
   const handleSort = (key: SortKey) => {
     if (key === sortKey) {
@@ -222,7 +224,7 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   return (
     <PanelShell title="Positions" accent="blue" right={
       <div className="flex items-center gap-2">
-        <RefreshCountdown interval={REFRESH_INTERVAL} />
+        <LiveIndicator connected={wsLive} />
         <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{filtered.length}/{positions.length}</span>
         <div className="flex gap-1">
           {([
@@ -278,9 +280,18 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
               const mkt = pos.market_price ? parseNum(pos.market_price) : null;
               const pnl = computePnl(pos);
               return (
-                <tr key={pos.id}>
+                <tr
+                  key={pos.id}
+                  data-testid={`position-row-${pos.symbol}`}
+                  data-symbol={pos.symbol}
+                  data-qty={qty}
+                >
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{pos.symbol}</td>
-                  <td className="text-right font-mono" style={{ color: qty >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                  <td
+                    className="text-right font-mono"
+                    style={{ color: qty >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}
+                    data-testid={`position-qty-${pos.symbol}`}
+                  >
                     {qty > 0 ? '+' : ''}{qty}
                   </td>
                   <td className="text-right font-mono" style={{ color: 'var(--text-primary)' }}>

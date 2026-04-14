@@ -66,6 +66,19 @@ class SubscribeBarsRequest(BaseModel):
     interval: str = "5s"
 
 
+class WarmupBarsRequest(BaseModel):
+    """Request body for prefetching historical bars to the Redis bar stream."""
+
+    symbol: str
+    duration_seconds: int = 7200
+
+
+class UnsubscribeBarsRequest(BaseModel):
+    """Request body for unsubscribing from realtime bars."""
+
+    symbol: str
+
+
 class HealthResponse(BaseModel):
     """Engine health check response."""
 
@@ -172,11 +185,56 @@ async def subscribe_bars(req: SubscribeBarsRequest):
     try:
         info = await _ctx.ib.qualify_contract(req.symbol)
         con_id = info["con_id"]
-        await _ctx.ib.subscribe_realtime_bars(con_id, req.symbol)
+        # Wire a Redis publisher so live bars flow to bar:{symbol}:5s where
+        # bots XREAD them. Without this callback, IB receives bars but they
+        # land nowhere.
+        callback = None
+        if _ctx.redis is not None:
+            from ib_trader.engine.main import _make_bar_publisher
+            callback = _make_bar_publisher(_ctx.redis, req.symbol)
+        await _ctx.ib.subscribe_realtime_bars(con_id, req.symbol, callback=callback)
         await _ctx.ib.subscribe_market_data(con_id, req.symbol)
         return {"status": "subscribed", "symbol": req.symbol, "con_id": con_id}
     except Exception as e:
         logger.exception('{"event": "SUBSCRIBE_BARS_FAILED", "symbol": "%s"}', req.symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/engine/warmup-bars")
+async def warmup_bars(req: WarmupBarsRequest):
+    """Publish historical 5s bars to the Redis bar stream for bot warmup.
+
+    Bots consume bar:{symbol}:5s from "0" during warmup to prefill their
+    aggregator. The live reqRealTimeBars callback writes to the same stream
+    for ongoing events.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
+    from ib_trader.engine.service import _handle_warmup_bars
+
+    try:
+        output = await _handle_warmup_bars(req.symbol, req.duration_seconds, _ctx)
+        return {"status": "ok", "symbol": req.symbol, "output": output}
+    except Exception as e:
+        logger.exception('{"event": "WARMUP_BARS_FAILED", "symbol": "%s"}', req.symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/engine/unsubscribe-bars")
+async def unsubscribe_bars(req: UnsubscribeBarsRequest):
+    """Unsubscribe from live bars and streaming quotes for a symbol."""
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
+    try:
+        info = await _ctx.ib.qualify_contract(req.symbol)
+        con_id = info["con_id"]
+        await _ctx.ib.unsubscribe_realtime_bars(con_id)
+        await _ctx.ib.unsubscribe_market_data(con_id)
+        return {"status": "unsubscribed", "symbol": req.symbol, "con_id": con_id}
+    except Exception as e:
+        logger.exception('{"event": "UNSUBSCRIBE_BARS_FAILED", "symbol": "%s"}', req.symbol)
         raise HTTPException(status_code=500, detail=str(e))
 
 

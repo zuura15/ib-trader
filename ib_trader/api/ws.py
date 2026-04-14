@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _POLL_INTERVAL_S = 1.5
+_FALLBACK_REFRESH_S = 30.0  # upper bound if no activity notifications arrive
 
 
 class _JSONEncoder(json.JSONEncoder):
@@ -223,12 +224,42 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
                 for e in events
             ]
 
+        elif channel == "bots":
+            # Delegate to the REST serializer so the WS channel and
+            # /api/bots stay shape-identical.
+            from ib_trader.data.repositories.bot_repository import BotRepository
+            from ib_trader.api.routes.bots import _serialize_bot
+            repo = BotRepository(sf)
+            return [_serialize_bot(b) for b in repo.get_all()]
+
+        elif channel == "status":
+            # Single-element snapshot. The id is stable so diff logic treats
+            # any field change as an "updated" event rather than add+remove.
+            from ib_trader.api.routes.system import get_status as _get_status
+            heartbeats_repo = HeartbeatRepository(sf)
+            alerts_repo = AlertRepository(sf)
+            try:
+                payload = _get_status(
+                    heartbeats=heartbeats_repo, alerts=alerts_repo, sf=sf,
+                )
+                return [{"id": "__status__", **payload}]
+            except Exception:
+                logger.exception(json.dumps({"event": "STATUS_FETCH_FAILED"}))
+                return []
+
         return []
     finally:
         sf.remove()
 
 
-_VALID_CHANNELS = {"trades", "orders", "alerts", "commands", "heartbeats", "bot_events"}
+_VALID_CHANNELS = {
+    "trades", "orders", "alerts", "commands", "heartbeats",
+    "bot_events", "bots", "status",
+}
+
+# When any activity in this set fires, the "status" channel is also marked
+# dirty. Keeps /api/status in sync with its backing state without a poll.
+_STATUS_TRIGGERS = frozenset({"trades", "orders", "alerts", "heartbeats", "commands"})
 
 
 async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
@@ -310,6 +341,199 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
             await asyncio.sleep(1)
 
 
+def _read_log_tail(log_path: str, backlog: int) -> list[str]:
+    """Return the last `backlog` lines of a text file. Runs in a worker
+    thread via asyncio.to_thread so the event loop stays responsive."""
+    from collections import deque
+    try:
+        with open(log_path, "r") as f:
+            return list(deque(f, maxlen=backlog))
+    except FileNotFoundError:
+        return []
+
+
+def _parse_log_entries(lines: list[str]) -> list[dict]:
+    """Parse structured JSON log lines into the shape the LogStream UI reads."""
+    entries: list[dict] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            entry = json.loads(ln)
+            entries.append({
+                "timestamp": entry.get("timestamp", ""),
+                "level": entry.get("level", "INFO"),
+                "event": entry.get("event", entry.get("message", "")),
+                "message": entry.get("message", entry.get("event", "")),
+            })
+        except json.JSONDecodeError:
+            entries.append({
+                "timestamp": "",
+                "level": "INFO",
+                "event": "log",
+                "message": ln,
+            })
+    return entries
+
+
+async def _stream_logs_to_ws(websocket: WebSocket, log_path: str, backlog: int = 100) -> None:
+    """Tail the structured log file and push each new JSON line to the WS.
+
+    Replaces the 5s /api/logs poll. On subscribe we send the last `backlog`
+    entries as a hydration batch, then stream new ones as they're written.
+    Handles log rotation by re-opening the file when the inode changes.
+    File I/O runs in a thread pool so the WS event loop stays responsive.
+    """
+    import os as _os
+
+    async def _send(entries: list[dict]) -> None:
+        if entries:
+            await websocket.send_text(_json_dumps({
+                "type": "log_batch",
+                "data": entries,
+            }))
+
+    try:
+        tail_lines = await asyncio.to_thread(_read_log_tail, log_path, backlog)
+        await _send(_parse_log_entries(tail_lines))
+
+        # Follow — reopen on inode change (log rotation).
+        current_inode: int | None = None
+        f = None
+
+        def _open_at_tail() -> tuple[object, int]:
+            fh = open(log_path, "r")
+            fh.seek(0, 2)
+            return fh, _os.fstat(fh.fileno()).st_ino
+
+        def _read_available(fh) -> list[str]:
+            # Drain whatever bytes are there; blocking read of small buffer
+            # is fine, returns empty string at EOF on a regular file.
+            out: list[str] = []
+            while True:
+                line = fh.readline()
+                if not line:
+                    break
+                out.append(line)
+            return out
+
+        while True:
+            try:
+                st = await asyncio.to_thread(_os.stat, log_path)
+            except FileNotFoundError:
+                await asyncio.sleep(0.5)
+                continue
+
+            if current_inode != st.st_ino:
+                if f is not None:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+                f, current_inode = await asyncio.to_thread(_open_at_tail)
+
+            new_lines = await asyncio.to_thread(_read_available, f)
+            if new_lines:
+                await _send(_parse_log_entries(new_lines))
+            else:
+                await asyncio.sleep(0.25)
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        return
+    except Exception:
+        logger.exception(json.dumps({"event": "WS_LOGS_STREAM_ERROR"}))
+
+
+async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
+    """Push broker positions to the WebSocket on every position:changes event.
+
+    Sends an initial snapshot, then re-reads and pushes on each event from
+    the engine's position:changes stream. A 30s fallback XREAD timeout
+    re-issues the snapshot so missed events can't strand the client.
+    """
+    from ib_trader.redis.streams import StreamNames
+    from ib_trader.api.routes.positions import _positions_from_redis
+
+    async def push_snapshot():
+        positions = await _positions_from_redis(redis)
+        await websocket.send_text(_json_dumps({
+            "type": "positions",
+            "data": positions,
+        }))
+
+    # Initial snapshot so the UI hydrates immediately
+    await push_snapshot()
+
+    last_id = "$"
+    while True:
+        try:
+            results = await redis.xread(
+                {StreamNames.position_changes(): last_id}, block=30000,
+            )
+            # Whether we got an event or timed out, re-push the snapshot.
+            # The event payload isn't rich enough to patch in place, and
+            # position aggregation across ibpos:* / pos:* keys benefits from
+            # a fresh read.
+            if results:
+                for _stream, entries in results:
+                    for entry_id, _raw in entries:
+                        last_id = entry_id
+            await push_snapshot()
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            return
+        except Exception:
+            logger.exception('{"event": "WS_POSITIONS_STREAM_ERROR"}')
+            await asyncio.sleep(1)
+
+
+async def _activity_listener(
+    redis, dirty: set[str], signal: asyncio.Event,
+    subscribed: set[str],
+) -> None:
+    """Mark channels dirty when the engine publishes an activity notification.
+
+    Replaces the 1.5s SQLite poll — the WS diff path now wakes on the
+    engine's own state-change events. The fallback refresh in the main
+    loop catches any missed notifications.
+    """
+    from ib_trader.redis.streams import StreamNames
+    if redis is None:
+        return
+    last_id = "$"
+    while True:
+        try:
+            results = await redis.xread({StreamNames.ACTIVITY: last_id}, block=30000)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('{"event": "WS_ACTIVITY_READ_ERROR"}')
+            await asyncio.sleep(1)
+            continue
+
+        if not results:
+            continue
+        for _stream, entries in results:
+            for entry_id, raw_data in entries:
+                last_id = entry_id
+                try:
+                    ch = raw_data.get("channel")
+                    if isinstance(ch, str) and ch.startswith('"') and ch.endswith('"'):
+                        ch = ch[1:-1]
+                except Exception:
+                    ch = None
+                if not ch:
+                    continue
+                if ch in subscribed:
+                    dirty.add(ch)
+                    signal.set()
+                # Status aggregates trades/orders/alerts/heartbeats/commands;
+                # mark it dirty whenever any of those fire so /api/status pushes
+                # without its own publisher wiring.
+                if ch in _STATUS_TRIGGERS and "status" in subscribed:
+                    dirty.add("status")
+                    signal.set()
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time data updates."""
@@ -327,7 +551,33 @@ async def websocket_endpoint(websocket: WebSocket):
     channel_states: dict[str, _ChannelState] = {}
     stream_tasks: list[asyncio.Task] = []
 
+    # Activity-driven diff refresh. `dirty` tracks which channels the engine
+    # has marked as changed; `signal` wakes the main loop so we diff
+    # without waiting out the client-message timeout.
+    dirty_channels: set[str] = set()
+    activity_signal = asyncio.Event()
+    activity_task: asyncio.Task | None = None
+    if redis is not None:
+        activity_task = asyncio.create_task(
+            _activity_listener(redis, dirty_channels, activity_signal, subscribed_channels)
+        )
+    last_full_refresh = 0.0
+
+    async def _emit_diffs(channels: set[str]) -> None:
+        for ch in channels:
+            if ch not in subscribed_channels:
+                continue
+            data = _fetch_channel_data(ch, sf)
+            diff = channel_states[ch].update(data)
+            if diff:
+                await websocket.send_text(_json_dumps({
+                    "type": "diff",
+                    "channel": ch,
+                    **diff,
+                }))
+
     try:
+        loop = asyncio.get_event_loop()
         while True:
             try:
                 raw = await asyncio.wait_for(
@@ -338,9 +588,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if msg_type == "subscribe":
                     channels = msg.get("channels", [])
-                    subscribed_channels = {
+                    subscribed_channels.clear()
+                    subscribed_channels.update(
                         c for c in channels if c in _VALID_CHANNELS
-                    }
+                    )
                     channel_states = {c: _ChannelState(c) for c in subscribed_channels}
 
                     snapshot_data = {}
@@ -353,6 +604,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "snapshot",
                         "data": snapshot_data,
                     }))
+                    last_full_refresh = loop.time()
 
                 elif msg_type == "subscribe_quote" and redis:
                     # Subscribe to a symbol's live quote stream
@@ -371,23 +623,47 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                         stream_tasks.append(task)
 
+                elif msg_type == "subscribe_positions" and redis:
+                    task = asyncio.create_task(
+                        _stream_positions_to_ws(websocket, redis)
+                    )
+                    stream_tasks.append(task)
+
+                elif msg_type == "subscribe_logs":
+                    import os as _os
+                    log_path = _os.environ.get("IB_TRADER_LOG_FILE", "logs/ib_trader.log")
+                    try:
+                        backlog = int(msg.get("backlog", 100))
+                    except (TypeError, ValueError):
+                        backlog = 100
+                    task = asyncio.create_task(
+                        _stream_logs_to_ws(websocket, log_path, backlog=backlog),
+                    )
+                    stream_tasks.append(task)
+
                 elif msg_type == "ping":
                     await websocket.send_text(_json_dumps({"type": "pong"}))
 
             except asyncio.TimeoutError:
                 pass
 
-            # Poll SQLite-backed channels (legacy diff path)
-            if subscribed_channels:
-                for ch in subscribed_channels:
-                    data = _fetch_channel_data(ch, sf)
-                    diff = channel_states[ch].update(data)
-                    if diff:
-                        await websocket.send_text(_json_dumps({
-                            "type": "diff",
-                            "channel": ch,
-                            **diff,
-                        }))
+            if not subscribed_channels:
+                continue
+
+            # Diff dirty channels (activity-driven) or refresh all on fallback.
+            now = loop.time()
+            due_for_full = (now - last_full_refresh) >= _FALLBACK_REFRESH_S
+            if activity_signal.is_set() or due_for_full or redis is None:
+                if activity_signal.is_set() and not due_for_full and redis is not None:
+                    to_refresh = set(dirty_channels)
+                    dirty_channels.clear()
+                    activity_signal.clear()
+                else:
+                    to_refresh = set(subscribed_channels)
+                    dirty_channels.clear()
+                    activity_signal.clear()
+                    last_full_refresh = now
+                await _emit_diffs(to_refresh)
 
     except WebSocketDisconnect:
         pass
@@ -400,3 +676,5 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         for t in stream_tasks:
             t.cancel()
+        if activity_task is not None:
+            activity_task.cancel()

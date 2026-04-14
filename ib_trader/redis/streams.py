@@ -187,3 +187,27 @@ class StreamNames:
         live updates to the browser without polling.
         """
         return f"bot:state:{bot_ref}:{symbol}"
+
+    ACTIVITY = "events:activity"
+    """Lightweight channel-change notifier consumed by the WebSocket API.
+
+    Writers publish {"channel": "<name>"} whenever a SQLite-backed domain
+    (trades, orders, alerts, commands, bot_events, heartbeats) changes, so
+    the WS endpoint can re-fetch and diff that channel without polling.
+    """
+
+
+async def publish_activity(redis, channel: str) -> None:
+    """Notify WS consumers that a diff-tracked domain has changed.
+
+    No-op on Redis errors — activity notifications are observational,
+    never gating. WS subscribers also refresh on a fallback timeout so
+    a dropped notification does not strand the UI.
+    """
+    if redis is None:
+        return
+    try:
+        writer = StreamWriter(redis, StreamNames.ACTIVITY, maxlen=500)
+        await writer.add({"channel": channel})
+    except Exception:
+        logger.debug('{"event": "ACTIVITY_PUBLISH_FAILED", "channel": "%s"}', channel)
