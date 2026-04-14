@@ -281,8 +281,11 @@ class Reconciler:
         ib_obj = self._ib._ib
         try:
             await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
-        except (asyncio.TimeoutError, Exception):
-            logger.exception('{"event": "RECONCILER_POSITIONS_FAILED"}')
+        except asyncio.TimeoutError:
+            logger.debug('{"event": "RECONCILER_POSITIONS_TIMEOUT"}')
+            return []
+        except Exception:
+            logger.warning('{"event": "RECONCILER_POSITIONS_FAILED"}')
             return []
 
         positions = []

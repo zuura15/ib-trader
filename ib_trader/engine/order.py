@@ -1616,6 +1616,13 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # Create close _OrderContext
     close_correlation_id = str(uuid.uuid4())
+    # Encode orderRef for the close — use 'S' side regardless of underlying
+    close_order_ref = None
+    if hasattr(cmd, 'bot_ref') and cmd.bot_ref:
+        from ib_trader.engine.order_ref import encode as encode_order_ref
+        side_code = "S" if close_side == "SELL" else "B"
+        close_order_ref = encode_order_ref(cmd.bot_ref, entry_symbol, side_code, cmd.serial)
+
     close_ctx = _OrderContext(
         trade_id=trade_group.id,
         trade_serial=cmd.serial,
@@ -1626,6 +1633,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         leg_type=LegType.CLOSE,
         correlation_id=close_correlation_id,
         security_type="STK",
+        order_ref=close_order_ref,
     )
 
     logger.info(
@@ -1649,6 +1657,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1677,6 +1686,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1706,6 +1716,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1744,6 +1755,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             ib_order_id = await ctx.ib.place_limit_order(
                 con_id, entry_symbol, close_side, qty_to_close, initial_price,
                 outside_rth=True, tif=_session_tif(),
+                order_ref=close_ctx.order_ref,
             )
             _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "LIMIT", qty_to_close, limit_price=initial_price,
@@ -1753,7 +1765,8 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                        "MARKET", qty_to_close, trade_serial=cmd.serial, **_txn_common)
             ib_order_id = await ctx.ib.place_market_order(
-                con_id, entry_symbol, close_side, qty_to_close, outside_rth=True
+                con_id, entry_symbol, close_side, qty_to_close, outside_rth=True,
+                order_ref=close_ctx.order_ref,
             )
             _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "MARKET", qty_to_close, ib_order_id=_safe_int(ib_order_id),

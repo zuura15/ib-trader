@@ -260,6 +260,7 @@ class ExecutionMiddleware:
             payload = {
                 "serial": serial,
                 "strategy": order.order_type,
+                "bot_ref": self._bot_ref,
             }
         else:
             url = f"{self._engine_url}/engine/orders"

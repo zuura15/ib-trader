@@ -834,6 +834,7 @@ class InsyncClient(IBClientBase):
         2107,  # HMDS data farm connection inactive (not an error)
         2108,  # Market data farm connection inactive (not an error)
         2158,  # Sec-def data farm connection OK
+        10340, # ManualOrderIndicator not supported (delayed warning, not an error)
     })
 
     def _on_error(self, reqId: int, errorCode: int, errorString: str, *_) -> None:

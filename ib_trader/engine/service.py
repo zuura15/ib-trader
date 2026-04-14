@@ -612,6 +612,8 @@ async def execute_single_command(
             await execute_order(parsed, cmd_ctx)
         elif isinstance(parsed, CloseCommand):
             from ib_trader.engine.order import execute_close
+            if bot_ref:
+                parsed = dataclasses.replace(parsed, bot_ref=bot_ref)
             await execute_close(parsed, cmd_ctx)
 
         output = "\n".join(renderer.messages) if renderer.messages else ""

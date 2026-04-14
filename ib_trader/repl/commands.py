@@ -67,6 +67,7 @@ class CloseCommand:
     profit_amount: Decimal | None
     take_profit_price: Decimal | None
     limit_price: Decimal | None = None
+    bot_ref: str | None = None  # Bot reference for orderRef tagging
 
 
 @dataclass

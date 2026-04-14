@@ -56,6 +56,7 @@ class CloseRequest(BaseModel):
     serial: int
     strategy: str = "market"
     profit: Optional[str] = None
+    bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
 
 
 class SubscribeBarsRequest(BaseModel):
@@ -147,7 +148,11 @@ async def close_position(req: CloseRequest):
         cmd_text += f" {req.profit}"
 
     try:
-        result = await execute_single_command(_ctx, cmd_text, source="api")
+        result = await execute_single_command(
+            _ctx, cmd_text,
+            source=f"bot:{req.bot_ref}" if req.bot_ref else "api",
+            bot_ref=req.bot_ref,
+        )
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.exception('{"event": "INTERNAL_API_CLOSE_FAILED"}')
