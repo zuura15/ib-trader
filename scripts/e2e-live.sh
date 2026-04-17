@@ -154,7 +154,25 @@ trap teardown EXIT INT TERM
 ensure_redis
 ensure_engine
 ensure_api
-ensure_bot_runner
+
+# Only spin up the bot runner for specs that drive bots. Otherwise it
+# bootstraps from YAML and any bot left in RUNNING state from a prior
+# run will resume — placing real orders that interfere with non-bot
+# tests (e.g. the Ford console workflow). Keyed off the spec name(s)
+# in IB_TRADER_E2E_EXTRA_PW_ARGS plus any positional args.
+NEED_BOTS="${IB_TRADER_E2E_NEED_BOTS:-auto}"
+if [[ "$NEED_BOTS" == "auto" ]]; then
+    if printf '%s\n' "${IB_TRADER_E2E_EXTRA_PW_ARGS:-}" "$@" | grep -q "bots"; then
+        NEED_BOTS=1
+    else
+        NEED_BOTS=0
+    fi
+fi
+if [[ "$NEED_BOTS" == "1" ]]; then
+    ensure_bot_runner
+else
+    log "Skipping bot runner — no bots spec selected"
+fi
 
 log "Stack up. Handing off to Playwright..."
 cd frontend

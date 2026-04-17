@@ -18,6 +18,11 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+
+try:
+    from redis.exceptions import ConnectionError as _RedisConnectionError
+except ImportError:
+    _RedisConnectionError = type(None)  # no-op if redis not installed
 from decimal import Decimal
 from pathlib import Path
 
@@ -97,46 +102,293 @@ class StrategyBotRunner(BotBase):
         self._bot_events_repo = BotEventRepository(session_factory)
         self._session_factory = session_factory
 
+    async def _apply_fill(self, *, bot_ref: str, symbol: str, side: str,
+                          qty: Decimal, price: Decimal, commission: Decimal,
+                          serial: int, ib_order_id: str) -> None:
+        """Accumulate a tagged fill into the bot's unified state key and
+        dispatch OrderFilled to the strategy.
+
+        Engine publishes each partial fill to the fill stream. Bot is the
+        sole writer of strat:<bot_ref>:<symbol>. Qty accumulates within the
+        same trade serial; a new serial resets.
+        """
+        redis = self.config.get("_redis")
+        from ib_trader.redis.state import StateStore
+        store = StateStore(redis)
+        key = f"bot:{self.bot_id}"
+        existing = await store.get(key) or {}
+
+        existing_qty = Decimal(existing.get("qty", "0"))
+        same_trade = (existing.get("serial") == serial)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if side == "B":
+            base_qty = existing_qty if same_trade else Decimal("0")
+            new_qty = base_qty + qty
+            new_state = "OPEN"
+            entry_time = existing.get("entry_time") if same_trade else now_iso
+            fill_event = OrderFilled(
+                trade_serial=serial, symbol=symbol, side="BUY",
+                fill_price=price, qty=qty, commission=commission,
+                ib_order_id=ib_order_id,
+            )
+            # Compute stop levels from strategy config so the UI shows
+            # meaningful data immediately — before the first quote tick.
+            exit_cfg = self.strategy_config.get("exit", {}) if isinstance(self.strategy_config.get("exit"), dict) else {}
+            hard_sl_pct = Decimal(str(exit_cfg.get("hard_stop_loss_pct", 0.003)))
+            trail_act_pct = Decimal(str(exit_cfg.get("trail_activation_pct", 0.00005)))
+            trail_width = Decimal(str(exit_cfg.get("trail_width_pct", 0.0005)))
+            hard_stop = price * (1 - hard_sl_pct)
+            trail_activation_price = price * (1 + trail_act_pct)
+            engine_fields = {
+                "state": new_state,
+                "position_state": new_state,
+                "qty": str(new_qty),
+                "avg_price": str(price),
+                "serial": serial,
+                "entry_price": str(price),
+                "entry_time": entry_time,
+                "symbol": self.strategy_config.get("symbol", ""),
+                "high_water_mark": str(price),
+                "current_stop": str(hard_stop.quantize(Decimal("0.01"))),
+                "hard_stop": str(hard_stop.quantize(Decimal("0.01"))),
+                "trail_activation_price": str(trail_activation_price.quantize(Decimal("0.01"))),
+                "trail_width_pct": str(trail_width),
+                "trail_activated": False,
+            }
+        else:
+            base_qty = existing_qty if same_trade else qty
+            new_qty = base_qty - qty if same_trade else Decimal("0")
+            if new_qty <= 0:
+                new_state = "FLAT"
+                new_qty = Decimal("0")
+            else:
+                new_state = "EXITING"
+            fill_event = OrderFilled(
+                trade_serial=serial, symbol=symbol, side="SELL",
+                fill_price=price, qty=qty, commission=commission,
+                ib_order_id=ib_order_id,
+            )
+            engine_fields = {
+                "state": new_state,
+                "position_state": new_state,
+                "qty": str(new_qty),
+                "avg_price": str(price),
+                "serial": serial,
+                "entry_price": existing.get("entry_price"),
+                "entry_time": existing.get("entry_time"),
+            }
+        engine_fields["updated_at"] = now_iso
+        await store.set(key, {**existing, **engine_fields})
+
+        # Strategy tick — trail/exit bookkeeping runs inside on_event.
+        actions = await self.strategy.on_event(fill_event, self.ctx)
+        if actions:
+            await self._run_pipeline(actions)
+
+        # Record P&L + trade count on full close.
+        if side != "B" and new_state == "FLAT":
+            entry_price_str = existing.get("entry_price")
+            if entry_price_str:
+                entry_price = Decimal(str(entry_price_str))
+                if entry_price > 0 and price > 0:
+                    pnl = (price - entry_price) * (base_qty if same_trade else qty)
+                    self._risk_mw.record_pnl(pnl)
+            self._risk_mw.record_trade()
+
+        # NOTE: FSM dispatch for fills is done by the caller in
+        # _dispatch_event (the order:updates stream handler). Do NOT
+        # dispatch here — that would double-count the qty.
+
+    async def _apply_cancel(self, *, bot_ref: str, symbol: str) -> None:
+        """Revert ENTERING → FLAT when an order is cancelled/rejected."""
+        redis = self.config.get("_redis")
+        from ib_trader.redis.state import StateStore
+        store = StateStore(redis)
+        key = f"bot:{self.bot_id}"
+        existing = await store.get(key) or {}
+        cur = existing.get("state") or existing.get("position_state")
+        if cur not in ("ENTERING", "EXITING"):
+            return
+        new_state = "FLAT" if cur == "ENTERING" else "OPEN"
+        existing["state"] = new_state
+        existing["position_state"] = new_state
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await store.set(key, existing)
+
+        # NOTE: FSM dispatch for cancels is done by the caller in
+        # _dispatch_event. Do NOT dispatch here.
+
+    async def _apply_reconciled(self, *, bot_ref: str, symbol: str,
+                                 new_state: str, reason: str,
+                                 qty: Decimal | None, avg_price: Decimal | None) -> None:
+        """Apply a hint from the reconciler — rare path, observability only."""
+        redis = self.config.get("_redis")
+        from ib_trader.redis.state import StateStore
+        store = StateStore(redis)
+        key = f"bot:{self.bot_id}"
+        existing = await store.get(key) or {}
+        existing["state"] = new_state
+        existing["position_state"] = new_state
+        if qty is not None:
+            existing["qty"] = str(qty)
+        if avg_price is not None:
+            existing["avg_price"] = str(avg_price)
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        existing["reconciled_reason"] = reason
+        await store.set(key, existing)
+        logger.warning(
+            '{"event": "BOT_RECONCILED", "bot_id": "%s", "symbol": "%s", '
+            '"new_state": "%s", "reason": "%s"}',
+            self.bot_id, symbol, new_state, reason,
+        )
+
+    async def _apply_position_event(self, *, bot_ref: str, symbol: str,
+                                     ib_qty: Decimal, ib_avg_price: Decimal) -> None:
+        """Apply the manual-close reconciliation rule on a positionEvent.
+
+        Discipline contract: bot has exclusive control of a symbol while
+        active. If IB's aggregate qty drops below what the bot tracks,
+        the user manually closed part/all of the position. Update our
+        state to match IB and log a MANUAL_CLOSE event.
+        """
+        redis = self.config.get("_redis")
+        from ib_trader.redis.state import StateStore
+        store = StateStore(redis)
+        key = f"bot:{self.bot_id}"
+        existing = await store.get(key) or {}
+        cur_state = existing.get("state") or existing.get("position_state", "FLAT")
+        if cur_state == "FLAT":
+            # Nothing to reconcile — bot has no tracked position.
+            return
+
+        expected = Decimal(existing.get("qty", "0"))
+        actual = abs(ib_qty)   # bot tracks absolute qty; long/short is implicit
+
+        if actual >= expected:
+            # IB has at least as much as we expect — no manual reduction.
+            # (actual > expected means manual add; bot doesn't claim those.)
+            return
+
+        reduction = expected - actual
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if actual == 0:
+            new_state = "FLAT"
+        else:
+            new_state = cur_state  # partial close — stay in OPEN/EXITING
+        existing["state"] = new_state
+        existing["position_state"] = new_state
+        existing["qty"] = str(actual)
+        existing["updated_at"] = now_iso
+        await store.set(key, existing)
+
+        # Bolt-on FSM dispatch — if actual==0, MANUAL_CLOSE takes us
+        # back to AWAITING_ENTRY_TRIGGER in the FSM.
+        if actual == 0:
+            from ib_trader.bots.fsm import FSM, BotEvent, EventType
+            try:
+                await FSM(self.bot_id, redis).dispatch(BotEvent(
+                    EventType.MANUAL_CLOSE,
+                    payload={
+                        "message": f"IB qty dropped to 0 (bot had {expected})",
+                        "reduction": str(reduction),
+                    },
+                ))
+            except Exception:
+                logger.exception(
+                    '{"event": "FSM_DISPATCH_MANUAL_CLOSE_FAILED", "bot_id": "%s"}',
+                    self.bot_id,
+                )
+
+        self.log_event(
+            "MANUAL_CLOSE",
+            message=f"User manually reduced {symbol} by {reduction} "
+                    f"(bot had {expected}, IB has {actual})",
+            payload={
+                "expected_qty": str(expected),
+                "actual_qty": str(actual),
+                "reduction": str(reduction),
+                "new_state": new_state,
+            },
+        )
+
     async def _load_state_from_redis(self, redis, bot_ref: str, symbol: str) -> dict | None:
         """Load strategy state from Redis key.
 
         Returns the state dict if found, None otherwise.
         """
-        from ib_trader.redis.state import StateStore, StateKeys
+        from ib_trader.redis.state import StateStore
         try:
             store = StateStore(redis)
-            # Try strategy state key first
-            strat_state = await store.get(StateKeys.strategy(bot_ref, symbol))
-            if strat_state:
+            state_doc = await store.get(f"bot:{self.bot_id}")
+            if state_doc:
                 logger.info(
-                    '{"event": "STATE_LOADED_REDIS", "bot_ref": "%s", "symbol": "%s"}',
-                    bot_ref, symbol,
+                    '{"event": "STATE_LOADED_REDIS", "bot_id": "%s", "symbol": "%s"}',
+                    self.bot_id, symbol,
                 )
-                return strat_state
-
-            # Try position state key
-            pos_state = await store.get(StateKeys.position(bot_ref, symbol))
-            if pos_state:
-                logger.info(
-                    '{"event": "POSITION_LOADED_REDIS", "bot_ref": "%s", "symbol": "%s", "state": "%s"}',
-                    bot_ref, symbol, pos_state.get("state"),
-                )
-                return {
-                    "position_state": pos_state.get("state", "FLAT"),
-                    "entry_price": pos_state.get("entry_price"),
-                    "entry_time": pos_state.get("entry_time"),
-                    "trade_serial": pos_state.get("serial", 0),
-                }
+                return state_doc
         except Exception:
             logger.exception('{"event": "REDIS_STATE_LOAD_ERROR", "bot_ref": "%s"}', bot_ref)
         return None
 
     async def _run_pipeline(self, actions: list, ctx=None) -> None:
-        """Run actions through pipeline and capture any submitted command ID."""
+        """Run actions through pipeline and capture any submitted command ID.
+
+        Dispatches FSM events for any PlaceOrder actions that made it
+        through the pipeline so the bot's state machine reflects the
+        order intent in Redis.
+        """
+        from ib_trader.bots.strategy import PlaceOrder
+        place_orders = [a for a in actions if isinstance(a, PlaceOrder)]
+
         await self.pipeline.process(actions, ctx or self.ctx)
-        if self.pipeline.last_cmd_id:
-            self._pending_cmd_id = self.pipeline.last_cmd_id
+
+        # Capture the command ID if the execution middleware placed an order
+        cmd_id = self.pipeline.last_cmd_id
+        if cmd_id is not None:
+            self._pending_cmd_id = cmd_id
             self.pipeline.last_cmd_id = None
+
+        # Dispatch FSM events whenever PlaceOrder actions went through
+        # the pipeline AND produced a command ID (any truthy or "0" value).
+        # The FSM transition is safe even on edge cases — cancel/timeout
+        # reverts if the order didn't actually execute.
+        if place_orders and cmd_id is not None:
+            await self._dispatch_place_order_fsm(place_orders)
+            logger.info(
+                '{"event": "FSM_PLACE_ORDER_DISPATCHED", "bot_id": "%s", '
+                '"cmd_id": "%s", "side": "%s"}',
+                self.bot_id, cmd_id,
+                place_orders[0].side if place_orders else "?",
+            )
+
+    async def _dispatch_place_order_fsm(self, place_orders) -> None:
+        """Emit PlaceEntryOrder / PlaceExitOrder FSM events for orders
+        that committed through the pipeline."""
+        redis = self.config.get("_redis")
+        if redis is None:
+            return
+        from ib_trader.bots.fsm import FSM, BotEvent, EventType
+        fsm = FSM(self.bot_id, redis)
+        for order in place_orders:
+            event_type = (
+                EventType.PLACE_ENTRY_ORDER if order.side == "BUY"
+                else EventType.PLACE_EXIT_ORDER
+            )
+            payload = {
+                "symbol": order.symbol,
+                "qty": str(order.qty),
+                "order_type": order.order_type,
+                "origin": getattr(order, "origin", "strategy"),
+                "serial": self.ctx.state.get("trade_serial"),
+            }
+            try:
+                await fsm.dispatch(BotEvent(event_type, payload=payload))
+            except Exception:
+                logger.exception(
+                    '{"event": "FSM_DISPATCH_PLACE_ORDER_FAILED", "bot_id": "%s"}',
+                    self.bot_id,
+                )
 
     async def on_startup(self, open_positions: list) -> None:
         """Initialize strategy, aggregator, middleware, and restore state."""
@@ -293,8 +545,11 @@ class StrategyBotRunner(BotBase):
         from ib_trader.redis.streams import StreamNames
         quote_stream = StreamNames.quote(symbol)
         bar_stream = StreamNames.bar(symbol, "5s")
-        fill_stream = StreamNames.fill(bot_ref)
+        order_stream = StreamNames.order_updates()
         pos_stream = StreamNames.position_changes()
+
+        # orderRef prefix for filtering — only events matching our bot
+        _order_ref_prefix = f"IBT:{bot_ref}:"
 
         # Resume bar stream from the warmup cursor so no bars are dropped in
         # the gap between warmup completion and the XREAD below. If warmup
@@ -303,14 +558,14 @@ class StrategyBotRunner(BotBase):
         streams = {
             quote_stream: "$",
             bar_stream: bar_start,
-            fill_stream: "$",
+            order_stream: "$",
             pos_stream: "$",
         }
 
         logger.info(
             '{"event": "BOT_EVENT_LOOP_STARTED", "bot_id": "%s", "symbol": "%s", '
             '"streams": ["%s", "%s", "%s", "%s"]}',
-            self.bot_id, symbol, quote_stream, bar_stream, fill_stream, pos_stream,
+            self.bot_id, symbol, quote_stream, bar_stream, order_stream, pos_stream,
         )
 
         while True:
@@ -320,6 +575,8 @@ class StrategyBotRunner(BotBase):
                 results = await redis.xread(streams, block=5000)
             except asyncio.CancelledError:
                 raise
+            except (ConnectionError, OSError, _RedisConnectionError):
+                raise asyncio.CancelledError()
             except Exception:
                 logger.exception('{"event": "BOT_XREAD_ERROR", "bot_id": "%s"}', self.bot_id)
                 await asyncio.sleep(1)
@@ -334,8 +591,9 @@ class StrategyBotRunner(BotBase):
                     try:
                         await self._dispatch_event(stream_name, raw_data,
                                                     quote_stream, bar_stream,
-                                                    fill_stream, pos_stream,
-                                                    symbol, bot_ref)
+                                                    order_stream, pos_stream,
+                                                    symbol, bot_ref,
+                                                    _order_ref_prefix)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -346,8 +604,9 @@ class StrategyBotRunner(BotBase):
 
     async def _dispatch_event(self, stream_name: str, raw_data: dict,
                                quote_stream: str, bar_stream: str,
-                               fill_stream: str, pos_stream: str,
-                               symbol: str, bot_ref: str) -> None:
+                               order_stream: str, pos_stream: str,
+                               symbol: str, bot_ref: str,
+                               order_ref_prefix: str = "") -> None:
         """Route a single Redis stream entry to the strategy."""
         import json as _json
 
@@ -433,91 +692,90 @@ class StrategyBotRunner(BotBase):
                 await self._run_pipeline(actions)
             return
 
-        # ── Fill / status from engine ─────────────────────────────────
-        if stream_name == fill_stream:
-            event_type = data.get("type", "")
-            pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
+        # ── Order updates from engine (unified stream) ─────────────────
+        if stream_name == order_stream:
+            # Filter: only process events tagged with our orderRef prefix
+            order_ref = data.get("orderRef") or ""
+            if not order_ref.startswith(order_ref_prefix):
+                return  # not ours — different bot or manual order
 
-            # Only react to FILL events that change position state
-            if event_type == "FILL":
-                redis = self.config.get("_redis")
-                from ib_trader.redis.state import StateStore, StateKeys
-                store = StateStore(redis)
-                redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
-                if not redis_pos:
-                    return
+            status = data.get("status", "")
+            terminal = data.get("terminal", False)
+            side = data.get("side", "")
+            filled_qty_str = data.get("filled_qty", "0")
+            avg_price_str = data.get("avg_price")
+            last_fill_qty_str = data.get("last_fill_qty")
+            last_fill_price_str = data.get("last_fill_price")
 
-                redis_state = redis_pos.get("state", "FLAT")
-                fill_qty = Decimal(redis_pos.get("qty") or "0")
-                fill_price = Decimal(redis_pos.get("avg_price") or "0")
-                serial = redis_pos.get("serial", 0)
+            # Always dispatch to FSM for doc update (both progress + terminal)
+            from ib_trader.bots.fsm import FSM, BotEvent, EventType
+            fsm = FSM(self.bot_id, self.config.get("_redis"))
 
-                # ENTERING → OPEN: BUY filled
-                if pos == PositionState.ENTERING and redis_state == "OPEN":
-                    fill_event = OrderFilled(
-                        trade_serial=serial,
+            if status in ("Filled", "PartiallyFilled", "PartialFillCancelled"):
+                # Fill event — progress or terminal
+                fsm_event = EventType.ENTRY_FILLED if side == "BUY" else EventType.EXIT_FILLED
+                await fsm.dispatch(BotEvent(fsm_event, payload={
+                    "qty": filled_qty_str,
+                    "price": avg_price_str or "0",
+                    "commission": data.get("total_commission", "0"),
+                    "terminal": terminal,
+                    "last_fill_qty": last_fill_qty_str,
+                    "last_fill_price": last_fill_price_str,
+                }))
+
+                # On terminal fills, also update strat:* key + dispatch to
+                # the strategy for trail init / P&L bookkeeping
+                if terminal:
+                    await self._apply_fill(
+                        bot_ref=bot_ref,
                         symbol=symbol,
-                        side="BUY",
-                        fill_price=fill_price,
-                        qty=fill_qty,
-                        commission=Decimal("0"),
-                        ib_order_id="",
+                        side=side[0] if side else "",  # "B" or "S"
+                        qty=Decimal(filled_qty_str),
+                        price=Decimal(avg_price_str or "0"),
+                        commission=Decimal(data.get("total_commission", "0")),
+                        serial=0,
+                        ib_order_id=data.get("ib_order_id", ""),
                     )
-                    actions = await self.strategy.on_event(fill_event, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
-                    return
 
-                # EXITING → FLAT: SELL filled (full close)
-                if pos == PositionState.EXITING and redis_state == "FLAT":
-                    entry_price_str = self.ctx.state.get("entry_price")
-                    entry_price = Decimal(str(entry_price_str)) if entry_price_str else Decimal("0")
-                    sell_qty = Decimal(redis_pos.get("qty") or "0")
-                    fill_event = OrderFilled(
-                        trade_serial=self.ctx.state.get("trade_serial") or 0,
-                        symbol=symbol,
-                        side="SELL",
-                        fill_price=fill_price,
-                        qty=sell_qty,
-                        commission=Decimal("0"),
-                        ib_order_id="",
-                    )
-                    actions = await self.strategy.on_event(fill_event, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
-                        if entry_price > 0 and fill_price > 0:
-                            pnl = (fill_price - entry_price) * sell_qty
-                            self._risk_mw.record_pnl(pnl)
-                        self._risk_mw.record_trade()
-                    return
+            elif terminal and status in ("Cancelled", "Rejected"):
+                # Terminal cancel/reject — revert state
+                pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
+                fsm_event = EventType.ENTRY_CANCELLED if pos == PositionState.ENTERING else EventType.EXIT_CANCELLED
+                await fsm.dispatch(BotEvent(fsm_event, payload={
+                    "reason": status,
+                    "filled_qty": filled_qty_str,
+                }))
+                await self._apply_cancel(bot_ref=bot_ref, symbol=symbol)
+                rejected = OrderRejected(
+                    trade_serial=None,
+                    symbol=symbol,
+                    reason=f"Order {status}",
+                    command_id="",
+                )
+                actions = await self.strategy.on_event(rejected, self.ctx)
+                if actions:
+                    await self._run_pipeline(actions)
 
-            # Cancellations / rejections
-            if event_type == "STATUS" and data.get("status") in ("Cancelled", "Inactive", "ApiCancelled"):
-                if pos == PositionState.ENTERING:
-                    rejected = OrderRejected(
-                        trade_serial=None,
-                        symbol=symbol,
-                        reason=f"Order {data.get('status', 'cancelled')}",
-                        command_id="",
-                    )
-                    actions = await self.strategy.on_event(rejected, self.ctx)
-                    if actions:
-                        await self._run_pipeline(actions)
+            # Non-terminal, non-fill statuses (Submitted, PreSubmitted) — log only
             return
 
         # ── Position change (external manipulation) ────────────────────
         if stream_name == pos_stream:
             if data.get("symbol") != symbol:
                 return
-            qty = Decimal(str(data.get("qty", "0")))
-            if qty == 0:
-                # Could be a full close from elsewhere — log it. Bot's own
-                # position is tracked by orderRef so it's not auto-flattened
-                # (see TODO.md for "external close while bot OPEN").
-                logger.info(
-                    '{"event": "EXTERNAL_POSITION_ZERO", "bot_id": "%s", "symbol": "%s"}',
-                    self.bot_id, symbol,
-                )
+            # Only react to STK position events — option contracts share
+            # the same symbol and would cause false MANUAL_CLOSE triggers.
+            # Once we re-key by con_id this filter goes away.
+            evt_sec_type = str(data.get("sec_type", "STK")).upper()
+            bot_sec_type = self.strategy_config.get("sec_type", "STK").upper()
+            if evt_sec_type != bot_sec_type:
+                return
+            await self._apply_position_event(
+                bot_ref=bot_ref,
+                symbol=symbol,
+                ib_qty=Decimal(str(data.get("qty", "0"))),
+                ib_avg_price=Decimal(str(data.get("avg_price", "0"))),
+            )
             return
 
     async def on_tick(self) -> None:
@@ -569,20 +827,36 @@ class StrategyBotRunner(BotBase):
             ]
             await self._run_pipeline(actions)
 
-    async def check_force_buy(self) -> None:
-        """Supervisory check: handle FORCE_BUY action set on the bot row.
+    _stop_requested: bool = False
 
-        Called by the supervisory task when it detects a control event
-        (the runner already wakes immediately on bot:control:* stream
-        events; this method just executes the action).
+    def request_stop(self) -> None:
+        """Signal the event loop to exit cleanly on next iteration."""
+        self._stop_requested = True
+
+    async def force_buy(self) -> dict:
+        """Execute a force-buy immediately. Called directly by the runner
+        HTTP API — no polling, no Redis key, no control stream.
+
+        Returns a result dict with order details.
+        """
+        if not self.strategy or not self.ctx:
+            raise RuntimeError("Bot not initialized")
+        symbol = self.strategy_config["symbol"]
+        await self._execute_force_buy(symbol)
+        return {"symbol": symbol, "action": "FORCE_BUY"}
+
+    async def check_force_buy(self) -> None:
+        """DEPRECATED — use force_buy() via the runner HTTP API instead.
+
+        Kept for backward compatibility with old control-stream path.
         """
         if not self.strategy or not self.ctx:
             return
-        last_action = self.read_last_action()
+        last_action = await self.read_last_action()
         if last_action != "FORCE_BUY":
             return
 
-        self.clear_last_action()
+        await self.clear_last_action()
         symbol = self.strategy_config["symbol"]
         pos = PositionState(self.ctx.state.get("position_state", "FLAT"))
 
@@ -612,8 +886,13 @@ class StrategyBotRunner(BotBase):
                 payload={"no_fresh_data_s": elapsed},
             )]
             await self._run_pipeline(actions)
-            self._bots.update_status(self.bot_id, "ERROR",
-                                      error_message="STALE_QUOTES")
+            from ib_trader.bots.fsm import FSM, BotEvent, EventType
+            try:
+                await FSM(self.bot_id, self.config.get("_redis")).dispatch(
+                    BotEvent(EventType.CRASH, payload={"message": "STALE_QUOTES"})
+                )
+            except Exception:
+                pass
         elif elapsed > _STALE_QUOTE_WARN_SECONDS and not self._quote_stale_logged:
             logger.warning(
                 '{"event": "STALE_QUOTES", "bot_id": "%s", "no_fresh_s": %.1f}',
@@ -861,14 +1140,14 @@ class StrategyBotRunner(BotBase):
         if not redis:
             return
 
-        from ib_trader.redis.state import StateStore, StateKeys
+        from ib_trader.redis.state import StateStore
         store = StateStore(redis)
-        redis_pos = await store.get(StateKeys.position(bot_ref, symbol))
+        redis_pos = await store.get(f"bot:{self.bot_id}")
 
         if not redis_pos:
             return
 
-        redis_state = redis_pos.get("state", "FLAT")
+        redis_state = redis_pos.get("state") or redis_pos.get("position_state", "FLAT")
 
         # ENTERING → check if IB filled (OPEN) or cancelled (FLAT)
         if pos == PositionState.ENTERING:

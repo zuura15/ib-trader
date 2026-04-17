@@ -93,12 +93,15 @@ async def submit_command(body: CommandRequest):
 
             if resp.status_code == 200:
                 result = resp.json()
-                # Build output text from result for display
-                output = ""
-                if result.get("serial"):
-                    output = f"Order #{result['serial']} placed"
-                if result.get("order_ref"):
-                    output += f" ({result['order_ref']})"
+                # Use the engine's rendered output (includes fill details)
+                # instead of constructing a static "Order #X placed" string.
+                output = result.get("output") or ""
+                if not output:
+                    # Fallback for engines that don't return output yet
+                    if result.get("serial"):
+                        output = f"Order #{result['serial']} placed"
+                    if result.get("order_ref"):
+                        output += f" ({result['order_ref']})"
                 return CommandResponse(
                     command_id=result.get("ib_order_id") or "completed",
                     status="completed",

@@ -18,6 +18,11 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+try:
+    from redis.exceptions import ConnectionError as _RedisConnectionError
+except ImportError:
+    _RedisConnectionError = type(None)
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.data.models import (
@@ -34,7 +39,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _POLL_INTERVAL_S = 1.5
-_FALLBACK_REFRESH_S = 30.0  # upper bound if no activity notifications arrive
+_FALLBACK_REFRESH_S = 10.0  # upper bound if no activity notifications arrive
 
 
 class _JSONEncoder(json.JSONEncoder):
@@ -187,26 +192,27 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
         session.rollback()
 
         if channel == "trades":
+            # TODO: migrate to trades:open Redis hash + trades:recent_closed list.
+            # For now, still reads SQLite as the trades panel is rarely
+            # viewed in real-time and is closer to archival than live state.
             return [_serialize_trade(t) for t in TradeRepository(sf).get_all()]
 
         elif channel == "orders":
-            return [_serialize_order(t) for t in TransactionRepository(sf).get_open_orders()]
+            # Orders now served from Redis — handled in _fetch_channel_data_async.
+            # Return empty here; the async wrapper overrides.
+            return []
 
         elif channel == "alerts":
-            return [_serialize_alert(a) for a in AlertRepository(sf).get_open()]
+            # Alerts now served from Redis — handled in _fetch_channel_data_async.
+            return []
 
         elif channel == "commands":
             return [_serialize_command(c)
                     for c in PendingCommandRepository(sf).get_by_source("api", limit=50)]
 
         elif channel == "heartbeats":
-            repo = HeartbeatRepository(sf)
-            results = []
-            for process_name in ("REPL", "DAEMON", "ENGINE", "API", "BOT_RUNNER"):
-                hb = repo.get(process_name)
-                if hb:
-                    results.append(_serialize_heartbeat(hb))
-            return results
+            # Heartbeats now served from Redis — handled in _fetch_channel_data_async.
+            return []
 
         elif channel == "bot_events":
             from ib_trader.data.repositories.bot_repository import BotEventRepository
@@ -226,26 +232,17 @@ def _fetch_channel_data(channel: str, sf: scoped_session) -> list[dict]:
 
         elif channel == "bots":
             # Delegate to the REST serializer so the WS channel and
-            # /api/bots stay shape-identical.
-            from ib_trader.data.repositories.bot_repository import BotRepository
-            from ib_trader.api.routes.bots import _serialize_bot
-            repo = BotRepository(sf)
-            return [_serialize_bot(b) for b in repo.get_all()]
+            # /api/bots stay shape-identical. Redis runtime state is
+            # overlaid by the async wrapper `_fetch_channel_data_async`
+            # before this result reaches the wire — fetching it here
+            # (sync) would need a nested loop.
+            from ib_trader.bots import registry_config
+            from ib_trader.api.routes.bots import _serialize_bot_from_defn
+            return [_serialize_bot_from_defn(d) for d in registry_config.all_definitions()]
 
         elif channel == "status":
-            # Single-element snapshot. The id is stable so diff logic treats
-            # any field change as an "updated" event rather than add+remove.
-            from ib_trader.api.routes.system import get_status as _get_status
-            heartbeats_repo = HeartbeatRepository(sf)
-            alerts_repo = AlertRepository(sf)
-            try:
-                payload = _get_status(
-                    heartbeats=heartbeats_repo, alerts=alerts_repo, sf=sf,
-                )
-                return [{"id": "__status__", **payload}]
-            except Exception:
-                logger.exception(json.dumps({"event": "STATUS_FETCH_FAILED"}))
-                return []
+            # Now served from Redis via async wrapper
+            return []
 
         return []
     finally:
@@ -256,6 +253,122 @@ _VALID_CHANNELS = {
     "trades", "orders", "alerts", "commands", "heartbeats",
     "bot_events", "bots", "status",
 }
+
+
+async def _fetch_channel_data_async(
+    channel: str, sf: scoped_session, redis,
+) -> list[dict]:
+    """Async wrapper around ``_fetch_channel_data`` that overlays the
+    FSM state for the "bots" channel. Non-bots channels delegate to the
+    sync implementation unchanged.
+    """
+    data = _fetch_channel_data(channel, sf)
+
+    # Heartbeats: read from Redis hb:* keys instead of SQLite
+    if channel == "heartbeats" and redis:
+        try:
+            import json as _json
+            data = []
+            for process in ("REPL", "DAEMON", "ENGINE", "API", "BOT_RUNNER"):
+                from ib_trader.redis.state import StateKeys
+                raw = await redis.get(StateKeys.process_heartbeat(process))
+                if raw:
+                    try:
+                        doc = _json.loads(raw)
+                        data.append({
+                            "id": process,
+                            "process": process,
+                            "pid": doc.get("pid"),
+                            "last_seen_at": doc.get("ts"),
+                        })
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            logger.exception(json.dumps({"event": "HEARTBEATS_REDIS_READ_FAILED"}))
+
+    # Status: compute from Redis
+    if channel == "status" and redis:
+        try:
+            from ib_trader.api.routes.system import get_status as _get_status_async
+            payload = await _get_status_async(redis=redis)
+            data = [{"id": "__status__", **payload}]
+        except Exception:
+            logger.exception(json.dumps({"event": "STATUS_REDIS_FETCH_FAILED"}))
+
+    # Alerts: read from Redis hash
+    if channel == "alerts" and redis:
+        try:
+            import json as _json
+            from ib_trader.redis.state import StateKeys
+            raw = await redis.hgetall(StateKeys.alerts_active())
+            data = []
+            for aid, val in raw.items():
+                try:
+                    data.append(_json.loads(val))
+                except (ValueError, TypeError):
+                    pass
+        except Exception:
+            logger.exception(json.dumps({"event": "ALERTS_REDIS_READ_FAILED"}))
+
+    # Orders: read from Redis hash instead of SQLite
+    if channel == "orders" and redis:
+        try:
+            from ib_trader.redis.state import StateKeys
+            import json as _json
+            raw = await redis.hgetall(StateKeys.orders_open())
+            data = []
+            for oid, val in raw.items():
+                try:
+                    data.append(_json.loads(val))
+                except (ValueError, TypeError):
+                    pass
+        except Exception:
+            logger.exception(json.dumps({"event": "ORDERS_REDIS_READ_FAILED"}))
+
+    if channel == "bots" and data:
+        try:
+            import asyncio as _asyncio
+            from ib_trader.bots.fsm import FSM, BotState
+            from ib_trader.bots.state import BotStateStore
+            bss = BotStateStore(redis)
+            fsms = [FSM(d["id"], redis) for d in data]
+            docs = await _asyncio.gather(*[f.load() for f in fsms]) if redis else [{} for _ in data]
+            heartbeats = await _asyncio.gather(
+                *[bss.get_heartbeat(d["id"]) for d in data]
+            ) if redis else [None] * len(data)
+            for d, doc, hb in zip(data, docs, heartbeats):
+                state = doc.get("state") or BotState.OFF.value
+                d["state"] = state
+                # Legacy alias until frontend is migrated
+                if state == BotState.OFF.value:
+                    d["status"] = "STOPPED"
+                elif state == BotState.ERRORED.value:
+                    d["status"] = "ERROR"
+                else:
+                    d["status"] = "RUNNING"
+                d["error_reason"] = doc.get("error_reason")
+                d["error_message"] = doc.get("error_message")
+                d["last_action"] = doc.get("order_origin")
+                d["last_action_at"] = doc.get("updated_at")
+                d["last_heartbeat"] = hb
+                if state in (
+                    BotState.ENTRY_ORDER_PLACED.value,
+                    BotState.AWAITING_EXIT_TRIGGER.value,
+                    BotState.EXIT_ORDER_PLACED.value,
+                ):
+                    d["position"] = {
+                        "qty": doc.get("qty") or "0",
+                        "entry_price": doc.get("entry_price"),
+                        "high_water_mark": doc.get("high_water_mark"),
+                        "current_stop": doc.get("current_stop"),
+                        "trail_activated": doc.get("trail_activated", False),
+                        "last_price": doc.get("last_price"),
+                    }
+                else:
+                    d["position"] = None
+        except Exception:
+            logger.exception(json.dumps({"event": "BOTS_FSM_OVERLAY_FAILED"}))
+    return data
 
 # When any activity in this set fires, the "status" channel is also marked
 # dirty. Keeps /api/status in sync with its backing state without a poll.
@@ -287,6 +400,8 @@ async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
                     }))
         except (WebSocketDisconnect, asyncio.CancelledError):
             return
+        except (ConnectionError, OSError, _RedisConnectionError):
+            return  # Redis shut down — exit cleanly
         except Exception:
             logger.exception('{"event": "WS_QUOTE_STREAM_ERROR", "symbol": "%s"}', symbol)
             await asyncio.sleep(1)
@@ -307,23 +422,31 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
     pushes it. Stream payloads are markers; the keys are the source of truth.
     """
     from ib_trader.redis.streams import StreamNames
-    from ib_trader.redis.state import StateStore, StateKeys
+    from ib_trader.redis.state import StateStore
 
-    bot_state_stream = StreamNames.bot_state(bot_ref, symbol)
-    fill_stream = StreamNames.fill(bot_ref)
-    streams = {bot_state_stream: "$", fill_stream: "$"}
+    # Resolve bot_ref → UUID via registry
+    from ib_trader.bots import registry_config
+    defn = registry_config.get_by_name(bot_ref)
+    if defn is None:
+        return
+    bot_key = f"bot:{defn.id}"
     store = StateStore(redis)
 
+    # Use activity stream as wake signal (fires on every FSM transition)
+    streams = {StreamNames.ACTIVITY: "$"}
+
     async def push_snapshot():
-        strat = await store.get(StateKeys.strategy(bot_ref, symbol))
-        pos = await store.get(StateKeys.position(bot_ref, symbol))
-        await websocket.send_text(_json_dumps({
-            "type": "bot_state",
-            "bot_ref": bot_ref,
-            "symbol": symbol,
-            "strategy": strat,
-            "position": pos,
-        }))
+        state_doc = await store.get(bot_key)
+        try:
+            await websocket.send_text(_json_dumps({
+                "type": "bot_state",
+                "bot_ref": bot_ref,
+                "symbol": symbol,
+                "strategy": state_doc,
+                "position": state_doc,
+            }))
+        except (RuntimeError, WebSocketDisconnect):
+            raise asyncio.CancelledError()
 
     while True:
         try:
@@ -335,6 +458,8 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
                     streams[stream_name] = entry_id
             await push_snapshot()
         except (WebSocketDisconnect, asyncio.CancelledError):
+            return
+        except (ConnectionError, OSError, _RedisConnectionError):
             return
         except Exception:
             logger.exception('{"event": "WS_BOT_STATE_STREAM_ERROR"}')
@@ -451,15 +576,27 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
     the engine's position:changes stream. A 30s fallback XREAD timeout
     re-issues the snapshot so missed events can't strand the client.
     """
+    import os
+    import httpx
     from ib_trader.redis.streams import StreamNames
-    from ib_trader.api.routes.positions import _positions_from_redis
+
+    engine_port = os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
+    engine_url = f"http://127.0.0.1:{engine_port}"
 
     async def push_snapshot():
-        positions = await _positions_from_redis(redis)
-        await websocket.send_text(_json_dumps({
-            "type": "positions",
-            "data": positions,
-        }))
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{engine_url}/engine/positions")
+                positions = resp.json() if resp.status_code == 200 else []
+        except Exception:
+            positions = []
+        try:
+            await websocket.send_text(_json_dumps({
+                "type": "positions",
+                "data": positions,
+            }))
+        except (RuntimeError, WebSocketDisconnect):
+            raise asyncio.CancelledError()  # WS closed — exit the stream task
 
     # Initial snapshot so the UI hydrates immediately
     await push_snapshot()
@@ -472,8 +609,7 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
             )
             # Whether we got an event or timed out, re-push the snapshot.
             # The event payload isn't rich enough to patch in place, and
-            # position aggregation across ibpos:* / pos:* keys benefits from
-            # a fresh read.
+            # position data benefits from a fresh read on every event.
             if results:
                 for _stream, entries in results:
                     for entry_id, _raw in entries:
@@ -481,6 +617,8 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
             await push_snapshot()
         except (WebSocketDisconnect, asyncio.CancelledError):
             return
+        except (ConnectionError, OSError, _RedisConnectionError):
+            return  # Redis shut down
         except Exception:
             logger.exception('{"event": "WS_POSITIONS_STREAM_ERROR"}')
             await asyncio.sleep(1)
@@ -505,6 +643,8 @@ async def _activity_listener(
             results = await redis.xread({StreamNames.ACTIVITY: last_id}, block=30000)
         except asyncio.CancelledError:
             raise
+        except (ConnectionError, OSError, _RedisConnectionError):
+            return  # Redis shut down
         except Exception:
             logger.exception('{"event": "WS_ACTIVITY_READ_ERROR"}')
             await asyncio.sleep(1)
@@ -567,7 +707,7 @@ async def websocket_endpoint(websocket: WebSocket):
         for ch in channels:
             if ch not in subscribed_channels:
                 continue
-            data = _fetch_channel_data(ch, sf)
+            data = await _fetch_channel_data_async(ch, sf, redis)
             diff = channel_states[ch].update(data)
             if diff:
                 await websocket.send_text(_json_dumps({
@@ -596,7 +736,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     snapshot_data = {}
                     for ch in subscribed_channels:
-                        data = _fetch_channel_data(ch, sf)
+                        data = await _fetch_channel_data_async(ch, sf, redis)
                         channel_states[ch].update(data)
                         snapshot_data[ch] = data
 

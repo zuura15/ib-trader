@@ -126,49 +126,60 @@ class Reconciler:
         """
         try:
             ib_positions = await self._get_ib_positions()
-            ib_position_map = {p["symbol"]: p for p in ib_positions if p["qty"] != 0}
+            # Only compare STK positions — option contracts share the
+            # underlying symbol and cause false drift alerts until we
+            # re-key bot state by con_id.
+            ib_position_map = {
+                p["symbol"]: p for p in ib_positions
+                if p["qty"] != 0 and p.get("sec_type", "STK") == "STK"
+            }
 
-            # Scan Redis for all position keys
-            keys = []
-            async for key in self._redis.scan_iter(match="pos:*"):
-                keys.append(key)
-
-            for key in keys:
+            # Iterate bot state keys (bot:<uuid>) via the YAML registry
+            from ib_trader.bots import registry_config
+            for defn in registry_config.all_definitions():
+                key = f"bot:{defn.id}"
                 current = await self._state.get(key)
                 if not current:
                     continue
+                bot_ref = defn.config.get("ref_id", defn.name)
+                symbol = current.get("symbol") or defn.config.get("symbol", "")
+                state = current.get("state") or current.get("position_state", FLAT)
 
-                # Parse bot_ref and symbol from key: pos:{bot_ref}:{symbol}
-                parts = key.split(":")
-                if len(parts) != 3:
-                    continue
-                _, bot_ref, symbol = parts
-                state = current.get("state", FLAT)
+                # Skip reconciliation for bots that aren't running.
+                # Stale strat:* keys from prior sessions are just garbage —
+                # silently flush them instead of logging a scary WARNING.
+                from ib_trader.bots import registry_config
+                defn = registry_config.get_by_name(bot_ref)
+                if defn:
+                    from ib_trader.bots.fsm import FSM, BotState
+                    fsm = FSM(defn.id, self._redis)
+                    fsm_state = await fsm.current_state()
+                    if fsm_state in (BotState.OFF, BotState.ERRORED):
+                        if state != FLAT:
+                            # Silently clear stale state
+                            current["state"] = FLAT
+                            current["position_state"] = FLAT
+                            current["qty"] = "0"
+                            await self._state.set(key, current)
+                            logger.info(
+                                '{"event": "STALE_STATE_CLEARED", "key": "%s", '
+                                '"old_state": "%s", "reason": "bot_fsm_is_off"}',
+                                key, state,
+                            )
+                        continue
 
                 has_position = symbol in ib_position_map
 
+                # Observer-only: log drift + publish a RECONCILED event to
+                # the bot's fill stream. The bot applies the reconciliation
+                # rule on its own state key — reconciler no longer writes
+                # there directly.
                 if state == OPEN and not has_position:
                     logger.warning(
                         '{"event": "RECONCILER_DRIFT", "key": "%s", "local": "OPEN", "ib": "NO_POSITION"}',
                         key,
                     )
-                    current["state"] = FLAT
-                    current["qty"] = "0"
-                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    await self._state.set(key, current)
-
-                    # Also update the strategy state key so the bot picks up
-                    # the state change even if it's not consuming streams yet
-                    from ib_trader.redis.state import StateKeys
-                    strat_key = StateKeys.strategy(bot_ref, symbol)
-                    strat = await self._state.get(strat_key)
-                    if strat:
-                        strat["position_state"] = FLAT
-                        strat["updated_at"] = current["updated_at"]
-                        await self._state.set(strat_key, strat)
-
-                    # Publish state change
-                    writer = StreamWriter(self._redis, StreamNames.fill(bot_ref), maxlen=500)
+                    writer = StreamWriter(self._redis, StreamNames.order_updates(), maxlen=5000)
                     await writer.add({
                         "type": "RECONCILED",
                         "symbol": symbol,
@@ -185,20 +196,15 @@ class Reconciler:
                         '"ib": "HAS_POSITION", "qty": "%s"}',
                         key, ib_pos["qty"],
                     )
-                    # Repair: set to OPEN to match IB
-                    current["state"] = OPEN
-                    current["qty"] = str(ib_pos["qty"])
-                    current["avg_price"] = str(ib_pos.get("avg_price", 0))
-                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    await self._state.set(key, current)
-
-                    writer = StreamWriter(self._redis, StreamNames.fill(bot_ref), maxlen=500)
+                    writer = StreamWriter(self._redis, StreamNames.order_updates(), maxlen=5000)
                     await writer.add({
                         "type": "RECONCILED",
                         "symbol": symbol,
                         "prev_state": FLAT,
                         "new_state": OPEN,
                         "reason": "position_found_in_ib",
+                        "qty": str(ib_pos["qty"]),
+                        "avg_price": str(ib_pos.get("avg_price", 0)),
                         "ts": datetime.now(timezone.utc).isoformat(),
                     })
 

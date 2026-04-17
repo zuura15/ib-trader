@@ -6,13 +6,20 @@ import type { Bot, BotStatus } from '../../types';
 
 interface BotPositionState {
   position_state?: string;
+  state?: string;
   entry_price?: string;
   trade_serial?: number;
   qty?: string;
   last_price?: string;
   high_water_mark?: string;
   current_stop?: string;
+  hard_stop?: string;
+  trail_activation_price?: string;
+  trail_width_pct?: string;
   trail_activated?: boolean;
+  entry_time?: string;
+  symbol?: string;
+  [key: string]: unknown;  // allow extra fields from Redis
 }
 
 const statusConfig: Record<BotStatus, { var: string; label: string; dot: string }> = {
@@ -42,20 +49,49 @@ function mapApiBot(b: any): Bot {
   };
 }
 
+// Track pending actions per bot for optimistic UI feedback
+const pendingActions: Record<string, string> = {};
+function setPending(botId: string, action: string | null) {
+  if (action) pendingActions[botId] = action;
+  else delete pendingActions[botId];
+  // Force re-render in React — dispatch a synthetic state change on the
+  // nearest store. Lightweight: just bumps a counter.
+  window.dispatchEvent(new Event('bot-pending-change'));
+}
+function getPending(botId: string): string | null {
+  return pendingActions[botId] || null;
+}
+
 function toggleBot(botId: string, currentStatus: BotStatus) {
-  // Fire the lifecycle POST; the store is kept in sync by the WS "bots"
-  // diff the backend publishes from start_bot / stop_bot. No refetch
-  // needed here — that was a hold-over from the pre-WS poll.
   const action = currentStatus === 'running' ? 'stop' : 'start';
-  fetch(`/api/bots/${botId}/${action}`, { method: 'POST' }).catch(() => {});
+  setPending(botId, action === 'start' ? 'Starting...' : 'Stopping...');
+  fetch(`/api/bots/${botId}/${action}`, { method: 'POST' })
+    .then((r) => {
+      if (!r.ok) r.json().then((d) => alert(d.detail || `${action} failed`));
+    })
+    .catch(() => {})
+    .finally(() => setTimeout(() => setPending(botId, null), 2000));
+}
+
+function forceStop(botId: string) {
+  if (!window.confirm('Force-stop this bot? It will be parked in ERRORED and require Start to recover.')) return;
+  setPending(botId, 'Force stopping...');
+  fetch(`/api/bots/${botId}/force-stop`, { method: 'POST' })
+    .then((r) => {
+      if (!r.ok) r.json().then((d) => alert(d.detail || 'Force stop failed'));
+    })
+    .catch(() => {})
+    .finally(() => setTimeout(() => setPending(botId, null), 2000));
 }
 
 function forceBuy(botId: string) {
+  setPending(botId, 'Placing...');
   fetch(`/api/bots/${botId}/force-buy`, { method: 'POST' })
     .then((r) => {
       if (!r.ok) r.json().then((d) => alert(d.detail || 'Force buy failed'));
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => setTimeout(() => setPending(botId, null), 2000));
 }
 
 function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string; botRef?: string }) {
@@ -85,8 +121,11 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === 'quote' && msg.symbol === symbol) {
-          const last = parseFloat(msg.data.last) || parseFloat(msg.data.bid) || 0;
-          if (last > 0) setLivePrice(last);
+          // Use mid price (bid+ask)/2 — consistent with positions panel
+          const bid = parseFloat(msg.data.bid) || 0;
+          const ask = parseFloat(msg.data.ask) || 0;
+          const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : (parseFloat(msg.data.last) || 0);
+          if (mid > 0) setLivePrice(mid);
         } else if (msg.type === 'bot_state' && msg.symbol === symbol) {
           if (msg.strategy) setState(msg.strategy);
         }
@@ -96,56 +135,93 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
     return () => ws.close();
   }, [botId, symbol, botRef]);
 
-  if (!state.position_state || state.position_state === 'FLAT') return null;
+  const posState = state.position_state || state.state || 'FLAT';
+  if (posState === 'FLAT' || posState === 'OFF' || posState === 'AWAITING_ENTRY_TRIGGER') return null;
 
   const entry = state.entry_price ? parseFloat(state.entry_price) : 0;
   const qty = state.qty ? parseFloat(state.qty) : 0;
   const hwm = state.high_water_mark ? parseFloat(state.high_water_mark) : 0;
-  const stop = state.current_stop ? parseFloat(state.current_stop) : 0;
+  const hardStop = state.hard_stop ? parseFloat(state.hard_stop)
+    : (entry > 0 ? entry * (1 - 0.003) : 0);
+  const trailActPrice = state.trail_activation_price ? parseFloat(state.trail_activation_price)
+    : (entry > 0 ? entry * (1 + 0.00005) : 0);
+  const rawStop = state.current_stop ? parseFloat(state.current_stop) : 0;
+  const stop = rawStop > 0 ? rawStop : hardStop;
   const botLastPrice = state.last_price ? parseFloat(state.last_price) : 0;
-  // Prefer live quote (always fresh); fall back to bot's tracked price.
   const price = livePrice > 0 ? livePrice : (botLastPrice > 0 ? botLastPrice : (hwm > 0 ? hwm : entry));
-  // P&L: long position = (price - entry) * qty; short position = (entry - price) * |qty|
   const pnl = entry > 0 && price > 0 ? (price - entry) * qty : 0;
   const pnlPct = entry > 0 ? ((price - entry) / entry) * 100 * (qty >= 0 ? 1 : -1) : 0;
 
+  // Format duration since entry
+  const entryTime = state.entry_time ? new Date(state.entry_time) : null;
+  let elapsed = '';
+  if (entryTime) {
+    const secs = Math.floor((Date.now() - entryTime.getTime()) / 1000);
+    if (secs < 60) elapsed = `${secs}s`;
+    else if (secs < 3600) elapsed = `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    else elapsed = `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  }
+
+  const lbl = { color: 'var(--text-muted)' } as const;
+  const val = (color?: string) => ({ color: color || 'var(--text-primary)' }) as const;
+
   return (
-    <div className="ml-4 mt-1 px-2 py-1 rounded text-[11px] font-mono"
+    <div className="ml-4 mt-1 px-3 py-2 rounded text-[11px] font-mono"
       style={{ background: 'var(--bg-root)', border: '1px solid var(--border-default)' }}>
-      <div className="flex gap-4">
-        <span style={{ color: 'var(--text-muted)' }}>
-          {state.position_state === 'ENTERING' ? '⏳' : state.position_state === 'EXITING' ? '⏹' : '📈'}
-          {' '}{state.position_state}
+      {/* Row 1: Symbol, Qty, Entry, Time */}
+      <div className="flex gap-4 items-center mb-1">
+        <span style={val("var(--text-primary)")}>
+          <span className="font-semibold">{symbol}</span>
+          {' '}{qty > 0 ? '+' : ''}{qty} @ ${entry.toFixed(2)}
         </span>
-        <span>
-          <span style={{ color: 'var(--text-muted)' }}>qty:</span>{' '}
-          <span style={{ color: 'var(--text-primary)' }}>{qty}</span>
-        </span>
-        <span>
-          <span style={{ color: 'var(--text-muted)' }}>entry:</span>{' '}
-          <span style={{ color: 'var(--text-primary)' }}>${entry.toFixed(2)}</span>
-        </span>
-        {price > 0 && price !== entry && (
-          <span>
-            <span style={{ color: 'var(--text-muted)' }}>now:</span>{' '}
-            <span style={{ color: 'var(--text-primary)' }}>${price.toFixed(2)}</span>
-          </span>
+        {elapsed && (
+          <span style={lbl}>⏱ {elapsed} ago</span>
         )}
         <span style={{ color: pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: 600 }}>
-          {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)} ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(3)}%)
+          {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(3)}%)
         </span>
-        {state.trail_activated && (
-          <span style={{ color: 'var(--accent-yellow)' }}>
-            trail: ${stop.toFixed(2)}
-          </span>
+      </div>
+      {/* Row 2: Price + Stops */}
+      <div className="flex gap-4 items-center mb-1">
+        {price > 0 && (
+          <span><span style={lbl}>Mid:</span> <span style={val()}>${price.toFixed(2)}</span></span>
         )}
+        {hardStop > 0 && (
+          <span><span style={lbl}>Hard Stop:</span> <span style={val("var(--accent-red)")}>${hardStop.toFixed(2)}</span></span>
+        )}
+        {trailActPrice > 0 && !state.trail_activated && (
+          <span><span style={lbl}>Trail Arms @</span> <span style={val("var(--accent-yellow)")}>${trailActPrice.toFixed(2)}</span></span>
+        )}
+      </div>
+      {/* Row 3: Trail state */}
+      <div className="flex gap-4 items-center">
+        {stop > 0 && (
+          <span><span style={lbl}>Current Stop:</span> <span style={val(state.trail_activated ? 'var(--accent-yellow)' : 'var(--accent-red)')}>${stop.toFixed(2)}</span></span>
+        )}
+        {hwm > 0 && (
+          <span><span style={lbl}>HWM:</span> <span style={val()}>${hwm.toFixed(2)}</span></span>
+        )}
+        <span>
+          <span style={lbl}>Trail:</span>{' '}
+          <span style={val(state.trail_activated ? 'var(--accent-green)' : 'var(--text-muted)')}>
+            {state.trail_activated ? 'ACTIVE' : 'INACTIVE'}
+          </span>
+        </span>
       </div>
     </div>
   );
 }
 
+
 export function BotsPanel({ large = false }: { large?: boolean }) {
   const bots = useStore((s) => s.bots);
+  // Re-render when pending actions change (optimistic button labels)
+  const [, forceUpdate] = useState(0);
+  useEffect(() => {
+    const handler = () => forceUpdate((n) => n + 1);
+    window.addEventListener('bot-pending-change', handler);
+    return () => window.removeEventListener('bot-pending-change', handler);
+  }, []);
 
   if (large) {
     return (
@@ -182,17 +258,19 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                       {bot.strategy}
                     </span>
                     <button
-                      onClick={() => toggleBot(bot.id, bot.status)}
+                      onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
                       className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                      disabled={!!getPending(bot.id)}
                       style={{
-                        background: bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
-                        color: bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
-                        border: `1px solid ${bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
-                        cursor: 'pointer',
+                        background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
+                        color: getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
+                        border: `1px solid ${getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
+                        cursor: getPending(bot.id) ? 'wait' : 'pointer',
+                        opacity: getPending(bot.id) ? 0.7 : 1,
                       }}
                       data-testid={`bot-toggle-${bot.id}`}
                     >
-                      {bot.status === 'running' ? 'STOP' : 'START'}
+                      {getPending(bot.id) || (bot.status === 'running' ? 'STOP' : 'START')}
                     </button>
                     {bot.status === 'running' && (
                       <button
@@ -207,6 +285,22 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         data-testid={`bot-force-buy-${bot.id}`}
                       >
                         FORCE BUY
+                      </button>
+                    )}
+                    {bot.status === 'running' && (
+                      <button
+                        onClick={() => forceStop(bot.id)}
+                        className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                        style={{
+                          background: 'var(--badge-red-bg)',
+                          color: 'var(--accent-red)',
+                          border: '1px solid var(--accent-red)',
+                          cursor: 'pointer',
+                        }}
+                        data-testid={`bot-force-stop-${bot.id}`}
+                        title="Emergency stop — parks the bot in ERRORED"
+                      >
+                        FORCE STOP
                       </button>
                     )}
                   </div>
@@ -257,8 +351,13 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     </div>
                   )}
                 </div>
-                {bot.status === 'running' && (
-                  <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} botRef={bot.refId} />
+                {/* Render PositionLine whenever the bot has a symbol — the
+                    line renders FLAT state when there's no position, and
+                    keeps showing a live position if the bot is stopped
+                    while holding one. Gating on status hid real positions
+                    during transitions. */}
+                {bot.symbols[0] && (
+                  <PositionLine botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
                 )}
               </div>
             );
@@ -311,17 +410,19 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   </td>
                   <td>
                     <button
-                      onClick={() => toggleBot(bot.id, bot.status)}
+                      onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
                       className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                      disabled={!!getPending(bot.id)}
                       style={{
-                        background: bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
-                        color: bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
-                        border: `1px solid ${bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
-                        cursor: 'pointer',
+                        background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
+                        color: getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
+                        border: `1px solid ${getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
+                        cursor: getPending(bot.id) ? 'wait' : 'pointer',
+                        opacity: getPending(bot.id) ? 0.7 : 1,
                       }}
                       data-testid={`bot-toggle-${bot.id}`}
                     >
-                      {bot.status === 'running' ? 'STOP' : 'START'}
+                      {getPending(bot.id) || (bot.status === 'running' ? 'STOP' : 'START')}
                     </button>
                     {bot.status === 'running' && (
                       <button
@@ -336,6 +437,22 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         data-testid={`bot-force-buy-${bot.id}`}
                       >
                         FORCE
+                      </button>
+                    )}
+                    {bot.status === 'running' && (
+                      <button
+                        onClick={() => forceStop(bot.id)}
+                        className="text-[10px] px-2 py-0.5 rounded font-semibold ml-1"
+                        style={{
+                          background: 'var(--badge-red-bg)',
+                          color: 'var(--accent-red)',
+                          border: '1px solid var(--accent-red)',
+                          cursor: 'pointer',
+                        }}
+                        data-testid={`bot-force-stop-${bot.id}`}
+                        title="Emergency stop"
+                      >
+                        ABORT
                       </button>
                     )}
                   </td>

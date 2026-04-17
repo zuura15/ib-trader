@@ -110,14 +110,8 @@ class TestWebSocketData:
             assert trades[0]["symbol"] == "AAPL"
             assert trades[0]["status"] == "OPEN"
 
-    def test_snapshot_includes_alerts(self, ws_client, ws_session_factory):
-        s = ws_session_factory()
-        s.add(SystemAlert(
-            severity=AlertSeverity.WARNING, trigger="test",
-            message="Test warning", created_at=_now(),
-        ))
-        s.commit()
-
+    def test_snapshot_alerts_empty_without_redis(self, ws_client):
+        """Without Redis, alerts snapshot returns [] (alerts now in Redis)."""
         with ws_client.websocket_connect("/ws") as ws:
             ws.send_text(json.dumps({
                 "type": "subscribe",
@@ -125,8 +119,7 @@ class TestWebSocketData:
             }))
             resp = json.loads(ws.receive_text())
             alerts = resp["data"]["alerts"]
-            assert len(alerts) == 1
-            assert alerts[0]["severity"] == "WARNING"
+            assert alerts == []
 
 
 class TestDiffComputation:

@@ -70,7 +70,7 @@ class MeanRevertBot(BotBase):
         #
         # For now, we demonstrate the bot lifecycle without live data.
 
-        self.update_heartbeat()
+        await self.update_heartbeat()
 
         # Simulate price tracking (in production, read from market data)
         # This is a placeholder showing the bot framework API
@@ -94,7 +94,7 @@ class MeanRevertBot(BotBase):
             # Place order through the engine
             cmd_text = f"buy {self.symbol} {self.qty} mid"
             cmd_id = await self.place_order(cmd_text, broker=self.broker)
-            self.update_action(f"Placed BUY {self.qty} {self.symbol}")
+            await self.update_action(f"Placed BUY {self.qty} {self.symbol}")
 
             # Wait for command completion
             result = await self.wait_for_command(cmd_id, timeout=30)
@@ -119,7 +119,7 @@ class MeanRevertBot(BotBase):
                 if pos.symbol == self.symbol:
                     cmd_text = f"close {pos.serial_number} mid"
                     cmd_id = await self.place_order(cmd_text, broker=self.broker)
-                    self.update_action(f"Closing {self.symbol} (serial {pos.serial_number})")
+                    await self.update_action(f"Closing {self.symbol} (serial {pos.serial_number})")
 
                     result = await self.wait_for_command(cmd_id, timeout=30)
                     if result and result["status"] == "SUCCESS":

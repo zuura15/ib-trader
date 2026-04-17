@@ -57,6 +57,12 @@ class BotBase(ABC):
         self._trades = TradeRepository(session_factory)
         self._transactions = TransactionRepository(session_factory)
 
+        # Redis-backed runtime state (status, last_action, heartbeat,
+        # kill_switch, error_message). ``config['_redis']`` is populated
+        # by the runner from the process-wide client.
+        from ib_trader.bots.state import BotStateStore
+        self._state = BotStateStore(config.get("_redis"))
+
     @abstractmethod
     async def on_tick(self) -> None:
         """Called every tick_interval_seconds.
@@ -169,22 +175,32 @@ class BotBase(ABC):
         """Update this bot's last_signal in the bots table."""
         self._bots.update_signal(self.bot_id, signal)
 
-    def update_action(self, action: str) -> None:
-        """Update this bot's last_action in the bots table."""
-        self._bots.update_action(self.bot_id, action)
+    async def update_action(self, action: str) -> None:
+        """Record this bot's last action in Redis. Async; reads and
+        writes the ``bot:<id>:last_action`` state key. SQLite is no
+        longer used for last_action — it lagged hot paths.
+        """
+        await self._state.set_last_action(self.bot_id, action)
 
-    def read_last_action(self) -> str | None:
-        """Read this bot's last_action from the bots table."""
-        bot = self._bots.get(self.bot_id)
-        return bot.last_action if bot else None
+    async def read_last_action(self) -> str | None:
+        """Read the last_action string from Redis."""
+        data = await self._state.get_last_action(self.bot_id)
+        if not data:
+            return None
+        return data.get("action")
 
-    def clear_last_action(self) -> None:
-        """Clear this bot's last_action (set to None)."""
-        self._bots.update_action_raw(self.bot_id, None)
+    async def clear_last_action(self) -> None:
+        """Clear the Redis last_action key."""
+        await self._state.clear_last_action(self.bot_id)
 
-    def update_heartbeat(self) -> None:
-        """Update this bot's heartbeat timestamp."""
-        self._bots.update_heartbeat(self.bot_id)
+    async def update_heartbeat(self) -> None:
+        """Update this bot's heartbeat timestamp in Redis.
+
+        Called every 30s by the runner's supervisory loop. Redis is the
+        authoritative source for liveness; SQLite is no longer written
+        on this path.
+        """
+        await self._state.update_heartbeat(self.bot_id)
 
     def log_event(self, event_type: str, message: str | None = None,
                   payload: dict | None = None,

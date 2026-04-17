@@ -162,7 +162,18 @@ class StreamNames:
 
     @staticmethod
     def fill(bot_ref: str) -> str:
+        """DEPRECATED — use order_updates() for new code."""
         return f"fill:{bot_ref}"
+
+    @staticmethod
+    def order_updates() -> str:
+        """Global stream for all order lifecycle events (fills + statuses).
+
+        Engine publishes every IB order callback here with the raw
+        orderRef. Bots filter by orderRef prefix. Single schema,
+        ``terminal`` bool discriminates progress from final events.
+        """
+        return "order:updates"
 
     @staticmethod
     def position_changes() -> str:

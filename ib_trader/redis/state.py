@@ -133,6 +133,55 @@ class StateKeys:
     def heartbeat(process: str) -> str:
         return f"hb:{process}"
 
+    # ---- Live-state hashes (replace SQLite reads for UI) ----
+
+    @staticmethod
+    def orders_open() -> str:
+        """Redis hash: currently open orders keyed by ib_order_id."""
+        return "orders:open"
+
+    @staticmethod
+    def trades_open() -> str:
+        """Redis hash: currently open trade groups keyed by trade_id."""
+        return "trades:open"
+
+    @staticmethod
+    def trades_recent_closed() -> str:
+        """Redis list: last N closed trades (LRU, capped by caller)."""
+        return "trades:recent_closed"
+
+    @staticmethod
+    def alerts_active() -> str:
+        """Redis hash: currently unresolved alerts keyed by alert_id."""
+        return "alerts:active"
+
+    @staticmethod
+    def bot_stats(bot_id: str) -> str:
+        """Per-bot trade stats: {trades_total, trades_today, pnl_today}."""
+        return f"bot:stats:{bot_id}"
+
+    @staticmethod
+    def process_heartbeat(process: str) -> str:
+        """Per-process liveness key. TTL = PROCESS_HEARTBEAT_TTL."""
+        return f"hb:{process}"
+
+    PROCESS_HEARTBEAT_TTL = 120
+
+    # ---- Helpers for writing live state from sync code ----
+
+    @staticmethod
+    async def publish_alert(redis, alert_id: str, alert_dict: dict) -> None:
+        """Write an alert to the alerts:active Redis hash.
+
+        Called alongside the SQLite archival write. The ``alert_dict``
+        should be a JSON-serializable dict with at least {id, severity,
+        trigger, message, created_at}.
+        """
+        if redis is None:
+            return
+        import json as _json
+        await redis.hset(StateKeys.alerts_active(), alert_id, _json.dumps(alert_dict))
+
     # TTL constants
     QUOTE_TTL = 60
     HEARTBEAT_TTL = 120

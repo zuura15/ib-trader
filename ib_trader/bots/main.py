@@ -97,13 +97,33 @@ async def run(session_factory) -> None:
 
     # Start heartbeat loop
     heartbeat_task = asyncio.create_task(
-        _heartbeat_loop(heartbeats, pid)
+        _heartbeat_loop(heartbeats, pid, redis=redis)
     )
+
+    # Start internal HTTP API for the runner (control plane)
+    from ib_trader.bots import registry_config
+    bot_instances: dict = {}
+    runner_state = {
+        "running_tasks": {},
+        "bot_instances": bot_instances,
+        "redis": redis,
+        "registry": registry_config,
+        "session_factory": session_factory,
+        "engine_url": engine_url,
+    }
+    runner_api_port = settings.get("bot_runner_internal_port", 8082)
+    from ib_trader.bots.internal_api import start_bot_runner_api
+    api_task = await start_bot_runner_api(runner_state, port=runner_api_port)
+    print(f"[BOTS] Internal API on 127.0.0.1:{runner_api_port}")
 
     try:
         from ib_trader.bots.runner import run_bot_runner
-        await run_bot_runner(session_factory, redis=redis, engine_url=engine_url)
-    except KeyboardInterrupt:
+        await run_bot_runner(
+            session_factory, redis=redis, engine_url=engine_url,
+            running_tasks=runner_state["running_tasks"],
+            bot_instances=runner_state["bot_instances"],
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         heartbeat_task.cancel()
@@ -116,10 +136,18 @@ async def run(session_factory) -> None:
         logger.info('{"event": "BOT_RUNNER_STOPPED"}')
 
 
-async def _heartbeat_loop(heartbeats, pid: int) -> None:
-    """Write BOT_RUNNER heartbeat periodically."""
+async def _heartbeat_loop(heartbeats, pid: int, redis=None) -> None:
+    """Write BOT_RUNNER heartbeat to Redis (primary) + SQLite (audit)."""
+    import json as _json
+    from datetime import datetime, timezone
+    from ib_trader.redis.state import StateKeys
+
     while True:
         try:
+            if redis is not None:
+                key = StateKeys.process_heartbeat("BOT_RUNNER")
+                val = _json.dumps({"pid": pid, "ts": datetime.now(timezone.utc).isoformat()})
+                await redis.setex(key, StateKeys.PROCESS_HEARTBEAT_TTL, val)
             heartbeats.upsert("BOT_RUNNER", pid)
         except Exception:
             logger.exception('{"event": "HEARTBEAT_WRITE_FAILED"}')

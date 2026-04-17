@@ -284,24 +284,22 @@ class PersistenceMiddleware:
                 f"Redis not available — cannot persist strategy state for {self._bot_ref}:{self.symbol}"
             )
 
-        from ib_trader.redis.state import StateStore, StateKeys
-        from ib_trader.redis.streams import StreamWriter, StreamNames
+        from ib_trader.redis.state import StateStore
+        from ib_trader.redis.streams import publish_activity
 
         store = StateStore(self._redis)
-        key = StateKeys.strategy(self._bot_ref, self.symbol)
-        await store.set(key, state)
+        # Write to the single consolidated bot key: bot:<uuid>
+        # Merge with existing doc to preserve FSM fields
+        key = f"bot:{self.bot_id}"
+        existing = await store.get(key) or {}
+        merged = {**existing, **state}
+        await store.set(key, merged)
 
-        # Notify subscribers that bot state changed. Payload is minimal —
-        # the snapshot is read from the strategy key by the consumer.
+        # Nudge WS bots channel
         try:
-            writer = StreamWriter(self._redis, StreamNames.bot_state(self._bot_ref, self.symbol), maxlen=200)
-            await writer.add({
-                "bot_ref": self._bot_ref,
-                "symbol": self.symbol,
-                "ts": _now_utc().isoformat(),
-            })
+            await publish_activity(self._redis, "bots")
         except Exception:
-            logger.debug('{"event": "BOT_STATE_NOTIFY_FAILED", "bot_ref": "%s"}', self._bot_ref)
+            pass
 
 
 # ---------------------------------------------------------------------------

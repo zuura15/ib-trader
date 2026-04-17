@@ -26,6 +26,8 @@ log_compress_old: true
 heartbeat_interval_seconds: 30
 heartbeat_stale_threshold_seconds: 300
 poll_interval_seconds: 60
+position_poll_interval_seconds: 60
+bot_runner_internal_port: 8082
 reconciliation_interval_seconds: 3600
 db_integrity_check_interval_seconds: 21600
 daemon_tui_refresh_seconds: 5

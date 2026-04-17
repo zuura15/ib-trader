@@ -5,6 +5,9 @@ No raw SQL strings — use SQLAlchemy ORM only.
 Sessions are scoped and never exposed outside this module.
 Contract caching logic lives here, not in a separate module.
 """
+import logging
+import os
+import traceback
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -20,6 +23,8 @@ from ib_trader.data.models import (
     SystemHeartbeat, SystemAlert, TradeStatus,
 )
 from sqlalchemy import event as sa_event
+
+logger = logging.getLogger(__name__)
 
 
 def create_db_engine(db_url: str):
@@ -49,6 +54,44 @@ def create_db_engine(db_url: str):
             """Enable WAL mode and foreign key enforcement on every connection."""
             dbapi_conn.execute("PRAGMA journal_mode=WAL")
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    # Audit hook — every SQL statement gets logged with its caller so we can
+    # hunt down code paths that still reach into SQLite when they shouldn't.
+    # Off by default; flip IB_TRADER_SQLITE_AUDIT=1 to enable.
+    if os.environ.get("IB_TRADER_SQLITE_AUDIT") == "1":
+        _skip_prefixes = ("PRAGMA", "CREATE", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE")
+        _process = os.path.basename(
+            os.environ.get("IB_TRADER_PROCESS", "")
+        ) or f"pid{os.getpid()}"
+
+        @sa_event.listens_for(engine, "before_cursor_execute")
+        def _audit(conn, cursor, statement, params, context, executemany):
+            stmt_stripped = statement.lstrip()
+            if stmt_stripped[:16].upper().startswith(_skip_prefixes):
+                return
+            # Walk the stack to find the closest frame outside sqlalchemy
+            # and this file. That's the real caller.
+            caller = "?"
+            for frame in reversed(traceback.extract_stack()[:-1]):
+                fn = frame.filename
+                if "sqlalchemy" in fn:
+                    continue
+                if fn.endswith("data/repository.py"):
+                    continue
+                if "data/repositories/" in fn:
+                    # The repo method itself — keep walking for the real caller
+                    # if possible, but record as a fallback.
+                    if caller == "?":
+                        caller = f"{os.path.basename(fn)}:{frame.lineno} ({frame.name})"
+                    continue
+                caller = f"{os.path.basename(fn)}:{frame.lineno} ({frame.name})"
+                break
+            # Keep statement short — just the verb + table is usually enough.
+            short = " ".join(statement.split())[:200]
+            logger.info(
+                '{"event":"SQLITE_QUERY","proc":"%s","stmt":%r,"caller":%r}',
+                _process, short, caller,
+            )
 
     return engine
 
@@ -124,6 +167,16 @@ class TradeRepository(TradeRepositoryBase):
             .order_by(TradeGroup.serial_number.desc())
             .all()
         )
+
+    def aggregate_by_source(self, source_prefix: str) -> dict[str, dict]:
+        """Return ``{source: {total, today, pnl_today}}`` per source.
+
+        TODO: ``TradeGroup`` has no ``source`` column yet. Proper
+        implementation needs either a ``source`` column on trade_groups
+        or a join through PendingCommand. For now returns empty —
+        callers fall back to 0 for all counters (same as pre-refactor).
+        """
+        return {}
 
     def update_status(self, trade_id: str, status: TradeStatus) -> None:
         """Update the status of a trade group."""

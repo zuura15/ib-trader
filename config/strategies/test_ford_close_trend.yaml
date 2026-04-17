@@ -15,7 +15,7 @@ version: "1.0"
 symbol: F
 max_position_value: 200
 max_shares: 10
-order_strategy: market
+order_strategy: ask    # cross the spread on entry — fills immediately overnight (mid often hangs)
 
 bar_size_seconds: 60
 lookback_bars: 10

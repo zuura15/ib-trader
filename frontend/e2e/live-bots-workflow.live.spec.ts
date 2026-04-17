@@ -82,24 +82,18 @@ test.describe('Live bots workflow (test-ford)', () => {
     // run so tests always start from a known zero baseline. Without this,
     // force-buy hits max_shares and the order gets rejected.
     await api.post(`${API_BASE}/api/bots/${TEST_BOT_ID}/stop`).catch(() => null);
-    const pre = await fordPositionQty(api);
-    if (pre !== 0) {
-      const side = pre > 0 ? 'sell' : 'buy';
-      const cmd = `${side} ${SYMBOL} ${Math.abs(pre)} market`;
-      const resp = await api.post(`${API_BASE}/api/commands`, {
-        data: { command: cmd },
-      });
-      const body = await resp.text();
-      console.log(`[flatten-pre] cmd="${cmd}" status=${resp.status()} body=${body.slice(0, 300)}`);
-      await expect
-        .poll(async () => fordPositionQty(api), {
-          timeout: 60_000,
-          intervals: [500, 1000, 2000],
-          message: `F did not flatten to 0 within 60s (start=${pre})`,
-        })
-        .toBe(0);
-    }
-    baseline = 0;
+    // Cancel any orphan F orders left from prior runs — NYSE self-trade
+    // prevention will block our force-buy from filling if there's a
+    // resting opposite-side order on the same symbol.
+    const cancelResp = await api.post(`${API_BASE}/api/orders/cancel-by-symbol`, {
+      data: { symbol: SYMBOL },
+    });
+    const cancelBody = await cancelResp.text();
+    console.log(`[bots-spec] cancel-by-symbol ${SYMBOL}: ${cancelResp.status()} ${cancelBody}`);
+    // Don't flatten — overnight LMT fills are unreliable and a hanging
+    // SELL would block all tests. Tests are baseline-relative anyway.
+    baseline = await fordPositionQty(api);
+    console.log(`[bots-spec] baseline F position = ${baseline}`);
   });
 
   test.afterAll(async () => {

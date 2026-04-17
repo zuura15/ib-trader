@@ -58,6 +58,10 @@ class AppContext:
     templates: OrderTemplateRepository | None = None
     router: OutputRouter = field(default_factory=OutputRouter)
 
+    # In-memory IB positions cache — refreshed by positionEvent callback
+    # + 30s poll. Served via GET /engine/positions. No Redis.
+    positions_cache: list = field(default_factory=list)
+
     # Multi-broker support: dict of broker name → BrokerClientBase
     # When set, get_broker() uses this instead of self.ib
     _brokers: dict | None = field(default=None, repr=False)

@@ -1,12 +1,17 @@
 """Positions endpoint.
 
-GET /api/positions — returns current positions.
+GET /api/positions — proxies to the engine's in-memory position cache.
 
-Primary: reads from Redis keys (pos:* and quote:*:latest) for real-time data.
-Fallback: reads from run/positions.json (engine writes every 10s).
+No Redis, no SQLite. The engine holds the IB connection and maintains
+an in-memory positions dict refreshed by positionEvent + 30s poll.
+This endpoint proxies to GET /engine/positions on the engine's internal
+HTTP API. If the engine is down, returns 503 — honest "I don't know"
+instead of serving stale data.
 """
+import os
 import logging
 
+import httpx
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
@@ -17,94 +22,72 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
+def _engine_url() -> str:
+    port = os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
+    return f"http://127.0.0.1:{port}"
+
+
 @router.get("")
 async def list_positions(redis=Depends(get_redis)):
-    """Return current broker positions from Redis."""
-    if redis is None:
+    """Return current broker positions from the engine.
+
+    Primary: proxy to GET /engine/positions (engine's in-memory cache).
+    Supplement: scan Redis pos:* keys for bot-managed positions on symbols
+    the engine doesn't report (edge case: bot fill landed but positionEvent
+    hasn't fired yet).
+    """
+    positions = []
+    seen_symbols: set[str] = set()
+
+    # 1. Engine positions — authoritative for IB account state.
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{_engine_url()}/engine/positions")
+            if resp.status_code == 200:
+                positions = resp.json()
+                seen_symbols = {p.get("symbol", "") for p in positions}
+            else:
+                logger.warning(
+                    '{"event": "ENGINE_POSITIONS_FAILED", "status": %d}',
+                    resp.status_code,
+                )
+    except Exception:
+        logger.exception('{"event": "ENGINE_POSITIONS_UNREACHABLE"}')
         return JSONResponse(
-            content={"error": "Redis not available"},
+            content={"error": "Engine unavailable"},
             status_code=503,
         )
 
-    try:
-        positions = await _positions_from_redis(redis)
-    except Exception:
-        logger.exception('{"event": "REDIS_POSITIONS_ERROR"}')
-        return JSONResponse(
-            content={"error": "Redis read failed"},
-            status_code=503,
-        )
+    # 2. Bot-managed positions — from bot:<uuid> keys for bots with open positions
+    #    that the engine doesn't yet report (fill arrived but positionEvent hasn't fired).
+    if redis is not None:
+        try:
+            from ib_trader.redis.state import StateStore
+            from ib_trader.bots import registry_config
+            store = StateStore(redis)
+            for defn in registry_config.all_definitions():
+                data = await store.get(f"bot:{defn.id}")
+                if not data:
+                    continue
+                symbol = data.get("symbol") or defn.config.get("symbol", "")
+                if symbol in seen_symbols:
+                    continue
+                qty = data.get("qty", "0")
+                state = data.get("state", "FLAT")
+                if state == "FLAT" or state == "OFF" or qty == "0":
+                    continue
+                positions.append({
+                    "symbol": symbol,
+                    "bot_ref": defn.config.get("ref_id", defn.name),
+                    "quantity": qty,
+                    "avg_cost": data.get("avg_price") or data.get("entry_price") or "0",
+                    "market_price": None,
+                    "broker": "ib",
+                })
+        except Exception:
+            logger.exception('{"event": "BOT_POSITIONS_READ_ERROR"}')
 
     return JSONResponse(
         content=positions,
         headers={"Cache-Control": "no-store, max-age=0"},
     )
-
-
-async def _positions_from_redis(redis) -> list[dict]:
-    """Read positions from Redis.
-
-    Reads from two key patterns:
-    - ibpos:* — all IB positions (written by engine on startup + positionEvent)
-    - pos:* — bot-managed positions with state tracking
-    """
-    from ib_trader.redis.state import StateStore
-
-    store = StateStore(redis)
-    positions = []
-    seen_symbols = set()
-
-    # 1. IB positions (all account positions from the broker)
-    async for key in redis.scan_iter(match="ibpos:*"):
-        data = await store.get(key)
-        if data and data.get("quantity", "0") != "0":
-            symbol = data.get("symbol", "")
-            seen_symbols.add(symbol)
-
-            # Get latest quote for market price
-            quote = await store.get(f"quote:{symbol}:latest")
-            mkt_price = None
-            if quote:
-                bid = quote.get("bid")
-                ask = quote.get("ask")
-                last = quote.get("last")
-                if bid and ask:
-                    try:
-                        mkt_price = (float(bid) + float(ask)) / 2
-                    except (ValueError, TypeError):
-                        pass
-                elif last:
-                    try:
-                        mkt_price = float(last)
-                    except (ValueError, TypeError):
-                        pass
-
-            positions.append({
-                "id": f"{symbol}_{data.get('sec_type', 'STK')}_{data.get('con_id', 0)}",
-                "account_id": data.get("account", ""),
-                "symbol": symbol,
-                "sec_type": data.get("sec_type", "STK"),
-                "quantity": data.get("quantity", "0"),
-                "avg_cost": data.get("avg_cost", "0"),
-                "market_price": f"{mkt_price:.4f}" if mkt_price else None,
-                "broker": "ib",
-            })
-
-    # 2. Bot-managed positions (supplement with state info if not already shown)
-    async for key in redis.scan_iter(match="pos:*"):
-        data = await store.get(key)
-        if data and data.get("state") != "FLAT" and data.get("qty", "0") != "0":
-            parts = key.split(":")
-            if len(parts) == 3:
-                _, bot_ref, symbol = parts
-                if symbol not in seen_symbols:
-                    positions.append({
-                        "symbol": symbol,
-                        "bot_ref": bot_ref,
-                        "quantity": data.get("qty", "0"),
-                        "avg_cost": data.get("avg_price", "0"),
-                        "market_price": None,
-                        "broker": "ib",
-                    })
-
-    return positions

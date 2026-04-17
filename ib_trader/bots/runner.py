@@ -3,20 +3,26 @@
 The bot runner listens on the bot:control:* stream for START/STOP/FORCE_BUY
 commands. No polling — all lifecycle changes are event-driven via XREAD BLOCK.
 
-On startup, checks the bots table for any bots marked RUNNING and restarts them.
+On startup, checks Redis for any bots marked RUNNING and restarts them.
+Bot identity comes from the in-memory BotDefinition registry (loaded from
+config/bots/*.yaml). Runtime state (status, heartbeat) lives in Redis.
+SQLite is used ONLY for audit writes (bot_events).
 """
 import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 
+from redis.exceptions import ConnectionError as _RedisConnectionError
+
 from sqlalchemy.orm import scoped_session
 
-from ib_trader.data.models import BotStatus, BotEvent
-from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
-from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
+from ib_trader.data.models import BotEvent
+from ib_trader.data.repositories.bot_repository import BotEventRepository
 from ib_trader.bots.base import BotBase
+from ib_trader.bots.definition import BotDefinition
 from ib_trader.bots.registry import get_strategy_class
+from ib_trader.bots.state import BotStateStore, STATUS_RUNNING, STATUS_ERROR
 
 logger = logging.getLogger(__name__)
 
@@ -25,38 +31,78 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _run_single_bot(bot_row, session_factory: scoped_session,
+async def _create_and_start_bot(
+    defn: BotDefinition, session_factory: scoped_session,
+    redis=None, engine_url: str | None = None,
+) -> tuple:
+    """Create a bot instance, initialize it, and spawn its event loop task.
+
+    Returns (bot_instance, asyncio.Task). Used by the internal HTTP API
+    for the /start endpoint.
+    """
+    strategy_cls = get_strategy_class(defn.strategy)
+    if strategy_cls is None:
+        raise ValueError(f"Unknown strategy: {defn.strategy}")
+
+    config = dict(defn.config)
+    config["tick_interval_seconds"] = defn.tick_interval_seconds
+    config["_redis"] = redis
+    config["_engine_url"] = engine_url
+    bot = strategy_cls(defn.id, config, session_factory)
+
+    # Initialize the bot (strategy, middleware, aggregator, warmup)
+    await bot.on_startup([])
+
+    # Log start event
+    events_repo = BotEventRepository(session_factory)
+    events_repo.insert(BotEvent(
+        bot_id=defn.id, event_type="STARTED",
+        message=f"Bot started: {defn.name} ({defn.strategy})",
+        recorded_at=_now_utc(),
+    ))
+
+    # Spawn the event loop as a task
+    task = asyncio.create_task(
+        bot.run_event_loop(),
+        name=f"bot-{defn.id}",
+    )
+
+    print(f"[BOTS] START  '{defn.name}' (strategy={defn.strategy})")
+    logger.info(json.dumps({
+        "event": "BOT_TASK_STARTED",
+        "bot_id": defn.id,
+    }))
+
+    return bot, task
+
+
+async def _run_single_bot(defn: BotDefinition, session_factory: scoped_session,
                            recover: bool = False,
                            redis=None, engine_url: str | None = None) -> None:
-    """Run a single bot until stopped via control stream or crash.
-
-    The bot's on_tick() is called in a loop, but the loop is driven by
-    stream events (quotes, bars) rather than a fixed timer. Between events,
-    the bot also listens on its control stream for STOP/FORCE_BUY.
-    """
-    strategy_cls = get_strategy_class(bot_row.strategy)
+    """Run a single bot until stopped via control stream or crash."""
+    strategy_cls = get_strategy_class(defn.strategy)
     if strategy_cls is None:
-        print(f"[BOTS] ERROR  Unknown strategy '{bot_row.strategy}' for bot '{bot_row.name}'")
+        print(f"[BOTS] ERROR  Unknown strategy '{defn.strategy}' for bot '{defn.name}'")
         logger.error(json.dumps({
             "event": "UNKNOWN_STRATEGY",
-            "bot_id": bot_row.id,
-            "strategy": bot_row.strategy,
+            "bot_id": defn.id,
+            "strategy": defn.strategy,
         }))
-        bots_repo = BotRepository(session_factory)
-        bots_repo.update_status(
-            bot_row.id, BotStatus.ERROR,
-            error_message=f"Unknown strategy: {bot_row.strategy}",
+        state = BotStateStore(redis)
+        await state.set_status(
+            defn.id, STATUS_ERROR,
+            error_message=f"Unknown strategy: {defn.strategy}",
         )
         return
 
-    config = json.loads(bot_row.config_json) if bot_row.config_json else {}
-    config["tick_interval_seconds"] = bot_row.tick_interval_seconds
+    config = dict(defn.config)
+    config["tick_interval_seconds"] = defn.tick_interval_seconds
     config["_redis"] = redis
     config["_engine_url"] = engine_url
-    bot = strategy_cls(bot_row.id, config, session_factory)
+    bot = strategy_cls(defn.id, config, session_factory)
 
     events_repo = BotEventRepository(session_factory)
-    bots_repo = BotRepository(session_factory)
+    state = BotStateStore(redis)
 
     async def _nudge(channel: str) -> None:
         if redis is None:
@@ -64,44 +110,42 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
         from ib_trader.redis.streams import publish_activity
         await publish_activity(redis, channel)
 
-    # Log start event
     events_repo.insert(BotEvent(
-        bot_id=bot_row.id, event_type="STARTED",
-        message=f"Bot started: {bot_row.name} ({bot_row.strategy})",
+        bot_id=defn.id, event_type="STARTED",
+        message=f"Bot started: {defn.name} ({defn.strategy})",
         recorded_at=_now_utc(),
     ))
     await _nudge("bot_events")
     await _nudge("bots")
 
-    # Crash recovery: pass open positions from previous incarnation
+    # Always call on_startup — it initializes the strategy, context,
+    # middleware pipeline, and bar aggregator. The recover flag only
+    # controls whether to pass existing open positions for crash recovery.
+    open_positions = []
     if recover:
         from ib_trader.data.repository import TradeRepository
         trades_repo = TradeRepository(session_factory)
         open_positions = trades_repo.get_open()
-        await bot.on_startup(open_positions)
+    await bot.on_startup(open_positions)
 
     try:
-        # Run the bot with stream-driven ticks + control stream monitoring
-        await _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo)
+        await _stream_driven_loop(bot, defn, redis, state, events_repo)
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[BOTS] ERROR  Bot '{bot_row.name}' failed: {e}")
+        print(f"[BOTS] ERROR  Bot '{defn.name}' failed: {e}")
         logger.exception(json.dumps({
             "event": "BOT_ERROR",
-            "bot_id": bot_row.id,
+            "bot_id": defn.id,
             "error": str(e),
         }))
         events_repo.insert(BotEvent(
-            bot_id=bot_row.id, event_type="ERROR",
+            bot_id=defn.id, event_type="ERROR",
             message=str(e),
             recorded_at=_now_utc(),
         ))
-        bots_repo.update_status(
-            bot_row.id, BotStatus.ERROR,
-            error_message=str(e),
-        )
+        await state.set_status(defn.id, STATUS_ERROR, error_message=str(e))
         await _nudge("bot_events")
         await _nudge("bots")
     finally:
@@ -109,29 +153,20 @@ async def _run_single_bot(bot_row, session_factory: scoped_session,
             await bot.on_stop()
         except Exception:
             logger.exception(json.dumps({
-                "event": "BOT_STOP_ERROR", "bot_id": bot_row.id,
+                "event": "BOT_STOP_ERROR", "bot_id": defn.id,
             }))
         events_repo.insert(BotEvent(
-            bot_id=bot_row.id, event_type="STOPPED",
-            message=f"Bot stopped: {bot_row.name}",
+            bot_id=defn.id, event_type="STOPPED",
+            message=f"Bot stopped: {defn.name}",
             recorded_at=_now_utc(),
         ))
         await _nudge("bot_events")
         await _nudge("bots")
 
 
-async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> None:
-    """Run the bot as parallel asyncio tasks, all event-driven.
-
-    Spawns:
-      - bot.run_event_loop()       — strategy events from quote/bar/fill/position streams
-      - _control_consumer()        — STOP / FORCE_BUY from control streams
-      - _supervisory_loop()        — heartbeat (30s) + entry timeout + stale quote checks
-
-    Returns when the control consumer receives STOP, when any task fails,
-    or when the parent task is cancelled. The finally block in
-    _run_single_bot handles cleanup.
-    """
+async def _stream_driven_loop(bot, defn: BotDefinition, redis,
+                               state: BotStateStore, events_repo) -> None:
+    """Run the bot as parallel asyncio tasks, all event-driven."""
     if not redis:
         raise RuntimeError("Redis required for event-driven bot runner")
 
@@ -139,22 +174,20 @@ async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> No
 
     event_task = asyncio.create_task(
         bot.run_event_loop(),
-        name=f"bot-events-{bot_row.id}",
+        name=f"bot-events-{defn.id}",
     )
     control_task = asyncio.create_task(
-        _control_consumer(bot, bot_row, redis, stop_event),
-        name=f"bot-control-{bot_row.id}",
+        _control_consumer(bot, defn, redis, stop_event),
+        name=f"bot-control-{defn.id}",
     )
     supervisory_task = asyncio.create_task(
-        _supervisory_loop(bot, bot_row, stop_event),
-        name=f"bot-supervisor-{bot_row.id}",
+        _supervisory_loop(bot, defn, stop_event),
+        name=f"bot-supervisor-{defn.id}",
     )
 
     tasks = [event_task, control_task, supervisory_task]
     try:
-        # Wait for any task to finish (STOP signal, error, or cancellation)
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        # Surface exceptions from completed tasks (so the caller sees them)
         for t in done:
             if not t.cancelled():
                 exc = t.exception()
@@ -167,23 +200,21 @@ async def _stream_driven_loop(bot, bot_row, redis, bots_repo, events_repo) -> No
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _control_consumer(bot, bot_row, redis, stop_event: asyncio.Event) -> None:
-    """Listen on the bot's control stream for STOP / FORCE_BUY events.
-
-    Also polls the bot:{id}:force_buy fallback key every loop iteration
-    in case the stream event was missed (e.g., bot wasn't listening yet
-    when the API published).
-    """
+async def _control_consumer(bot, defn: BotDefinition, redis,
+                             stop_event: asyncio.Event) -> None:
+    """Listen on the bot's control stream for STOP / FORCE_BUY events."""
     from ib_trader.redis.streams import StreamNames
-    control_stream = StreamNames.bot_control(bot_row.id)
+    control_stream = StreamNames.bot_control(defn.id)
     control_last_id = "$"
-    force_key = f"bot:{bot_row.id}:force_buy"
+    force_key = f"bot:{defn.id}:force_buy"
 
     while True:
         try:
             results = await redis.xread({control_stream: control_last_id}, block=5000)
         except asyncio.CancelledError:
             raise
+        except (ConnectionError, OSError, _RedisConnectionError):
+            raise asyncio.CancelledError()
         except Exception:
             logger.exception('{"event": "CONTROL_STREAM_READ_ERROR"}')
             await asyncio.sleep(1)
@@ -197,174 +228,118 @@ async def _control_consumer(bot, bot_row, redis, stop_event: asyncio.Event) -> N
                     if action == "STOP":
                         logger.info(
                             '{"event": "BOT_STOP_VIA_STREAM", "bot_id": "%s"}',
-                            bot_row.id,
+                            defn.id,
                         )
                         stop_event.set()
                         return
                     elif action == "FORCE_BUY":
                         logger.info(
                             '{"event": "FORCE_BUY_VIA_STREAM", "bot_id": "%s"}',
-                            bot_row.id,
+                            defn.id,
                         )
-                        bot.update_action("FORCE_BUY")
+                        await bot.update_action("FORCE_BUY")
                         await bot.check_force_buy()
 
-        # Fallback: check the force-buy key (persists even if we missed
-        # the stream event during startup).
         try:
             if await redis.get(force_key):
                 await redis.delete(force_key)
                 logger.info(
                     '{"event": "FORCE_BUY_VIA_KEY", "bot_id": "%s"}',
-                    bot_row.id,
+                    defn.id,
                 )
-                bot.update_action("FORCE_BUY")
+                await bot.update_action("FORCE_BUY")
                 await bot.check_force_buy()
         except Exception:
             pass
 
 
-async def _supervisory_loop(bot, bot_row, stop_event: asyncio.Event) -> None:
-    """Periodic supervisory tasks — NOT driven by market events.
-
-    These run on their own intervals because they're time-based:
-      - Heartbeat (30s): updates bots.last_heartbeat for UI liveness
-      - Entry timeout: cancels stuck ENTERING positions after entry_timeout_seconds
-      - Stale quote check: warns/halts when no quotes arrive for too long
-    """
+async def _supervisory_loop(bot, defn: BotDefinition,
+                             stop_event: asyncio.Event) -> None:
+    """Periodic supervisory tasks — heartbeat, entry timeout, stale quote check."""
     while True:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=10)
-            return  # stop signalled
+            return
         except asyncio.TimeoutError:
             pass
 
         try:
-            bot.update_heartbeat()
+            await bot.update_heartbeat()
             await bot.check_entry_timeout()
             await bot.check_stale_quote()
         except Exception:
             logger.exception(
-                '{"event": "SUPERVISORY_ERROR", "bot_id": "%s"}', bot_row.id,
+                '{"event": "SUPERVISORY_ERROR", "bot_id": "%s"}', defn.id,
             )
 
 
 async def run_bot_runner(session_factory: scoped_session,
-                         redis=None, engine_url: str | None = None) -> None:
-    """Main bot runner — listens for lifecycle events via Redis streams.
+                         redis=None, engine_url: str | None = None,
+                         running_tasks: dict | None = None,
+                         bot_instances: dict | None = None) -> None:
+    """Main bot runner — cleanup loop for crashed tasks.
 
-    On startup, checks for RUNNING bots and restarts them.
-    Then listens on bot:control:* for START/STOP commands.
+    Lifecycle commands (start/stop/force-buy) are handled by the runner's
+    internal HTTP API via direct method calls. This loop only:
+    1. Restarts bots whose FSM was in a running state on startup
+    2. Cleans up crashed tasks every 5s
     """
-    from ib_trader.redis.streams import StreamNames
+    from ib_trader.bots import registry_config
+    from ib_trader.bots.fsm import FSM, BotEvent, BotState, EventType
 
-    bots_repo = BotRepository(session_factory)
-    running_tasks: dict[str, asyncio.Task] = {}
+    if running_tasks is None:
+        running_tasks = {}
+    if bot_instances is None:
+        bot_instances = {}
+    _RUNNING_FSM_STATES = {
+        BotState.AWAITING_ENTRY_TRIGGER,
+        BotState.ENTRY_ORDER_PLACED,
+        BotState.AWAITING_EXIT_TRIGGER,
+        BotState.EXIT_ORDER_PLACED,
+    }
 
     logger.info(json.dumps({"event": "BOT_RUNNER_STARTED"}))
 
-    # Startup: restart any bots that were RUNNING before crash
-    all_bots = bots_repo.get_all()
-    for bot_row in all_bots:
-        if bot_row.status == BotStatus.RUNNING:
-            task = asyncio.create_task(
-                _run_single_bot(bot_row, session_factory, recover=True,
-                                redis=redis, engine_url=engine_url),
-            )
-            running_tasks[bot_row.id] = task
-            print(f"[BOTS] START  '{bot_row.name}' (strategy={bot_row.strategy})")
-            logger.info(json.dumps({
-                "event": "BOT_TASK_STARTED",
-                "bot_id": bot_row.id,
-                "name": bot_row.name,
-            }))
+    # Startup: restart bots whose FSM is in a running state
+    all_defs = registry_config.all_definitions()
+    for defn in all_defs:
+        fsm = FSM(defn.id, redis)
+        cur = await fsm.current_state()
+        if cur in _RUNNING_FSM_STATES:
+            try:
+                bot, task = await _create_and_start_bot(
+                    defn, session_factory, redis=redis, engine_url=engine_url,
+                )
+                running_tasks[defn.id] = task
+                bot_instances[defn.id] = bot
+            except Exception:
+                logger.exception(
+                    '{"event": "BOT_RESTART_FAILED", "bot_id": "%s"}', defn.id,
+                )
 
-    # Listen for lifecycle commands on a global control stream
-    # The API publishes START/STOP to bot:control:{bot_id}
-    # We listen on all bot control streams
-    global_control = "bot:control:global"
-    last_id = "$"
-
+    # Main loop: just clean up crashed tasks. All lifecycle commands
+    # flow through the runner's internal HTTP API via direct method calls.
     while True:
         try:
-            # Clean up finished tasks
+            await asyncio.sleep(5)
+
             for bot_id in list(running_tasks.keys()):
                 task = running_tasks[bot_id]
                 if task.done():
                     exc = task.exception() if not task.cancelled() else None
                     if exc:
-                        bots_repo.update_status(
-                            bot_id, BotStatus.ERROR,
-                            error_message=str(exc),
-                        )
+                        try:
+                            await FSM(bot_id, redis).dispatch(BotEvent(
+                                EventType.CRASH,
+                                payload={"message": str(exc)},
+                            ))
+                        except Exception:
+                            logger.exception('{"event": "FSM_CRASH_DISPATCH_FAILED", "bot_id": "%s"}', bot_id)
                         print(f"[BOTS] CRASH  bot_id={bot_id}: {exc}")
                     del running_tasks[bot_id]
-
-            # XREAD BLOCK on global control stream — wakes on any bot lifecycle event
-            results = None
-            if redis:
-                try:
-                    results = await redis.xread(
-                        {global_control: last_id},
-                        block=5000,  # 5s timeout for cleanup checks
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception('{"event": "GLOBAL_CONTROL_READ_ERROR"}')
-                    await asyncio.sleep(1)
-                    continue
-            else:
-                await asyncio.sleep(5)
-
-            if results:
-                for stream_name, entries in results:
-                    for entry_id, data in entries:
-                        last_id = entry_id
-                        action = data.get("action", "")
-                        bot_id = data.get("bot_id", "")
-
-                        if action == "START" and bot_id and bot_id not in running_tasks:
-                            bot_row = bots_repo.get(bot_id)
-                            if bot_row and bot_row.status == BotStatus.RUNNING:
-                                task = asyncio.create_task(
-                                    _run_single_bot(bot_row, session_factory, recover=True,
-                                                    redis=redis, engine_url=engine_url),
-                                )
-                                running_tasks[bot_id] = task
-                                print(f"[BOTS] START  '{bot_row.name}' (strategy={bot_row.strategy})")
-                                logger.info(json.dumps({
-                                    "event": "BOT_TASK_STARTED",
-                                    "bot_id": bot_id,
-                                }))
-
-                        elif action == "STOP" and bot_id and bot_id in running_tasks:
-                            # Send STOP to the bot's own control stream
-                            if redis:
-                                from ib_trader.redis.streams import StreamWriter
-                                writer = StreamWriter(redis, StreamNames.bot_control(bot_id), maxlen=100)
-                                await writer.add({"action": "STOP"})
-                            running_tasks[bot_id].cancel()
-                            del running_tasks[bot_id]
-                            print(f"[BOTS] STOP   bot_id={bot_id}")
-                            logger.info(json.dumps({
-                                "event": "BOT_TASK_STOPPED",
-                                "bot_id": bot_id,
-                            }))
-
-                        elif action == "FORCE_BUY" and bot_id:
-                            # Forward to the bot's control stream
-                            if redis:
-                                from ib_trader.redis.streams import StreamWriter
-                                writer = StreamWriter(redis, StreamNames.bot_control(bot_id), maxlen=100)
-                                await writer.add({"action": "FORCE_BUY"})
-                            logger.info(json.dumps({
-                                "event": "FORCE_BUY_FORWARDED",
-                                "bot_id": bot_id,
-                            }))
+                    bot_instances.pop(bot_id, None)
 
         except asyncio.CancelledError:
-            # Shutdown: cancel all running bots
             for bot_id, task in running_tasks.items():
                 task.cancel()
             await asyncio.gather(*running_tasks.values(), return_exceptions=True)

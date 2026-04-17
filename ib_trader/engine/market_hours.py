@@ -96,6 +96,18 @@ def is_overnight_session(now: datetime | None = None) -> bool:
     return mins < _BREAK_START_MINS or mins >= _OVERNIGHT_START_MINS
 
 
+def is_outside_rth(now: datetime | None = None) -> bool:
+    """True when outside Regular Trading Hours (9:30 AM – 4:00 PM ET).
+
+    Covers pre-market, after-hours, overnight, weekend, session break —
+    any time a MARKET order won't fill on NASDAQ/NYSE. Used by order
+    placement to convert market orders to aggressive limit orders.
+    """
+    n = _et(now)
+    mins = n.hour * 60 + n.minute
+    return mins < 9 * 60 + 30 or mins >= 16 * 60 or is_weekend_closure(n) or is_session_break(n)
+
+
 def is_ib_session_active(now: datetime | None = None) -> bool:
     """True when at least one IB US equity trading session is open.
 

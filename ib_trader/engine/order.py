@@ -23,7 +23,7 @@ from ib_trader.data.models import (
 )
 from ib_trader.engine.exceptions import IBOrderRejectedError, SafetyLimitError, TradeNotFoundError
 from ib_trader.engine.market_hours import (
-    is_ib_session_active, is_overnight_session, presubmitted_reason, session_label,
+    is_ib_session_active, is_overnight_session, is_outside_rth, presubmitted_reason, session_label,
 )
 
 
@@ -1044,8 +1044,8 @@ async def _execute_market_order(
     orders.  We auto-convert to an aggressive limit at the ask (BUY) or
     bid (SELL) so the order fills immediately at the best available price.
     """
-    if is_overnight_session():
-        # Overnight venue rejects market orders — convert to aggressive limit
+    if is_outside_rth():
+        # Outside RTH: exchanges reject market orders — convert to aggressive limit
         snapshot = await ctx.ib.get_market_snapshot(con_id)
         bid, ask = snapshot["bid"], snapshot["ask"]
         if bid == 0 and ask == 0:
@@ -1790,7 +1790,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         # Market order — immediate execution expected.
         # During overnight session, Blue Ocean ATS rejects market orders.
         # Convert to aggressive limit at the bid (SELL) or ask (BUY).
-        if is_overnight_session():
+        if is_outside_rth():
             snapshot = await ctx.ib.get_market_snapshot(con_id)
             bid, ask = snapshot["bid"], snapshot["ask"]
             if bid == 0 and ask == 0:

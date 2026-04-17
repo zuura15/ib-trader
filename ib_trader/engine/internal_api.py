@@ -48,6 +48,7 @@ class OrderResponse(BaseModel):
     serial: int
     order_ref: Optional[str] = None
     status: str
+    output: Optional[str] = None
 
 
 class CloseRequest(BaseModel):
@@ -142,6 +143,7 @@ async def place_order(req: OrderRequest):
             serial=result.get("serial", 0),
             order_ref=result.get("order_ref"),
             status=result.get("status", "SUBMITTED"),
+            output=result.get("output"),
         )
     except Exception as e:
         logger.exception('{"event": "INTERNAL_API_ORDER_FAILED"}')
@@ -166,10 +168,40 @@ async def close_position(req: CloseRequest):
             source=f"bot:{req.bot_ref}" if req.bot_ref else "api",
             bot_ref=req.bot_ref,
         )
-        return {"status": "ok", "result": result}
+        return {"status": "ok", "output": result.get("output"), "result": result}
     except Exception as e:
         logger.exception('{"event": "INTERNAL_API_CLOSE_FAILED"}')
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/engine/cancel-by-symbol")
+async def cancel_by_symbol(req: dict):
+    """Cancel every open IB order for a given symbol.
+
+    Used by tests / cleanup tooling so we never carry orphan working
+    orders across runs (NYSE self-trade prevention will block new BUYs
+    against any resting SELL on the same symbol).
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    symbol = (req.get("symbol") or "").upper()
+    if not symbol:
+        raise HTTPException(status_code=422, detail="symbol required")
+    open_orders = await _ctx.ib.get_open_orders()
+    targets = [o for o in open_orders if (o.get("symbol") or "").upper() == symbol]
+    cancelled: list[str] = []
+    for order in targets:
+        oid = str(order["ib_order_id"])
+        try:
+            await _ctx.ib.cancel_order(oid)
+            cancelled.append(oid)
+        except Exception:
+            logger.exception('{"event": "CANCEL_BY_SYMBOL_FAILED", "ib_order_id": "%s"}', oid)
+    logger.info(
+        '{"event": "CANCEL_BY_SYMBOL", "symbol": "%s", "cancelled": %d}',
+        symbol, len(cancelled),
+    )
+    return {"symbol": symbol, "cancelled": cancelled, "count": len(cancelled)}
 
 
 @app.post("/engine/subscribe-bars")
@@ -263,6 +295,18 @@ async def reload_watchlist():
     except Exception as e:
         logger.exception('{"event": "RELOAD_WATCHLIST_FAILED"}')
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engine/positions")
+async def get_positions():
+    """Return current IB positions from the engine's in-memory cache.
+
+    The cache is refreshed by positionEvent callbacks (real-time) and a
+    30s poll loop (fallback). No Redis — the API proxies here directly.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    return _ctx.positions_cache
 
 
 @app.get("/engine/health", response_model=HealthResponse)
