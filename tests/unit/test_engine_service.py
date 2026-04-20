@@ -5,7 +5,6 @@ pending_commands audit rows.
 """
 from datetime import datetime, timezone
 
-import pytest
 
 from ib_trader.data.models import PendingCommand, PendingCommandStatus
 from ib_trader.engine.service import _ListRenderer, recover_stale_commands

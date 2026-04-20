@@ -173,8 +173,8 @@ class OutputRouter:
         if self._renderer is not None:
             try:
                 self._renderer.update_order_row(serial, data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("update_order_row failed", exc_info=e)
 
     # ------------------------------------------------------------------
     # Internal helpers

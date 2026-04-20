@@ -33,7 +33,7 @@ async def list_open_orders(redis=Depends(get_redis)):
     from ib_trader.redis.state import StateKeys
     raw = await redis.hgetall(StateKeys.orders_open())
     orders = []
-    for oid, val in raw.items():
+    for _oid, val in raw.items():
         try:
             order = json.loads(val)
             orders.append(order)
@@ -54,8 +54,8 @@ async def get_order(ib_order_id: str, redis=Depends(get_redis)):
         raise HTTPException(status_code=404, detail="Order not found (may have already completed)")
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=500, detail="Corrupt order data")
+    except (json.JSONDecodeError, TypeError) as e:
+        raise HTTPException(status_code=500, detail="Corrupt order data") from e
 
 
 @router.post("/cancel-by-symbol")

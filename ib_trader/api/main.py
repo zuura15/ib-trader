@@ -28,14 +28,14 @@ logger = logging.getLogger(__name__)
 @click.option("--env", default=".env", help="Environment file path")
 @click.option("--settings", "settings_path", default="config/settings.yaml",
               help="Settings YAML path")
-@click.option("--host", default="0.0.0.0", help="API server bind host")
+@click.option("--host", default="0.0.0.0", help="API server bind host")  # noqa: S104 — intentional LAN bind (see README)
 @click.option("--port", default=8000, type=int, help="API server port")
 def main(db: str, env: str, settings_path: str, host: str, port: int):
     """IB Trader API Server — REST API for the trading platform."""
     setup_logging()
 
     # Load configuration
-    env_vars = load_env(env)
+    load_env(env)
     settings = load_settings(settings_path)
 
     # Check DB permissions
@@ -69,8 +69,6 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
     # Write API heartbeat
     pid = os.getpid()
     heartbeats = HeartbeatRepository(session_factory)
-    from datetime import datetime, timezone
-    from ib_trader.data.models import SystemHeartbeat
     heartbeats.upsert("API", pid)
     logger.info('{"event": "API_STARTED", "pid": %d, "port": %d}', pid, port)
     print(f"[API] Starting on {host}:{port} (pid={pid}). No broker connection needed.")

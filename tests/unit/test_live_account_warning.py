@@ -5,7 +5,6 @@ Verifies:
 - Account ID not starting with 'DU' → warning generated
 - LIVE_ACCOUNT_CONNECTED event logged when live account detected
 """
-import pytest
 
 
 class TestLiveAccountDetection:

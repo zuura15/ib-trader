@@ -21,6 +21,18 @@ _apply_overnight_patch()
 
 logger = logging.getLogger(__name__)
 
+# Retain references to fire-and-forget asyncio tasks so the loop's weakref
+# collection doesn't cancel them mid-flight. See Python docs on create_task.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """Create an asyncio task, track it, and auto-discard on completion."""
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 class InsyncClient(IBClientBase):
     """IB API client implemented via ib_async.
@@ -154,6 +166,10 @@ class InsyncClient(IBClientBase):
     def is_connected(self) -> bool:
         """Return True if the underlying IB connection is alive."""
         return self._ib.isConnected()
+
+    def managed_accounts(self) -> list[str]:
+        """Return the IB account IDs attached to this Gateway session."""
+        return list(self._ib.managedAccounts())
 
     async def qualify_contract(
         self,
@@ -588,8 +604,8 @@ class InsyncClient(IBClientBase):
             if not entry.get("enriched"):
                 try:
                     self._ib.cancelMktData(entry["contract"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("cancelMktData failed during upgrade", exc_info=e)
                 ticker = self._ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
                 entry["ticker"] = ticker
                 entry["enriched"] = True
@@ -625,8 +641,8 @@ class InsyncClient(IBClientBase):
         if entry["refs"] <= 0:
             try:
                 self._ib.cancelMktData(entry["contract"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelMktData failed on unsubscribe", exc_info=e)
             del self._streaming[con_id]
             logger.info(
                 '{"event": "STREAMING_SUB_CANCELLED", "con_id": %d}', con_id,
@@ -787,7 +803,7 @@ class InsyncClient(IBClientBase):
                         try:
                             import asyncio
                             if asyncio.iscoroutinefunction(cb):
-                                asyncio.ensure_future(cb(bar_data))
+                                _spawn_background(cb(bar_data))
                             else:
                                 cb(bar_data)
                         except Exception as exc:
@@ -811,8 +827,8 @@ class InsyncClient(IBClientBase):
         if entry["refs"] <= 0:
             try:
                 self._ib.cancelRealTimeBars(entry["bars"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelRealTimeBars failed", exc_info=e)
             del self._realtime_bars[con_id]
             logger.info(
                 '{"event": "RT_BARS_CANCELLED", "con_id": %d}', con_id,
@@ -853,13 +869,24 @@ class InsyncClient(IBClientBase):
         newer ib_async versions without breaking older ones.
         """
         ib_order_id = str(reqId)
+        is_info = errorCode in self._INFO_CODES
         if ib_order_id in self._active_trades:
-            logger.error(
-                '{"event": "IB_ORDER_ERROR", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
-                ib_order_id, errorCode, errorString,
-            )
-            self._order_errors[ib_order_id] = f"[{errorCode}] {errorString}"
-        elif errorCode in self._INFO_CODES:
+            # INFO-class codes (e.g. 10340 ManualOrderIndicator) still
+            # reference an active order but must NOT be treated as a
+            # rejection — log at INFO and skip the _order_errors write
+            # so downstream code doesn't surface a false failure.
+            if is_info:
+                logger.info(
+                    '{"event": "IB_NOTICE", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+            else:
+                logger.error(
+                    '{"event": "IB_ORDER_ERROR", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+                self._order_errors[ib_order_id] = f"[{errorCode}] {errorString}"
+        elif is_info:
             logger.info(
                 '{"event": "IB_NOTICE", "reqId": %d, "code": %d, "msg": "%s"}',
                 reqId, errorCode, errorString,
@@ -927,12 +954,11 @@ class InsyncClient(IBClientBase):
             fill.execution.exchange,
         )
 
-        loop = asyncio.get_event_loop()
         # Dispatch to order-specific callbacks, then global callbacks.
         for cb in self._fill_callbacks.get(ib_order_id, []):
-            loop.create_task(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
         for cb in self._fill_callbacks.get("_GLOBAL", []):
-            loop.create_task(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
 
     def _on_order_status(self, trade: Trade) -> None:
         """Handle order status change event from IB and dispatch to callbacks.
@@ -982,12 +1008,11 @@ class InsyncClient(IBClientBase):
             )
             return
 
-        loop = asyncio.get_event_loop()
         # Dispatch to order-specific callbacks, then global callbacks.
         for cb in self._status_callbacks.get(ib_order_id, []):
-            loop.create_task(cb(ib_order_id, status))
+            _spawn_background(cb(ib_order_id, status))
         for cb in self._status_callbacks.get("_GLOBAL", []):
-            loop.create_task(cb(ib_order_id, status))
+            _spawn_background(cb(ib_order_id, status))
 
         # Auto-cleanup after terminal status dispatch.
         if status in self._TERMINAL_STATUSES:

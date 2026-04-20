@@ -4,12 +4,14 @@ The engine runs the internal HTTP API (see engine/internal_api.py); this
 module provides the execute_single_command coroutine that the API invokes
 to run buy/sell/close commands and the historical-bar warmup helper.
 """
+import asyncio
 import dataclasses
 import json
 import logging
 
 from ib_trader.config.context import AppContext
 from ib_trader.data.models import PendingCommandStatus
+from ib_trader.redis.streams import StreamNames, StreamWriter
 from ib_trader.repl.commands import (
     BuyCommand, SellCommand, CloseCommand, parse_command,
 )
@@ -50,17 +52,64 @@ class _ListRenderer:
     Used by the engine service to capture command output for writing
     back to the pending_commands table. Also captures structured metadata
     (trade serial, order_ref) for the internal HTTP API.
+
+    When ``redis`` and ``cmd_id`` are provided, every captured message is
+    also XADDed to ``cmd:{cmd_id}:output`` so the frontend can render it
+    live via a WebSocket subscription without waiting for the HTTP
+    response to complete.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, redis=None, cmd_id: str | None = None) -> None:
         self.messages: list[str] = []
         self.metadata: dict = {}  # Structured data: serial, order_ref, etc.
+        self._writer: StreamWriter | None = None
+        if redis is not None and cmd_id:
+            self._writer = StreamWriter(
+                redis, StreamNames.command_output(cmd_id), maxlen=500,
+            )
+
+    def _append(self, message: str, severity=None) -> None:
+        # OutputRouter routes WARNING/ERROR messages to BOTH panes, which
+        # calls write_log and write_command_output back-to-back with the
+        # same text. Collapse that adjacent duplicate so the HTTP response
+        # output doesn't show the same line twice.
+        if self.messages and self.messages[-1] == message:
+            return
+        self.messages.append(message)
+        self._publish(message, severity)
+
+    def _publish(self, message: str, severity) -> None:
+        if self._writer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop — sync test path, skip publish
+        sev = getattr(severity, "value", None) or "info"
+        loop.create_task(self._writer.add({
+            "type": "line",
+            "message": message,
+            "severity": sev,
+        }))
+
+    async def publish_terminal(self, status: str, error: str | None = None) -> None:
+        """Emit a terminal marker so WS subscribers can close the stream."""
+        if self._writer is None:
+            return
+        try:
+            await self._writer.add({
+                "type": "done",
+                "status": status,
+                "error": error or "",
+            })
+        except Exception:
+            logger.debug('{"event": "CMD_OUTPUT_TERMINAL_PUBLISH_FAILED"}')
 
     def write_log(self, message: str, severity=None) -> None:
-        self.messages.append(message)
+        self._append(message, severity)
 
     def write_command_output(self, message: str, severity=None) -> None:
-        self.messages.append(message)
+        self._append(message, severity)
 
     def update_order_row(self, serial, data) -> None:
         # Capture the serial when the order row is updated
@@ -195,6 +244,7 @@ async def execute_single_command(
     command_text: str,
     source: str = "api",
     bot_ref: str | None = None,
+    cmd_id: str | None = None,
 ) -> dict:
     """Execute a buy/sell/close/built-in command for the internal HTTP API.
 
@@ -211,7 +261,14 @@ async def execute_single_command(
     Returns:
         Dict with keys: status, output, serial, order_ref.
     """
-    renderer = _ListRenderer()
+    # The cmd_id (if caller supplied one — the public API forwards the
+    # frontend-generated UUID so the browser can subscribe to live output
+    # before the POST returns) doubles as both the pending-commands audit
+    # id and the Redis output-stream key.
+    import uuid as _uuid
+    resolved_cmd_id = cmd_id or str(_uuid.uuid4())
+
+    renderer = _ListRenderer(redis=getattr(ctx, "redis", None), cmd_id=resolved_cmd_id)
     cmd_router = OutputRouter()
     cmd_router.set_renderer(renderer)
     cmd_ctx = dataclasses.replace(ctx, router=cmd_router)
@@ -222,12 +279,11 @@ async def execute_single_command(
             await publish_activity(ctx.redis, "commands")
 
     # Write audit log to pending_commands (write-only, never read on hot path)
-    audit_id = None
+    audit_id: str | None = None
     if ctx.pending_commands:
         from ib_trader.data.models import PendingCommand
-        import uuid
         from datetime import datetime as _dt, timezone as _tz
-        audit_id = str(uuid.uuid4())
+        audit_id = resolved_cmd_id
         cmd = PendingCommand(
             id=audit_id,
             source=source,
@@ -247,14 +303,16 @@ async def execute_single_command(
             if audit_id:
                 ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
                 await _notify_commands_changed()
-            return {"status": "FAILURE", "output": error}
+            await renderer.publish_terminal("FAILURE", error=error)
+            return {"status": "FAILURE", "output": error, "cmd_id": resolved_cmd_id}
 
         if isinstance(parsed, str):
             output = _handle_builtin(parsed, cmd_ctx)
             if audit_id:
                 ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
                 await _notify_commands_changed()
-            return {"status": "SUCCESS", "output": output}
+            await renderer.publish_terminal("SUCCESS")
+            return {"status": "SUCCESS", "output": output, "cmd_id": resolved_cmd_id}
 
         if isinstance(parsed, (BuyCommand, SellCommand)):
             from ib_trader.engine.order import execute_order
@@ -275,7 +333,7 @@ async def execute_single_command(
 
         # Use structured metadata from the renderer (set by update_order_row
         # and execute_order) instead of parsing output text
-        result = {"status": "SUCCESS", "output": output}
+        result = {"status": "SUCCESS", "output": output, "cmd_id": resolved_cmd_id}
         result.update(renderer.metadata)
 
         # Build order_ref from bot_ref + the engine-allocated serial
@@ -289,6 +347,7 @@ async def execute_single_command(
             except (ValueError, AttributeError):
                 pass
 
+        await renderer.publish_terminal("SUCCESS")
         return result
 
     except Exception as e:
@@ -296,4 +355,5 @@ async def execute_single_command(
         if audit_id:
             ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
             await _notify_commands_changed()
+        await renderer.publish_terminal("FAILURE", error=error)
         raise

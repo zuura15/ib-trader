@@ -78,7 +78,7 @@ class TestStreamReader:
 
         result = await StreamReader.read_latest(fake_redis, "test:stream")
         assert result is not None
-        entry_id, data = result
+        _entry_id, data = result
         assert data["val"] == "second"
 
 

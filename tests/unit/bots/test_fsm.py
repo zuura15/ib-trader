@@ -6,14 +6,12 @@ mutate the stored doc.
 """
 from __future__ import annotations
 
-import json
 from decimal import Decimal
 
 import pytest
 
 from ib_trader.bots.fsm import (
-    FSM, BotState, BotEvent, EventType, TransitionResult,
-    _TRANSITIONS,
+    FSM, BotState, BotEvent, EventType, _TRANSITIONS,
 )
 
 
@@ -109,12 +107,18 @@ async def test_stop_from_awaiting_entry(fsm):
 
 @pytest.mark.asyncio
 async def test_stop_from_entry_order_placed_requests_cancel(fsm):
-    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {"serial": 42})
+    # cancel-by-symbol is the runtime-side resolution path because we
+    # need to handle pre-fill orders that have no trade serial yet.
+    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
+        "serial": 42, "symbol": "F", "ib_order_id": "ib-123",
+    })
     result = await fsm.dispatch(BotEvent(EventType.STOP))
     assert result.new_state == BotState.OFF
     assert len(result.side_effects) == 1
     assert result.side_effects[0].action == "cancel_order"
-    assert result.side_effects[0].args == {"serial": 42}
+    assert result.side_effects[0].args == {
+        "symbol": "F", "serial": 42, "ib_order_id": "ib-123",
+    }
 
 
 @pytest.mark.asyncio
@@ -247,11 +251,14 @@ async def test_entry_cancelled_returns_to_awaiting_entry(fsm):
 
 @pytest.mark.asyncio
 async def test_entry_timeout_cancels_order(fsm):
-    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {"serial": 42})
+    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
+        "serial": 42, "symbol": "F", "ib_order_id": "ib-123",
+    })
     result = await fsm.dispatch(BotEvent(EventType.ENTRY_TIMEOUT))
     assert result.new_state == BotState.AWAITING_ENTRY_TRIGGER
     assert any(
-        s.action == "cancel_order" and s.args == {"serial": 42}
+        s.action == "cancel_order"
+        and s.args == {"symbol": "F", "serial": 42, "ib_order_id": "ib-123"}
         for s in result.side_effects
     )
 

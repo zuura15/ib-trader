@@ -4,11 +4,14 @@ GET /api/status — heartbeats, alerts, system health, account info, P&L
 All live state reads from Redis. SQLite is not queried.
 """
 import json as _json
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from ib_trader.api.deps import get_redis
-from ib_trader.redis.state import StateKeys
+from ib_trader.redis.state import StateKeys, StateStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["system"])
 
@@ -49,24 +52,36 @@ async def get_status(redis=Depends(get_redis)):
 
                     if process_name == "ENGINE" and alive:
                         engine_uptime_seconds = round(age)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("failed to parse heartbeat for %s", process_name, exc_info=e)
 
     # Connection status
     engine_alive = service_health.get("engine", False)
     connection_status = "connected" if engine_alive else "disconnected"
 
-    # Account mode from .env
-    from ib_trader.config.loader import load_env
+    # Account mode — prefer what the engine actually connected to (written
+    # to Redis at engine startup). Fall back to a best-effort .env parse
+    # only when the engine hasn't run yet; that path is an educated guess,
+    # not a source of truth.
     account_mode = "unknown"
     acct = ""
-    try:
-        env_vars = load_env()
-        acct = env_vars.get("IB_ACCOUNT_ID", "")
-    except Exception:
-        pass
-    if acct:
-        account_mode = "paper" if acct.startswith("DU") else "live"
+    if redis:
+        try:
+            session = await StateStore(redis).get(StateKeys.engine_session())
+            if session:
+                account_mode = session.get("account_mode") or "unknown"
+                acct = session.get("account_id") or ""
+        except Exception as e:
+            logger.debug("engine session read failed", exc_info=e)
+    if account_mode == "unknown":
+        from ib_trader.config.loader import load_env
+        try:
+            env_vars = load_env()
+            acct = env_vars.get("IB_ACCOUNT_ID", "")
+            if acct:
+                account_mode = "paper" if acct.startswith("DU") else "live"
+        except Exception as e:
+            logger.debug("failed to load account env", exc_info=e)
 
     # Open alerts from Redis
     alert_list = []
@@ -74,14 +89,14 @@ async def get_status(redis=Depends(get_redis)):
     if redis:
         try:
             raw_alerts = await redis.hgetall(StateKeys.alerts_active())
-            for aid, val in raw_alerts.items():
+            for _aid, val in raw_alerts.items():
                 try:
                     alert_list.append(_json.loads(val))
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    logger.debug("failed to decode alert", exc_info=e)
             alert_count = len(alert_list)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("alerts fetch failed", exc_info=e)
 
     # Realized P&L from bot:stats:* Redis hashes
     realized_pnl = 0.0
@@ -93,10 +108,10 @@ async def get_status(redis=Depends(get_redis)):
                     try:
                         stats = _json.loads(raw)
                         realized_pnl += float(stats.get("pnl_today", 0))
-                    except (ValueError, TypeError):
-                        pass
-        except Exception:
-            pass
+                    except (ValueError, TypeError) as e:
+                        logger.debug("failed to parse bot stats", exc_info=e)
+        except Exception as e:
+            logger.debug("realized pnl scan failed", exc_info=e)
 
     return {
         "heartbeats": hb_list,

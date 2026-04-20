@@ -209,8 +209,8 @@ def check_file_permissions(path: str, required_mode: int, label: str) -> None:
     """
     try:
         file_stat = os.stat(path)
-    except FileNotFoundError:
-        raise ConfigurationError(f"{label} file not found: {path}")
+    except FileNotFoundError as err:
+        raise ConfigurationError(f"{label} file not found: {path}") from err
 
     actual_mode = stat.S_IMODE(file_stat.st_mode)
     if actual_mode != required_mode:

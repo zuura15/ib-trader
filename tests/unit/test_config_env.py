@@ -18,7 +18,7 @@ class TestLoadEnv:
         assert env["IB_ACCOUNT_ID"] == "U1234567"
 
     def test_missing_env_file_raises(self):
-        with pytest.raises(ConfigurationError, match=".env file not found"):
+        with pytest.raises(ConfigurationError, match=r"\.env file not found"):
             load_env("/nonexistent/.env")
 
     def test_wrong_permissions_raises(self, tmp_path):

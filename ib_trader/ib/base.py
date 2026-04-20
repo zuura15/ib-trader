@@ -62,6 +62,18 @@ class IBClientBase(ABC):
         ...
 
     @abstractmethod
+    def managed_accounts(self) -> list[str]:
+        """Return the account IDs this Gateway session can trade.
+
+        IB authenticates at the session level; the account ID on each
+        order is validated against this list by IB on submission. Call
+        this after connect() to verify the configured account_id is
+        actually one the Gateway can reach — catches wrong-env-var
+        configs before any order is placed.
+        """
+        ...
+
+    @abstractmethod
     async def qualify_contract(
         self,
         symbol: str,

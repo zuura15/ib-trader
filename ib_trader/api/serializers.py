@@ -4,7 +4,6 @@ All Decimal fields serialize as strings to avoid float precision loss.
 All datetimes serialize as ISO 8601 UTC strings.
 """
 from datetime import datetime
-from decimal import Decimal
 from pydantic import BaseModel, ConfigDict
 
 
@@ -12,6 +11,7 @@ class CommandRequest(BaseModel):
     """Request body for POST /api/commands."""
     command: str
     broker: str = "ib"
+    command_id: str | None = None  # Client-supplied id; keys the live-output Redis stream so the frontend can subscribe before the POST returns.
 
 
 class CommandResponse(BaseModel):

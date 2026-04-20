@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -25,13 +25,9 @@ except ImportError:
     _RedisConnectionError = type(None)
 from sqlalchemy.orm import scoped_session
 
-from ib_trader.data.models import (
-    PendingCommandStatus,
-)
 from ib_trader.data.repository import (
-    TradeRepository, HeartbeatRepository, AlertRepository,
+    TradeRepository,
 )
-from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 
 logger = logging.getLogger(__name__)
@@ -124,7 +120,7 @@ def _serialize_heartbeat(h) -> dict:
 
 def _hash_snapshot(data: list[dict]) -> str:
     """Hash a list of dicts for diff detection."""
-    return hashlib.md5(_json_dumps(data).encode()).hexdigest()
+    return hashlib.md5(_json_dumps(data).encode(), usedforsecurity=False).hexdigest()
 
 
 def _compute_diff(old: list[dict], new: list[dict], key: str = "id") -> dict:
@@ -302,11 +298,11 @@ async def _fetch_channel_data_async(
             from ib_trader.redis.state import StateKeys
             raw = await redis.hgetall(StateKeys.alerts_active())
             data = []
-            for aid, val in raw.items():
+            for _aid, val in raw.items():
                 try:
                     data.append(_json.loads(val))
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    logger.debug("failed to decode alert", exc_info=e)
         except Exception:
             logger.exception(json.dumps({"event": "ALERTS_REDIS_READ_FAILED"}))
 
@@ -317,11 +313,11 @@ async def _fetch_channel_data_async(
             import json as _json
             raw = await redis.hgetall(StateKeys.orders_open())
             data = []
-            for oid, val in raw.items():
+            for _oid, val in raw.items():
                 try:
                     data.append(_json.loads(val))
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    logger.debug("failed to decode order", exc_info=e)
         except Exception:
             logger.exception(json.dumps({"event": "ORDERS_REDIS_READ_FAILED"}))
 
@@ -336,7 +332,7 @@ async def _fetch_channel_data_async(
             heartbeats = await _asyncio.gather(
                 *[bss.get_heartbeat(d["id"]) for d in data]
             ) if redis else [None] * len(data)
-            for d, doc, hb in zip(data, docs, heartbeats):
+            for d, doc, hb in zip(data, docs, heartbeats, strict=True):
                 state = doc.get("state") or BotState.OFF.value
                 d["state"] = state
                 # Legacy alias until frontend is migrated
@@ -384,7 +380,7 @@ async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
             results = await redis.xread({stream: last_id}, block=10000)
             if not results:
                 continue
-            for stream_name, entries in results:
+            for _stream_name, entries in results:
                 for entry_id, raw_data in entries:
                     last_id = entry_id
                     data = {}
@@ -445,8 +441,8 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
                 "strategy": state_doc,
                 "position": state_doc,
             }))
-        except (RuntimeError, WebSocketDisconnect):
-            raise asyncio.CancelledError()
+        except (RuntimeError, WebSocketDisconnect) as e:
+            raise asyncio.CancelledError() from e
 
     while True:
         try:
@@ -554,8 +550,8 @@ async def _stream_logs_to_ws(websocket: WebSocket, log_path: str, backlog: int =
                 if f is not None:
                     try:
                         f.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("log file close failed", exc_info=e)
                 f, current_inode = await asyncio.to_thread(_open_at_tail)
 
             new_lines = await asyncio.to_thread(_read_available, f)
@@ -567,6 +563,58 @@ async def _stream_logs_to_ws(websocket: WebSocket, log_path: str, backlog: int =
         return
     except Exception:
         logger.exception(json.dumps({"event": "WS_LOGS_STREAM_ERROR"}))
+
+
+async def _stream_command_output_to_ws(
+    websocket: WebSocket, redis, cmd_id: str,
+) -> None:
+    """Push live command-output lines from Redis to the WebSocket client.
+
+    The engine XADDs each ``ctx.router.emit`` to ``cmd:{cmd_id}:output``
+    with a ``{"type":"line","message":"…","severity":"…"}`` payload, and
+    emits a final ``{"type":"done","status":"SUCCESS"|"FAILURE",...}``
+    marker. We XREAD from "0" so subscriptions that race the first XADD
+    still replay everything from the start. When the terminal marker
+    arrives the stream is done — stop listening.
+    """
+    from ib_trader.redis.streams import StreamNames
+
+    stream = StreamNames.command_output(cmd_id)
+    last_id = "0"
+    while True:
+        try:
+            results = await redis.xread({stream: last_id}, block=30000)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            return
+        except (ConnectionError, OSError, _RedisConnectionError):
+            return
+        except Exception:
+            logger.exception('{"event": "WS_CMD_OUTPUT_READ_ERROR", "cmd_id": "%s"}', cmd_id)
+            await asyncio.sleep(1)
+            continue
+
+        if not results:
+            continue
+
+        for _stream_name, entries in results:
+            for entry_id, raw_data in entries:
+                last_id = entry_id
+                data = {}
+                for k, v in raw_data.items():
+                    try:
+                        data[k] = json.loads(v)
+                    except (ValueError, TypeError):
+                        data[k] = v
+                try:
+                    await websocket.send_text(_json_dumps({
+                        "type": "command_output",
+                        "cmd_id": cmd_id,
+                        "data": data,
+                    }))
+                except (WebSocketDisconnect, RuntimeError):
+                    return
+                if data.get("type") == "done":
+                    return
 
 
 async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
@@ -595,8 +643,8 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
                 "type": "positions",
                 "data": positions,
             }))
-        except (RuntimeError, WebSocketDisconnect):
-            raise asyncio.CancelledError()  # WS closed — exit the stream task
+        except (RuntimeError, WebSocketDisconnect) as e:
+            raise asyncio.CancelledError() from e  # WS closed — exit the stream task
 
     # Initial snapshot so the UI hydrates immediately
     await push_snapshot()
@@ -769,6 +817,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     stream_tasks.append(task)
 
+                elif msg_type == "subscribe_command_output" and redis:
+                    cmd_id = msg.get("cmd_id", "")
+                    if cmd_id:
+                        task = asyncio.create_task(
+                            _stream_command_output_to_ws(websocket, redis, cmd_id)
+                        )
+                        stream_tasks.append(task)
+
                 elif msg_type == "subscribe_logs":
                     import os as _os
                     log_path = _os.environ.get("IB_TRADER_LOG_FILE", "logs/ib_trader.log")
@@ -811,8 +867,8 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.exception(json.dumps({"event": "WEBSOCKET_ERROR"}))
         try:
             await websocket.close(code=1011)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("websocket close failed", exc_info=e)
     finally:
         for t in stream_tasks:
             t.cancel()

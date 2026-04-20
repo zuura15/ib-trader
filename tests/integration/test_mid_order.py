@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import TransactionAction, LegType, TradeGroup, TradeStatus, TransactionEvent
+from ib_trader.data.models import TransactionAction, LegType, TradeGroup, TradeStatus
 from ib_trader.engine.order import execute_order, _handle_fill, _handle_partial, _OrderContext
 from ib_trader.engine.exceptions import IBOrderRejectedError
 
@@ -97,7 +97,6 @@ class TestOrderPlacementPreSubmitted:
         from datetime import datetime
         from zoneinfo import ZoneInfo
         from tests.conftest import MockIBClient
-        from ib_trader.engine.exceptions import IBOrderRejectedError
 
         class PreSubmittedMock(_PreSubmittedMock, MockIBClient):
             pass

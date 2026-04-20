@@ -4,12 +4,11 @@ POST /api/commands — forwards command to engine HTTP API (synchronous)
 GET /api/commands/{cmd_id} — get command result from audit log
 """
 import logging
-from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
-from ib_trader.api.deps import get_pending_commands, get_session_factory
+from ib_trader.api.deps import get_pending_commands
 from ib_trader.api.serializers import CommandRequest, CommandResponse, CommandStatusResponse
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.config.loader import load_settings
@@ -80,6 +79,7 @@ async def submit_command(body: CommandRequest):
                     "side": side,
                     "qty": qty,
                     "order_type": order_type,
+                    "cmd_id": body.command_id,
                 })
             elif verb == "close":
                 serial = int(parts[1]) if len(parts) > 1 else 0
@@ -87,6 +87,7 @@ async def submit_command(body: CommandRequest):
                 resp = await client.post(f"{engine_url}/engine/close", json={
                     "serial": serial,
                     "strategy": strategy,
+                    "cmd_id": body.command_id,
                 })
             else:
                 raise HTTPException(status_code=400, detail=f"Unknown command: {verb}")
@@ -102,24 +103,33 @@ async def submit_command(body: CommandRequest):
                         output = f"Order #{result['serial']} placed"
                     if result.get("order_ref"):
                         output += f" ({result['order_ref']})"
+                # Prefer the cmd_id echoed back by the engine (matches the
+                # Redis output stream the client has already subscribed to);
+                # fall back to the client-supplied id, then legacy fields.
+                cmd_id = (
+                    result.get("cmd_id")
+                    or body.command_id
+                    or result.get("ib_order_id")
+                    or "completed"
+                )
                 return CommandResponse(
-                    command_id=result.get("ib_order_id") or "completed",
+                    command_id=cmd_id,
                     status="completed",
                     output=output or "Order accepted",
                 )
             else:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
         raise HTTPException(
             status_code=503,
             detail="Engine not reachable. Is ib-engine running?",
-        )
+        ) from e
     except HTTPException:
         raise
     except Exception as e:
         logger.exception('{"event": "COMMAND_FORWARD_FAILED"}')
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/{cmd_id}", response_model=CommandStatusResponse)

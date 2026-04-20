@@ -1,6 +1,5 @@
 """Tests for bot framework: repositories, base class, registry, runner."""
 import pytest
-import json
 from datetime import datetime, timezone
 from decimal import Decimal
 

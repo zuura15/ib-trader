@@ -165,6 +165,17 @@ class StateKeys:
         """Per-process liveness key. TTL = PROCESS_HEARTBEAT_TTL."""
         return f"hb:{process}"
 
+    @staticmethod
+    def engine_session() -> str:
+        """Metadata about the engine's current IB connection.
+
+        Value shape: {account_id, account_mode ("paper"|"live"), port,
+        paper (bool), connected_at (isoformat)}. Written by the engine
+        on connect; read by /api/status so the UI reports what the
+        engine is actually talking to rather than parsing .env.
+        """
+        return "engine:session"
+
     PROCESS_HEARTBEAT_TTL = 120
 
     # ---- Helpers for writing live state from sync code ----

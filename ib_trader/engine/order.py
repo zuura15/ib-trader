@@ -23,7 +23,7 @@ from ib_trader.data.models import (
 )
 from ib_trader.engine.exceptions import IBOrderRejectedError, SafetyLimitError, TradeNotFoundError
 from ib_trader.engine.market_hours import (
-    is_ib_session_active, is_overnight_session, is_outside_rth, presubmitted_reason, session_label,
+    is_ib_session_active, is_outside_rth, presubmitted_reason, session_label,
 )
 
 
@@ -378,7 +378,7 @@ async def _execute_limit_order(
                }))
 
     # Register fill/status callbacks so SQLite gets updated on fill
-    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
+    ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
         if fill_ib_id == ib_order_id:
@@ -702,12 +702,10 @@ async def _execute_mid_order(
         )
     )
 
-    # Await fill or timeout
+    # Await full fill, cancel, or timeout. Loops across partial fills so a
+    # SMART split into 9+6 doesn't trip the PARTIAL path after the first 9.
     total_duration = float(settings["reprice_duration_seconds"])
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=total_duration + 2)
-    except asyncio.TimeoutError:
-        pass
+    await _await_full_fill_or_timeout(track, ib_order_id, qty, total_duration + 2, ctx)
 
     reprice_task.cancel()
     try:
@@ -741,7 +739,7 @@ async def _execute_mid_order(
 
         if _ib_final_status == "Inactive":
             _err = ctx.ib.get_order_error(ib_order_id)
-            reason = _err or f"IB set order Inactive"
+            reason = _err or "IB set order Inactive"
             if _why_held:
                 reason += f" (whyHeld: {_why_held!r})"
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
@@ -929,11 +927,9 @@ async def _execute_bid_ask_order(
     # Wait briefly to catch immediate fills (e.g. ask buy fills at once).
     # If not filled within bid_ask_wait_seconds, leave the GTC order live —
     # daemon reconciler will update the DB when IB eventually reports the fill.
+    # Use the partial-aware waiter so a split fill doesn't short-circuit us.
     bid_ask_wait = float(ctx.settings.get("bid_ask_wait_seconds", 30))
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=bid_ask_wait)
-    except asyncio.TimeoutError:
-        pass
+    await _await_full_fill_or_timeout(track, ib_order_id, qty, bid_ask_wait, ctx)
 
     status = await ctx.ib.get_order_status(ib_order_id)
     ib_status = status["status"]
@@ -958,7 +954,7 @@ async def _execute_bid_ask_order(
         _err = ctx.ib.get_order_error(ib_order_id) or ""
         _why = status.get("why_held") or ""
         if ib_status == "Inactive":
-            reason = _err or f"IB set order Inactive"
+            reason = _err or "IB set order Inactive"
             if _why:
                 reason += f" (whyHeld: {_why!r})"
             event_label = "INACTIVE"
@@ -1114,11 +1110,10 @@ async def _execute_market_order(
 
     ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
 
-    # Market orders should fill quickly — wait up to 30 seconds
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        pass
+    # Market orders should fill quickly — wait up to 30 seconds. Use the
+    # partial-aware waiter so a SMART split (fills arriving as 9 + 6, etc.)
+    # doesn't cause us to declare PARTIAL while the remainder is still en route.
+    await _await_full_fill_or_timeout(track, ib_order_id, qty, 30.0, ctx)
 
     status = await ctx.ib.get_order_status(ib_order_id)
     if _fill_qty > 0:
@@ -1191,6 +1186,38 @@ async def _handle_fill(
             ctx=ctx,
             trade_serial=trade_group.serial_number,
         )
+
+
+async def _await_full_fill_or_timeout(
+    track, ib_order_id: str, target_qty: Decimal,
+    timeout: float, ctx: AppContext,
+) -> None:
+    """Wait for cumulative fill >= target_qty, cancel, or timeout.
+
+    ``tracker.notify_filled`` sets ``fill_event`` on EVERY partial fill, so
+    a naive ``await wait_for(fill_event.wait(), ...)`` returns on the first
+    partial and causes the caller to declare PARTIAL + cancel while IB is
+    still filling the remainder (live SMART routing frequently splits an
+    order across venues and reports fills incrementally). We instead loop:
+    wait, clear, re-check cumulative filled qty, and keep waiting until
+    full fill, cancel, or the window elapses.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(track.fill_event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return
+        track.fill_event.clear()
+        if track.is_canceled:
+            return
+        status = await ctx.ib.get_order_status(ib_order_id)
+        if status["qty_filled"] >= target_qty:
+            return
 
 
 async def _handle_partial(

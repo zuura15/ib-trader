@@ -71,7 +71,7 @@ class TransactionRepository:
         return (
             s.query(TransactionEvent)
             .join(latest, TransactionEvent.id == latest.c.max_id)
-            .filter(TransactionEvent.is_terminal == False)  # noqa: E712
+            .filter(TransactionEvent.is_terminal == False)
             .all()
         )
 
@@ -190,7 +190,7 @@ class TransactionRepository:
         return (
             s.query(TransactionEvent)
             .join(latest, TransactionEvent.id == latest.c.max_id)
-            .filter(TransactionEvent.is_terminal == False)  # noqa: E712
+            .filter(TransactionEvent.is_terminal == False)
             .all()
         )
 

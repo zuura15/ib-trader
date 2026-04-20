@@ -20,6 +20,16 @@ Guarantees
    refused unless ``force=True``; force performs an explicit stop-then-
    delete of the DB row.
 
+Source of truth for "is this bot running?"
+------------------------------------------
+The caller passes ``running_bot_ids`` — a snapshot of the FSM state in
+Redis. SQLite ``bots.status`` is no longer consulted for this gating
+decision; it remained a stale derivative view that could drift after a
+crash and is being phased out. At startup the runner hasn't spawned
+any bots yet, so ``running_bot_ids=None`` (equivalent to empty) is the
+correct default. The API reload endpoint snapshots Redis FSM state
+before calling.
+
 The function is synchronous + transactional; it runs once at process
 startup and again when the reload endpoint fires. Not on the hot path.
 """
@@ -31,7 +41,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 from sqlalchemy.orm import scoped_session
 
@@ -40,6 +49,11 @@ from ib_trader.bots.config_loader import DEFAULT_BOTS_DIR
 from ib_trader.bots.definition import BotDefinition
 from ib_trader.data.models import Bot, BotStatus
 from ib_trader.data.repositories.bot_repository import BotRepository
+
+# `BotStatus` import is retained because the inserter still seeds new
+# rows with `BotStatus.STOPPED`. Reads of `row.status` for the
+# RUNNING-gating decision have been removed in favour of Redis FSM.
+_ = BotStatus  # silence "unused" linters during the transition
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +148,7 @@ def bootstrap_bots_from_yaml(
     bots_dir: Path | str = DEFAULT_BOTS_DIR,
     *,
     force: bool = False,
+    running_bot_ids: frozenset[str] | set[str] | None = None,
 ) -> BootstrapReport:
     """Reconcile ``bots`` table to match the YAML directory.
 
@@ -141,9 +156,18 @@ def bootstrap_bots_from_yaml(
     call repeatedly. Populates the process-wide registry_config so other
     code paths can read bot definitions from memory.
 
+    ``running_bot_ids`` is the set of bot IDs the caller knows to be
+    running according to the live FSM in Redis. ``None`` means "the
+    caller has no live view" — typical at process startup before the
+    runner has spawned any bots — and is treated as the empty set. The
+    SQLite ``bots.status`` column is no longer consulted for this
+    decision because it can drift after a crash.
+
     Returns a BootstrapReport describing what changed. Raises
     BootstrapError when a refusal occurs without ``force``.
     """
+    running_set: frozenset[str] = frozenset(running_bot_ids or ())
+
     # Populate the in-memory registry first — this is the canonical
     # source of truth for the process. SQLite follows.
     definitions = registry_config.load(bots_dir)
@@ -158,7 +182,8 @@ def bootstrap_bots_from_yaml(
     for row_id, row in existing_rows.items():
         if row_id in defs_by_id:
             continue
-        if row.status == BotStatus.RUNNING and not force:
+        is_running = row_id in running_set
+        if is_running and not force:
             reason = (
                 f"SQLite row for bot_id={row_id!r} name={row.name!r} has no "
                 f"matching YAML in {bots_dir}. Bot is RUNNING — refuse to "
@@ -191,7 +216,7 @@ def bootstrap_bots_from_yaml(
             report.unchanged.append(d.id)
             continue
 
-        if existing.status == BotStatus.RUNNING:
+        if d.id in running_set:
             immutable_diff = _immutable_fields_changed(existing, d)
             if immutable_diff:
                 reason = (

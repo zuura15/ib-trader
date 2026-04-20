@@ -234,20 +234,50 @@ export const useStore = create<AppStore>((set, get) => ({
     }));
 
     if (DATA_MODE === 'live') {
+      // Subscribe to the live command-output Redis stream *before* the POST
+      // so we don't race the first XADD from the engine. Every line gets
+      // appended to the command bubble as it arrives; the final `done`
+      // marker unregisters the handler.
+      let liveOutput = '';
+      const unsubscribe = wsManager.subscribeCommandOutput(id, (msg) => {
+        const data = msg.data;
+        if (data.type === 'line' && data.message) {
+          liveOutput = liveOutput ? `${liveOutput}\n${data.message}` : data.message;
+          get().updateCommand(id, {
+            status: 'running' as CommandStatus,
+            output: liveOutput,
+          });
+        } else if (data.type === 'done') {
+          const isFailure = data.status === 'FAILURE';
+          get().updateCommand(id, {
+            status: (isFailure ? 'failure' : 'success') as CommandStatus,
+            output: liveOutput || data.error || undefined,
+            completedAt: new Date(),
+          });
+        }
+      });
+
       // Submit to API, then poll for completion
-      submitCommand(cmd).then(async (resp) => {
+      submitCommand(cmd, id).then(async (resp) => {
         const serverId = resp.command_id;
         console.log(`[store] Command submitted: ${cmd} → server id=${serverId} status=${resp.status}`);
 
         // Synchronous response: command already done (read-only commands or
         // immediate-fail orders). Skip polling.
         if (resp.status === 'completed' || (resp as any).output) {
-          store.updateCommand(id, {
-            id: serverId,
-            status: 'success' as CommandStatus,
-            output: (resp as any).output,
-            completedAt: new Date(),
-          });
+          // If the live stream already delivered terminal output, keep it;
+          // otherwise fall back to the HTTP-response text.
+          const current = get().commands.find((c) => c.id === id);
+          const alreadyTerminal = current?.status === 'success' || current?.status === 'failure';
+          if (!alreadyTerminal) {
+            store.updateCommand(id, {
+              id: serverId,
+              status: 'success' as CommandStatus,
+              output: (resp as any).output,
+              completedAt: new Date(),
+            });
+          }
+          unsubscribe();
           if ((resp as any).output) {
             store.addLogMessage('info', 'command.success',
               `${cmd}: ${(resp as any).output}`);
@@ -320,6 +350,7 @@ export const useStore = create<AppStore>((set, get) => ({
           completedAt: new Date(),
         });
       }).catch((err) => {
+        unsubscribe();
         store.updateCommand(id, {
           status: 'failure' as CommandStatus,
           output: `API error: ${err.message}`,

@@ -144,7 +144,7 @@ def test_untracked_fill_creates_entry(ledger):
         side="BUY", remaining=Decimal("0"),
     )
     assert any(e["terminal"] for e in events)
-    terminal = [e for e in events if e["terminal"]][0]
+    terminal = next(e for e in events if e["terminal"])
     assert terminal["filled_qty"] == "5"
 
 

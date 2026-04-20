@@ -10,7 +10,7 @@ import logging
 import logging.handlers
 import os
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,7 +81,6 @@ def setup_logging(
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = JSONFormatter()
-    level = getattr(logging, log_level.upper(), logging.INFO)
 
     # File handler (rotating, with optional gzip compression)
     if compress_old:

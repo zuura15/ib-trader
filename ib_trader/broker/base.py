@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from decimal import Decimal
 
 from ib_trader.broker.types import (
-    BrokerCapabilities, Instrument, Snapshot, OrderResult, FillResult,
+    BrokerCapabilities, Instrument, Snapshot, OrderResult,
 )
 from ib_trader.broker.fill_stream import FillStream
 from ib_trader.broker.market_hours import MarketHoursProvider
@@ -259,17 +259,14 @@ class BrokerClientBase(ABC):
     # These methods exist so that existing IB-specific engine code continues
     # working during the migration. They delegate to the new generic methods.
 
-    def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:
+    def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:  # noqa: B027 — optional override, default no-op
         """Legacy IB callback registration. Override in IBClient only."""
-        pass
 
-    def register_status_callback(self, callback, ib_order_id: str | None = None) -> None:
+    def register_status_callback(self, callback, ib_order_id: str | None = None) -> None:  # noqa: B027 — optional override, default no-op
         """Legacy IB callback registration. Override in IBClient only."""
-        pass
 
-    def unregister_callbacks(self, ib_order_id: str) -> None:
+    def unregister_callbacks(self, ib_order_id: str) -> None:  # noqa: B027 — optional override, default no-op
         """Legacy IB callback cleanup. Override in IBClient only."""
-        pass
 
     def has_contract_cached(self, con_id: int) -> bool:
         """Legacy IB method. Delegates to has_instrument_cached."""

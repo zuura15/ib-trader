@@ -47,10 +47,10 @@ export interface CommandStatusResponse {
   completed_at: string | null;
 }
 
-export function submitCommand(command: string, broker = 'ib') {
+export function submitCommand(command: string, commandId?: string, broker = 'ib') {
   return request<CommandSubmitResponse>('/commands', {
     method: 'POST',
-    body: JSON.stringify({ command, broker }),
+    body: JSON.stringify({ command, broker, command_id: commandId }),
   });
 }
 

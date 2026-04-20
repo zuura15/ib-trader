@@ -102,8 +102,8 @@ class AlpacaFillStream(FillStream):
         if self._stream:
             try:
                 await self._stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("alpaca stream close failed", exc_info=e)
         if self._task:
             self._task.cancel()
 
@@ -154,8 +154,9 @@ class AlpacaFillStream(FillStream):
         """
         self._replace_map[old_id] = new_id
 
-    async def wait_for_fill(self, broker_order_id: str,
-                             timeout: float = 30.0):
+    async def wait_for_fill(
+        self, broker_order_id: str, timeout: float = 30.0,
+    ):
         import asyncio
         event = asyncio.Event()
         self._watches[broker_order_id] = event
@@ -223,10 +224,10 @@ class AlpacaClient(BrokerClientBase):
                 "event": "ALPACA_CONNECTED",
                 "paper": self._paper,
             }))
-        except ImportError:
+        except ImportError as e:
             raise RuntimeError(
                 "alpaca-py SDK not installed. Install with: pip install alpaca-py"
-            )
+            ) from e
 
     async def disconnect(self) -> None:
         self._trading_client = None

@@ -8,13 +8,16 @@ reprice_duration_seconds: 10
 # The order stays live in IB after this window; daemon reconciler catches the fill.
 bid_ask_wait_seconds: 30
 ib_host: 127.0.0.1
-ib_port: 4001
+# Paper trading is the default. Gateway paper listens on 4002, live on 4001.
+# Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics
+# explicit; passing --live (or setting IB_PORT) switches to the live Gateway.
+ib_port: 4002
 ib_client_id: 1
 ib_min_call_interval_ms: 100
 # IB market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen.
-# Paper trading accounts must use 3 to avoid error 10197 (competing live session).
+# Paper accounts must use 3 to avoid error 10197 (competing live session).
 # Live accounts with real-time subscriptions should use 1.
-ib_market_data_type: 1
+ib_market_data_type: 3
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081

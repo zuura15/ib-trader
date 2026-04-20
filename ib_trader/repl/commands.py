@@ -88,8 +88,8 @@ def _parse_decimal(value: str, name: str) -> Decimal:
     """Parse a string as Decimal, raising ValueError on failure."""
     try:
         return Decimal(value)
-    except InvalidOperation:
-        raise ValueError(f"'{name}' must be a number, got: {value!r}")
+    except InvalidOperation as e:
+        raise ValueError(f"'{name}' must be a number, got: {value!r}") from e
 
 
 def parse_buy_sell(

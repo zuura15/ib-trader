@@ -62,6 +62,45 @@ const mockLogs = [
   { timestamp: new Date(Date.now() - 10000).toISOString(), level: 'ERROR', event: 'COMMAND_FAILED', message: 'No market data for GME' },
 ];
 
+// Bots fixture. One running, one stopped — enough to exercise toggle
+// (START/STOP) and force-buy button paths from Playwright.
+const mockBots = [
+  {
+    id: 'bot-alpha',
+    name: 'test-alpha',
+    strategy: 'strategy_bot',
+    status: 'STOPPED',
+    last_heartbeat: new Date().toISOString(),
+    last_signal: null,
+    last_action: null,
+    last_action_at: null,
+    error_message: null,
+    trades_total: 0,
+    trades_today: 0,
+    pnl_today: '0.00',
+    symbols_json: JSON.stringify(['F']),
+    ref_id: 'alpha',
+  },
+  {
+    id: 'bot-bravo',
+    name: 'test-bravo',
+    strategy: 'strategy_bot',
+    status: 'RUNNING',
+    last_heartbeat: new Date().toISOString(),
+    last_signal: 'BUY',
+    last_action: null,
+    last_action_at: null,
+    error_message: null,
+    trades_total: 3,
+    trades_today: 1,
+    pnl_today: '12.50',
+    symbols_json: JSON.stringify(['QQQ']),
+    ref_id: 'bravo',
+  },
+];
+
+const forceBuyHits = { count: 0, last_bot_id: null };
+
 // ── HTTP Server ──
 
 function parseBody(req) {
@@ -87,7 +126,10 @@ function json(res, data, status = 200) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const path = url.pathname;
+  // Vite's /api proxy target is VITE_API_URL which already contains /api,
+  // so proxied requests arrive as /api/api/<path>. Strip the doubled prefix
+  // so route matching below stays simple.
+  const path = url.pathname.replace(/^\/api\/api\//, '/api/');
   const method = req.method;
 
   // CORS preflight
@@ -210,7 +252,65 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (path === '/api/bots' && method === 'GET') {
-    return json(res, []);
+    return json(res, mockBots);
+  }
+
+  // Per-bot runtime state (position_state, entry_price, hwm…). Empty for
+  // the mock stack — the frontend handles the no-state case gracefully.
+  const stateMatch = path.match(/^\/api\/bots\/([^/]+)\/state$/);
+  if (stateMatch && method === 'GET') {
+    return json(res, {});
+  }
+
+  // Bot lifecycle endpoints: start / stop / force-buy / force-stop.
+  // These mutate mockBots and broadcast a WS diff on channel "bots" so
+  // the frontend's store.handleDiff picks up the status flip.
+  const lifecycleMatch = path.match(/^\/api\/bots\/([^/]+)\/(start|stop|force-buy|force-stop)$/);
+  if (lifecycleMatch && method === 'POST') {
+    const [, botId, action] = lifecycleMatch;
+    const bot = mockBots.find(b => b.id === botId);
+    if (!bot) return json(res, { detail: 'Bot not found' }, 404);
+
+    if (action === 'start') {
+      bot.status = 'RUNNING';
+      bot.last_heartbeat = new Date().toISOString();
+    } else if (action === 'stop') {
+      bot.status = 'STOPPED';
+    } else if (action === 'force-stop') {
+      bot.status = 'ERROR';
+      bot.error_message = 'Force-stopped by operator';
+    } else if (action === 'force-buy') {
+      forceBuyHits.count += 1;
+      forceBuyHits.last_bot_id = botId;
+      bot.last_action = 'FORCE_BUY';
+      bot.last_action_at = new Date().toISOString();
+    }
+
+    broadcastBotUpdate(bot);
+    return json(res, { bot_id: botId, action, status: bot.status.toLowerCase() });
+  }
+
+  // Test-only probe: lets playwright specs confirm the mock received
+  // the HTTP POST without racing the WS diff.
+  if (path === '/api/_test/force-buy-hits' && method === 'GET') {
+    return json(res, forceBuyHits);
+  }
+
+  // Test-only reset: restores the default bot fixture so tests that
+  // share the mock process don't inherit state from each other.
+  if (path === '/api/_test/reset' && method === 'POST') {
+    mockBots[0].status = 'STOPPED';
+    mockBots[0].error_message = null;
+    mockBots[0].last_action = null;
+    mockBots[0].last_action_at = null;
+    mockBots[1].status = 'RUNNING';
+    mockBots[1].error_message = null;
+    mockBots[1].last_action = null;
+    mockBots[1].last_action_at = null;
+    forceBuyHits.count = 0;
+    forceBuyHits.last_bot_id = null;
+    for (const bot of mockBots) broadcastBotUpdate(bot);
+    return json(res, { ok: true });
   }
 
   // 404
@@ -218,10 +318,27 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ── WebSocket ──
+// Serve WS on BOTH /ws and /api/ws. vite.config.ts builds the proxy
+// target by appending to VITE_API_URL (which contains /api), so the
+// upgrade lands on /api/ws when proxied through the Vite dev server.
+// Keeping /ws too for any direct-connection callers.
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ noServer: true });
+const wsClients = new Set();
+
+server.on('upgrade', (req, socket, head) => {
+  const rawPath = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  const path = rawPath.replace(/^\/api\/api\//, '/api/');
+  if (path === '/ws' || path === '/api/ws') {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on('connection', (ws) => {
+  wsClients.add(ws);
+  ws.on('close', () => wsClients.delete(ws));
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
@@ -234,6 +351,7 @@ wss.on('connection', (ws) => {
             alerts: mockAlerts,
             commands: [],
             heartbeats: mockHeartbeats,
+            bots: mockBots,
           },
         }));
       } else if (msg.type === 'ping') {
@@ -242,6 +360,23 @@ wss.on('connection', (ws) => {
     } catch {}
   });
 });
+
+// Broadcast a per-row diff on the "bots" channel so the frontend store
+// applies the new status via handleDiff. The wire format matches
+// WSDiff in frontend/src/api/ws.ts — added/updated/removed are top-level,
+// not nested under a "diff" key.
+function broadcastBotUpdate(bot) {
+  const payload = JSON.stringify({
+    type: 'diff',
+    channel: 'bots',
+    added: [],
+    updated: [bot],
+    removed: [],
+  });
+  for (const ws of wsClients) {
+    if (ws.readyState === 1) ws.send(payload);
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`Mock API server running on http://localhost:${PORT}`);

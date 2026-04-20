@@ -76,15 +76,19 @@ async def stop_bot(bot_id: str):
     if cur == BotState.OFF:
         return {"bot_id": bot_id, "state": "OFF", "message": "already off"}
 
-    # Signal the bot to stop and cancel the task
+    # Dispatch STOP first so the FSM emits the cancel_order side effect
+    # for any in-flight order while the bot's task is still alive (the
+    # executor reaches out via httpx → engine and needs the event loop
+    # running). Then signal stop + cancel the task.
     bot = bot_instances.pop(bot_id, None)
+    result = await fsm.dispatch(BotEvent(EventType.STOP))
+    if bot is not None and result is not None:
+        await bot._execute_side_effects(result)
     if bot and hasattr(bot, 'request_stop'):
         bot.request_stop()
     task = running_tasks.pop(bot_id, None)
     if task:
         task.cancel()
-
-    await fsm.dispatch(BotEvent(EventType.STOP))
 
     logger.info('{"event": "BOT_STOPPED_VIA_HTTP", "bot_id": "%s"}', bot_id)
     return {"bot_id": bot_id, "state": "OFF"}
@@ -98,17 +102,22 @@ async def force_stop_bot(bot_id: str):
     redis = state["redis"]
 
     bot = bot_instances.pop(bot_id, None)
+    fsm = FSM(bot_id, redis)
+    # FORCE_STOP itself emits no side effects today, but pass the result
+    # through the executor for symmetry / forward-compat. The cancel
+    # of any in-flight order on operator-initiated force stop should be
+    # added to ``_h_force_stop`` if/when desired.
+    result = await fsm.dispatch(BotEvent(
+        EventType.FORCE_STOP,
+        payload={"message": "Operator force-stop via HTTP"},
+    ))
+    if bot is not None and result is not None:
+        await bot._execute_side_effects(result)
     if bot and hasattr(bot, 'request_stop'):
         bot.request_stop()
     task = running_tasks.pop(bot_id, None)
     if task:
         task.cancel()
-
-    fsm = FSM(bot_id, redis)
-    await fsm.dispatch(BotEvent(
-        EventType.FORCE_STOP,
-        payload={"message": "Operator force-stop via HTTP"},
-    ))
 
     logger.info('{"event": "BOT_FORCE_STOPPED_VIA_HTTP", "bot_id": "%s"}', bot_id)
     return {"bot_id": bot_id, "state": "ERRORED", "error_reason": "force_stop"}
@@ -151,7 +160,7 @@ async def force_buy(bot_id: str):
         await fsm.dispatch(BotEvent(EventType.ENTRY_CANCELLED, payload={
             "reason": str(e),
         }))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     logger.info('{"event": "BOT_FORCE_BUY_VIA_HTTP", "bot_id": "%s"}', bot_id)
     return {"bot_id": bot_id, "state": "ENTRY_ORDER_PLACED", **result}

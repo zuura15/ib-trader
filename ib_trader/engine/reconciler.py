@@ -11,7 +11,6 @@ The reconciler is the SAFETY NET, not the primary update path. The primary
 path is push-based: IB callbacks → Redis streams + keys immediately.
 """
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -22,11 +21,25 @@ from ib_trader.redis.state import StateStore, StateKeys
 
 logger = logging.getLogger(__name__)
 
-# Position states
+# Reconciler-local vocabulary for the drift-detection logic below. The
+# authoritative bot lifecycle lives in ib_trader.bots.fsm.BotState; this
+# module only needs a coarse-grained "am I flat / entering / open /
+# exiting" view that matches IB order + position observations.
 FLAT = "FLAT"
 ENTERING = "ENTERING"
 OPEN = "OPEN"
 EXITING = "EXITING"
+
+
+def _fsm_to_pos_state(fsm_state: str | None) -> str:
+    """Map ib_trader.bots.fsm.BotState values to the reconciler's
+    coarse-grained vocabulary. Used only for drift detection."""
+    return {
+        "AWAITING_ENTRY_TRIGGER": FLAT,
+        "ENTRY_ORDER_PLACED": ENTERING,
+        "AWAITING_EXIT_TRIGGER": OPEN,
+        "EXIT_ORDER_PLACED": EXITING,
+    }.get(fsm_state or "", FLAT)
 
 
 class Reconciler:
@@ -143,11 +156,12 @@ class Reconciler:
                     continue
                 bot_ref = defn.config.get("ref_id", defn.name)
                 symbol = current.get("symbol") or defn.config.get("symbol", "")
-                state = current.get("state") or current.get("position_state", FLAT)
+                # FSM state is the sole source of truth; map it down to the
+                # reconciler's FLAT/ENTERING/OPEN/EXITING vocabulary for the
+                # drift-detection branches below.
+                state = _fsm_to_pos_state(current.get("state"))
 
                 # Skip reconciliation for bots that aren't running.
-                # Stale strat:* keys from prior sessions are just garbage —
-                # silently flush them instead of logging a scary WARNING.
                 from ib_trader.bots import registry_config
                 defn = registry_config.get_by_name(bot_ref)
                 if defn:
@@ -155,17 +169,8 @@ class Reconciler:
                     fsm = FSM(defn.id, self._redis)
                     fsm_state = await fsm.current_state()
                     if fsm_state in (BotState.OFF, BotState.ERRORED):
-                        if state != FLAT:
-                            # Silently clear stale state
-                            current["state"] = FLAT
-                            current["position_state"] = FLAT
-                            current["qty"] = "0"
-                            await self._state.set(key, current)
-                            logger.info(
-                                '{"event": "STALE_STATE_CLEARED", "key": "%s", '
-                                '"old_state": "%s", "reason": "bot_fsm_is_off"}',
-                                key, state,
-                            )
+                        # FSM._h_stop already cleared position fields; the
+                        # reconciler does not write to bot:<id> directly.
                         continue
 
                 has_position = symbol in ib_position_map

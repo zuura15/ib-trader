@@ -4,12 +4,11 @@ Tests the complete limit order path: place at user-specified price,
 confirm IB acceptance, return immediately. No reprice loop, no timeout.
 Assertions use TransactionEvent rows instead of Order rows.
 """
-import asyncio
 import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy
-from ib_trader.data.models import TransactionAction, TradeStatus, LegType
+from ib_trader.data.models import TransactionAction, TradeStatus
 from ib_trader.engine.order import execute_order
 
 

@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterable
 
 from ib_trader.redis.state import StateKeys, StateStore
@@ -171,6 +172,70 @@ class BotStateStore:
             )
             return True
         return bool(data) and bool(data.get("engaged"))
+
+    # ---- daily trade stats (drives RiskMiddleware caps) ----
+    #
+    # Persisted in Redis so they survive a runner restart — the previous
+    # in-process counters (``RiskMiddleware._trades_today`` /
+    # ``_pnl_today``) reset to 0 every restart, which made the daily
+    # loss cap and trades-per-day cap effectively meaningless after a
+    # crash. The stats document is auto-rotated when the date rolls.
+
+    async def get_stats(self, bot_id: str) -> dict[str, Any]:
+        """Return ``{trades_today, trades_total, pnl_today, date}``.
+
+        Defaults are filled in for missing keys so callers can read
+        without None-checks. ``pnl_today`` is a Decimal-string. The
+        ``date`` field is the local-date the today-counters apply to.
+        Counters auto-rotate via :meth:`_maybe_reset_daily`.
+        """
+        defaults = {
+            "trades_today": 0,
+            "trades_total": 0,
+            "pnl_today": "0",
+            "date": date.today().isoformat(),
+        }
+        if self._store is None:
+            return defaults
+        doc = await self._store.get(StateKeys.bot_stats(bot_id)) or {}
+        return {**defaults, **doc}
+
+    async def _maybe_reset_daily(self, bot_id: str) -> dict[str, Any]:
+        """Read stats and rotate today-counters if the date changed.
+
+        Returns the (possibly-rotated) stats doc. Trades-total is
+        preserved across rotations; trades-today and pnl-today reset.
+        """
+        stats = await self.get_stats(bot_id)
+        today = date.today().isoformat()
+        if stats.get("date") != today:
+            stats = {
+                "trades_today": 0,
+                "trades_total": int(stats.get("trades_total") or 0),
+                "pnl_today": "0",
+                "date": today,
+            }
+            if self._store is not None:
+                await self._store.set(StateKeys.bot_stats(bot_id), stats)
+        return stats
+
+    async def record_trade(self, bot_id: str) -> None:
+        """Increment trades_today and trades_total. Daily-rotates first."""
+        if self._store is None:
+            return
+        stats = await self._maybe_reset_daily(bot_id)
+        stats["trades_today"] = int(stats.get("trades_today") or 0) + 1
+        stats["trades_total"] = int(stats.get("trades_total") or 0) + 1
+        await self._store.set(StateKeys.bot_stats(bot_id), stats)
+
+    async def record_pnl(self, bot_id: str, pnl: Decimal) -> None:
+        """Add realized P&L to today's running total. Daily-rotates first."""
+        if self._store is None:
+            return
+        stats = await self._maybe_reset_daily(bot_id)
+        cur = Decimal(str(stats.get("pnl_today") or "0"))
+        stats["pnl_today"] = str(cur + pnl)
+        await self._store.set(StateKeys.bot_stats(bot_id), stats)
 
     # ---- bulk read (used by API list / WS snapshot) ----
 

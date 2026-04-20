@@ -5,7 +5,6 @@ Covers: connection, subscribe, snapshot delivery, ping/pong, diff detection.
 import json
 import pytest
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -13,7 +12,6 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import (
     Base, TradeGroup, TradeStatus,
-    SystemAlert, AlertSeverity,
 )
 from ib_trader.api.app import create_app
 from ib_trader.api import deps as api_deps

@@ -276,12 +276,16 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
 @click.option("--settings", "settings_path", default="config/settings.yaml", help="Settings YAML path")
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml", help="Symbols YAML path")
 @click.option("--smoke", is_flag=True, default=False, help="STUB: run smoke tests before starting")
-@click.option("--paper", is_flag=True, default=False, help="Use paper trading account (IB_PORT_PAPER / IB_ACCOUNT_ID_PAPER from .env)")
+@click.option(
+    "--paper/--live", "paper",
+    default=True,
+    help="Paper trading (default). Pass --live to target the live Gateway.",
+)
 def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool, paper: bool) -> None:
     """IB Trader Daemon — background monitoring and reconciliation TUI.
 
     Runs persistently in a dedicated terminal window.
-    Defaults to live trading. Pass --paper to use the paper trading account.
+    Defaults to paper trading. Pass --live to target the live Gateway.
     """
     if smoke:
         logger.info('{"event": "MODIFY_STUB_RECEIVED", "cmd": "--smoke", "note": "not implemented"}')
@@ -299,12 +303,12 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool, 
 
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
     if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", 4002))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", 3))
+        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", settings.get("ib_port", 4002)))
+        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", settings.get("ib_market_data_type", 3)))
         account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
     else:
-        settings["ib_port"] = int(env_vars.get("IB_PORT", settings.get("ib_port", 4001)))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", settings.get("ib_market_data_type", 1)))
+        settings["ib_port"] = int(env_vars.get("IB_PORT", 4001))
+        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", 1))
         account_id = env_vars["IB_ACCOUNT_ID"]
     # Daemon uses client_id + 1 to avoid conflict with REPL
     repl_client_id = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))

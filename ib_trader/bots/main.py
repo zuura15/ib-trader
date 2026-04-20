@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 def main(db: str, settings_path: str):
     """IB Trader Bot Runner — manages bot lifecycle."""
     setup_logging()
-    settings = load_settings(settings_path)
+    load_settings(settings_path)
 
     # Check DB permissions
     if Path(db).exists():
@@ -67,14 +67,7 @@ def main(db: str, settings_path: str):
 
 def _import_strategies():
     """Import all bot strategy modules to trigger register_strategy() calls."""
-    try:
-        import ib_trader.bots.examples.mean_revert  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import ib_trader.bots.runtime  # noqa: F401  — registers strategy_bot
-    except ImportError:
-        pass
+    import ib_trader.bots.runtime  # noqa: F401  — registers strategy_bot
 
 
 async def run(session_factory) -> None:
@@ -113,7 +106,8 @@ async def run(session_factory) -> None:
     }
     runner_api_port = settings.get("bot_runner_internal_port", 8082)
     from ib_trader.bots.internal_api import start_bot_runner_api
-    api_task = await start_bot_runner_api(runner_state, port=runner_api_port)
+    # Task is held by uvicorn's server; we don't need the handle here.
+    await start_bot_runner_api(runner_state, port=runner_api_port)
     print(f"[BOTS] Internal API on 127.0.0.1:{runner_api_port}")
 
     try:
@@ -131,8 +125,8 @@ async def run(session_factory) -> None:
         try:
             from ib_trader.redis.client import close_redis
             await close_redis()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("REDIS_CLOSE_FAILED", exc_info=e)
         logger.info('{"event": "BOT_RUNNER_STOPPED"}')
 
 

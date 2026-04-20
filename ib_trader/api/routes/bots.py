@@ -7,6 +7,7 @@ POST /api/bots/{bot_id}/start — start a bot
 POST /api/bots/{bot_id}/stop — stop a bot
 """
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -14,8 +15,10 @@ from ib_trader.api.deps import get_session_factory, get_redis
 from ib_trader.data.models import BotStatus
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
 from ib_trader.bots.definition import BotDefinition
-from ib_trader.bots.fsm import FSM, BotEvent, BotState, EventType
+from ib_trader.bots.fsm import FSM, BotState
 from ib_trader.bots.state import BotStateStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/bots", tags=["bots"])
 
@@ -51,8 +54,8 @@ def _serialize_bot(b, fsm_doc: dict | None = None,
             with open(strategy_config_path) as f:
                 strat = yaml.safe_load(f)
                 ref_id = strat.get("ref_id")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("failed to load strategy ref_id", exc_info=e)
 
     fsm_doc = fsm_doc or {"state": BotState.OFF.value}
     state = fsm_doc.get("state", BotState.OFF.value)
@@ -156,7 +159,44 @@ async def _fetch_fsm_docs(redis, bot_ids: list[str]) -> dict[str, dict]:
     import asyncio as _asyncio
     fsms = [FSM(bid, redis) for bid in bot_ids]
     docs = await _asyncio.gather(*[f.load() for f in fsms])
-    return {bid: doc for bid, doc in zip(bot_ids, docs)}
+    return {bid: doc for bid, doc in zip(bot_ids, docs, strict=True)}
+
+
+# FSM states that indicate the bot is actively running (not OFF / ERRORED).
+# Used by the reload endpoint to gate immutable-field edits.
+_RUNNING_FSM_STATES = frozenset({
+    BotState.AWAITING_ENTRY_TRIGGER,
+    BotState.ENTRY_ORDER_PLACED,
+    BotState.AWAITING_EXIT_TRIGGER,
+    BotState.EXIT_ORDER_PLACED,
+})
+
+
+async def _running_bot_ids(redis) -> frozenset[str]:
+    """Snapshot the set of bot IDs whose FSM is in a running state.
+
+    Returns an empty set when Redis isn't available — the reload
+    endpoint then degrades to "no running bots known", which means YAML
+    edits to immutable fields will be accepted. That is the correct
+    behaviour during a Redis outage where we have no way to confirm
+    what's actually running.
+    """
+    from ib_trader.bots import registry_config
+    if redis is None:
+        return frozenset()
+    defs = registry_config.all_definitions()
+    if not defs:
+        return frozenset()
+    docs = await _fetch_fsm_docs(redis, [d.id for d in defs])
+    out = set()
+    for bid, doc in docs.items():
+        try:
+            cur = BotState(doc.get("state", BotState.OFF.value))
+        except ValueError:
+            continue
+        if cur in _RUNNING_FSM_STATES:
+            out.add(bid)
+    return frozenset(out)
 
 
 @router.get("")
@@ -176,7 +216,7 @@ async def list_bots(redis=Depends(get_redis)):
     heartbeats = await _asyncio.gather(
         *[bss.get_heartbeat(d.id) for d in defs]
     ) if redis else [None] * len(defs)
-    hb_map = {d.id: ({"ts": hb} if hb else None) for d, hb in zip(defs, heartbeats)}
+    hb_map = {d.id: ({"ts": hb} if hb else None) for d, hb in zip(defs, heartbeats, strict=True)}
 
     return [
         _serialize_bot_from_defn(
@@ -211,8 +251,14 @@ async def reload_bots(
     effect only on the next start.
     """
     from ib_trader.bots.bootstrap import bootstrap_bots_from_yaml, BootstrapError
+    # Snapshot which bots are running according to the live FSM in
+    # Redis. Bootstrap uses this to gate immutable-field edits + deletes
+    # — the SQLite ``bots.status`` column is no longer authoritative.
+    running_ids = await _running_bot_ids(redis)
     try:
-        report = bootstrap_bots_from_yaml(sf, force=force)
+        report = bootstrap_bots_from_yaml(
+            sf, force=force, running_bot_ids=running_ids,
+        )
     except BootstrapError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
@@ -273,8 +319,8 @@ async def start_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             result = resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Bot runner unavailable")
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
     # SQLite archival write
     BotRepository(sf).update_status(bot_id, BotStatus.RUNNING)
     if redis:
@@ -294,8 +340,8 @@ async def stop_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(g
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             result = resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Bot runner unavailable")
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
     BotRepository(sf).update_status(bot_id, BotStatus.STOPPED)
     if redis:
         from ib_trader.redis.streams import publish_activity
@@ -314,8 +360,8 @@ async def force_stop_bot(bot_id: str, sf=Depends(get_session_factory), redis=Dep
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             result = resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Bot runner unavailable")
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
     BotRepository(sf).update_status(bot_id, BotStatus.ERROR)
     if redis:
         from ib_trader.redis.streams import publish_activity
@@ -336,17 +382,30 @@ async def get_bot_state(bot_id: str, redis=Depends(get_redis)):
 
 @router.post("/{bot_id}/force-buy", status_code=202)
 async def force_buy(bot_id: str, redis=Depends(get_redis)):
-    """Force-buy — proxies to the runner."""
+    """Force-buy — proxies to the runner.
+
+    The runner's handler synchronously walks the full order lifecycle
+    (PlaceOrder → engine → IB → reprice loop). The engine's reprice
+    window is 10s and IB fill latency adds a few more, so the timeout
+    has to comfortably exceed that — 30s keeps us safely above the
+    steady-state submission path while still failing loud if the
+    runner truly hangs.
+    """
     _get_defn_or_404(bot_id)
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(f"{_runner_url()}/bots/{bot_id}/force-buy")
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Bot runner unavailable")
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
+    except httpx.ReadTimeout as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Bot runner did not respond within 30s; the order may still be in flight — check the positions and orders panes before retrying.",
+        ) from e
 
 
 @router.get("/{bot_id}/events")

@@ -166,38 +166,35 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
   const val = (color?: string) => ({ color: color || 'var(--text-primary)' }) as const;
 
   return (
-    <div className="ml-4 mt-1 px-3 py-2 rounded text-[11px] font-mono"
-      style={{ background: 'var(--bg-root)', border: '1px solid var(--border-default)' }}>
-      {/* Row 1: Symbol, Qty, Entry, Time */}
-      <div className="flex gap-4 items-center mb-1">
+    <div className="mt-1 px-2 py-2 rounded text-[10px] font-mono"
+      style={{ background: 'var(--bg-root)', border: '1px solid var(--border-default)', overflowWrap: 'break-word' }}>
+      {/* Row 1: Position headline + P&L */}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 items-center mb-1">
         <span style={val("var(--text-primary)")}>
           <span className="font-semibold">{symbol}</span>
           {' '}{qty > 0 ? '+' : ''}{qty} @ ${entry.toFixed(2)}
         </span>
-        {elapsed && (
-          <span style={lbl}>⏱ {elapsed} ago</span>
-        )}
         <span style={{ color: pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontWeight: 600 }}>
           {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(3)}%)
         </span>
+        {elapsed && (
+          <span style={lbl}>⏱ {elapsed}</span>
+        )}
       </div>
-      {/* Row 2: Price + Stops */}
-      <div className="flex gap-4 items-center mb-1">
+      {/* Row 2: Price + Stops — wraps on mobile */}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 items-center mb-1">
         {price > 0 && (
           <span><span style={lbl}>Mid:</span> <span style={val()}>${price.toFixed(2)}</span></span>
         )}
         {hardStop > 0 && (
-          <span><span style={lbl}>Hard Stop:</span> <span style={val("var(--accent-red)")}>${hardStop.toFixed(2)}</span></span>
+          <span><span style={lbl}>Hard:</span> <span style={val("var(--accent-red)")}>${hardStop.toFixed(2)}</span></span>
         )}
-        {trailActPrice > 0 && !state.trail_activated && (
-          <span><span style={lbl}>Trail Arms @</span> <span style={val("var(--accent-yellow)")}>${trailActPrice.toFixed(2)}</span></span>
+        {stop > 0 && (
+          <span><span style={lbl}>Stop:</span> <span style={val(state.trail_activated ? 'var(--accent-yellow)' : 'var(--accent-red)')}>${stop.toFixed(2)}</span></span>
         )}
       </div>
-      {/* Row 3: Trail state */}
-      <div className="flex gap-4 items-center">
-        {stop > 0 && (
-          <span><span style={lbl}>Current Stop:</span> <span style={val(state.trail_activated ? 'var(--accent-yellow)' : 'var(--accent-red)')}>${stop.toFixed(2)}</span></span>
-        )}
+      {/* Row 3: Trail state + projected P&L at stop — wraps on mobile */}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 items-center">
         {hwm > 0 && (
           <span><span style={lbl}>HWM:</span> <span style={val()}>${hwm.toFixed(2)}</span></span>
         )}
@@ -207,6 +204,20 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
             {state.trail_activated ? 'ACTIVE' : 'INACTIVE'}
           </span>
         </span>
+        {trailActPrice > 0 && !state.trail_activated && (
+          <span><span style={lbl}>Arms @</span> <span style={val("var(--accent-yellow)")}>${trailActPrice.toFixed(2)}</span></span>
+        )}
+        {stop > 0 && entry > 0 && qty !== 0 && (() => {
+          const exitPnl = (stop - entry) * qty;
+          return (
+            <span>
+              <span style={lbl}>If stopped:</span>{' '}
+              <span style={val(exitPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)')}>
+                {exitPnl >= 0 ? '+' : ''}${exitPnl.toFixed(2)}
+              </span>
+            </span>
+          );
+        })()}
       </div>
     </div>
   );

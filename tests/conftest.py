@@ -55,6 +55,12 @@ class MockIBClient(IBClientBase):
     async def disconnect(self) -> None:
         self.connected = False
 
+    def managed_accounts(self) -> list[str]:
+        """Tests default to a single paper account. Override via attribute
+        (``mock_ib.mock_managed_accounts = [...]``) when a test needs to
+        exercise mismatch detection."""
+        return getattr(self, "mock_managed_accounts", ["DU0000000"])
+
     async def qualify_contract(self, symbol, sec_type="STK", exchange="SMART", currency="USD") -> dict:
         await self._throttle()
         return self._qualify_result

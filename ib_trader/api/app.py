@@ -64,8 +64,8 @@ def create_app(
         try:
             from ib_trader.redis.client import close_redis
             await close_redis()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("redis close failed on shutdown", exc_info=e)
         logger.info('{"event": "API_SERVER_STOPPED"}')
 
     app = FastAPI(

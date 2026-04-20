@@ -8,11 +8,11 @@ from ib_trader.redis.streams import StreamWriter, StreamReader, StreamNames
 from ib_trader.redis.state import StateStore, StateKeys
 
 __all__ = [
-    "get_redis",
-    "close_redis",
-    "StreamWriter",
-    "StreamReader",
-    "StreamNames",
-    "StateStore",
     "StateKeys",
+    "StateStore",
+    "StreamNames",
+    "StreamReader",
+    "StreamWriter",
+    "close_redis",
+    "get_redis",
 ]

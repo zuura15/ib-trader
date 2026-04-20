@@ -5,15 +5,13 @@ No live broker connection required.
 """
 import pytest
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import (
-    Base, TradeGroup, TradeStatus, TransactionAction, TransactionEvent, LegType,
-    SystemAlert, AlertSeverity, PendingCommand, PendingCommandStatus,
+    Base, TradeGroup, TradeStatus,
 )
 # Ensure all models are registered with Base.metadata before create_all
 import ib_trader.data.models  # noqa: F401

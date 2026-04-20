@@ -44,6 +44,18 @@ from ib_trader.logging_.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
+# Retain references to fire-and-forget asyncio tasks so the loop's weakref
+# collection doesn't cancel them mid-flight. See Python docs on create_task.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """Create an asyncio task, track it, and auto-discard on completion."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 @click.command()
 @click.option("--db", default="trader.db", help="SQLite database path")
@@ -52,7 +64,11 @@ logger = logging.getLogger(__name__)
               help="Settings YAML path")
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml",
               help="Symbols whitelist path")
-@click.option("--paper", is_flag=True, default=False, help="Use paper trading account")
+@click.option(
+    "--paper/--live", "paper",
+    default=True,
+    help="Paper trading (default) — pass --live to target the live Gateway.",
+)
 def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool):
     """IB Trader Engine Service — central command execution loop."""
     setup_logging()
@@ -62,17 +78,23 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool):
     settings = load_settings(settings_path)
     symbols = load_symbols(symbols_path)
 
-    # Override with env values
+    # Override with env values. Paper is the default; --live opts in to the
+    # live Gateway. settings.yaml carries the paper defaults (port 4002,
+    # market data type 3) so env overrides are additive.
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
     if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", 4002))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", 3))
+        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", settings.get("ib_port", 4002)))
+        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", settings.get("ib_market_data_type", 3)))
         account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
     else:
         settings["ib_port"] = int(env_vars.get("IB_PORT", 4001))
         settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", 1))
         account_id = env_vars["IB_ACCOUNT_ID"]
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", 1))
+    # Remember the mode choice so downstream code (API /status, UI
+    # header) can report what the engine is actually connected to
+    # instead of guessing from the .env account-id prefix.
+    settings["account_mode"] = "paper" if paper else "live"
 
     # Check DB permissions
     if Path(db).exists():
@@ -160,6 +182,16 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         if hasattr(ctx.ib, "set_disconnect_callback"):
             ctx.ib.set_disconnect_callback(lambda: _raise_ib_disconnect_alert(ctx))
 
+        # Fail fast if the configured account_id isn't one the Gateway
+        # can actually trade. IB authenticates at the session level, so
+        # a connect() success alone doesn't confirm we can place orders
+        # on the account we think we're using.
+        _validate_account_id(ctx)
+
+        # Also fail fast if the Gateway port vs account prefix disagree
+        # (e.g. paper port 4002 but account_id doesn't start with "DU").
+        _validate_account_mode(ctx)
+
         print("[ENGINE] Connected to IB Gateway.")
 
         # Warm contract cache
@@ -189,6 +221,28 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         redis = await get_redis(redis_url)
         ctx.redis = redis
         print("[ENGINE] Connected to Redis.")
+
+        # --- Publish engine session metadata ---
+        # /api/status reads this so the UI header reports what the engine
+        # is actually connected to (paper vs live) rather than parsing
+        # .env. The account_mode flag was set from the CLI --paper/--live
+        # choice; account_id was picked from the matching env key.
+        from datetime import datetime as _dt, timezone as _tz
+        from ib_trader.redis.state import StateStore, StateKeys
+        _store = StateStore(redis)
+        await _store.set(StateKeys.engine_session(), {
+            "account_id": ctx.account_id,
+            "account_mode": ctx.settings.get("account_mode", "unknown"),
+            "port": ctx.settings.get("ib_port"),
+            "host": ctx.settings.get("ib_host"),
+            "connected_at": _dt.now(_tz.utc).isoformat(),
+        })
+        logger.info(
+            '{"event": "ENGINE_SESSION_PUBLISHED", "account_mode": "%s", '
+            '"port": %s, "account_id": "%s"}',
+            ctx.settings.get("account_mode"), ctx.settings.get("ib_port"),
+            ctx.account_id,
+        )
 
         # --- Subscribe to watchlist symbols for tick publishing ---
         from ib_trader.config.loader import load_watchlist
@@ -254,13 +308,13 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         ctx.heartbeats.delete("ENGINE")
         try:
             await asyncio.shield(ctx.ib.disconnect())
-        except Exception:
-            pass  # IB may already be dead — don't crash during cleanup
+        except Exception as e:
+            logger.debug("IB disconnect failed during cleanup", exc_info=e)
         try:
             from ib_trader.redis.client import close_redis
             await close_redis()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("redis close failed during cleanup", exc_info=e)
         print("[ENGINE] Stopped.")
         logger.info('{"event": "ENGINE_STOPPED"}')
 
@@ -297,6 +351,77 @@ async def _connect_with_retry(ctx: AppContext, retry_interval: int = 10) -> None
             await asyncio.sleep(retry_interval)
 
 
+def _validate_account_id(ctx: AppContext) -> None:
+    """Fail fast if the configured account_id isn't in the Gateway's
+    managed-accounts list.
+
+    IB Gateway authenticates per-session (the user logs in through the
+    Gateway UI). A successful connect() proves the Gateway is reachable
+    but says nothing about whether our configured account_id matches.
+    If it doesn't, orders get rejected on submission — sometimes with
+    a useful error, sometimes silently routed to the logged-in account.
+    Either way it's a footgun. Catch it here instead.
+    """
+    try:
+        managed = list(ctx.ib.managed_accounts())
+    except Exception as e:
+        logger.error(
+            '{"event": "MANAGED_ACCOUNTS_READ_FAILED", "error": "%s"}', str(e),
+        )
+        raise SystemExit(
+            f"Could not read managedAccounts from IB: {e}. Refusing to start."
+        ) from e
+    if not managed:
+        raise SystemExit(
+            "Gateway reported no managed accounts. Check that Gateway is "
+            "logged in and the API client has account permissions."
+        )
+    if ctx.account_id not in managed:
+        logger.error(
+            '{"event": "ACCOUNT_ID_MISMATCH", "configured": "%s", '
+            '"gateway_managed": %s}',
+            ctx.account_id, json.dumps(managed),
+        )
+        raise SystemExit(
+            f"Configured account_id {ctx.account_id!r} is NOT in the "
+            f"Gateway's managed accounts {managed}. Fix IB_ACCOUNT_ID / "
+            f"IB_ACCOUNT_ID_PAPER in .env or switch Gateway accounts. "
+            f"Refusing to start — orders would otherwise be silently "
+            f"rejected or mis-routed."
+        )
+    logger.info(
+        '{"event": "ACCOUNT_ID_VALIDATED", "account_id": "%s", '
+        '"managed_accounts": %s}',
+        ctx.account_id, json.dumps(managed),
+    )
+
+
+def _validate_account_mode(ctx: AppContext) -> None:
+    """Sanity-check the paper/live declaration against the IB account type.
+
+    IB paper accounts begin with "DU"; live accounts are "U" + digits.
+    A mismatch (e.g. --paper flag but the configured account is a live
+    U-account, or vice versa) usually means .env wasn't updated when the
+    flag was. Refuse to start rather than silently trading on the wrong
+    surface.
+    """
+    acct = ctx.account_id
+    mode = ctx.settings.get("account_mode", "unknown")
+    is_paper_acct = acct.startswith("DU")
+    if mode == "paper" and not is_paper_acct:
+        raise SystemExit(
+            f"--paper selected but account_id {acct!r} does not start with "
+            f"'DU'. Either set IB_ACCOUNT_ID_PAPER in .env to the real "
+            f"paper account, or pass --live if you really meant to trade "
+            f"the live account."
+        )
+    if mode == "live" and is_paper_acct:
+        raise SystemExit(
+            f"--live selected but account_id {acct!r} starts with 'DU' "
+            f"(paper). Either fix IB_ACCOUNT_ID in .env or pass --paper."
+        )
+
+
 def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
     """Write a CATASTROPHIC alert when the IB Gateway connection drops.
 
@@ -330,7 +455,7 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
         # reaches the UI on the 30s fallback refresh.
         if ctx.redis is not None:
             from ib_trader.redis.streams import publish_activity
-            asyncio.create_task(publish_activity(ctx.redis, "alerts"))
+            _spawn_background(publish_activity(ctx.redis, "alerts"))
     except Exception:
         logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
 
@@ -376,8 +501,8 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
                     market_price = str(round((float(bid) + float(ask)) / 2, 4))
                 elif last:
                     market_price = str(last)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("ticker price enrichment failed", exc_info=e)
 
         positions.append({
             "id": f"{sym}_{sec_type}_{con_id}",
@@ -395,8 +520,8 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         if subscribe_mktdata and sec_type == "STK":
             try:
                 await ctx.ib.subscribe_market_data(con_id, sym)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("market data subscribe failed for %s", sym, exc_info=e)
 
     # Atomic swap — readers see the old list or the new list, never partial.
     ctx.positions_cache = positions
@@ -433,16 +558,14 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     This is the PRIMARY update path — the reconciler is just a safety net.
     """
     from decimal import Decimal
-    from datetime import datetime, timezone
     from ib_trader.redis.streams import StreamWriter, StreamNames
-    from ib_trader.redis.state import StateStore, StateKeys
+    from ib_trader.redis.state import StateKeys
     from ib_trader.engine.order_ledger import OrderLedger
 
     redis = ctx.redis
     if redis is None:
         return
 
-    state = StateStore(redis)
     ledger = OrderLedger()
     # Expose on ctx so the position poll loop can sweep stale entries
     ctx._order_ledger = ledger
@@ -567,18 +690,18 @@ async def _event_relay_loop(ctx: AppContext) -> None:
 
         def on_position_event(position) -> None:
             """Handle position change from IB (any source, including manual TWS closes)."""
-            asyncio.create_task(_handle_position_event(ctx, position, _position_sem))
+            _spawn_background(_handle_position_event(ctx, position, _position_sem))
 
         ib_obj.positionEvent += on_position_event
         # Subscribe to position updates
         try:
             await ib_obj.reqPositionsAsync()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("reqPositionsAsync failed during wire-up", exc_info=e)
         logger.info('{"event": "POSITION_EVENT_WIRED"}')
 
-    # Keep the task alive
-    while True:
+    # Keep the task alive — this is a daemonic loop, cancelled at shutdown.
+    while True:  # noqa: ASYNC110 — not waiting on an event; it's a sleep-forever keepalive
         await asyncio.sleep(3600)
 
 
@@ -618,8 +741,8 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
                     market_price = str(round((float(bid) + float(ask)) / 2, 4))
                 elif last:
                     market_price = str(last)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("ticker price enrichment failed", exc_info=e)
         entry = {
             "id": f"{symbol}_{sec_type}_{con_id}",
             "account_id": position.account,
@@ -785,7 +908,7 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
     def on_pending_tickers(tickers) -> None:
         # ib_async fires this synchronously; schedule per-ticker async work.
         for t in tickers:
-            asyncio.create_task(_publish_one(t))
+            _spawn_background(_publish_one(t))
 
     ctx.ib._ib.pendingTickersEvent += on_pending_tickers
     logger.info('{"event": "TICK_PUBLISHER_WIRED"}')
@@ -795,8 +918,8 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
     finally:
         try:
             ctx.ib._ib.pendingTickersEvent -= on_pending_tickers
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("pendingTickersEvent unwire failed", exc_info=e)
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:

@@ -8,19 +8,18 @@ Runs as a uvicorn server inside the engine process on a configurable port
 port 8000 forwards to this when needed.
 """
 import asyncio
-import json
 import logging
 from contextlib import asynccontextmanager
-from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Module-level reference to AppContext, set by start_internal_api()
-_ctx = None
+# Module-level reference to AppContext, set by start_internal_api().
+# Typed as Any since AppContext is not imported here to avoid cycles.
+_ctx: "Any | None" = None
 
 
 _VALID_SIDES = {"BUY", "SELL"}
@@ -39,6 +38,7 @@ class OrderRequest(BaseModel):
     serial: Optional[int] = Field(default=None, description="Trade serial number")
     profit: Optional[str] = Field(default=None, description="Profit target in dollars")
     stop_loss: Optional[str] = Field(default=None, description="Stop loss in dollars")
+    cmd_id: Optional[str] = Field(default=None, description="Caller-supplied command id; keys the Redis live-output stream")
 
 
 class OrderResponse(BaseModel):
@@ -49,6 +49,7 @@ class OrderResponse(BaseModel):
     order_ref: Optional[str] = None
     status: str
     output: Optional[str] = None
+    cmd_id: Optional[str] = None
 
 
 class CloseRequest(BaseModel):
@@ -58,6 +59,7 @@ class CloseRequest(BaseModel):
     strategy: str = "market"
     profit: Optional[str] = None
     bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
+    cmd_id: Optional[str] = Field(default=None, description="Caller-supplied command id; keys the Redis live-output stream")
 
 
 class SubscribeBarsRequest(BaseModel):
@@ -110,7 +112,6 @@ async def place_order(req: OrderRequest):
     if _ctx is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
-    from ib_trader.repl.commands import parse_command
     from ib_trader.engine.service import execute_single_command
 
     # Validate inputs
@@ -137,6 +138,7 @@ async def place_order(req: OrderRequest):
             _ctx, cmd_text,
             source=f"bot:{req.bot_ref}" if req.bot_ref else "api",
             bot_ref=req.bot_ref,
+            cmd_id=req.cmd_id,
         )
         return OrderResponse(
             ib_order_id=result.get("ib_order_id", ""),
@@ -144,10 +146,11 @@ async def place_order(req: OrderRequest):
             order_ref=result.get("order_ref"),
             status=result.get("status", "SUBMITTED"),
             output=result.get("output"),
+            cmd_id=result.get("cmd_id"),
         )
     except Exception as e:
         logger.exception('{"event": "INTERNAL_API_ORDER_FAILED"}')
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/engine/close")
@@ -167,11 +170,12 @@ async def close_position(req: CloseRequest):
             _ctx, cmd_text,
             source=f"bot:{req.bot_ref}" if req.bot_ref else "api",
             bot_ref=req.bot_ref,
+            cmd_id=req.cmd_id,
         )
-        return {"status": "ok", "output": result.get("output"), "result": result}
+        return {"status": "ok", "output": result.get("output"), "result": result, "cmd_id": result.get("cmd_id")}
     except Exception as e:
         logger.exception('{"event": "INTERNAL_API_CLOSE_FAILED"}')
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/engine/cancel-by-symbol")
@@ -229,7 +233,7 @@ async def subscribe_bars(req: SubscribeBarsRequest):
         return {"status": "subscribed", "symbol": req.symbol, "con_id": con_id}
     except Exception as e:
         logger.exception('{"event": "SUBSCRIBE_BARS_FAILED", "symbol": "%s"}', req.symbol)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/engine/warmup-bars")
@@ -250,7 +254,7 @@ async def warmup_bars(req: WarmupBarsRequest):
         return {"status": "ok", "symbol": req.symbol, "output": output}
     except Exception as e:
         logger.exception('{"event": "WARMUP_BARS_FAILED", "symbol": "%s"}', req.symbol)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/engine/unsubscribe-bars")
@@ -267,7 +271,7 @@ async def unsubscribe_bars(req: UnsubscribeBarsRequest):
         return {"status": "unsubscribed", "symbol": req.symbol, "con_id": con_id}
     except Exception as e:
         logger.exception('{"event": "UNSUBSCRIBE_BARS_FAILED", "symbol": "%s"}', req.symbol)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/engine/reload-watchlist")
@@ -294,7 +298,7 @@ async def reload_watchlist():
         return {"status": "reloaded", "symbols": subscribed}
     except Exception as e:
         logger.exception('{"event": "RELOAD_WATCHLIST_FAILED"}')
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/engine/positions")

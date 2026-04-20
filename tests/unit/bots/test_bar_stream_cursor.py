@@ -7,7 +7,6 @@ Regression coverage for two related bugs:
      raw 5s bars).
 """
 import pytest
-from datetime import datetime, timezone
 
 from ib_trader.redis.streams import StreamWriter, StreamNames
 

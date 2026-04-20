@@ -9,11 +9,12 @@ from sqlalchemy import (
     Column, String, Integer, Numeric, Boolean,
     DateTime, Enum, ForeignKey, Text
 )
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase
 import enum
 
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    """Declarative base for all ORM models."""
 
 
 def _uuid() -> str:

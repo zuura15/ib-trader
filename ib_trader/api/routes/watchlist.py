@@ -4,7 +4,6 @@ GET  /api/watchlist         — live market data for watchlist symbols
 GET  /api/watchlist/symbols — current symbol list from config
 PUT  /api/watchlist/symbols — update symbol list in config
 """
-import json
 import logging
 from pathlib import Path
 

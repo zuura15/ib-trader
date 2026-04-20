@@ -35,23 +35,23 @@ except ImportError:
     # readline is unavailable on Windows without pyreadline; degrade silently.
     readline = None  # type: ignore[assignment]
 
-import click  # noqa: E402
+import click
 
-from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions  # noqa: E402
-from ib_trader.config.context import AppContext  # noqa: E402
-from ib_trader.data.repository import (  # noqa: E402
+from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions
+from ib_trader.config.context import AppContext
+from ib_trader.data.repository import (
     TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
-from ib_trader.data.repositories.transaction_repository import TransactionRepository  # noqa: E402
-from ib_trader.engine.tracker import OrderTracker  # noqa: E402
-from ib_trader.engine.exceptions import ConfigurationError, SafetyLimitError  # noqa: E402
-from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings, close_orphaned_trade_groups  # noqa: E402
-from ib_trader.engine.order import execute_order, execute_close  # noqa: E402
-from ib_trader.ib.insync_client import InsyncClient  # noqa: E402
-from ib_trader.logging_.logger import setup_logging  # noqa: E402
-from ib_trader.repl.commands import (  # noqa: E402
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
+from ib_trader.engine.tracker import OrderTracker
+from ib_trader.engine.exceptions import ConfigurationError, SafetyLimitError
+from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings
+from ib_trader.engine.order import execute_order, execute_close
+from ib_trader.ib.insync_client import InsyncClient
+from ib_trader.logging_.logger import setup_logging
+from ib_trader.repl.commands import (
     parse_command, BuyCommand, SellCommand, CloseCommand, ModifyCommand
 )
 
@@ -73,7 +73,7 @@ async def run_repl(ctx: AppContext, symbols: list[str]) -> None:
     except Exception as e:
         print(f"\u2717 IB connection failed: {e}")
         print("Please check that TWS or IB Gateway is running, then press Enter to retry...")
-        input()
+        await asyncio.to_thread(input)
         try:
             await ctx.ib.connect()
         except Exception as e2:
@@ -395,12 +395,16 @@ SESSION
 @click.option("--env", default=".env", help=".env file path")
 @click.option("--settings", "settings_path", default="config/settings.yaml", help="Settings YAML path")
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml", help="Symbols YAML path")
-@click.option("--paper", is_flag=True, default=False, help="Use paper trading account (IB_PORT_PAPER / IB_ACCOUNT_ID_PAPER from .env)")
+@click.option(
+    "--paper/--live", "paper",
+    default=True,
+    help="Paper trading (default). Pass --live to connect to the live Gateway.",
+)
 def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) -> None:
     """IB Trader — interactive trading session for Interactive Brokers.
 
     Start once and trade from the prompt. Type 'help' for commands.
-    Defaults to live trading. Pass --paper to use the paper trading account.
+    Defaults to paper trading. Pass --live to connect to the live Gateway.
     """
     setup_logging()
 
@@ -412,15 +416,17 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) 
         print(f"\u2717 Configuration error: {e}")
         sys.exit(1)
 
-    # Override settings with .env values, switching to paper keys when --paper is set
+    # settings.yaml defaults to paper (port 4002, market data type 3). The
+    # --paper / --live flags + IB_PORT_PAPER / IB_PORT env vars are opt-in
+    # overrides.
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
     if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", 4002))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", 3))
+        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", settings.get("ib_port", 4002)))
+        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", settings.get("ib_market_data_type", 3)))
         account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
     else:
-        settings["ib_port"] = int(env_vars.get("IB_PORT", settings.get("ib_port", 4001)))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", settings.get("ib_market_data_type", 1)))
+        settings["ib_port"] = int(env_vars.get("IB_PORT", 4001))
+        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", 1))
         account_id = env_vars["IB_ACCOUNT_ID"]
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
 

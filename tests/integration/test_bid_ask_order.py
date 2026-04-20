@@ -6,7 +6,6 @@ No reprice loop runs for these orders.
 Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
-import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy

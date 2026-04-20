@@ -95,7 +95,7 @@ async def check_ib_connectivity(ctx: AppContext, consecutive_failures: list) -> 
                 alert = SystemAlert(
                     severity=AlertSeverity.CATASTROPHIC,
                     trigger="IB_CONNECTIVITY_FAILURE",
-                    message=f"IB Gateway unreachable — {count} consecutive failures. Last error: {str(e)}",
+                    message=f"IB Gateway unreachable — {count} consecutive failures. Last error: {e!s}",
                     created_at=datetime.now(timezone.utc),
                 )
                 ctx.alerts.create(alert)
@@ -107,7 +107,7 @@ async def check_ib_connectivity(ctx: AppContext, consecutive_failures: list) -> 
             alert = SystemAlert(
                 severity=AlertSeverity.WARNING,
                 trigger="IB_CONNECTIVITY_WARNING",
-                message=f"IB Gateway connectivity check failed (attempt {count}): {str(e)}",
+                message=f"IB Gateway connectivity check failed (attempt {count}): {e!s}",
                 created_at=datetime.now(timezone.utc),
             )
             ctx.alerts.create(alert)

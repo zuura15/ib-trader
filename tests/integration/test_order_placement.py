@@ -10,7 +10,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import TransactionAction, LegType
+from ib_trader.data.models import LegType
 from ib_trader.engine.order import execute_order, place_profit_taker
 from ib_trader.engine.exceptions import SafetyLimitError
 

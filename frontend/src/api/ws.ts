@@ -22,11 +22,28 @@ export interface WSSnapshot {
   data: Record<Channel, Record<string, unknown>[]>;
 }
 
-export type WSMessage = WSDiff | WSSnapshot | { type: 'pong' };
+export interface WSCommandOutput {
+  type: 'command_output';
+  cmd_id: string;
+  data: {
+    type?: 'line' | 'done';
+    message?: string;
+    severity?: string;
+    status?: string;
+    error?: string;
+  };
+}
+
+export type WSMessage =
+  | WSDiff
+  | WSSnapshot
+  | WSCommandOutput
+  | { type: 'pong' };
 
 type DiffHandler = (channel: Channel, diff: WSDiff) => void;
 type SnapshotHandler = (data: WSSnapshot['data']) => void;
 type StatusHandler = (connected: boolean) => void;
+type CommandOutputHandler = (msg: WSCommandOutput) => void;
 
 // Use wss:// when the page is served over HTTPS (e.g. LAN access via basic-ssl).
 // Browsers block mixed-content ws:// from an https:// page.
@@ -50,6 +67,29 @@ export class WSManager {
   private onSnapshot: SnapshotHandler | null = null;
   private onStatus: StatusHandler | null = null;
   private destroyed = false;
+  private cmdOutputHandlers = new Map<string, CommandOutputHandler>();
+  // Commands subscribed before the WS opened — flushed on connect.
+  private pendingCmdSubscriptions = new Set<string>();
+
+  /**
+   * Subscribe to live output for a single in-flight command.
+   *
+   * The server XREADs the ``cmd:{cmdId}:output`` Redis stream from the
+   * beginning and pushes each line plus a final ``done`` marker. Handler
+   * is auto-unregistered on the ``done`` message.
+   */
+  subscribeCommandOutput(cmdId: string, handler: CommandOutputHandler): () => void {
+    this.cmdOutputHandlers.set(cmdId, handler);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'subscribe_command_output', cmd_id: cmdId }));
+    } else {
+      this.pendingCmdSubscriptions.add(cmdId);
+    }
+    return () => {
+      this.cmdOutputHandlers.delete(cmdId);
+      this.pendingCmdSubscriptions.delete(cmdId);
+    };
+  }
 
   /**
    * Register handlers and connect.
@@ -99,6 +139,11 @@ export class WSManager {
           type: 'subscribe',
           channels: CHANNELS,
         }));
+        // Flush any command-output subscriptions queued before connect.
+        for (const cmdId of this.pendingCmdSubscriptions) {
+          this.ws.send(JSON.stringify({ type: 'subscribe_command_output', cmd_id: cmdId }));
+        }
+        this.pendingCmdSubscriptions.clear();
       }
 
       // Start ping keepalive every 25s
@@ -116,6 +161,12 @@ export class WSManager {
           this.onSnapshot?.(msg.data);
         } else if (msg.type === 'diff') {
           this.onDiff?.(msg.channel, msg as WSDiff);
+        } else if (msg.type === 'command_output') {
+          const handler = this.cmdOutputHandlers.get(msg.cmd_id);
+          handler?.(msg);
+          if (msg.data?.type === 'done') {
+            this.cmdOutputHandlers.delete(msg.cmd_id);
+          }
         }
         // pong is silently ignored
       } catch {

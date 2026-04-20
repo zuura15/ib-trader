@@ -17,9 +17,10 @@ from decimal import Decimal
 
 import pytest
 
+from ib_trader.bots.fsm import BotState
 from ib_trader.bots.middleware import ManualEntryMiddleware
 from ib_trader.bots.strategy import (
-    LogSignal, PlaceOrder, PositionState, StrategyContext, UpdateState,
+    LogSignal, PlaceOrder, StrategyContext, UpdateState,
 )
 
 
@@ -40,7 +41,7 @@ def ctx():
     # StrategyContext is only used as a bag for strategy state here; the
     # middleware doesn't read anything off it.
     return StrategyContext(
-        state={}, position_state=PositionState.FLAT, bot_id="bot1", config={},
+        state={}, fsm_state=BotState.AWAITING_ENTRY_TRIGGER, bot_id="bot1", config={},
     )
 
 
@@ -88,7 +89,7 @@ class TestEnabled:
         mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
         actions = [
             LogSignal(event_type="SIGNAL", message="hi"),
-            UpdateState(state={"position_state": "OPEN"}),
+            UpdateState(state={"last_price": "100.00"}),
         ]
         out = mw.process(actions, ctx)
         assert out == actions

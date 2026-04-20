@@ -104,7 +104,7 @@ class TestValidation:
             {"name": "log",  "rank": 2},
             {"name": "command", "rank": 2},
         ]
-        with pytest.raises(ValueError, match="[Dd]uplicate"):
+        with pytest.raises(ValueError, match=r"[Dd]uplicate"):
             load_pane_configs(settings_with_panes(panes))
 
     def test_unknown_pane_name_in_settings_ignored(self):

@@ -4,13 +4,15 @@ GET /api/alerts — list active alerts from Redis alerts:active hash
 POST /api/alerts/{alert_id}/resolve — resolve: remove from Redis + archive in SQLite
 """
 import json
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from ib_trader.api.deps import get_alerts, get_redis
-from ib_trader.api.serializers import AlertResponse
 from ib_trader.data.repository import AlertRepository
 from ib_trader.redis.state import StateKeys
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -22,11 +24,11 @@ async def list_alerts(redis=Depends(get_redis)):
         return []
     raw = await redis.hgetall(StateKeys.alerts_active())
     alerts = []
-    for aid, val in raw.items():
+    for _aid, val in raw.items():
         try:
             alerts.append(json.loads(val))
-        except (json.JSONDecodeError, TypeError):
-            pass
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.debug("failed to decode alert payload", exc_info=e)
     return alerts
 
 
@@ -39,8 +41,8 @@ async def resolve_alert(
     """Resolve an alert: remove from Redis active hash + archive in SQLite."""
     if redis:
         await redis.hdel(StateKeys.alerts_active(), alert_id)
-    # SQLite archival write
+    # SQLite archival write; alert may not exist if it was created post-migration.
     try:
         alerts.resolve(alert_id)
-    except Exception:
-        pass  # alert may not exist in SQLite if it was created post-migration
+    except Exception as e:
+        logger.debug("alert resolve skipped (not in SQLite)", exc_info=e)

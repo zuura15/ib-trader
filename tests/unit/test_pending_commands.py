@@ -2,7 +2,6 @@
 
 Covers: CRUD operations, status transitions, crash recovery of stale commands.
 """
-import pytest
 from datetime import datetime, timezone
 
 from ib_trader.data.models import PendingCommand, PendingCommandStatus

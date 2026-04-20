@@ -192,6 +192,17 @@ class StreamNames:
         return f"bot:control:{bot_id}"
 
     @staticmethod
+    def command_output(cmd_id: str) -> str:
+        """Per-command live output stream.
+
+        Every ``ctx.router.emit`` inside the engine's execute-single-command
+        path is appended here so the frontend can render reprice steps and
+        fill updates live instead of waiting for the HTTP response.
+        Terminated by a ``{"type": "done"}`` entry.
+        """
+        return f"cmd:{cmd_id}:output"
+
+    @staticmethod
     def bot_state(bot_ref: str, symbol: str) -> str:
         """Stream of 'state changed' markers — emitted whenever the bot
         writes new strategy state to Redis. UI subscribes to this to push

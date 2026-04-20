@@ -2,23 +2,12 @@
 
 from decimal import Decimal
 
+from ib_trader.bots.fsm import BotState
 from ib_trader.bots.strategy import (
-    StrategyManifest, Subscription, StrategyContext, PositionState,
+    StrategyManifest, Subscription, StrategyContext,
     BarCompleted, QuoteUpdate, OrderFilled, PlaceOrder, LogSignal,
-    UpdateState, CancelOrder, Strategy,
+    UpdateState,
 )
-
-
-class TestPositionState:
-    def test_states_are_strings(self):
-        assert PositionState.FLAT.value == "FLAT"
-        assert PositionState.ENTERING.value == "ENTERING"
-        assert PositionState.OPEN.value == "OPEN"
-        assert PositionState.EXITING.value == "EXITING"
-
-    def test_roundtrip_from_string(self):
-        assert PositionState("FLAT") == PositionState.FLAT
-        assert PositionState("OPEN") == PositionState.OPEN
 
 
 class TestStrategyManifest:
@@ -95,10 +84,17 @@ class TestActions:
 class TestStrategyContext:
     def test_creation(self):
         ctx = StrategyContext(
-            state={"position_state": "FLAT"},
-            position_state=PositionState.FLAT,
+            state={},
+            fsm_state=BotState.AWAITING_ENTRY_TRIGGER,
             bot_id="test-bot",
             config={"symbol": "META"},
         )
         assert ctx.bot_id == "test-bot"
-        assert ctx.position_state == PositionState.FLAT
+        assert ctx.fsm_state == BotState.AWAITING_ENTRY_TRIGGER
+
+    def test_all_fsm_states_accepted(self):
+        for state in BotState:
+            ctx = StrategyContext(
+                state={}, fsm_state=state, bot_id="b", config={},
+            )
+            assert ctx.fsm_state == state

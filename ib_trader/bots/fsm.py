@@ -29,14 +29,36 @@ below for the full set of valid transitions.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Per-bot locks serialize concurrent FSM dispatches inside this process.
+# All FSM mutators (event-loop fill handler, internal HTTP API, runner
+# crash dispatch, supervisory checks) live in the bot-runner process, so
+# a process-local asyncio.Lock is sufficient. Cross-process producers
+# would need a Redis-side WATCH/MULTI or Lua script — not in scope here.
+_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_dispatch_lock(bot_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock for ``bot_id``, creating it on first use.
+
+    Safe under asyncio's single-threaded execution model — the
+    check-then-create pair never yields the loop.
+    """
+    lock = _DISPATCH_LOCKS.get(bot_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _DISPATCH_LOCKS[bot_id] = lock
+    return lock
 
 
 class BotState(str, Enum):
@@ -114,6 +136,7 @@ def _clear_position_fields() -> dict:
         "entry_price": None,
         "entry_time": None,
         "serial": None,
+        "ib_order_id": None,
         "high_water_mark": None,
         "current_stop": None,
         "trail_activated": False,
@@ -136,18 +159,30 @@ def _h_start(doc: dict, event: BotEvent) -> TransitionResult:
 
 def _h_stop(doc: dict, event: BotEvent) -> TransitionResult:
     # If an order is in flight, request cancellation as a side effect.
+    # Cancellation is by symbol (the bot owns one symbol at a time and
+    # the engine's /engine/cancel-by-symbol endpoint covers both pre-fill
+    # and post-fill cases without needing a serial → ib_order_id mapping
+    # in this layer.
     cur = BotState(doc.get("state", BotState.OFF.value))
     side_effects: list[SideEffect] = []
     if cur in (BotState.ENTRY_ORDER_PLACED, BotState.EXIT_ORDER_PLACED):
-        serial = doc.get("serial")
-        if serial:
+        symbol = doc.get("symbol")
+        if symbol:
             side_effects.append(SideEffect(
                 action="cancel_order",
-                args={"serial": serial},
+                args={
+                    "symbol": symbol,
+                    "serial": doc.get("serial"),
+                    "ib_order_id": doc.get("ib_order_id"),
+                },
             ))
     return TransitionResult(
         new_state=BotState.OFF,
-        state_patch={"error_reason": None, "error_message": None},
+        state_patch={
+            "error_reason": None,
+            "error_message": None,
+            **_clear_position_fields(),
+        },
         side_effects=side_effects,
     )
 
@@ -188,14 +223,18 @@ def _h_ib_mismatch(doc: dict, event: BotEvent) -> TransitionResult:
 def _h_place_entry_order(doc: dict, event: BotEvent) -> TransitionResult:
     p = event.payload
     origin = p.get("origin", "strategy")
+    state_patch = {
+        "order_qty": str(p["qty"]),
+        "filled_qty": "0",
+        "serial": p.get("serial"),
+        "order_origin": origin,
+        "symbol": p.get("symbol") or doc.get("symbol"),
+    }
+    if "ib_order_id" in p:
+        state_patch["ib_order_id"] = p["ib_order_id"]
     return TransitionResult(
         new_state=BotState.ENTRY_ORDER_PLACED,
-        state_patch={
-            "order_qty": str(p["qty"]),
-            "filled_qty": "0",
-            "serial": p.get("serial"),
-            "order_origin": origin,
-        },
+        state_patch=state_patch,
         side_effects=[SideEffect(
             action="place_order",
             args={
@@ -273,12 +312,16 @@ def _h_entry_cancelled(doc: dict, event: BotEvent) -> TransitionResult:
 
 
 def _h_entry_timeout(doc: dict, event: BotEvent) -> TransitionResult:
-    serial = doc.get("serial")
     side_effects: list[SideEffect] = []
-    if serial:
+    symbol = doc.get("symbol")
+    if symbol:
         side_effects.append(SideEffect(
             action="cancel_order",
-            args={"serial": serial},
+            args={
+                "symbol": symbol,
+                "serial": doc.get("serial"),
+                "ib_order_id": doc.get("ib_order_id"),
+            },
         ))
     return TransitionResult(
         new_state=BotState.AWAITING_ENTRY_TRIGGER,
@@ -315,13 +358,16 @@ def _h_place_exit_order(doc: dict, event: BotEvent) -> TransitionResult:
     p = event.payload
     origin = p.get("origin", "strategy")
     qty = p.get("qty") or doc.get("qty") or "0"
+    state_patch: dict = {
+        "order_qty": str(qty),
+        "filled_qty": "0",
+        "order_origin": origin,
+    }
+    if "ib_order_id" in p:
+        state_patch["ib_order_id"] = p["ib_order_id"]
     return TransitionResult(
         new_state=BotState.EXIT_ORDER_PLACED,
-        state_patch={
-            "order_qty": str(qty),
-            "filled_qty": "0",
-            "order_origin": origin,
-        },
+        state_patch=state_patch,
         side_effects=[SideEffect(
             action="place_order",
             args={
@@ -527,52 +573,57 @@ class FSM:
         Returns the TransitionResult on success so the caller can execute
         side effects. Returns None if the (state, event) pair has no
         registered handler — the event is dropped and logged.
+
+        Serializes load → handler → save under a per-bot asyncio.Lock so
+        concurrent dispatches (event loop + HTTP API + crash handler)
+        don't lose updates to overlapping fields like ``filled_qty``.
         """
-        doc = await self.load()
-        try:
-            cur = BotState(doc.get("state", BotState.OFF.value))
-        except ValueError:
-            logger.error(
-                '{"event": "FSM_CORRUPT_STATE", "bot_id": "%s", "state": %r}',
-                self.bot_id, doc.get("state"),
-            )
-            cur = BotState.OFF
-
-        handler = _TRANSITIONS.get((cur, event.type))
-        if handler is None:
-            logger.info(
-                '{"event": "FSM_INVALID_TRANSITION", "bot_id": "%s", '
-                '"state": "%s", "event_type": "%s"}',
-                self.bot_id, cur.value, event.type.value,
-            )
-            return None
-
-        try:
-            result = handler(doc, event)
-        except Exception:
-            logger.exception(
-                '{"event": "FSM_HANDLER_ERROR", "bot_id": "%s", '
-                '"state": "%s", "event_type": "%s"}',
-                self.bot_id, cur.value, event.type.value,
-            )
-            return None
-
-        new_doc = {**doc, **result.state_patch}
-        new_doc["state"] = result.new_state.value
-        new_doc["updated_at"] = _now_iso()
-        await self.save(new_doc)
-
-        # Nudge the WS bots channel so the UI refreshes immediately
-        if self._redis is not None and cur != result.new_state:
+        async with _get_dispatch_lock(self.bot_id):
+            doc = await self.load()
             try:
-                from ib_trader.redis.streams import publish_activity
-                await publish_activity(self._redis, "bots")
-            except Exception:
-                pass
+                cur = BotState(doc.get("state", BotState.OFF.value))
+            except ValueError:
+                logger.error(
+                    '{"event": "FSM_CORRUPT_STATE", "bot_id": "%s", "state": %r}',
+                    self.bot_id, doc.get("state"),
+                )
+                cur = BotState.OFF
 
-        logger.info(
-            '{"event": "FSM_TRANSITION", "bot_id": "%s", '
-            '"from": "%s", "to": "%s", "trigger": "%s"}',
-            self.bot_id, cur.value, result.new_state.value, event.type.value,
-        )
-        return result
+            handler = _TRANSITIONS.get((cur, event.type))
+            if handler is None:
+                logger.info(
+                    '{"event": "FSM_INVALID_TRANSITION", "bot_id": "%s", '
+                    '"state": "%s", "event_type": "%s"}',
+                    self.bot_id, cur.value, event.type.value,
+                )
+                return None
+
+            try:
+                result = handler(doc, event)
+            except Exception:
+                logger.exception(
+                    '{"event": "FSM_HANDLER_ERROR", "bot_id": "%s", '
+                    '"state": "%s", "event_type": "%s"}',
+                    self.bot_id, cur.value, event.type.value,
+                )
+                return None
+
+            new_doc = {**doc, **result.state_patch}
+            new_doc["state"] = result.new_state.value
+            new_doc["updated_at"] = _now_iso()
+            await self.save(new_doc)
+
+            # Nudge the WS bots channel so the UI refreshes immediately
+            if self._redis is not None and cur != result.new_state:
+                try:
+                    from ib_trader.redis.streams import publish_activity
+                    await publish_activity(self._redis, "bots")
+                except Exception as e:
+                    logger.debug("FSM_NUDGE_FAILED", exc_info=e)
+
+            logger.info(
+                '{"event": "FSM_TRANSITION", "bot_id": "%s", '
+                '"from": "%s", "to": "%s", "trigger": "%s"}',
+                self.bot_id, cur.value, result.new_state.value, event.type.value,
+            )
+            return result

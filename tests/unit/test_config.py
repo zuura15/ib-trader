@@ -40,7 +40,7 @@ daemon_tui_refresh_seconds: 5
         assert settings["ib_port"] == 7497
 
     def test_missing_file_raises(self):
-        with pytest.raises(ConfigurationError, match="settings.yaml not found"):
+        with pytest.raises(ConfigurationError, match=r"settings\.yaml not found"):
             load_settings("/nonexistent/path/settings.yaml")
 
     def test_missing_key_raises(self, tmp_path):
@@ -72,7 +72,7 @@ class TestLoadSymbols:
         assert "MSFT" in symbols
 
     def test_missing_file_raises(self):
-        with pytest.raises(ConfigurationError, match="symbols.yaml not found"):
+        with pytest.raises(ConfigurationError, match=r"symbols\.yaml not found"):
             load_symbols("/nonexistent/symbols.yaml")
 
     def test_empty_list_raises(self, tmp_path):

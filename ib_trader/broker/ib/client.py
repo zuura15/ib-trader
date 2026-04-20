@@ -7,7 +7,6 @@ This is a thin wrapper that translates between the broker-agnostic interface
 The actual IB API communication still lives in ib_trader.ib.insync_client.
 This wrapper just adapts the interface.
 """
-import json
 import logging
 from decimal import Decimal
 
@@ -59,8 +58,9 @@ class IBFillStream(FillStream):
         if event:
             event.set()
 
-    async def wait_for_fill(self, broker_order_id: str,
-                             timeout: float = 30.0):
+    async def wait_for_fill(
+        self, broker_order_id: str, timeout: float = 30.0,
+    ):
         import asyncio
         event = asyncio.Event()
         self._watches[broker_order_id] = event

@@ -15,7 +15,6 @@ Invariants:
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -109,28 +108,30 @@ class TestMutableEdits:
 
 
 class TestRunningBotSafety:
-    def _set_running(self, session_factory, bot_id: str) -> None:
-        BotRepository(session_factory).update_status(bot_id, BotStatus.RUNNING)
+    """Running-bot gating now comes from the caller's ``running_bot_ids``
+    set (a Redis FSM snapshot), not from SQLite ``bots.status``."""
 
     def test_rename_running_bot_accepted(self, tmp_path: Path, session_factory):
         # Name is mutable even while running.
         _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha\nstrategy: s\n")
         bootstrap_bots_from_yaml(session_factory, tmp_path)
-        self._set_running(session_factory, "a1")
 
         _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha-2\nstrategy: s\n")
-        report = bootstrap_bots_from_yaml(session_factory, tmp_path)
+        report = bootstrap_bots_from_yaml(
+            session_factory, tmp_path, running_bot_ids={"a1"},
+        )
         assert "a1" in report.updated
         assert _existing_bot_row(session_factory, "a1").name == "alpha-2"
 
     def test_strategy_change_on_running_bot_refused(self, tmp_path: Path, session_factory):
         _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha\nstrategy: s1\n")
         bootstrap_bots_from_yaml(session_factory, tmp_path)
-        self._set_running(session_factory, "a1")
 
         _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha\nstrategy: s2\n")
         with pytest.raises(BootstrapError, match="immutable fields"):
-            bootstrap_bots_from_yaml(session_factory, tmp_path)
+            bootstrap_bots_from_yaml(
+                session_factory, tmp_path, running_bot_ids={"a1"},
+            )
 
         # DB unchanged
         assert _existing_bot_row(session_factory, "a1").strategy == "s1"
@@ -144,7 +145,6 @@ config:
   ref_id: old-ref
 """)
         bootstrap_bots_from_yaml(session_factory, tmp_path)
-        self._set_running(session_factory, "a1")
 
         _write_yaml(tmp_path, "a.yaml", """
 id: a1
@@ -154,7 +154,9 @@ config:
   ref_id: new-ref
 """)
         with pytest.raises(BootstrapError, match="ref_id"):
-            bootstrap_bots_from_yaml(session_factory, tmp_path)
+            bootstrap_bots_from_yaml(
+                session_factory, tmp_path, running_bot_ids={"a1"},
+            )
 
     def test_symbol_change_on_running_bot_refused(self, tmp_path: Path, session_factory):
         _write_yaml(tmp_path, "a.yaml", """
@@ -165,7 +167,6 @@ config:
   symbol: F
 """)
         bootstrap_bots_from_yaml(session_factory, tmp_path)
-        self._set_running(session_factory, "a1")
 
         _write_yaml(tmp_path, "a.yaml", """
 id: a1
@@ -175,7 +176,24 @@ config:
   symbol: QQQ
 """)
         with pytest.raises(BootstrapError, match="symbol"):
-            bootstrap_bots_from_yaml(session_factory, tmp_path)
+            bootstrap_bots_from_yaml(
+                session_factory, tmp_path, running_bot_ids={"a1"},
+            )
+
+    def test_immutable_change_when_not_in_running_set_accepted(
+        self, tmp_path: Path, session_factory,
+    ):
+        """When the caller doesn't list a bot as running, immutable
+        edits go through — this is the startup case where the runner
+        hasn't started yet."""
+        _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha\nstrategy: s1\n")
+        bootstrap_bots_from_yaml(session_factory, tmp_path)
+        _write_yaml(tmp_path, "a.yaml", "id: a1\nname: alpha\nstrategy: s2\n")
+        report = bootstrap_bots_from_yaml(
+            session_factory, tmp_path, running_bot_ids=None,
+        )
+        assert "a1" in report.updated
+        assert _existing_bot_row(session_factory, "a1").strategy == "s2"
 
 
 class TestOrphanSqliteRows:
@@ -207,19 +225,23 @@ class TestOrphanSqliteRows:
         assert report.removed == ["orphan"]
         assert _existing_bot_row(session_factory, "orphan") is None
 
-    def test_running_orphan_refused_even_with_force(self, tmp_path: Path, session_factory):
+    def test_running_orphan_refused_without_force(self, tmp_path: Path, session_factory):
         repo = BotRepository(session_factory)
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         repo.create(Bot(
             id="orphan", name="orphan", strategy="s",
             broker="ib", config_json="{}", tick_interval_seconds=10,
-            status=BotStatus.RUNNING, created_at=now, updated_at=now,
+            created_at=now, updated_at=now,
         ))
 
-        # Running-bot clause fires first — operator must stop the bot.
+        # Caller's running snapshot says this bot is up — the running-bot
+        # branch fires its specific "Bot is RUNNING" message rather than
+        # the generic "no matching YAML" branch.
         with pytest.raises(BootstrapError, match="RUNNING"):
-            bootstrap_bots_from_yaml(session_factory, tmp_path)
+            bootstrap_bots_from_yaml(
+                session_factory, tmp_path, running_bot_ids={"orphan"},
+            )
 
 
 class TestConfigVersion:
