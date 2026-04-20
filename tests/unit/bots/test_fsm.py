@@ -425,7 +425,7 @@ async def test_exit_filled_full_returns_to_awaiting_entry(fsm):
     })
     result = await fsm.dispatch(BotEvent(
         EventType.EXIT_FILLED,
-        payload={"qty": "10", "price": "12.80"},
+        payload={"qty": "10", "price": "12.80", "terminal": True},
     ))
     assert result.new_state == BotState.AWAITING_ENTRY_TRIGGER
     doc = await fsm.load()
@@ -439,17 +439,107 @@ async def test_exit_filled_full_returns_to_awaiting_entry(fsm):
 
 
 @pytest.mark.asyncio
-async def test_exit_filled_partial_stays_in_exit_order_placed(fsm):
+async def test_exit_filled_progress_stays_in_exit_order_placed(fsm):
+    """Non-terminal partials track cumulative but don't transition."""
     await _prime(fsm, BotState.EXIT_ORDER_PLACED, {
         "qty": "10", "entry_price": "12.73", "order_qty": "10", "filled_qty": "0",
     })
     result = await fsm.dispatch(BotEvent(
         EventType.EXIT_FILLED,
-        payload={"qty": "4", "price": "12.80"},
+        payload={"qty": "4", "price": "12.80", "terminal": False},
     ))
     assert result.new_state == BotState.EXIT_ORDER_PLACED
     doc = await fsm.load()
     assert doc["filled_qty"] == "4"
+    # Position qty untouched during progress — only terminal decrements it.
+    assert doc["qty"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_exit_filled_terminal_partial_retries_for_residual(fsm):
+    """Terminal with residual triggers a retry: new SELL for the
+    remaining position qty, exit_retries counter bumped, stay in
+    EXIT_ORDER_PLACED because another order is going in."""
+    await _prime(fsm, BotState.EXIT_ORDER_PLACED, {
+        "qty": "10", "entry_price": "12.73",
+        "order_qty": "10", "filled_qty": "0",
+        "symbol": "QQQ",
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.EXIT_FILLED,
+        payload={"qty": "7", "price": "12.80", "terminal": True},
+    ))
+    assert result.new_state == BotState.EXIT_ORDER_PLACED
+    doc = await fsm.load()
+    assert doc["qty"] == "3"            # position reduced by the 7 filled
+    assert doc["order_qty"] == "3"      # next retry order is for residual
+    assert doc["filled_qty"] == "0"     # reset for the retry order
+    assert int(doc["exit_retries"]) == 1
+    retry = next(s for s in result.side_effects if s.action == "retry_exit_order")
+    assert retry.args["qty"] == "3"
+    assert retry.args["symbol"] == "QQQ"
+    assert retry.args["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_filled_retries_exhausted_raises_pager(fsm):
+    """Fourth partial terminal (after 3 retries) -> ERRORED + pager."""
+    await _prime(fsm, BotState.EXIT_ORDER_PLACED, {
+        "qty": "3", "entry_price": "12.73",
+        "order_qty": "3", "filled_qty": "0",
+        "symbol": "QQQ",
+        "exit_retries": 3,
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.EXIT_FILLED,
+        payload={"qty": "1", "price": "12.80", "terminal": True},
+    ))
+    assert result.new_state == BotState.ERRORED
+    doc = await fsm.load()
+    assert doc["qty"] == "2"           # 2 shares still unsold
+    assert doc["error_reason"] == "exit_retries_exhausted"
+    pager = next(s for s in result.side_effects if s.action == "pager_alert")
+    assert pager.args["severity"] == "CATASTROPHIC"
+    assert pager.args["trigger"] == "BOT_EXIT_RETRIES_EXHAUSTED"
+    assert pager.args["residual_qty"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_exit_filled_progress_does_not_count_as_retry(fsm):
+    """Progress (non-terminal) must not bump the retry counter or
+    trigger escalation, even if the running cumulative is below
+    order_qty."""
+    await _prime(fsm, BotState.EXIT_ORDER_PLACED, {
+        "qty": "10", "entry_price": "12.73",
+        "order_qty": "10", "filled_qty": "0",
+        "symbol": "QQQ",
+        "exit_retries": 3,     # would escalate on terminal
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.EXIT_FILLED,
+        payload={"qty": "1", "price": "12.80", "terminal": False},
+    ))
+    assert result.new_state == BotState.EXIT_ORDER_PLACED
+    doc = await fsm.load()
+    assert int(doc["exit_retries"]) == 3   # unchanged
+    assert doc["qty"] == "10"              # unchanged
+    # No pager from a progress event.
+    assert not any(s.action == "pager_alert" for s in result.side_effects)
+
+
+@pytest.mark.asyncio
+async def test_crash_raises_pager_alert(fsm):
+    await _prime(fsm, BotState.AWAITING_EXIT_TRIGGER, {
+        "qty": "5", "symbol": "QQQ",
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.CRASH,
+        payload={"message": "IB disconnected mid-exit"},
+    ))
+    assert result.new_state == BotState.ERRORED
+    pager = next(s for s in result.side_effects if s.action == "pager_alert")
+    assert pager.args["trigger"] == "BOT_CRASH"
+    assert "IB disconnected" in pager.args["message"]
 
 
 @pytest.mark.asyncio

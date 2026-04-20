@@ -199,13 +199,22 @@ def _h_force_stop(doc: dict, event: BotEvent) -> TransitionResult:
 
 
 def _h_crash(doc: dict, event: BotEvent) -> TransitionResult:
+    msg = event.payload.get("message", "Unhandled exception")
     return TransitionResult(
         new_state=BotState.ERRORED,
         state_patch={
             "error_reason": "crash",
-            "error_message": event.payload.get("message", "Unhandled exception"),
+            "error_message": msg,
         },
-        side_effects=[],
+        side_effects=[SideEffect(
+            action="pager_alert",
+            args={
+                "trigger": "BOT_CRASH",
+                "severity": "CATASTROPHIC",
+                "symbol": doc.get("symbol"),
+                "message": f"Bot crashed: {msg}",
+            },
+        )],
     )
 
 
@@ -386,6 +395,11 @@ def _h_place_exit_order(doc: dict, event: BotEvent) -> TransitionResult:
         "order_qty": str(qty),
         "filled_qty": "0",
         "order_origin": origin,
+        # Fresh exit cycle — reset the retry counter. The retry side
+        # effect in ``_h_exit_filled`` bumps this on each terminal
+        # partial; a user-initiated or strategy-initiated exit starts
+        # the count over.
+        "exit_retries": 0,
     }
     if "ib_order_id" in p:
         state_patch["ib_order_id"] = p["ib_order_id"]
@@ -406,53 +420,158 @@ def _h_place_exit_order(doc: dict, event: BotEvent) -> TransitionResult:
     )
 
 
-def _h_exit_filled(doc: dict, event: BotEvent) -> TransitionResult:
-    """Handle an exit fill.
+# Max retry attempts on a partial exit. Exit isn't "done" until every
+# share is back out — if IB terminates the order with a residual, we
+# re-place a SELL for what's left. After this many retries, escalate.
+_MAX_EXIT_RETRIES = 3
 
-    Accumulates ``filled_qty`` on the exit order. When the accumulated
-    filled amount reaches ``order_qty``, transitions back to
-    AWAITING_ENTRY_TRIGGER.
+
+def _h_exit_filled(doc: dict, event: BotEvent) -> TransitionResult:
+    """Handle an exit fill event from the engine's order ledger.
+
+    Semantics mirror ``_h_entry_filled``: the ledger emits cumulative
+    ``filled_qty`` per order plus a ``terminal`` flag.
+
+    Exit rule (user-stated): the bot is not done until every share is
+    out. So:
+    - Progress (``terminal=False``): record the running cumulative
+      against the current exit order. Stay in ``EXIT_ORDER_PLACED``.
+    - Terminal with ``cum_filled >= order_qty``: this exit order closed
+      whatever it targeted. If the position is now flat (bot's qty
+      minus this fill drops to 0) we record the trade and return to
+      ``AWAITING_ENTRY_TRIGGER``. Otherwise we retry for the residual.
+    - Terminal with ``cum_filled < order_qty``: IB stopped working
+      this order with a residual still to sell. Retry up to
+      ``_MAX_EXIT_RETRIES`` times; after that, transition to
+      ``ERRORED`` and raise a pager alert so a human can intervene.
     """
     p = event.payload
-    qty_incr = Decimal(str(p.get("qty", "0")))
+    cum_filled = Decimal(str(p.get("qty", "0")))  # cumulative on THIS exit order
     price = Decimal(str(p.get("price", "0")))
-    prev_filled = Decimal(doc.get("filled_qty") or "0")
-    new_filled = prev_filled + qty_incr
+    terminal = bool(p.get("terminal", False))
     order_qty = Decimal(doc.get("order_qty") or "0")
+    position_qty = Decimal(doc.get("qty") or "0")
 
-    side_effects = [SideEffect(
-        action="emit_strategy_event",
-        args={
-            "type": "OrderFilled",
-            "side": "SELL",
-            "qty": str(qty_incr),
-            "price": str(price),
-            "serial": p.get("serial"),
-        },
-    )]
-
-    if order_qty > 0 and new_filled < order_qty:
-        # Partial — stay in EXIT_ORDER_PLACED
+    # Progress — just record the running total for this order. No
+    # state change, no trade close, no retry logic.
+    if not terminal:
         return TransitionResult(
             new_state=BotState.EXIT_ORDER_PLACED,
-            state_patch={"filled_qty": str(new_filled)},
-            side_effects=side_effects,
+            state_patch={"filled_qty": str(cum_filled)},
+            side_effects=[],
         )
 
-    # Fully exited — clear position, back to AWAITING_ENTRY_TRIGGER.
-    entry_price = Decimal(doc.get("entry_price") or "0")
-    realized_pnl = (price - entry_price) * order_qty if entry_price > 0 else Decimal("0")
-    side_effects.append(SideEffect(
-        action="record_trade_closed",
-        args={"realized_pnl": str(realized_pnl), "serial": doc.get("serial")},
-    ))
+    # Terminal. Compute the residual we still need to sell. ``order_qty``
+    # was the quantity we asked IB to sell on this exit order. The
+    # remaining position after this terminal is ``position_qty - cum_filled``.
+    residual_on_order = max(order_qty - cum_filled, Decimal("0"))
+    new_position_qty = max(position_qty - cum_filled, Decimal("0"))
+
+    # Fully flat — record the closed trade and return to awaiting entry.
+    if new_position_qty == 0:
+        entry_price = Decimal(doc.get("entry_price") or "0")
+        realized_pnl = (
+            (price - entry_price) * position_qty
+            if entry_price > 0 else Decimal("0")
+        )
+        return TransitionResult(
+            new_state=BotState.AWAITING_ENTRY_TRIGGER,
+            state_patch={
+                **_clear_position_fields(),
+                "last_realized_pnl": str(realized_pnl),
+                "exit_retries": 0,
+            },
+            side_effects=[
+                SideEffect(
+                    action="emit_strategy_event",
+                    args={
+                        "type": "OrderFilled",
+                        "side": "SELL",
+                        "qty": str(cum_filled),
+                        "price": str(price),
+                        "serial": p.get("serial"),
+                    },
+                ),
+                SideEffect(
+                    action="record_trade_closed",
+                    args={"realized_pnl": str(realized_pnl), "serial": doc.get("serial")},
+                ),
+            ],
+        )
+
+    # Terminal with residual still to sell. We've either partially
+    # filled this order or IB rejected the remainder — either way the
+    # bot is NOT flat. Decide between retry and escalation.
+    prior_retries = int(doc.get("exit_retries") or 0)
+
+    if prior_retries >= _MAX_EXIT_RETRIES:
+        # Exhausted retries. Escalate.
+        return TransitionResult(
+            new_state=BotState.ERRORED,
+            state_patch={
+                "qty": str(new_position_qty),
+                "error_reason": "exit_retries_exhausted",
+                "error_message": (
+                    f"Exit failed after {_MAX_EXIT_RETRIES} retries — "
+                    f"{new_position_qty} shares remain unsold on {doc.get('symbol')}"
+                ),
+            },
+            side_effects=[
+                SideEffect(
+                    action="pager_alert",
+                    args={
+                        "trigger": "BOT_EXIT_RETRIES_EXHAUSTED",
+                        "severity": "CATASTROPHIC",
+                        "symbol": doc.get("symbol"),
+                        "message": (
+                            f"Exit failed after {_MAX_EXIT_RETRIES} retries — "
+                            f"{new_position_qty} shares of {doc.get('symbol')} "
+                            f"still held. Manual intervention required."
+                        ),
+                        "residual_qty": str(new_position_qty),
+                        "retries": prior_retries,
+                    },
+                ),
+            ],
+        )
+
+    # Retry: place a new SELL for the residual position. Bump the
+    # counter; stay in EXIT_ORDER_PLACED because another exit order
+    # is about to go in. The runtime executes the retry via the
+    # ``retry_exit_order`` side effect.
+    symbol = doc.get("symbol")
     return TransitionResult(
-        new_state=BotState.AWAITING_ENTRY_TRIGGER,
+        new_state=BotState.EXIT_ORDER_PLACED,
         state_patch={
-            **_clear_position_fields(),
-            "last_realized_pnl": str(realized_pnl),
+            "qty": str(new_position_qty),
+            "order_qty": str(new_position_qty),
+            "filled_qty": "0",
+            "exit_retries": prior_retries + 1,
         },
-        side_effects=side_effects,
+        side_effects=[
+            SideEffect(
+                action="emit_strategy_event",
+                args={
+                    "type": "OrderFilled",
+                    "side": "SELL",
+                    "qty": str(cum_filled),
+                    "price": str(price),
+                    "serial": p.get("serial"),
+                },
+            ),
+            SideEffect(
+                action="retry_exit_order",
+                args={
+                    "symbol": symbol,
+                    "qty": str(new_position_qty),
+                    "attempt": prior_retries + 1,
+                    "reason": (
+                        f"terminal residual: {residual_on_order}/{order_qty} "
+                        f"unsold on order, {new_position_qty} remain in position"
+                    ),
+                },
+            ),
+        ],
     )
 
 

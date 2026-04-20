@@ -454,6 +454,10 @@ class StrategyBotRunner(BotBase):
                         message=se.args.get("message"),
                         payload=se.args.get("payload"),
                     )
+                elif se.action == "pager_alert":
+                    await self._handle_pager_alert(se.args)
+                elif se.action == "retry_exit_order":
+                    await self._handle_retry_exit_order(se.args)
                 # place_order / emit_strategy_event / run_strategy_tick
                 # are owned by the runtime's existing direct paths.
             except asyncio.CancelledError:
@@ -494,6 +498,118 @@ class StrategyBotRunner(BotBase):
                 '"symbol": "%s", "ib_order_id": "%s"}',
                 self.bot_id, symbol, args.get("ib_order_id"),
             )
+
+    async def _handle_pager_alert(self, args: dict) -> None:
+        """Raise a pager-class (CATASTROPHIC) alert that blocks the UI.
+
+        Writes into the existing ``alerts:active`` Redis hash so the
+        public /api/alerts endpoint and the WebSocket alerts channel
+        pick it up without any new plumbing. The ``pager`` flag is what
+        the frontend keys on to render a blocking modal / fatal banner
+        (future wiring — the alert is visible today on the alerts panel
+        in any case).
+
+        This is a "model" of the pager integration — a real pager push
+        (PagerDuty / Opsgenie / SMS) will attach later and consume the
+        same CATASTROPHIC alerts feed, keyed off ``trigger`` and
+        ``pager=true``.
+        """
+        redis = self.config.get("_redis")
+        if redis is None:
+            logger.error(
+                '{"event": "PAGER_ALERT_NO_REDIS", "bot_id": "%s", "trigger": "%s"}',
+                self.bot_id, args.get("trigger"),
+            )
+            return
+        from ib_trader.redis.state import StateKeys
+        import uuid as _uuid
+        alert_id = str(_uuid.uuid4())
+        alert_dict = {
+            "id": alert_id,
+            "severity": args.get("severity", "CATASTROPHIC"),
+            "trigger": args.get("trigger", "BOT_PAGER"),
+            "message": args.get("message", "Pager alert"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "pager": True,
+            "bot_id": self.bot_id,
+            "symbol": args.get("symbol"),
+            # Any extra context the caller passed (residual_qty, retries, etc.)
+            **{k: v for k, v in args.items()
+               if k not in ("severity", "trigger", "message", "symbol")},
+        }
+        try:
+            await StateKeys.publish_alert(redis, alert_id, alert_dict)
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(redis, "alerts")
+        except Exception:
+            logger.exception(
+                '{"event": "PAGER_ALERT_PUBLISH_FAILED", "bot_id": "%s", "trigger": "%s"}',
+                self.bot_id, args.get("trigger"),
+            )
+            return
+        logger.error(
+            '{"event": "PAGER_ALERT_RAISED", "bot_id": "%s", "trigger": "%s", '
+            '"symbol": "%s", "alert_id": "%s"}',
+            self.bot_id, args.get("trigger"), args.get("symbol") or "", alert_id,
+        )
+
+    async def _handle_retry_exit_order(self, args: dict) -> None:
+        """Place a follow-up SELL for the residual when an exit order
+        terminated with unsold shares.
+
+        Uses the engine's ``/engine/orders`` endpoint directly (bypassing
+        the strategy pipeline) so the retry stays local to the FSM's
+        decision. The orderRef is tagged with the bot_ref so the fill
+        events route back into this bot's order-stream handler.
+        """
+        symbol = args.get("symbol")
+        qty = args.get("qty")
+        engine_url = self.config.get("_engine_url")
+        bot_ref = self.config.get("bot_ref") or self.config.get("ref")
+        if not (symbol and qty and engine_url):
+            logger.warning(
+                '{"event": "RETRY_EXIT_SKIPPED_INCOMPLETE", "bot_id": "%s"}',
+                self.bot_id,
+            )
+            return
+        logger.warning(
+            '{"event": "BOT_EXIT_RETRY", "bot_id": "%s", "symbol": "%s", '
+            '"qty": "%s", "attempt": %d, "reason": "%s"}',
+            self.bot_id, symbol, qty, int(args.get("attempt") or 0),
+            args.get("reason", ""),
+        )
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{engine_url}/engine/orders",
+                    json={
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "qty": str(qty),
+                        "order_type": "market",
+                        "bot_ref": bot_ref,
+                    },
+                )
+                resp.raise_for_status()
+        except Exception as e:
+            # Retry submission itself failed — escalate to pager. This
+            # catches the "IB connection is dead" branch of the user's
+            # requirement: if we can't even get the order across, page.
+            logger.exception(
+                '{"event": "BOT_EXIT_RETRY_FAILED", "bot_id": "%s", "symbol": "%s"}',
+                self.bot_id, symbol,
+            )
+            await self._handle_pager_alert({
+                "trigger": "BOT_EXIT_RETRY_SUBMIT_FAILED",
+                "severity": "CATASTROPHIC",
+                "symbol": symbol,
+                "message": (
+                    f"Failed to submit retry exit for {qty} {symbol}: {e}. "
+                    f"Connection to engine may be down. Manual intervention required."
+                ),
+                "residual_qty": str(qty),
+            })
 
     async def _handle_record_trade_closed(self, args: dict) -> None:
         """Record realized P&L + trade count when an exit fully fills.
