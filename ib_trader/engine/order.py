@@ -1259,10 +1259,40 @@ async def _walk_limit_aggressive(
             await ctx.ib.amend_order(ib_order_id, step_price)
             last_sent = step_price
         except Exception:
+            # Amend almost always fails for one reason: the order hit a
+            # terminal state between our last status check and the amend
+            # (IB code 104 "Cannot modify a filled order" / 201 "Order is
+            # already filled", or ib_async's pre-send assertion on a
+            # DoneState). Verify and exit immediately — do NOT loop. A
+            # looping walker on a filled order is a runaway.
             logger.exception(
                 '{"event": "SMART_MARKET_AMEND_FAILED", "ib_order_id": "%s"}',
                 ib_order_id,
             )
+            try:
+                _check = await ctx.ib.get_order_status(ib_order_id)
+            except Exception:
+                _check = {"status": "", "qty_filled": Decimal("0")}
+            _st = _check.get("status") or ""
+            if _st in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+                return {
+                    "status": _st.lower(),
+                    "hit_cap": False,
+                    "last_sent_price": last_sent,
+                }
+            if (_check.get("qty_filled") or Decimal("0")) >= target_qty:
+                return {
+                    "status": "filled",
+                    "hit_cap": False,
+                    "last_sent_price": last_sent,
+                }
+            # Order not terminal but amend failed — abort the walker to
+            # avoid spinning on a permanent failure mode.
+            return {
+                "status": "amend_failed",
+                "hit_cap": False,
+                "last_sent_price": last_sent,
+            }
 
 
 async def _execute_smart_market_order(

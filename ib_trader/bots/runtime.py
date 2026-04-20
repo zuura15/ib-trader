@@ -578,9 +578,8 @@ class StrategyBotRunner(BotBase):
             self.bot_id, symbol, qty, int(args.get("attempt") or 0),
             args.get("reason", ""),
         )
-        # Use "smart_market" — same session-aware aggressive-mid algo the
-        # strategies themselves use for exits. Engine handles the RTH
-        # cross-to-market and the ETH slippage cap.
+        # Reverted from "smart_market" pending diagnosis of a
+        # repeat-exit runaway observed in production.
         import httpx
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -590,7 +589,7 @@ class StrategyBotRunner(BotBase):
                         "symbol": symbol,
                         "side": "SELL",
                         "qty": str(qty),
-                        "order_type": "smart_market",
+                        "order_type": "market",
                         "bot_ref": bot_ref,
                     },
                 )

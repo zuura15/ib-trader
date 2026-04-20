@@ -416,10 +416,12 @@ class SawtoothRsiStrategy:
                 symbol=symbol,
                 side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                # Exits want to fill now but without a naked MKT; use the
-                # session-aware aggressive-mid algo. Engine handles the
-                # RTH cross-to-market and ETH slippage cap.
-                order_type="smart_market",
+                # Reverted from "smart_market" pending diagnosis of a
+                # repeat-exit runaway (multiple SELLs fired per second
+                # while the bot's FSM state hadn't yet caught up to the
+                # in-flight exit). Keep raw market behaviour until the
+                # root cause is understood.
+                order_type="market",
                 origin="exit",
             ),
         ]
