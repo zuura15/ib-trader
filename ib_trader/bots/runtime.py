@@ -91,6 +91,16 @@ class StrategyBotRunner(BotBase):
         self.aggregator: BarAggregator | None = None
         self._warmup_complete: bool = False
         self._pending_cmd_id: str | None = None  # tracks the active command we're waiting on
+        # Set synchronously at the TOP of _run_pipeline whenever a
+        # PlaceOrder action is about to be submitted, cleared in a
+        # finally once the pipeline + FSM dispatch have both completed.
+        # Quote / bar handlers bail if this is True so the strategy
+        # cannot re-emit a duplicate order while the first one is still
+        # being processed. Prevents the Apr 19 runaway where SMART_MARKET's
+        # ~600ms HTTP round-trip let 17 quote ticks queue up and each
+        # emitted its own SELL before the FSM transitioned out of
+        # AWAITING_EXIT_TRIGGER.
+        self._order_submit_in_flight: bool = False
 
         # Market data state
         self._last_bar_ts: datetime | None = None
@@ -367,26 +377,38 @@ class StrategyBotRunner(BotBase):
         from ib_trader.bots.strategy import PlaceOrder
         place_orders = [a for a in actions if isinstance(a, PlaceOrder)]
 
-        await self.pipeline.process(actions, ctx or self.ctx)
+        # Guard: while an order is being submitted the FSM hasn't yet
+        # transitioned (the PLACE_* event only fires AFTER the HTTP
+        # response). Hold a flag across the whole round-trip so quote /
+        # bar handlers skip strategy evaluation — preventing duplicate
+        # orders on every subsequent tick that arrives mid-submit.
+        had_place_orders = bool(place_orders)
+        if had_place_orders:
+            self._order_submit_in_flight = True
+        try:
+            await self.pipeline.process(actions, ctx or self.ctx)
 
-        # Capture the command ID if the execution middleware placed an order
-        cmd_id = self.pipeline.last_cmd_id
-        if cmd_id is not None:
-            self._pending_cmd_id = cmd_id
-            self.pipeline.last_cmd_id = None
+            # Capture the command ID if the execution middleware placed an order
+            cmd_id = self.pipeline.last_cmd_id
+            if cmd_id is not None:
+                self._pending_cmd_id = cmd_id
+                self.pipeline.last_cmd_id = None
 
-        # Dispatch FSM events whenever PlaceOrder actions went through
-        # the pipeline AND produced a command ID (any truthy or "0" value).
-        # The FSM transition is safe even on edge cases — cancel/timeout
-        # reverts if the order didn't actually execute.
-        if place_orders and cmd_id is not None:
-            await self._dispatch_place_order_fsm(place_orders, cmd_id)
-            logger.info(
-                '{"event": "FSM_PLACE_ORDER_DISPATCHED", "bot_id": "%s", '
-                '"cmd_id": "%s", "side": "%s"}',
-                self.bot_id, cmd_id,
-                place_orders[0].side if place_orders else "?",
-            )
+            # Dispatch FSM events whenever PlaceOrder actions went through
+            # the pipeline AND produced a command ID (any truthy or "0" value).
+            # The FSM transition is safe even on edge cases — cancel/timeout
+            # reverts if the order didn't actually execute.
+            if place_orders and cmd_id is not None:
+                await self._dispatch_place_order_fsm(place_orders, cmd_id)
+                logger.info(
+                    '{"event": "FSM_PLACE_ORDER_DISPATCHED", "bot_id": "%s", '
+                    '"cmd_id": "%s", "side": "%s"}',
+                    self.bot_id, cmd_id,
+                    place_orders[0].side if place_orders else "?",
+                )
+        finally:
+            if had_place_orders:
+                self._order_submit_in_flight = False
 
     async def _dispatch_place_order_fsm(self, place_orders, cmd_id: str) -> None:
         """Emit PlaceEntryOrder / PlaceExitOrder FSM events for orders
@@ -874,6 +896,14 @@ class StrategyBotRunner(BotBase):
         if stream_name == quote_stream:
             if self.ctx.fsm_state != BotState.AWAITING_EXIT_TRIGGER:
                 return  # Quotes only matter for exit monitoring
+            if self._order_submit_in_flight:
+                # An order is being submitted. The FSM hasn't transitioned
+                # yet (that happens AFTER the HTTP response), so the state
+                # check above passes — but the strategy would emit a
+                # duplicate exit if we ran it here. Skip this tick; the
+                # order-stream handler will wake the bot up when the order
+                # terminalises.
+                return
 
             bid_str = data.get("bid")
             ask_str = data.get("ask")
@@ -907,6 +937,12 @@ class StrategyBotRunner(BotBase):
         # ── Bar completion (5s raw bar from IB) ────────────────────────
         if stream_name == bar_stream:
             if not self.aggregator:
+                return
+            if self._order_submit_in_flight:
+                # Mirror of the quote-tick guard. A strategy eval here
+                # could re-emit a duplicate entry while the first is in
+                # flight. Skip; next bar after the order terminalises
+                # will carry the up-to-date state.
                 return
 
             bar = {
