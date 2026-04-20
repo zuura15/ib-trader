@@ -271,16 +271,43 @@ class CloseTrendRsiStrategy:
             return []
 
         state = ctx.state
+        _redis = ctx.config.get("_redis") if isinstance(ctx.config, dict) else None
+
+        # Invariant guard: AWAITING_EXIT_TRIGGER implies we hold a
+        # non-zero position. If qty is 0/negative/invalid here, FSM
+        # state and position fields are out of sync (Apr 19 bug: FSM
+        # stuck at AWAITING_EXIT_TRIGGER while qty collapsed to 0,
+        # causing zero-qty SELLs to fire on every tick). Alert + bail.
+        from decimal import InvalidOperation
+        from ib_trader.logging_.alerts import fire_and_forget_alert
+        qty_raw = state.get("qty", "0")
+        try:
+            position_qty = Decimal(str(qty_raw))
+        except (ValueError, TypeError, InvalidOperation):
+            position_qty = Decimal("0")
+        if position_qty <= 0:
+            fire_and_forget_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED_QTY_ZERO",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER with qty={qty_raw!r}. "
+                    f"State doc is inconsistent — refusing to emit zero-qty SELL."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "qty", "value": str(qty_raw),
+                       "entry_price": str(state.get("entry_price"))},
+            )
+            return []
+
         entry_price = Decimal(str(state.get("entry_price", "0")))
         if entry_price <= 0:
             # Invariant: AWAITING_EXIT_TRIGGER implies a filled entry with
             # a positive entry_price. If we got here without one, state is
             # inconsistent — surface it loudly (UI + log) instead of
             # silently eating quote ticks forever.
-            from ib_trader.logging_.alerts import log_and_alert
-            _redis = ctx.config.get("_redis") if isinstance(ctx.config, dict) else None
-            import asyncio as _asyncio
-            _asyncio.create_task(log_and_alert(
+            fire_and_forget_alert(
                 redis=_redis,
                 trigger="BOT_INVARIANT_VIOLATED",
                 message=(
@@ -291,8 +318,7 @@ class CloseTrendRsiStrategy:
                 bot_id=ctx.bot_id,
                 symbol=state.get("symbol"),
                 extra={"field": "entry_price", "value": str(state.get("entry_price"))},
-                exc_info=False,
-            ))
+            )
             return []
 
         exit_cfg = self.config.get("exit", {})

@@ -43,8 +43,11 @@ def _make_runner() -> StrategyBotRunner:
     runner._pending_cmd_id = None
     runner._awaiting_terminal_ib_order_id = None
     runner._stoic_mode_set_at = 0.0
+    runner._recent_submit_times = []
     runner.bot_id = "test-bot"
     runner.ctx = None
+    runner.config = {"_redis": None}
+    runner.strategy_config = {"symbol": "TEST"}
     return runner
 
 

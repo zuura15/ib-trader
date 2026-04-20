@@ -27,6 +27,44 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def fire_and_forget_alert(
+    *,
+    redis,
+    trigger: str,
+    message: str,
+    severity: str = "WARNING",
+    bot_id: str | None = None,
+    symbol: str | None = None,
+    ib_order_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Schedule ``log_and_alert`` without awaiting. Safe to call from
+    sync code. If no event loop is running (test harnesses, bootstrap
+    code), falls back to a plain ``logger.warning`` so the signal is
+    not lost and no coroutine is leaked.
+    """
+    import asyncio
+
+    coro = log_and_alert(
+        redis=redis, trigger=trigger, message=message,
+        severity=severity, bot_id=bot_id, symbol=symbol,
+        ib_order_id=ib_order_id, extra=extra, exc_info=False,
+    )
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        # No running loop — close the coroutine so it doesn't leak,
+        # and at least emit the log line synchronously.
+        coro.close()
+        _extra = {"severity": severity, "trigger": trigger,
+                  "message": message, "bot_id": bot_id, "symbol": symbol,
+                  "ib_order_id": ib_order_id}
+        if extra:
+            _extra.update(extra)
+        logger.warning(json.dumps({k: v for k, v in _extra.items()
+                                    if v is not None}))
+
+
 async def log_and_alert(
     *,
     redis,

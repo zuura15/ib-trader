@@ -105,6 +105,13 @@ class StrategyBotRunner(BotBase):
         self._order_submit_in_flight: bool = False
         self._awaiting_terminal_ib_order_id: str | None = None
         self._stoic_mode_set_at: float = 0.0  # time.monotonic() when flag was raised
+        # Rolling ring of submit timestamps (time.monotonic seconds).
+        # Circuit breaker: if `bot_order_rate_limit_count` submissions
+        # land within `bot_order_rate_limit_window_seconds`, the bot is
+        # force-STOPped to OFF and a CATASTROPHIC alert fires. Final
+        # safety net regardless of which upstream bug caused the
+        # runaway.
+        self._recent_submit_times: list[float] = []
 
         # Market data state
         self._last_bar_ts: datetime | None = None
@@ -163,6 +170,16 @@ class StrategyBotRunner(BotBase):
         self.ctx.state = doc
         self.ctx.fsm_state = BotState(doc.get("state", BotState.AWAITING_ENTRY_TRIGGER.value))
 
+    async def _read_state_doc(self) -> dict | None:
+        """Read the current bot:<id> doc from Redis WITHOUT mutating
+        self.ctx. Used by _apply_fill to get the post-FSM values
+        instead of the stale pre-FSM snapshot in self.ctx.state."""
+        redis = self.config.get("_redis")
+        if redis is None:
+            return None
+        from ib_trader.redis.state import StateStore
+        return await StateStore(redis).get(f"bot:{self.bot_id}")
+
     # ------------------------------------------------------------------
 
     async def _apply_fill(self, *, bot_ref: str, symbol: str, side: str,
@@ -213,17 +230,25 @@ class StrategyBotRunner(BotBase):
                 "trail_activated": False,
             }
         else:
-            new_qty = max(existing_qty - qty, Decimal("0"))
+            # SELL branch. FSM has already written qty (post-decrement)
+            # + cleared entry fields on full exit. _apply_fill must NOT
+            # re-decrement qty or resurrect cleared entry fields from
+            # the stale ctx.state snapshot. We only update avg_price
+            # here; everything else is FSM's authority. Plaster fix
+            # pending the Part B FSM architectural cleanup that
+            # dissolves _apply_fill entirely.
             fill_event = OrderFilled(
                 trade_serial=None, symbol=symbol, side="SELL",
                 fill_price=price, qty=qty, commission=commission,
                 ib_order_id=ib_order_id,
             )
+            try:
+                fresh_doc = await self._read_state_doc() or {}
+            except Exception:
+                fresh_doc = {}
+            new_qty = Decimal(str(fresh_doc.get("qty") or "0"))
             engine_fields = {
-                "qty": str(new_qty),
                 "avg_price": str(price),
-                "entry_price": self.ctx.state.get("entry_price"),
-                "entry_time": self.ctx.state.get("entry_time"),
             }
         engine_fields["updated_at"] = now_iso
         await self._write_state(engine_fields)
@@ -381,15 +406,24 @@ class StrategyBotRunner(BotBase):
         from ib_trader.bots.strategy import PlaceOrder
         place_orders = [a for a in actions if isinstance(a, PlaceOrder)]
 
+        # Circuit breaker: catch runaways from any cause. If the rolling
+        # window of recent submits exceeds the configured threshold,
+        # force the bot OFF and raise a CATASTROPHIC alert before we
+        # add another order to the flood.
+        had_place_orders = bool(place_orders)
+        if had_place_orders:
+            await self._check_order_rate_limit()
+
         # Stoic-mode: set the flag synchronously so any quote/bar/
         # position event processed while we're in the HTTP round-trip
         # bails out (see quote-tick handler guard). Once an ib_order_id
         # is captured, the flag stays set until the order-stream handler
         # observes the terminal event for that id (see _dispatch_event).
-        had_place_orders = bool(place_orders)
         if had_place_orders:
             self._order_submit_in_flight = True
             self._stoic_mode_set_at = time.monotonic()
+            # Record this submission for the rate-limit ring.
+            self._recent_submit_times.append(time.monotonic())
         cmd_id: str | None = None
         try:
             await self.pipeline.process(actions, ctx or self.ctx)
@@ -890,6 +924,85 @@ class StrategyBotRunner(BotBase):
                             '{"event": "BOT_DISPATCH_ERROR", "bot_id": "%s", "stream": "%s"}',
                             self.bot_id, stream_name,
                         )
+
+    async def _check_order_rate_limit(self) -> None:
+        """Hard-stop circuit breaker for runaway order emission.
+
+        Belt-and-braces safety net: regardless of which upstream bug
+        causes a bot to re-emit orders in a tight loop (Apr 19 stoic-
+        race, later zero-qty-SELL storm, future unknowns), no bot
+        should ever place more than ``bot_order_rate_limit_count``
+        orders inside ``bot_order_rate_limit_window_seconds``. When
+        tripped, this force-STOPs the bot to OFF, raises a
+        CATASTROPHIC alert (blocking modal in the UI), and raises an
+        exception so the pipeline aborts before submitting the order
+        that would push us over.
+        """
+        cfg = self.config.get("_settings") if isinstance(self.config, dict) else None
+        cfg = cfg or self.config or {}
+        limit_count = int(cfg.get("bot_order_rate_limit_count", 5) or 5)
+        window = float(cfg.get("bot_order_rate_limit_window_seconds", 2.0) or 2.0)
+
+        now = time.monotonic()
+        cutoff = now - window
+        # Keep only timestamps inside the window.
+        self._recent_submit_times = [
+            t for t in self._recent_submit_times if t >= cutoff
+        ]
+        # +1 because we're about to add the current submission.
+        if len(self._recent_submit_times) + 1 < limit_count:
+            return
+
+        # Trip. Force the bot OFF, alert loudly, raise so the caller
+        # aborts the in-progress submission.
+        logger.error(
+            '{"event": "BOT_ORDER_RATE_LIMIT_EXCEEDED", "bot_id": "%s", '
+            '"count": %d, "window_s": %.2f}',
+            self.bot_id, len(self._recent_submit_times) + 1, window,
+        )
+        try:
+            from ib_trader.bots.fsm import FSM, BotEvent, EventType
+            fsm = FSM(self.bot_id, self.config.get("_redis"))
+            await fsm.dispatch(BotEvent(EventType.STOP))
+        except Exception:
+            logger.exception(
+                '{"event": "RATE_LIMIT_FORCE_STOP_FAILED", "bot_id": "%s"}',
+                self.bot_id,
+            )
+
+        try:
+            from ib_trader.logging_.alerts import log_and_alert
+            await log_and_alert(
+                redis=self.config.get("_redis"),
+                trigger="BOT_ORDER_RATE_LIMIT_EXCEEDED",
+                severity="CATASTROPHIC",
+                message=(
+                    f"Bot emitted {len(self._recent_submit_times) + 1} orders "
+                    f"within {window:.1f}s — force-stopped to OFF. Investigate "
+                    f"before re-enabling."
+                ),
+                bot_id=self.bot_id,
+                symbol=self.strategy_config.get("symbol"),
+                extra={
+                    "count": len(self._recent_submit_times) + 1,
+                    "window_s": window,
+                    "limit_count": limit_count,
+                },
+                exc_info=False,
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "RATE_LIMIT_ALERT_FAILED", "bot_id": "%s"}',
+                self.bot_id,
+            )
+
+        # Clear the ring now that the bot is OFF — if anything re-
+        # enables it, it starts fresh.
+        self._recent_submit_times.clear()
+        raise RuntimeError(
+            f"bot {self.bot_id} rate-limit exceeded "
+            f"({limit_count} orders in {window:.1f}s)"
+        )
 
     async def _check_stoic_mode_timeout(self) -> None:
         """Release stoic mode if the terminal event never arrived.

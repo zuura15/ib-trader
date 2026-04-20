@@ -294,17 +294,51 @@ class SawtoothRsiStrategy:
             return []
 
         state = ctx.state
+        _redis = ctx.config.get("_redis") if isinstance(ctx.config, dict) else None
+
+        # Invariant: AWAITING_EXIT_TRIGGER implies a real position. If
+        # qty is 0/negative/invalid, the state doc is inconsistent and
+        # we must not emit a zero-qty SELL (Apr 19 runaway root cause).
+        from decimal import InvalidOperation
+        from ib_trader.logging_.alerts import fire_and_forget_alert
+        qty_raw = state.get("qty", "0")
+        try:
+            position_qty = Decimal(str(qty_raw))
+        except (ValueError, TypeError, InvalidOperation):
+            position_qty = Decimal("0")
+        if position_qty <= 0:
+            fire_and_forget_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED_QTY_ZERO",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER with qty={qty_raw!r}. "
+                    f"State doc is inconsistent — refusing to emit zero-qty SELL."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "qty", "value": str(qty_raw),
+                       "entry_price": str(state.get("entry_price"))},
+            )
+            return []
+
         entry_price = Decimal(str(state.get("entry_price", "0")))
         if entry_price <= 0:
             # Invariant: AWAITING_EXIT_TRIGGER implies a filled entry with
             # a positive entry_price. If we got here without one, state is
             # inconsistent — surface it loudly instead of silently eating
             # quote ticks forever.
-            logger.warning(
-                '{"event": "INVARIANT_VIOLATED", "bot_id": "%s", '
-                '"field": "entry_price", "value": "%s", '
-                '"fsm_state": "AWAITING_EXIT_TRIGGER"}',
-                ctx.bot_id, state.get("entry_price"),
+            fire_and_forget_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED_ENTRY_PRICE",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER without a positive entry_price "
+                    f"(value={state.get('entry_price')!r}). Cannot evaluate exit logic."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "entry_price", "value": str(state.get("entry_price"))},
             )
             return []
 

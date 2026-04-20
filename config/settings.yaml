@@ -29,6 +29,13 @@ smart_market_eth_max_slippage_pct: 0.005
 # moment the terminal event hits the Redis stream (sub-second). This
 # is for the "IB went silent" / "terminal event dropped" case.
 stoic_mode_max_seconds: 300
+# Hard-stop circuit breaker. If any bot emits more than
+# ``bot_order_rate_limit_count`` orders within
+# ``bot_order_rate_limit_window_seconds``, the bot is force-STOPped
+# to OFF and a CATASTROPHIC alert fires. Final safety net for runaway
+# order-emission loops regardless of upstream cause.
+bot_order_rate_limit_count: 5
+bot_order_rate_limit_window_seconds: 2.0
 ib_host: 127.0.0.1
 # Paper trading is the default. Gateway paper listens on 4002, live on 4001.
 # Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics
