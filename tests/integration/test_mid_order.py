@@ -281,6 +281,18 @@ class TestHandlePartial:
             take_profit_price=None, stop_loss=None,
         )
 
+        # _handle_partial now waits for IB to confirm the cancel (so a
+        # late-arriving fill can be promoted to FILLED). Pre-register the
+        # mock order so cancel_order() flips it to Cancelled and the wait
+        # loop returns on the first iteration instead of hitting the
+        # settle timeout.
+        ctx.ib._order_statuses["mock-ib-123"] = {
+            "status": "Submitted",
+            "qty_filled": Decimal("6"),
+            "avg_fill_price": Decimal("100.00"),
+            "commission": Decimal("0.60"),
+        }
+
         await _handle_partial(
             order_ctx, trade,
             qty_requested=Decimal("10"),

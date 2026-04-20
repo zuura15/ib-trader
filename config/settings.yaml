@@ -7,6 +7,12 @@ reprice_duration_seconds: 10
 # How long to wait for an immediate fill on bid/ask GTC orders before moving on.
 # The order stays live in IB after this window; daemon reconciler catches the fill.
 bid_ask_wait_seconds: 30
+# After we send a cancel to IB, how long to wait for IB to either confirm the
+# cancel or deliver more fills first. Short default (10s) covers the typical
+# case; bump if your Gateway/market session runs slower (overnight IBEOS can
+# take tens of seconds). The hard cap below is a safety net for a silent IB —
+# hitting it logs a WARNING and proceeds with whatever status IB has reported.
+cancel_settle_timeout_seconds: 120
 ib_host: 127.0.0.1
 # Paper trading is the default. Gateway paper listens on 4002, live on 4001.
 # Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics

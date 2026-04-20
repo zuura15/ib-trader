@@ -179,13 +179,19 @@ class StrategyBotRunner(BotBase):
             trail_width = Decimal(str(exit_cfg.get("trail_width_pct", 0.0005)))
             hard_stop = price * (1 - hard_sl_pct)
             trail_activation_price = price * (1 + trail_act_pct)
+            # Idempotency: preserve entry_price / entry_time / high_water_mark
+            # if they're already set from a previous call on the same position.
+            # Today _apply_fill only runs once per order, but any future
+            # re-invocation (reconciler, replay) must not reset the entry
+            # anchors. Stops + qty still refresh each call.
+            keep_entry = bool(self.ctx.state.get("entry_time"))
             engine_fields = {
                 "qty": str(new_qty),
                 "avg_price": str(price),
-                "entry_price": str(price),
-                "entry_time": now_iso,
+                "entry_price": self.ctx.state["entry_price"] if keep_entry else str(price),
+                "entry_time": self.ctx.state["entry_time"] if keep_entry else now_iso,
                 "symbol": self.strategy_config.get("symbol", ""),
-                "high_water_mark": str(price),
+                "high_water_mark": self.ctx.state["high_water_mark"] if keep_entry else str(price),
                 "current_stop": str(hard_stop.quantize(Decimal("0.01"))),
                 "hard_stop": str(hard_stop.quantize(Decimal("0.01"))),
                 "trail_activation_price": str(trail_activation_price.quantize(Decimal("0.01"))),

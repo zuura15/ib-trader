@@ -249,50 +249,74 @@ def _h_place_entry_order(doc: dict, event: BotEvent) -> TransitionResult:
 
 
 def _h_entry_filled(doc: dict, event: BotEvent) -> TransitionResult:
-    """Handle an entry fill.
+    """Handle an entry fill event from the engine's order ledger.
 
-    May arrive in either ENTRY_ORDER_PLACED (the first partial or full
-    fill that transitions to AWAITING_EXIT_TRIGGER) or in
-    AWAITING_EXIT_TRIGGER itself (subsequent partials). In both cases we
-    accumulate ``filled_qty`` and update ``qty``; only the first fill
-    carries the state transition + HWM init.
+    The ledger emits CUMULATIVE ``filled_qty`` in every event plus a
+    ``terminal`` flag. Semantics:
+
+    - ``terminal=False`` (progress): one or more execDetails have
+      landed but IB has not yet declared the order done. We only
+      update the running cumulative in the doc. We do NOT transition
+      to ``AWAITING_EXIT_TRIGGER`` — per the design rule, the bot is
+      "active" only after IB says the order is terminal.
+    - ``terminal=True`` with ``qty > 0``: IB has declared the order
+      done (Filled / PartialFillCancelled). This is the moment the
+      bot becomes active. Transition to ``AWAITING_EXIT_TRIGGER`` and
+      initialise position-tracking fields (entry_price, entry_time,
+      HWM).
+    - ``terminal=True`` with ``qty == 0``: the runtime normally routes
+      this through the ENTRY_CANCELLED branch; if it lands here we
+      return to AWAITING_ENTRY_TRIGGER as a safety net.
     """
     p = event.payload
-    qty_incr = Decimal(str(p.get("qty", "0")))
+    cum_filled = Decimal(str(p.get("qty", "0")))   # cumulative from the ledger
     price = Decimal(str(p.get("price", "0")))
-    prev_filled = Decimal(doc.get("filled_qty") or "0")
-    new_filled = prev_filled + qty_incr
+    terminal = bool(p.get("terminal", False))
     cur_state = BotState(doc.get("state", BotState.OFF.value))
 
-    patch: dict = {
-        "filled_qty": str(new_filled),
-        "qty": str(new_filled),
-        "avg_price": str(price),
-    }
+    # Progress event — just record the running total, no state change.
+    if not terminal:
+        return TransitionResult(
+            new_state=cur_state,
+            state_patch={
+                "filled_qty": str(cum_filled),
+                "qty": str(cum_filled),
+                "avg_price": str(price),
+            },
+            side_effects=[],  # strategy is notified once, on terminal, via _apply_fill
+        )
 
-    if cur_state == BotState.ENTRY_ORDER_PLACED:
-        # First partial (or full) — initialize position tracking + HWM
-        patch.update({
+    # Terminal with 0 fills — treat as a cancel (safety net; normal path
+    # is the runtime's ENTRY_CANCELLED dispatch for 0-qty terminals).
+    if cum_filled == 0:
+        return TransitionResult(
+            new_state=BotState.AWAITING_ENTRY_TRIGGER,
+            state_patch=_clear_position_fields(),
+            side_effects=[SideEffect(
+                action="emit_strategy_event",
+                args={"type": "OrderRejected", "reason": "terminal_zero_fill"},
+            )],
+        )
+
+    # Terminal with qty > 0 — bot is now active with whatever IB filled.
+    return TransitionResult(
+        new_state=BotState.AWAITING_EXIT_TRIGGER,
+        state_patch={
+            "filled_qty": str(cum_filled),
+            "qty": str(cum_filled),
+            "avg_price": str(price),
             "entry_price": str(price),
             "entry_time": _now_iso(),
             "high_water_mark": str(price),
             "current_stop": None,
             "trail_activated": False,
-        })
-        new_state = BotState.AWAITING_EXIT_TRIGGER
-    else:
-        # Subsequent partial — stay in AWAITING_EXIT_TRIGGER
-        new_state = BotState.AWAITING_EXIT_TRIGGER
-
-    return TransitionResult(
-        new_state=new_state,
-        state_patch=patch,
+        },
         side_effects=[SideEffect(
             action="emit_strategy_event",
             args={
                 "type": "OrderFilled",
                 "side": "BUY",
-                "qty": str(qty_incr),
+                "qty": str(cum_filled),
                 "price": str(price),
                 "serial": p.get("serial"),
             },
@@ -501,7 +525,10 @@ _TRANSITIONS: dict[tuple[BotState, EventType], Callable[[dict, BotEvent], Transi
     # Fill can arrive before PlaceEntryOrder due to async race (fill via
     # stream vs HTTP response). Allow direct transition.
     (BotState.AWAITING_ENTRY_TRIGGER, EventType.ENTRY_FILLED): _h_entry_filled,
-    (BotState.AWAITING_EXIT_TRIGGER, EventType.ENTRY_FILLED): _h_entry_filled,  # partial fills
+    # No (AWAITING_EXIT_TRIGGER, ENTRY_FILLED) entry: under the "active on
+    # terminal only" rule we never dispatch another ENTRY_FILLED once the
+    # order is terminal. A late duplicate is logged as an invalid
+    # transition and dropped by the FSM driver.
     (BotState.ENTRY_ORDER_PLACED, EventType.ENTRY_CANCELLED): _h_entry_cancelled,
     (BotState.ENTRY_ORDER_PLACED, EventType.ENTRY_TIMEOUT): _h_entry_timeout,
 

@@ -193,7 +193,7 @@ async def test_place_entry_order_invalid_outside_awaiting_entry(fsm):
 
 
 @pytest.mark.asyncio
-async def test_entry_filled_transitions_and_inits_hwm(fsm):
+async def test_entry_filled_terminal_transitions_and_inits_hwm(fsm):
     await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
         "order_qty": "10",
         "filled_qty": "0",
@@ -201,7 +201,7 @@ async def test_entry_filled_transitions_and_inits_hwm(fsm):
     })
     result = await fsm.dispatch(BotEvent(
         EventType.ENTRY_FILLED,
-        payload={"qty": "10", "price": "12.73", "serial": 7},
+        payload={"qty": "10", "price": "12.73", "serial": 7, "terminal": True},
     ))
     assert result.new_state == BotState.AWAITING_EXIT_TRIGGER
     doc = await fsm.load()
@@ -212,25 +212,116 @@ async def test_entry_filled_transitions_and_inits_hwm(fsm):
 
 
 @pytest.mark.asyncio
-async def test_entry_filled_partial_stays_in_awaiting_exit(fsm):
+async def test_entry_fill_progress_does_not_transition(fsm):
+    """Non-terminal progress events track cumulative qty but don't
+    move the bot into AWAITING_EXIT_TRIGGER — the bot is only
+    'active' once IB declares the order terminal."""
+    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
+        "order_qty": "15",
+        "filled_qty": "0",
+        "serial": 7,
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.ENTRY_FILLED,
+        payload={"qty": "9", "price": "12.73", "serial": 7, "terminal": False},
+    ))
+    assert result.new_state == BotState.ENTRY_ORDER_PLACED
+    doc = await fsm.load()
+    assert doc["filled_qty"] == "9"
+    assert doc["qty"] == "9"
+    # Position-anchor fields must NOT be written on a progress event.
+    assert doc.get("entry_price") is None
+    assert doc.get("entry_time") is None
+    assert doc.get("high_water_mark") is None
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_progress_then_terminal_uses_cumulative(fsm):
+    """Engine emits cumulative filled_qty in every event. The FSM must
+    assign, not accumulate — otherwise 9 then terminal-9 would end up
+    as filled_qty=18.
+    """
+    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
+        "order_qty": "15",
+        "filled_qty": "0",
+        "serial": 7,
+    })
+    # Progress: 9 filled so far
+    await fsm.dispatch(BotEvent(
+        EventType.ENTRY_FILLED,
+        payload={"qty": "9", "price": "12.73", "serial": 7, "terminal": False},
+    ))
+    # Terminal (PartialFillCancelled): final cumulative still 9
+    result = await fsm.dispatch(BotEvent(
+        EventType.ENTRY_FILLED,
+        payload={"qty": "9", "price": "12.73", "serial": 7, "terminal": True},
+    ))
+    assert result.new_state == BotState.AWAITING_EXIT_TRIGGER
+    doc = await fsm.load()
+    assert doc["filled_qty"] == "9"   # not 18
+    assert doc["qty"] == "9"
+    assert doc["entry_price"] == "12.73"
+    assert doc["high_water_mark"] == "12.73"
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_terminal_partial_cancelled_still_active(fsm):
+    """PartialFillCancelled with filled_qty > 0: bot becomes active
+    with whatever shares IB delivered (per the 'any qty on terminal'
+    rule)."""
+    await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
+        "order_qty": "15",
+        "filled_qty": "0",
+        "serial": 7,
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.ENTRY_FILLED,
+        payload={"qty": "1", "price": "12.73", "serial": 7, "terminal": True},
+    ))
+    assert result.new_state == BotState.AWAITING_EXIT_TRIGGER
+    doc = await fsm.load()
+    assert doc["qty"] == "1"
+    assert doc["entry_price"] == "12.73"
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_terminal_zero_qty_returns_to_awaiting_entry(fsm):
+    """Terminal with 0 fills is a safety-net path — the runtime
+    normally routes 0-fill terminals through ENTRY_CANCELLED, but if
+    ENTRY_FILLED arrives with qty=0 we treat it as a cancel."""
     await _prime(fsm, BotState.ENTRY_ORDER_PLACED, {
         "order_qty": "10",
         "filled_qty": "0",
         "serial": 7,
     })
-    await fsm.dispatch(BotEvent(
-        EventType.ENTRY_FILLED,
-        payload={"qty": "3", "price": "12.73", "serial": 7},
-    ))
-    # Now we're in AWAITING_EXIT_TRIGGER with qty=3. Next partial arrives:
     result = await fsm.dispatch(BotEvent(
         EventType.ENTRY_FILLED,
-        payload={"qty": "7", "price": "12.74", "serial": 7},
+        payload={"qty": "0", "price": "0", "serial": 7, "terminal": True},
     ))
-    assert result.new_state == BotState.AWAITING_EXIT_TRIGGER
+    assert result.new_state == BotState.AWAITING_ENTRY_TRIGGER
     doc = await fsm.load()
-    assert doc["filled_qty"] == "10"
-    assert doc["qty"] == "10"
+    assert doc["qty"] == "0"
+    assert doc.get("entry_price") is None
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_on_awaiting_exit_is_invalid_transition(fsm):
+    """Once terminal has moved the bot into AWAITING_EXIT_TRIGGER, a
+    late duplicate ENTRY_FILLED must not re-run the handler.
+    """
+    await _prime(fsm, BotState.AWAITING_EXIT_TRIGGER, {
+        "qty": "9",
+        "filled_qty": "9",
+        "entry_price": "12.73",
+    })
+    result = await fsm.dispatch(BotEvent(
+        EventType.ENTRY_FILLED,
+        payload={"qty": "9", "price": "12.80", "serial": 7, "terminal": True},
+    ))
+    assert result is None  # invalid transition — dropped
+    doc = await fsm.load()
+    assert doc["qty"] == "9"           # unchanged
+    assert doc["entry_price"] == "12.73"
 
 
 @pytest.mark.asyncio
