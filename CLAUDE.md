@@ -43,6 +43,11 @@ No exceptions. Treat these as team-level non-negotiables.
 - On final retry failure: log full context, print clear human-readable error, exit non-zero.
 - NEVER catch a generic Exception without logging and re-raising.
 - Order rejections from IB must surface the rejection reason clearly — never hide it.
+- **No silent `except` blocks in `ib_trader/engine/**`, `ib_trader/bots/**` (including strategies), or any module that talks to the broker.** Every caught exception MUST either:
+  1. Re-raise (letting the caller own the alert), OR
+  2. Call `ib_trader.logging_.alerts.log_and_alert(...)` so the failure is logged at ERROR AND surfaced to the UI alerts panel.
+- `logger.debug(...)`-only except blocks are NOT acceptable for broker-facing or money-moving code paths. Benign parse/decode failures (`(ValueError, TypeError)` around a JSON/numeric conversion that falls back to a sentinel) MAY remain silent — only if the fallback is safe and doesn't mask a broker or state-consistency failure.
+- Broker-facing failures (wrapping `ctx.ib.*`) use `severity="CATASTROPHIC"` — the frontend CatastrophicOverlay renders a blocking modal. Everything else defaults to `severity="WARNING"`.
 
 ## Testing
 - Every new function in `engine/`, `ib/`, or `data/` must have a corresponding unit test.

@@ -103,7 +103,19 @@ class _ListRenderer:
                 "error": error or "",
             })
         except Exception:
-            logger.debug('{"event": "CMD_OUTPUT_TERMINAL_PUBLISH_FAILED"}')
+            # Promote this from a DEBUG-only swallow so the UI surfaces
+            # a failing live-output stream — otherwise the user sees a
+            # command bubble stuck in "running" with no signal why.
+            try:
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=self._writer._redis if self._writer else None,
+                    trigger="CMD_OUTPUT_TERMINAL_PUBLISH_FAILED",
+                    message="Failed to publish terminal marker to cmd:<id>:output stream.",
+                    severity="WARNING",
+                )
+            except Exception:
+                logger.exception('{"event": "CMD_OUTPUT_TERMINAL_PUBLISH_FAILED"}')
 
     def write_log(self, message: str, severity=None) -> None:
         self._append(message, severity)

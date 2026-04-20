@@ -99,6 +99,81 @@ async def _run_bot_lifecycle(bot, defn: BotDefinition) -> None:
         await asyncio.gather(*children, return_exceptions=True)
 
 
+async def _panic_alert_on_startup(redis, defn, prior_state) -> None:
+    """Publish a CATASTROPHIC alert when a bot's prior state implies
+    a held position or in-flight order.
+
+    The alert is written to the existing ``alerts:active`` Redis hash
+    so the WebSocket alerts channel picks it up and the frontend's
+    CatastrophicOverlay renders a blocking modal. ``pager=true`` so a
+    future real-pager integration consumes the same feed.
+    """
+    if redis is None:
+        logger.error(
+            '{"event": "BOT_STARTUP_PANIC_NO_REDIS", "bot_id": "%s", '
+            '"prior_state": "%s"}',
+            defn.id, getattr(prior_state, "value", str(prior_state)),
+        )
+        return
+
+    from ib_trader.redis.state import StateKeys, StateStore
+    from ib_trader.redis.streams import publish_activity
+    import uuid as _uuid
+
+    # Best-effort: pull last-known position/order context from the bot
+    # state doc so the operator has something to investigate with.
+    try:
+        state_doc = await StateStore(redis).get(f"bot:{defn.id}") or {}
+    except Exception:
+        logger.exception(
+            '{"event": "BOT_STARTUP_PANIC_STATE_READ_FAILED", "bot_id": "%s"}',
+            defn.id,
+        )
+        state_doc = {}
+
+    symbol = state_doc.get("symbol") or defn.config.get("symbol") or defn.symbol
+    qty = state_doc.get("qty")
+    entry_price = state_doc.get("entry_price")
+    ib_order_id = state_doc.get("ib_order_id")
+
+    alert_id = str(_uuid.uuid4())
+    alert_dict = {
+        "id": alert_id,
+        "severity": "CATASTROPHIC",
+        "trigger": "BOT_ACTIVE_STATE_AT_STARTUP",
+        "message": (
+            f"Bot '{defn.name}' was in state {getattr(prior_state, 'value', prior_state)} "
+            f"on restart. This implies a live IB position or an in-flight order. "
+            f"Forcing bot to OFF. Check TWS for working orders and residual "
+            f"position on {symbol}; resolve manually; re-enable the bot when clean."
+        ),
+        "created_at": _now_utc().isoformat(),
+        "pager": True,
+        "bot_id": defn.id,
+        "bot_name": defn.name,
+        "symbol": symbol,
+        "prior_state": getattr(prior_state, "value", str(prior_state)),
+        "qty": qty,
+        "entry_price": entry_price,
+        "ib_order_id": ib_order_id,
+    }
+    try:
+        await StateKeys.publish_alert(redis, alert_id, alert_dict)
+        await publish_activity(redis, "alerts")
+    except Exception:
+        logger.exception(
+            '{"event": "BOT_STARTUP_PANIC_ALERT_PUBLISH_FAILED", "bot_id": "%s"}',
+            defn.id,
+        )
+    logger.error(
+        '{"event": "BOT_ACTIVE_STATE_AT_STARTUP", "bot_id": "%s", '
+        '"symbol": "%s", "prior_state": "%s", "qty": "%s", "entry_price": "%s", '
+        '"ib_order_id": "%s"}',
+        defn.id, symbol, getattr(prior_state, "value", prior_state),
+        qty, entry_price, ib_order_id,
+    )
+
+
 async def _create_and_start_bot(
     defn: BotDefinition, session_factory: scoped_session,
     redis=None, engine_url: str | None = None,
@@ -171,22 +246,66 @@ async def run_bot_runner(session_factory: scoped_session,
 
     logger.info(json.dumps({"event": "BOT_RUNNER_STARTED"}))
 
-    # Startup: restart bots whose FSM is in a running state
+    # Startup policy (Apr 19 incident fix):
+    # ------------------------------------
+    # Every bot is forced to OFF at app startup regardless of prior
+    # FSM state. The user re-enables bots explicitly via the UI once
+    # they've confirmed the external world (TWS positions + open orders)
+    # is consistent. Prior states that imply a held position or an
+    # in-flight order raise a CATASTROPHIC "pager" alert so the operator
+    # doesn't miss it.
+    #
+    # Panic triggers (alert + force OFF):
+    #   ENTRY_ORDER_PLACED, AWAITING_EXIT_TRIGGER, EXIT_ORDER_PLACED, ERRORED
+    # Silent force OFF (no alert):
+    #   AWAITING_ENTRY_TRIGGER — no real-money implication
+    #   OFF — already there
     all_defs = registry_config.all_definitions()
+    _PANIC_STATES = {
+        BotState.ENTRY_ORDER_PLACED,
+        BotState.AWAITING_EXIT_TRIGGER,
+        BotState.EXIT_ORDER_PLACED,
+        BotState.ERRORED,
+    }
     for defn in all_defs:
         fsm = FSM(defn.id, redis)
-        cur = await fsm.current_state()
-        if cur in _RUNNING_FSM_STATES:
+        try:
+            cur = await fsm.current_state()
+        except Exception:
+            logger.exception(
+                '{"event": "BOT_STARTUP_STATE_LOAD_FAILED", "bot_id": "%s"}',
+                defn.id,
+            )
+            continue
+
+        if cur in _PANIC_STATES:
+            await _panic_alert_on_startup(redis, defn, cur)
             try:
-                bot, task = await _create_and_start_bot(
-                    defn, session_factory, redis=redis, engine_url=engine_url,
-                )
-                running_tasks[defn.id] = task
-                bot_instances[defn.id] = bot
+                await fsm.dispatch(BotEvent(EventType.STOP))
             except Exception:
                 logger.exception(
-                    '{"event": "BOT_RESTART_FAILED", "bot_id": "%s"}', defn.id,
+                    '{"event": "BOT_FORCE_OFF_DISPATCH_FAILED", "bot_id": "%s"}',
+                    defn.id,
                 )
+            logger.warning(
+                '{"event": "BOT_STARTUP_FORCED_OFF_WITH_PANIC", '
+                '"bot_id": "%s", "prior_state": "%s"}',
+                defn.id, cur.value,
+            )
+        elif cur != BotState.OFF:
+            # AWAITING_ENTRY_TRIGGER — silent force OFF, no alert.
+            try:
+                await fsm.dispatch(BotEvent(EventType.STOP))
+            except Exception:
+                logger.exception(
+                    '{"event": "BOT_FORCE_OFF_DISPATCH_FAILED", "bot_id": "%s"}',
+                    defn.id,
+                )
+            logger.info(
+                '{"event": "BOT_STARTUP_FORCED_OFF", "bot_id": "%s", '
+                '"prior_state": "%s"}', defn.id, cur.value,
+            )
+        # OFF: nothing to do.
 
     # Main loop: just clean up crashed tasks. All lifecycle commands
     # flow through the runner's internal HTTP API via direct method calls.

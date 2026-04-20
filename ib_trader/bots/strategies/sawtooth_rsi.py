@@ -416,12 +416,12 @@ class SawtoothRsiStrategy:
                 symbol=symbol,
                 side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                # Reverted from "smart_market" pending diagnosis of a
-                # repeat-exit runaway (multiple SELLs fired per second
-                # while the bot's FSM state hadn't yet caught up to the
-                # in-flight exit). Keep raw market behaviour until the
-                # root cause is understood.
-                order_type="market",
+                # Session-aware aggressive-mid exit. Safe to re-enable
+                # after the Apr 19 runaway fix: the bot's stoic-mode
+                # flag now holds from submit until the terminal
+                # order:updates event is consumed, so a longer walker
+                # round-trip can no longer trigger duplicate SELLs.
+                order_type="smart_market",
                 origin="exit",
             ),
         ]

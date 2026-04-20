@@ -369,7 +369,32 @@ class MiddlewarePipeline:
                     try:
                         await self._rollback_fn(state_snapshot)
                     except Exception as rollback_err:
-                        logger.debug("PIPELINE_ROLLBACK_FAILED", exc_info=rollback_err)
+                        # Rollback failure is serious — it means the
+                        # bot state doc may be inconsistent. Surface it
+                        # to the UI, not just DEBUG.
+                        try:
+                            from ib_trader.logging_.alerts import log_and_alert
+                            _redis = None
+                            if isinstance(mw, ExecutionMiddleware):
+                                _redis = getattr(mw, "_redis", None) or getattr(
+                                    mw, "config", {}
+                                ).get("_redis") if hasattr(mw, "config") else None
+                            await log_and_alert(
+                                redis=_redis,
+                                trigger="PIPELINE_ROLLBACK_FAILED",
+                                message=(
+                                    "Pipeline state rollback failed after "
+                                    "execution error — bot state may be "
+                                    f"inconsistent: {rollback_err!r}"
+                                ),
+                                severity="WARNING",
+                                exc_info=False,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "PIPELINE_ROLLBACK_FAILED",
+                                exc_info=rollback_err,
+                            )
                     logger.warning(
                         '{"event": "PIPELINE_STATE_ROLLBACK", "reason": "execution_failed"}'
                     )

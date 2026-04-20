@@ -23,6 +23,12 @@ cancel_settle_timeout_seconds: 120
 smart_market_reprice_interval_ms: 100
 smart_market_rth_duration_seconds: 10
 smart_market_eth_max_slippage_pct: 0.005
+# How long a bot stays in "stoic mode" (ignoring all non-order events)
+# waiting for the terminal order-updates event on an order it placed.
+# Safety bound only — under normal operation the flag releases the
+# moment the terminal event hits the Redis stream (sub-second). This
+# is for the "IB went silent" / "terminal event dropped" case.
+stoic_mode_max_seconds: 300
 ib_host: 127.0.0.1
 # Paper trading is the default. Gateway paper listens on 4002, live on 4001.
 # Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics

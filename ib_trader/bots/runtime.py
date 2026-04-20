@@ -91,16 +91,20 @@ class StrategyBotRunner(BotBase):
         self.aggregator: BarAggregator | None = None
         self._warmup_complete: bool = False
         self._pending_cmd_id: str | None = None  # tracks the active command we're waiting on
-        # Set synchronously at the TOP of _run_pipeline whenever a
-        # PlaceOrder action is about to be submitted, cleared in a
-        # finally once the pipeline + FSM dispatch have both completed.
-        # Quote / bar handlers bail if this is True so the strategy
-        # cannot re-emit a duplicate order while the first one is still
-        # being processed. Prevents the Apr 19 runaway where SMART_MARKET's
-        # ~600ms HTTP round-trip let 17 quote ticks queue up and each
-        # emitted its own SELL before the FSM transitioned out of
-        # AWAITING_EXIT_TRIGGER.
+        # Stoic mode: the bot ignores every non-order event (quote, bar,
+        # position-change) while an order is in flight. The flag is set
+        # synchronously when _run_pipeline detects a PlaceOrder action
+        # and is only cleared when:
+        #   (a) the order-stream handler consumes a terminal event for
+        #       self._awaiting_terminal_ib_order_id, OR
+        #   (b) the safety timeout elapses (stoic_mode_max_seconds), OR
+        #   (c) the pipeline exited without producing an ib_order_id
+        #       (nothing was actually placed).
+        # Prevents the Apr 19 runaway where a duplicate SELL was fired
+        # on every queued quote tick during the round-trip.
         self._order_submit_in_flight: bool = False
+        self._awaiting_terminal_ib_order_id: str | None = None
+        self._stoic_mode_set_at: float = 0.0  # time.monotonic() when flag was raised
 
         # Market data state
         self._last_bar_ts: datetime | None = None
@@ -377,14 +381,16 @@ class StrategyBotRunner(BotBase):
         from ib_trader.bots.strategy import PlaceOrder
         place_orders = [a for a in actions if isinstance(a, PlaceOrder)]
 
-        # Guard: while an order is being submitted the FSM hasn't yet
-        # transitioned (the PLACE_* event only fires AFTER the HTTP
-        # response). Hold a flag across the whole round-trip so quote /
-        # bar handlers skip strategy evaluation — preventing duplicate
-        # orders on every subsequent tick that arrives mid-submit.
+        # Stoic-mode: set the flag synchronously so any quote/bar/
+        # position event processed while we're in the HTTP round-trip
+        # bails out (see quote-tick handler guard). Once an ib_order_id
+        # is captured, the flag stays set until the order-stream handler
+        # observes the terminal event for that id (see _dispatch_event).
         had_place_orders = bool(place_orders)
         if had_place_orders:
             self._order_submit_in_flight = True
+            self._stoic_mode_set_at = time.monotonic()
+        cmd_id: str | None = None
         try:
             await self.pipeline.process(actions, ctx or self.ctx)
 
@@ -408,7 +414,18 @@ class StrategyBotRunner(BotBase):
                 )
         finally:
             if had_place_orders:
-                self._order_submit_in_flight = False
+                if cmd_id is not None:
+                    # Order was placed — remain stoic until the terminal
+                    # order-stream event releases the flag.
+                    self._awaiting_terminal_ib_order_id = str(cmd_id)
+                else:
+                    # Pipeline returned without placing an order (e.g.
+                    # middleware dropped it, or it raised before submit).
+                    # Nothing is in flight; drop stoic mode so the bot
+                    # can react to the next event.
+                    self._order_submit_in_flight = False
+                    self._awaiting_terminal_ib_order_id = None
+                    self._stoic_mode_set_at = 0.0
 
     async def _dispatch_place_order_fsm(self, place_orders, cmd_id: str) -> None:
         """Emit PlaceEntryOrder / PlaceExitOrder FSM events for orders
@@ -600,8 +617,10 @@ class StrategyBotRunner(BotBase):
             self.bot_id, symbol, qty, int(args.get("attempt") or 0),
             args.get("reason", ""),
         )
-        # Reverted from "smart_market" pending diagnosis of a
-        # repeat-exit runaway observed in production.
+        # Session-aware aggressive-mid retry — matches the strategy
+        # exit convention. The stoic-mode guard in _run_pipeline /
+        # _dispatch_event prevents duplicate retries from firing while
+        # this one is in flight.
         import httpx
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -611,7 +630,7 @@ class StrategyBotRunner(BotBase):
                         "symbol": symbol,
                         "side": "SELL",
                         "qty": str(qty),
-                        "order_type": "market",
+                        "order_type": "smart_market",
                         "bot_ref": bot_ref,
                     },
                 )
@@ -872,6 +891,56 @@ class StrategyBotRunner(BotBase):
                             self.bot_id, stream_name,
                         )
 
+    async def _check_stoic_mode_timeout(self) -> None:
+        """Release stoic mode if the terminal event never arrived.
+
+        Normally stoic mode clears when the order-stream handler sees
+        ``terminal=True`` for ``self._awaiting_terminal_ib_order_id``.
+        If IB goes silent or a stream publisher drops the terminal
+        event, the flag would pin the bot mute forever. Bound the
+        hang at ``stoic_mode_max_seconds`` (default 300) and surface a
+        WARNING alert so the operator investigates.
+        """
+        if not self._order_submit_in_flight:
+            return
+        if self._stoic_mode_set_at == 0.0:
+            return
+        max_seconds = float(
+            self.config.get("stoic_mode_max_seconds")
+            or self.config.get("_settings", {}).get("stoic_mode_max_seconds", 300)
+        )
+        if time.monotonic() - self._stoic_mode_set_at < max_seconds:
+            return
+
+        awaited = self._awaiting_terminal_ib_order_id or "<unknown>"
+        logger.error(
+            '{"event": "BOT_STOIC_MODE_TIMEOUT", "bot_id": "%s", '
+            '"ib_order_id": "%s", "timeout_s": %.0f}',
+            self.bot_id, awaited, max_seconds,
+        )
+        # Publish a WARNING alert through the same pager-style writer
+        # used by fatal bot events — reuse the existing helper.
+        try:
+            await self._handle_pager_alert({
+                "trigger": "BOT_STOIC_MODE_TIMEOUT",
+                "severity": "WARNING",
+                "symbol": self.strategy_config.get("symbol"),
+                "message": (
+                    f"Bot {self.bot_id} was waiting on terminal event for "
+                    f"ib_order_id={awaited} but it never arrived within "
+                    f"{max_seconds:.0f}s. Stoic mode released; investigate."
+                ),
+                "ib_order_id": awaited,
+            })
+        except Exception:
+            logger.exception(
+                '{"event": "STOIC_TIMEOUT_ALERT_FAILED", "bot_id": "%s"}',
+                self.bot_id,
+            )
+        self._order_submit_in_flight = False
+        self._awaiting_terminal_ib_order_id = None
+        self._stoic_mode_set_at = 0.0
+
     async def _dispatch_event(self, stream_name: str, raw_data: dict,
                                quote_stream: str, bar_stream: str,
                                order_stream: str, pos_stream: str,
@@ -879,6 +948,13 @@ class StrategyBotRunner(BotBase):
                                order_ref_prefix: str = "") -> None:
         """Route a single Redis stream entry to the strategy."""
         import json as _json
+
+        # Safety timeout on stoic mode. If for some reason we never
+        # received the terminal order-stream event for our order, the
+        # flag would pin the bot silent forever. Break out after N
+        # seconds, log, and surface a WARNING alert so the operator
+        # notices.
+        await self._check_stoic_mode_timeout()
 
         # Refresh ctx.state from Redis at the top of every event —
         # single source of truth, no stale reads.
@@ -1008,6 +1084,25 @@ class StrategyBotRunner(BotBase):
             avg_price_str = data.get("avg_price")
             last_fill_qty_str = data.get("last_fill_qty")
             last_fill_price_str = data.get("last_fill_price")
+            event_ib_order_id = str(data.get("ib_order_id") or "")
+
+            # Release stoic mode as soon as the terminal event for the
+            # order we were waiting on arrives. This is the only
+            # mechanism (other than the safety timeout) that clears the
+            # flag once a PlaceOrder has actually been submitted.
+            if (
+                terminal
+                and self._awaiting_terminal_ib_order_id is not None
+                and event_ib_order_id == self._awaiting_terminal_ib_order_id
+            ):
+                logger.info(
+                    '{"event": "BOT_STOIC_MODE_RELEASED", "bot_id": "%s", '
+                    '"ib_order_id": "%s", "status": "%s"}',
+                    self.bot_id, event_ib_order_id, status,
+                )
+                self._order_submit_in_flight = False
+                self._awaiting_terminal_ib_order_id = None
+                self._stoic_mode_set_at = 0.0
 
             # Always dispatch to FSM for doc update (both progress + terminal)
             from ib_trader.bots.fsm import FSM, BotEvent, EventType
@@ -1072,6 +1167,12 @@ class StrategyBotRunner(BotBase):
 
         # ── Position change (external manipulation) ────────────────────
         if stream_name == pos_stream:
+            if self._order_submit_in_flight:
+                # A manual-close detector running mid-submit could emit a
+                # second, conflicting order. Skip; the position-change
+                # event will be re-evaluated from the Redis positionEvent
+                # cache next time around.
+                return
             if data.get("symbol") != symbol:
                 return
             # Only react to STK position events — option contracts share
@@ -1246,8 +1347,13 @@ class StrategyBotRunner(BotBase):
                         json={"symbol": symbol},
                     )
             except Exception:
-                logger.debug(
-                    '{"event": "UNSUBSCRIBE_HTTP_FAILED", "symbol": "%s"}', symbol,
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=self.config.get("_redis"),
+                    trigger="UNSUBSCRIBE_HTTP_FAILED",
+                    message=f"Failed to unsubscribe bars for {symbol} via engine HTTP.",
+                    severity="WARNING",
+                    bot_id=self.bot_id, symbol=symbol,
                 )
 
     async def _execute_force_buy(self, symbol: str) -> None:
@@ -1333,7 +1439,14 @@ class StrategyBotRunner(BotBase):
                         json={"symbol": symbol, "duration_seconds": duration_seconds},
                     )
             except Exception:
-                logger.debug('{"event": "WARMUP_HTTP_FAILED", "symbol": "%s"}', symbol)
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=self.config.get("_redis"),
+                    trigger="WARMUP_HTTP_FAILED",
+                    message=f"Failed to warm up bars for {symbol} via engine HTTP.",
+                    severity="WARNING",
+                    bot_id=self.bot_id, symbol=symbol,
+                )
 
         # Read only the warmup bars (and any live bars that landed while we
         # were waiting). Oversize the count so a typical 20x3-min lookback
@@ -1449,7 +1562,14 @@ class StrategyBotRunner(BotBase):
                 timestamp=ts,
             )
         except Exception:
-            logger.debug('{"event": "REDIS_QUOTE_READ_ERROR", "symbol": "%s"}', symbol)
+            from ib_trader.logging_.alerts import log_and_alert
+            await log_and_alert(
+                redis=self.config.get("_redis"),
+                trigger="REDIS_QUOTE_READ_ERROR",
+                message=f"Failed to read latest quote for {symbol} from Redis.",
+                severity="WARNING",
+                bot_id=self.bot_id, symbol=symbol,
+            )
             return None
 
 def _reconcile_state(state: dict | None, open_positions: list,

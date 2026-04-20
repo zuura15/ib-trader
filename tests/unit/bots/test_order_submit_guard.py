@@ -41,6 +41,8 @@ def _make_runner() -> StrategyBotRunner:
     runner = StrategyBotRunner.__new__(StrategyBotRunner)
     runner._order_submit_in_flight = False
     runner._pending_cmd_id = None
+    runner._awaiting_terminal_ib_order_id = None
+    runner._stoic_mode_set_at = 0.0
     runner.bot_id = "test-bot"
     runner.ctx = None
     return runner
@@ -99,3 +101,69 @@ async def test_flag_cleared_on_pipeline_exception():
         await runner._run_pipeline([_make_place_order()], ctx=object())
     assert observed == [True]
     assert runner._order_submit_in_flight is False
+    assert runner._awaiting_terminal_ib_order_id is None
+
+
+class _CmdIdPipeline:
+    """Records an ib_order_id on last_cmd_id after processing — mimics
+    the real ExecutionMiddleware after a successful /engine/orders
+    submission."""
+
+    def __init__(self, cmd_id: str, observed: list):
+        self._cmd_id = cmd_id
+        self._observed = observed
+        self.last_cmd_id = None
+
+    async def process(self, actions, ctx):
+        self._observed.append(True)
+        self.last_cmd_id = self._cmd_id
+        return actions
+
+
+@pytest.mark.asyncio
+async def test_flag_remains_set_after_pipeline_when_order_submitted():
+    """With an ib_order_id captured, the guard stays set until the
+    order-stream handler consumes the terminal event."""
+    runner = _make_runner()
+    runner._dispatch_place_order_fsm = _async_noop  # type: ignore[method-assign]
+    pipeline = _CmdIdPipeline("ib-9999", observed=[])
+    pipeline._runner = runner
+    runner.pipeline = pipeline
+
+    await runner._run_pipeline([_make_place_order()], ctx=object())
+    assert runner._order_submit_in_flight is True
+    assert runner._awaiting_terminal_ib_order_id == "ib-9999"
+
+
+async def _async_noop(*_args, **_kwargs):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_stoic_mode_timeout_releases_and_alerts(monkeypatch):
+    """If the terminal event never arrives, _check_stoic_mode_timeout
+    must eventually release the flag and surface a WARNING alert."""
+    runner = _make_runner()
+    # Pretend the flag was set well beyond the configured timeout.
+    import time as _time
+    runner._order_submit_in_flight = True
+    runner._awaiting_terminal_ib_order_id = "ib-stuck"
+    runner._stoic_mode_set_at = _time.monotonic() - 999.0
+
+    # Minimum config so the helper can read stoic_mode_max_seconds.
+    runner.config = {"stoic_mode_max_seconds": 1}
+    runner.strategy_config = {"symbol": "QQQ"}
+
+    alerted: list[dict] = []
+
+    async def fake_pager(args):
+        alerted.append(args)
+
+    runner._handle_pager_alert = fake_pager  # type: ignore[method-assign]
+    await runner._check_stoic_mode_timeout()
+
+    assert runner._order_submit_in_flight is False
+    assert runner._awaiting_terminal_ib_order_id is None
+    assert len(alerted) == 1
+    assert alerted[0]["trigger"] == "BOT_STOIC_MODE_TIMEOUT"
+    assert alerted[0]["severity"] == "WARNING"

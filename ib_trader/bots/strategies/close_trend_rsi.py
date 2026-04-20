@@ -275,14 +275,24 @@ class CloseTrendRsiStrategy:
         if entry_price <= 0:
             # Invariant: AWAITING_EXIT_TRIGGER implies a filled entry with
             # a positive entry_price. If we got here without one, state is
-            # inconsistent — surface it loudly instead of silently eating
-            # quote ticks forever.
-            logger.warning(
-                '{"event": "INVARIANT_VIOLATED", "bot_id": "%s", '
-                '"field": "entry_price", "value": "%s", '
-                '"fsm_state": "AWAITING_EXIT_TRIGGER"}',
-                ctx.bot_id, state.get("entry_price"),
-            )
+            # inconsistent — surface it loudly (UI + log) instead of
+            # silently eating quote ticks forever.
+            from ib_trader.logging_.alerts import log_and_alert
+            _redis = ctx.config.get("_redis") if isinstance(ctx.config, dict) else None
+            import asyncio as _asyncio
+            _asyncio.create_task(log_and_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER without a positive entry_price "
+                    f"(value={state.get('entry_price')!r}). Cannot evaluate exit logic."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "entry_price", "value": str(state.get("entry_price"))},
+                exc_info=False,
+            ))
             return []
 
         exit_cfg = self.config.get("exit", {})
@@ -380,9 +390,9 @@ class CloseTrendRsiStrategy:
             PlaceOrder(
                 symbol=symbol, side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                # Reverted from "smart_market" pending diagnosis of a
-                # repeat-exit runaway (see sawtooth_rsi for details).
-                order_type="market",
+                # Session-aware aggressive-mid exit (see sawtooth_rsi
+                # for the why; same rationale applies here).
+                order_type="smart_market",
                 origin="exit",
             ),
         ]
