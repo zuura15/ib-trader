@@ -578,6 +578,12 @@ class StrategyBotRunner(BotBase):
             self.bot_id, symbol, qty, int(args.get("attempt") or 0),
             args.get("reason", ""),
         )
+        # Use "mid" so the retry goes through _execute_mid_order's reprice
+        # ladder — starts at mid and steps aggressively toward the bid
+        # (for SELL) over the reprice window. This is the "pseudo-market"
+        # semantics the bots expect: priced to fill quickly without
+        # submitting a naked MKT (which blows up during overnight
+        # sessions where the ATS rejects market orders anyway).
         import httpx
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -587,7 +593,7 @@ class StrategyBotRunner(BotBase):
                         "symbol": symbol,
                         "side": "SELL",
                         "qty": str(qty),
-                        "order_type": "market",
+                        "order_type": "mid",
                         "bot_ref": bot_ref,
                     },
                 )
