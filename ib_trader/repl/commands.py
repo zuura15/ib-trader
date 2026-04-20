@@ -23,12 +23,25 @@ if TYPE_CHECKING:
 
 
 class Strategy(StrEnum):
-    """Valid order placement strategies."""
+    """Valid order placement strategies.
+
+    This enum is the single source of truth for the string values
+    accepted by the engine's ``/engine/orders`` API, the REPL command
+    parser, and the bot middleware. Downstream code should derive
+    validation sets and user-facing descriptions from here rather than
+    re-listing the values.
+    """
     MID = "mid"
     MARKET = "market"
     BID = "bid"
     ASK = "ask"
     LIMIT = "limit"
+    # Session-aware aggressive-mid execution. RTH: reprice fast toward
+    # the far side for a fixed duration, then cross to MKT for any
+    # residual. ETH/overnight: reprice fast toward the far side but cap
+    # at a slippage floor; raise CATASTROPHIC alert if the cap is hit.
+    # See docs/design/execution-algos.md for the full spec.
+    SMART_MARKET = "smart_market"
 
 
 @dataclass

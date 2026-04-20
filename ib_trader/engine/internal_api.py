@@ -23,7 +23,13 @@ _ctx: "Any | None" = None
 
 
 _VALID_SIDES = {"BUY", "SELL"}
-_VALID_ORDER_TYPES = {"mid", "market", "bid", "ask", "limit"}
+# Derived from the Strategy enum so adding a new value there
+# automatically extends the whitelist + the Pydantic description below.
+# Avoids the drift bug where, e.g., bots/strategy.py had a stale
+# "mid, market, limit" inline comment missing bid/ask.
+from ib_trader.repl.commands import Strategy
+_VALID_ORDER_TYPES: frozenset[str] = frozenset(s.value for s in Strategy)
+_VALID_ORDER_TYPES_DOC: str = ", ".join(sorted(_VALID_ORDER_TYPES))
 
 
 class OrderRequest(BaseModel):
@@ -32,7 +38,10 @@ class OrderRequest(BaseModel):
     symbol: str
     side: str = Field(description="BUY or SELL")
     qty: str = Field(description="Order quantity as string (Decimal-safe)")
-    order_type: str = Field(default="mid", description="Order strategy: mid, limit, market, bid, ask")
+    order_type: str = Field(
+        default=Strategy.MID.value,
+        description=f"Order strategy: one of {{{_VALID_ORDER_TYPES_DOC}}}",
+    )
     price: Optional[str] = Field(default=None, description="Limit price (required for limit orders)")
     bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
     serial: Optional[int] = Field(default=None, description="Trade serial number")

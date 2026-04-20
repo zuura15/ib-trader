@@ -1,6 +1,11 @@
 # Execution & Exit Algorithm Refactor — Design Notes
 
-**Status:** Design in progress, not yet implemented. Planning ahead of the next refactor pass.
+**Status:** Session-aware aggressive-mid execution is now implemented as
+`Strategy.SMART_MARKET` (separate value from the legacy raw-MKT `Strategy.MARKET`
+so REPL / manual commands keep raw-MKT semantics). Bot exit paths use
+`order_type="smart_market"`. Remaining work: extract `execution/` + `exits/`
+modules, introduce the `FillType` enum across strategies, and add
+`PatientLimit` / `LIMIT_AT_PRICE`.
 
 ## Context
 

@@ -380,7 +380,8 @@ class CloseTrendRsiStrategy:
             PlaceOrder(
                 symbol=symbol, side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                order_type="market",
+                # Session-aware aggressive-mid exit (see sawtooth for rationale).
+                order_type="smart_market",
                 origin="exit",
             ),
         ]

@@ -416,7 +416,10 @@ class SawtoothRsiStrategy:
                 symbol=symbol,
                 side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                order_type="market",
+                # Exits want to fill now but without a naked MKT; use the
+                # session-aware aggressive-mid algo. Engine handles the
+                # RTH cross-to-market and ETH slippage cap.
+                order_type="smart_market",
                 origin="exit",
             ),
         ]

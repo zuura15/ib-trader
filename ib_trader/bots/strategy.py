@@ -198,7 +198,7 @@ class PlaceOrder:
     symbol: str
     side: str  # "BUY" or "SELL"
     qty: Decimal
-    order_type: str  # "mid", "market", "limit"
+    order_type: str  # See Strategy enum in ib_trader.repl.commands for the full set.
     price: Decimal | None = None  # required for limit orders
     params: dict = field(default_factory=dict)  # profit_target, stop_loss, tif, etc.
     origin: str = "strategy"  # "strategy" | "exit" | "manual_override"

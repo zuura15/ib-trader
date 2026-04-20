@@ -13,6 +13,16 @@ bid_ask_wait_seconds: 30
 # take tens of seconds). The hard cap below is a safety net for a silent IB —
 # hitting it logs a WARNING and proceeds with whatever status IB has reported.
 cancel_settle_timeout_seconds: 120
+# SMART_MARKET execution algo (session-aware aggressive-mid).
+# RTH: reprice every N ms toward the far side (bid for SELL, ask for BUY)
+#      for `duration` seconds, then cross to MKT for any residual.
+# ETH: reprice every N ms but never past a floor of
+#      trigger_price × (1 − max_slippage_pct) for SELL (or × (1 + pct) for BUY);
+#      raises a CATASTROPHIC alert (EXIT_PRICE_CAP_REACHED) when the cap is hit,
+#      and leaves the order resting at the cap for human intervention.
+smart_market_reprice_interval_ms: 100
+smart_market_rth_duration_seconds: 10
+smart_market_eth_max_slippage_pct: 0.005
 ib_host: 127.0.0.1
 # Paper trading is the default. Gateway paper listens on 4002, live on 4001.
 # Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics
