@@ -22,6 +22,9 @@ const ALPHA = 'bot-alpha';
 const BRAVO = 'bot-bravo';
 const WS_SETTLE_MS = 15_000;   // WS snapshot after connect on cold start
 
+// Run serially — shared mock-bot fixture with bots-lifecycle.spec.ts.
+test.describe.configure({ mode: 'serial' });
+
 test.describe('Bots panel', () => {
   test.beforeEach(async ({ page, request }) => {
     // Reset shared mock fixture so tests are independent of order.

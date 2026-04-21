@@ -345,8 +345,12 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
                 )}
               </div>
 
-              {/* Separator line between completed commands */}
-              {isTerminal(cmd.status) && idx < commands.length - 1 && (
+              {/* EOF marker — rendered after every completed command so
+                  the user has a visible closing bracket for the output
+                  block (not a header for the next command). Previous
+                  behaviour skipped the last command; now the newest
+                  completed command also gets its marker. */}
+              {isTerminal(cmd.status) && (
                 <div style={{
                   borderBottom: '1px solid var(--border-default)',
                   margin: '8px 0 10px 0',

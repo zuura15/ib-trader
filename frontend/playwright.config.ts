@@ -9,6 +9,11 @@ export default defineConfig({
   testIgnore: /.*\.live\.spec\.ts$/,
   timeout: 30000,
   retries: 0,
+  // Single worker — all specs share one mock-api process, and the bots
+  // specs (bots.spec.ts + bots-lifecycle.spec.ts) mutate the same
+  // bot-alpha/bot-bravo fixture. Parallel workers would interleave
+  // their /api/_test/reset calls and trip cross-file races.
+  workers: 1,
   use: {
     baseURL: 'https://localhost:5199',
     headless: true,

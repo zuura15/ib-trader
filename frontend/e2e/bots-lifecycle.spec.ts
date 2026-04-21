@@ -23,6 +23,11 @@ const BRAVO = 'bot-bravo';
 const BRAVO_SYMBOL = 'QQQ';
 const WS_SETTLE_MS = 15_000;
 
+// Run serially — all three tests mutate the same mock bot fixture
+// (shared with bots.spec.ts) so parallel execution trips the
+// check-then-expect races the mock reset is meant to absorb.
+test.describe.configure({ mode: 'serial' });
+
 test.describe('Bots lifecycle', () => {
   test.beforeEach(async ({ page, request }) => {
     await request.post('http://localhost:5198/api/_test/reset');

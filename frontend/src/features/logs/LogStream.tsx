@@ -190,8 +190,14 @@ export function LogStream({
           return (
             <div
               key={log.id}
-              className="flex flex-wrap gap-2 px-1"
-              style={{ borderRadius: 2 }}
+              className="flex flex-wrap gap-2 px-1 py-0.5"
+              style={{
+                borderRadius: 2,
+                // Thin separator between entries so long multi-line
+                // events (exc_info traces, heavy `key=value` tails)
+                // don't visually bleed into the next row.
+                borderBottom: '1px solid var(--border-default)',
+              }}
               onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--row-hover)')}
               onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
               data-testid="log-entry"
