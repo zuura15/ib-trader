@@ -729,11 +729,14 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             logger.exception('{"event": "STATUS_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
 
     # --- Global commission callback ---
-    # IB delivers CommissionReport AFTER execDetails. By the time it
-    # lands, the fill event + bot_trade row may already be persisted
-    # with commission=0. This handler updates both the transactions
-    # row and any matching bot_trades row in place. Non-gating: runs
-    # as its own background task; bot FSM flow never waits for it.
+    # IB delivers CommissionReport on a separate event that fires
+    # shortly after execDetails but often BEFORE the engine's own
+    # _handle_fill coroutine has written the FILLED TransactionEvent
+    # row (observed ~14 ms skew in live PSQ trades). Naively calling
+    # add_commission at that moment finds 0 rows and loses the value.
+    # Retry with small backoff — the row almost always shows up
+    # within a few hundred ms. Non-gating: this runs as its own
+    # background task; bot FSM flow never waits for it.
     async def on_commission(ib_order_id: str, exec_id: str, commission: Decimal) -> None:
         if commission is None or commission == 0:
             return
@@ -742,8 +745,25 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         except (TypeError, ValueError):
             return
         try:
-            # transactions.commission accumulates per fill.
-            txn_rows = ctx.transactions.add_commission(order_id_int, commission)
+            txn_rows = 0
+            # Backoff: 50, 100, 200, 400, 800, 1600 ms (~3.15 s total).
+            # Covers the normal 10–50 ms race and tolerates a stalled
+            # DB write without exhausting the event loop.
+            delays = [0.05, 0.1, 0.2, 0.4, 0.8, 1.6]
+            for attempt, delay in enumerate([0.0] + delays):
+                if delay:
+                    await asyncio.sleep(delay)
+                txn_rows = ctx.transactions.add_commission(order_id_int, commission)
+                if txn_rows > 0:
+                    break
+            if txn_rows == 0:
+                logger.warning(
+                    '{"event": "COMMISSION_UNMATCHED", "ib_order_id": "%s", '
+                    '"exec_id": "%s", "commission": "%s", "reason": '
+                    '"no_FILLED_transaction_row_after_retry"}',
+                    ib_order_id, exec_id, commission,
+                )
+                return
             # Resolve trade_serial via any transaction row for this order.
             trade_serial = None
             try:
