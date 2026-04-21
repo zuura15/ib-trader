@@ -192,6 +192,16 @@ async def _create_and_start_bot(
     config["tick_interval_seconds"] = defn.tick_interval_seconds
     config["_redis"] = redis
     config["_engine_url"] = engine_url
+    # Pull global tunables that apply to every bot — avoids threading a
+    # settings dict through every call site for a handful of keys.
+    try:
+        from ib_trader.config.loader import load_settings
+        _settings = load_settings("config/settings.yaml")
+        if "market_data_heartbeat_stale_halt_seconds" in _settings:
+            config["market_data_heartbeat_stale_halt_seconds"] = \
+                _settings["market_data_heartbeat_stale_halt_seconds"]
+    except Exception:
+        logger.debug("settings_load_failed", exc_info=True)
     bot = strategy_cls(defn.id, config, session_factory)
 
     # Initialize the bot (strategy, middleware, aggregator, warmup)

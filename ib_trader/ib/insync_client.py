@@ -886,6 +886,7 @@ class InsyncClient(IBClientBase):
         104,    # Cannot modify a filled order
         105,    # Order does not match any existing order
         135,    # Can't find order with id
+        201,    # Order rejected - reason: Order is already filled (amend-race)
         10147,  # OrderId is not an active order
     })
 

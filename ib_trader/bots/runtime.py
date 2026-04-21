@@ -65,7 +65,11 @@ def _parse_aware_dt(s: str) -> datetime:
     return dt
 _QUOTE_CHECK_INTERVAL = 1.0  # seconds between exit quote checks
 _STALE_QUOTE_WARN_SECONDS = 45   # engine polls every 30s, so 45s = missed one poll
-_STALE_QUOTE_HALT_SECONDS = 120  # 2 minutes with no fresh data = halt
+# Halt threshold is the engine-wide market-data heartbeat default;
+# overridden per-deployment by settings.market_data_heartbeat_stale_halt_seconds.
+# The previous per-symbol halt wasn't reliable — illiquid symbols (PSQ, etc.)
+# go 120s+ between ticks during quiet sessions without anything being wrong.
+_DEFAULT_HEARTBEAT_STALE_HALT_SECONDS = 120
 
 class StrategyBotRunner(BotBase):
     """BotBase adapter that runs a Strategy via the runtime.
@@ -2160,11 +2164,40 @@ class StrategyBotRunner(BotBase):
             )]
             await self._run_pipeline(actions)
 
+    async def _read_heartbeat_age(self) -> tuple[bool, float | None, dict]:
+        """Return (present, age_seconds, raw_payload) for the engine's
+        market-data heartbeat key. Age is None if the key is absent or
+        the timestamp can't be parsed.
+        """
+        redis = self.config.get("_redis")
+        if redis is None:
+            return False, None, {"redis": "unavailable"}
+        try:
+            from ib_trader.redis.state import StateStore, StateKeys
+            hb = await StateStore(redis).get(StateKeys.market_data_heartbeat())
+        except Exception as e:
+            return False, None, {"redis_get_error": str(e)}
+        if not hb:
+            return False, None, {}
+        ts_str = hb.get("ts")
+        if not ts_str:
+            return True, None, hb
+        try:
+            from datetime import datetime, timezone
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = round((datetime.now(timezone.utc) - ts).total_seconds(), 1)
+            return True, age, hb
+        except Exception as e:
+            return True, None, {**hb, "ts_parse_error": str(e)}
+
     async def _probe_quote_source(self, symbol: str) -> dict:
         """Gather diagnostics about the quote source — the bot has no
         direct IB handle, so we check the state store (what the engine's
-        tick publisher last wrote) and note its age. Pure read; safe to
-        call from the stale-quote path without risk of side effects.
+        tick publisher last wrote) and note both the per-symbol quote
+        and the engine-wide heartbeat. Pure read; safe to call from the
+        stale-quote path without risk of side effects.
         """
         info: dict = {"symbol": symbol, "redis_quote_key_present": False}
         redis = self.config.get("_redis")
@@ -2177,75 +2210,116 @@ class StrategyBotRunner(BotBase):
         except Exception as e:
             info["redis_get_error"] = str(e)
             return info
-        if not q:
-            return info
-        info["redis_quote_key_present"] = True
-        info["redis_bid"] = q.get("bid")
-        info["redis_ask"] = q.get("ask")
-        info["redis_last"] = q.get("last")
-        info["redis_quote_ts"] = q.get("ts")
-        # Age of the cached quote vs now.
-        try:
-            from datetime import datetime, timezone
-            ts_str = q.get("ts")
-            if ts_str:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                info["redis_quote_age_s"] = round(
-                    (datetime.now(timezone.utc) - ts).total_seconds(), 1,
-                )
-        except Exception as e:
-            info["redis_ts_parse_error"] = str(e)
+        if q:
+            info["redis_quote_key_present"] = True
+            info["redis_bid"] = q.get("bid")
+            info["redis_ask"] = q.get("ask")
+            info["redis_last"] = q.get("last")
+            info["redis_quote_ts"] = q.get("ts")
+            try:
+                from datetime import datetime, timezone
+                ts_str = q.get("ts")
+                if ts_str:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    info["redis_quote_age_s"] = round(
+                        (datetime.now(timezone.utc) - ts).total_seconds(), 1,
+                    )
+            except Exception as e:
+                info["redis_ts_parse_error"] = str(e)
+
+        # Engine-wide market-data heartbeat — the authoritative halt signal.
+        hb_present, hb_age, hb_raw = await self._read_heartbeat_age()
+        info["heartbeat_present"] = hb_present
+        if hb_age is not None:
+            info["heartbeat_age_s"] = hb_age
+        if hb_raw.get("symbol"):
+            info["heartbeat_last_symbol"] = hb_raw["symbol"]
         return info
 
     async def check_stale_quote(self) -> None:
-        """Supervisory check: warn / halt if no quote arrives for too long."""
+        """Supervisory check: warn on a quiet symbol, halt only when the
+        engine-wide market-data heartbeat goes stale.
+
+        Rationale: individual symbols (especially inverse ETFs like PSQ)
+        can genuinely go 120 s+ between IB ticks during quiet periods
+        without any outage. A per-symbol halt false-positives the bot
+        into ERRORED in those windows. Engine-level liveness — "is ANY
+        symbol ticking right now?" — is the real "something broke"
+        signal.
+        """
         if not self.strategy or not self.ctx:
             return
         await self._refresh_state()
         if self.ctx.fsm_state != BotState.AWAITING_EXIT_TRIGGER:
             return  # Stale quotes only matter when monitoring exits
 
-        elapsed = time.monotonic() - self._last_quote_time
+        per_symbol_elapsed = time.monotonic() - self._last_quote_time
         symbol = self.strategy_config.get("symbol", "")
-        if elapsed > _STALE_QUOTE_HALT_SECONDS and not self._quote_stale_logged:
+        halt_threshold = float(
+            self.config.get(
+                "market_data_heartbeat_stale_halt_seconds",
+                _DEFAULT_HEARTBEAT_STALE_HALT_SECONDS,
+            )
+        )
+
+        # Halt decision is driven by the engine-wide heartbeat key,
+        # not per-symbol freshness.
+        hb_present, hb_age, _ = await self._read_heartbeat_age()
+        heartbeat_stale = (
+            not hb_present or hb_age is None or hb_age > halt_threshold
+        )
+
+        if heartbeat_stale and not self._quote_stale_logged:
             self._quote_stale_logged = True
             probe = await self._probe_quote_source(symbol)
-            # Emit the probe details as a structured log so we can see in
-            # the Errors panel exactly what the engine-side quote state
-            # looked like at crash time (does Redis still have a recent
-            # value? Is the age consistent with our elapsed counter?).
+            effective_elapsed = (
+                hb_age if (hb_present and hb_age is not None) else per_symbol_elapsed
+            )
             logger.error(
                 '{"event": "STALE_QUOTE_HALT_DIAG", "bot_id": "%s", '
-                '"symbol": "%s", "elapsed_s": %.1f, "probe": %s}',
-                self.bot_id, symbol, elapsed, json.dumps(probe),
+                '"symbol": "%s", "elapsed_s": %.1f, '
+                '"heartbeat_present": %s, "halt_threshold_s": %.1f, '
+                '"probe": %s}',
+                self.bot_id, symbol, effective_elapsed,
+                "true" if hb_present else "false",
+                halt_threshold, json.dumps(probe),
             )
             actions = [LogSignal(
                 event_type=LogEventType.ERROR,
-                message=f"No quote data for {elapsed:.0f}s — halting bot",
-                payload={"no_fresh_data_s": elapsed, "probe": probe},
+                message=(
+                    f"Market-data heartbeat stale ({effective_elapsed:.0f}s) "
+                    f"— halting bot"
+                ),
+                payload={
+                    "heartbeat_age_s": hb_age,
+                    "heartbeat_present": hb_present,
+                    "probe": probe,
+                },
             )]
             await self._run_pipeline(actions)
             try:
-                await self.on_crash(message="STALE_QUOTES")
+                await self.on_crash(message="STALE_MARKET_DATA_HEARTBEAT")
             except Exception:
                 logger.exception(
                     '{"event": "STALE_QUOTE_CRASH_DISPATCH_FAILED", "bot_id": "%s"}',
                     self.bot_id,
                 )
-        elif elapsed > _STALE_QUOTE_WARN_SECONDS and not self._quote_stale_logged:
-            # Warn-level probe: fires ONCE per stale episode (guarded by
-            # _quote_stale_logged, which the callback resets on fresh
-            # ticks). Gives an early diagnostic snapshot so we can tell
-            # whether the engine is still publishing to Redis but the
-            # bot's local tick counter didn't get reset, vs. the whole
-            # pipeline going silent.
+        elif (
+            per_symbol_elapsed > _STALE_QUOTE_WARN_SECONDS
+            and not self._quote_stale_logged
+        ):
+            # Warn-level probe for a quiet individual symbol — ONCE per
+            # stale episode (guarded by _quote_stale_logged, reset on
+            # fresh ticks). Informational, not a halt: QQQ may be
+            # ticking fine while PSQ is silent for several minutes on a
+            # slow day.
             probe = await self._probe_quote_source(symbol)
             logger.warning(
                 '{"event": "STALE_QUOTES", "bot_id": "%s", "symbol": "%s", '
                 '"no_fresh_s": %.1f, "probe": %s}',
-                self.bot_id, symbol, elapsed, json.dumps(probe),
+                self.bot_id, symbol, per_symbol_elapsed, json.dumps(probe),
             )
 
     async def on_teardown(self) -> None:

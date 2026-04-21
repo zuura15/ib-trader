@@ -1032,6 +1032,16 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                 quote_data,
                 ttl=StateKeys.QUOTE_TTL,
             )
+            # Engine-wide market-data liveness heartbeat. Any tick for
+            # any tracked symbol keeps this key fresh. Bots halt when
+            # they see this key stale — distinct from "my specific
+            # symbol is quiet", which can happen naturally on illiquid
+            # instruments (PSQ, etc.) without indicating an outage.
+            await state.set(
+                StateKeys.market_data_heartbeat(),
+                {"ts": quote_data["ts"], "symbol": symbol},
+                ttl=StateKeys.MARKET_DATA_HEARTBEAT_TTL,
+            )
         except Exception:
             logger.exception('{"event": "TICK_PUBLISHER_ERROR"}')
 
