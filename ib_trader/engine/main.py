@@ -689,9 +689,73 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         except Exception:
             logger.exception('{"event": "STATUS_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
 
+    # --- Global commission callback ---
+    # IB delivers CommissionReport AFTER execDetails. By the time it
+    # lands, the fill event + bot_trade row may already be persisted
+    # with commission=0. This handler updates both the transactions
+    # row and any matching bot_trades row in place. Non-gating: runs
+    # as its own background task; bot FSM flow never waits for it.
+    from ib_trader.data.repositories.transaction_repository import (
+        TransactionRepository,
+    )
+    from ib_trader.data.repositories.bot_trade_repository import (
+        BotTradeRepository,
+    )
+
+    async def on_commission(ib_order_id: str, exec_id: str, commission: Decimal) -> None:
+        if commission is None or commission == 0:
+            return
+        try:
+            order_id_int = int(ib_order_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            txn_repo = TransactionRepository(session_factory)
+            trade_repo = BotTradeRepository(session_factory)
+            # Update transactions.commission (accumulates per fill).
+            txn_rows = txn_repo.add_commission(order_id_int, commission)
+            # Resolve trade_serial via any transaction row for this order.
+            trade_serial = None
+            try:
+                from ib_trader.data.models import (
+                    TransactionEvent, TransactionAction,
+                )
+                s = session_factory()
+                ev = (
+                    s.query(TransactionEvent)
+                    .filter(
+                        TransactionEvent.ib_order_id == order_id_int,
+                        TransactionEvent.action.in_([
+                            TransactionAction.FILLED,
+                            TransactionAction.PARTIAL_FILL,
+                        ]),
+                    )
+                    .first()
+                )
+                if ev is not None:
+                    trade_serial = ev.trade_serial
+            except Exception:
+                logger.debug("commission serial lookup failed", exc_info=True)
+            bt_rows = 0
+            if trade_serial is not None:
+                bt_rows = trade_repo.add_commission_by_serial(trade_serial, commission)
+            logger.info(
+                '{"event": "COMMISSION_APPLIED", "ib_order_id": "%s", '
+                '"exec_id": "%s", "commission": "%s", '
+                '"txn_rows": %d, "bot_trade_rows": %d}',
+                ib_order_id, exec_id, commission, txn_rows, bt_rows,
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "COMMISSION_APPLY_FAILED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+
     # Register global callbacks (fire for ALL orders)
     ctx.ib.register_fill_callback(on_fill)
     ctx.ib.register_status_callback(on_status)
+    if hasattr(ctx.ib, "register_commission_callback"):
+        ctx.ib.register_commission_callback(on_commission)
 
     # --- Position event callback ---
     # Wire up positionEvent if the IB client supports it.

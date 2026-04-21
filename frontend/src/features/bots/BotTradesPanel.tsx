@@ -47,6 +47,25 @@ function formatPnl(pnl: string | null): { text: string; color: string } {
   };
 }
 
+/** Net P&L = gross - commission. Null-safe: if commission missing,
+ * returns gross as-is so we don't silently zero the number. */
+function netPnl(grossStr: string | null, commStr: string | null): number | null {
+  if (grossStr === null || grossStr === undefined) return null;
+  const gross = parseFloat(grossStr);
+  if (isNaN(gross)) return null;
+  const comm = commStr ? parseFloat(commStr) : 0;
+  return gross - (isNaN(comm) ? 0 : comm);
+}
+
+function formatSignedDollars(v: number | null): { text: string; color: string } {
+  if (v === null || v === undefined || isNaN(v)) return { text: '—', color: 'var(--text-muted)' };
+  const sign = v >= 0 ? '+' : '-';
+  return {
+    text: `${sign}$${Math.abs(v).toFixed(2)}`,
+    color: v >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+  };
+}
+
 function fmtPrice(s: string | null): string {
   if (!s) return '—';
   const v = parseFloat(s);
@@ -74,8 +93,9 @@ function compareValues(a: BotTradeResponse, b: BotTradeResponse, key: SortKey): 
     case 'duration_seconds':
       return (a.duration_seconds ?? 0) - (b.duration_seconds ?? 0);
     case 'realized_pnl': {
-      const av = a.realized_pnl !== null ? parseFloat(a.realized_pnl) : 0;
-      const bv = b.realized_pnl !== null ? parseFloat(b.realized_pnl) : 0;
+      // Sort by net (gross − commission) — matches what the column shows.
+      const av = netPnl(a.realized_pnl, a.commission) ?? 0;
+      const bv = netPnl(b.realized_pnl, b.commission) ?? 0;
       return av - bv;
     }
     case 'exit_time': {
@@ -164,7 +184,7 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
               <SortHeader label="Symbol" myKey="symbol" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               <SortHeader label="Dir" myKey="direction" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               <SortHeader label="Duration" myKey="duration_seconds" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              <SortHeader label="P&L" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              <SortHeader label="P&L (net)" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               {!compact && (
                 <SortHeader label="Closed" myKey="exit_time" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               )}
@@ -180,7 +200,9 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
               </tr>
             ) : (
               sortedTrades.flatMap((t) => {
-                const pnl = formatPnl(t.realized_pnl);
+                const netValue = netPnl(t.realized_pnl, t.commission);
+                const pnl = formatSignedDollars(netValue);
+                const grossPnl = formatPnl(t.realized_pnl);
                 const dur = formatDuration(t.duration_seconds);
                 const isExpanded = expandedId === t.id;
                 const rows: JSX.Element[] = [
@@ -214,6 +236,33 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                   </tr>,
                 ];
                 if (isExpanded) {
+                  // Visual hierarchy: label 10 px uppercase muted ≫ value
+                  // 14 px semibold primary. The font-size + weight jump is
+                  // what separates the two; keeping both the same only
+                  // gave a 2 px width difference, so they read as one blob.
+                  const labelStyle: React.CSSProperties = {
+                    color: 'var(--text-muted)',
+                    fontSize: 10,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.05em',
+                    marginBottom: 3,
+                  };
+                  const valueStyle: React.CSSProperties = {
+                    fontSize: 14,
+                    color: 'var(--text-primary)',
+                    fontWeight: 600,
+                    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                  };
+                  const metaStyle: React.CSSProperties = {
+                    fontSize: 11,
+                    color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                    marginTop: 2,
+                  };
+                  const gross = t.realized_pnl ? parseFloat(t.realized_pnl) : null;
+                  const comm = t.commission ? parseFloat(t.commission) : 0;
+                  const grossFmt = formatSignedDollars(gross);
+                  const net = formatSignedDollars(netValue);
                   rows.push(
                     <tr key={`${t.id}-detail`} data-testid={`bot-trade-detail-${t.id}`}>
                       <td
@@ -221,50 +270,51 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                         style={{ background: 'var(--bg-root)', padding: 0, borderTop: 'none' }}
                       >
                         <div style={{
-                          padding: '10px 16px',
+                          padding: '12px 16px',
                           display: 'grid',
                           gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-                          gap: '8px 20px',
-                          fontSize: 12,
+                          gap: '12px 24px',
                         }}>
                           <div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Entry</div>
-                            <div className="font-mono">
+                            <div style={labelStyle}>Entry</div>
+                            <div style={valueStyle}>
                               {fmtPrice(t.entry_price)} × {fmtQty(t.entry_qty)}
                             </div>
-                            <div className="font-mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                              {fmtTime(t.entry_time)}
-                            </div>
+                            <div style={metaStyle}>{fmtTime(t.entry_time)}</div>
                           </div>
                           <div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Exit</div>
-                            <div className="font-mono">
+                            <div style={labelStyle}>Exit</div>
+                            <div style={valueStyle}>
                               {fmtPrice(t.exit_price)} × {fmtQty(t.exit_qty)}
                             </div>
-                            <div className="font-mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                              {fmtTime(t.exit_time)}
+                            <div style={metaStyle}>{fmtTime(t.exit_time)}</div>
+                          </div>
+                          <div>
+                            <div style={labelStyle}>P&amp;L breakdown</div>
+                            <div style={{ ...valueStyle, color: grossFmt.color }}>
+                              Gross {grossFmt.text}
+                            </div>
+                            <div style={metaStyle}>
+                              − ${comm.toFixed(2)} commission
+                            </div>
+                            <div style={{ ...valueStyle, color: net.color, marginTop: 2 }}>
+                              Net {net.text}
                             </div>
                           </div>
                           <div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Trail resets</div>
-                            <div className="font-mono">{t.trail_reset_count}</div>
-                          </div>
-                          <div>
-                            <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Commission</div>
-                            <div className="font-mono">
-                              {t.commission ? `$${parseFloat(t.commission).toFixed(2)}` : '$0.00'}
-                            </div>
+                            <div style={labelStyle}>Trail resets</div>
+                            <div style={valueStyle}>{t.trail_reset_count}</div>
                           </div>
                           {t.bot_name && (
                             <div>
-                              <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Bot</div>
-                              <div className="font-mono">{t.bot_name}</div>
+                              <div style={labelStyle}>Bot</div>
+                              <div style={valueStyle}>{t.bot_name}</div>
                             </div>
                           )}
                           {(t.entry_serial || t.exit_serial) && (
                             <div>
-                              <div style={{ color: 'var(--text-muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Serials</div>
-                              <div className="font-mono">
+                              <div style={labelStyle}>Serials</div>
+                              <div style={valueStyle}>
                                 #{t.entry_serial ?? '—'} → #{t.exit_serial ?? '—'}
                               </div>
                             </div>

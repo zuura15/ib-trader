@@ -7,6 +7,8 @@ After the orders table removal, this is the sole persistent record of
 order state. IB is the source of truth for live state; transactions are
 the source of truth for historical state and trade-group linkage.
 """
+from decimal import Decimal
+
 from sqlalchemy.orm import scoped_session, Session
 from sqlalchemy import func
 
@@ -49,6 +51,40 @@ class TransactionRepository:
         s = self._session()
         s.add(event)
         s.commit()
+
+    def add_commission(self, ib_order_id: int, delta: Decimal) -> int:
+        """Add ``delta`` to the commission of every FILLED/PARTIAL_FILL row
+        matching ``ib_order_id``. Returns the number of rows updated.
+
+        Called when IB delivers a ``commissionReport`` AFTER the initial
+        ``execDetails`` — the row was inserted with commission=0 and this
+        method brings it up to date. Uses addition (not replace) so
+        concurrent commission reports for multi-leg orders accumulate.
+        """
+        if delta is None:
+            return 0
+        if not isinstance(delta, Decimal):
+            delta = Decimal(str(delta))
+        s = self._session()
+        rows = (
+            s.query(TransactionEvent)
+            .filter(
+                TransactionEvent.ib_order_id == ib_order_id,
+                TransactionEvent.action.in_([
+                    TransactionAction.FILLED,
+                    TransactionAction.PARTIAL_FILL,
+                ]),
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            existing = row.commission or Decimal("0")
+            row.commission = existing + delta
+            updated += 1
+        if updated:
+            s.commit()
+        return updated
 
     # -----------------------------------------------------------------------
     # Queries by IB order ID

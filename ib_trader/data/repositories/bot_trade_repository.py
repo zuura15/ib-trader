@@ -69,3 +69,37 @@ class BotTradeRepository:
             .limit(limit)
             .all()
         )
+
+    def add_commission_by_serial(
+        self, serial: int, delta: Decimal,
+    ) -> int:
+        """Accumulate ``delta`` into the commission of every bot_trade row
+        matching ``serial`` as either entry_serial or exit_serial. Returns
+        the number of rows updated.
+
+        Commission arrives asynchronously (IB delivers ``commissionReport``
+        after ``execDetails``). By the time it lands, the round-trip may
+        already have been closed out into a bot_trades row — this method
+        updates it in place.
+        """
+        if delta is None:
+            return 0
+        if not isinstance(delta, Decimal):
+            delta = Decimal(str(delta))
+        s = self._session()
+        rows = (
+            s.query(BotTrade)
+            .filter(
+                (BotTrade.entry_serial == serial)
+                | (BotTrade.exit_serial == serial)
+            )
+            .all()
+        )
+        updated = 0
+        for row in rows:
+            existing = row.commission or Decimal("0")
+            row.commission = existing + delta
+            updated += 1
+        if updated:
+            s.commit()
+        return updated

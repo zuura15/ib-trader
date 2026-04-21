@@ -81,6 +81,15 @@ class InsyncClient(IBClientBase):
         # fire for every order and are never auto-removed.
         self._fill_callbacks: dict[str, list] = {}
         self._status_callbacks: dict[str, list] = {}
+        # Commission callbacks fire when IB delivers a CommissionReport
+        # (typically slightly after the matching execDetails). Same
+        # keying convention as _fill_callbacks: per-ib_order_id scoped
+        # callbacks + a _GLOBAL bucket that fires for all orders.
+        # Non-gating — handlers only update persisted state.
+        self._commission_callbacks: dict[str, list] = {}
+        # Seen exec_ids for commission-dedup: IB occasionally re-delivers
+        # the same CommissionReport on reconnect.
+        self._seen_commission_execs: set[str] = set()
         # Maps ib_order_id -> Trade object for amendment support
         self._active_trades: dict[str, Trade] = {}
         # Maps con_id -> fully-qualified Contract ready for order placement.
@@ -148,6 +157,7 @@ class InsyncClient(IBClientBase):
         self._ib.disconnectedEvent += self._on_disconnected
         self._ib.execDetailsEvent += self._on_exec_details
         self._ib.orderStatusEvent += self._on_order_status
+        self._ib.commissionReportEvent += self._on_commission_report
         self._ib.errorEvent += self._on_error
         self._ib.reqMarketDataType(self._market_data_type)
         logger.info(
@@ -959,6 +969,65 @@ class InsyncClient(IBClientBase):
             _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
         for cb in self._fill_callbacks.get("_GLOBAL", []):
             _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
+
+    def _on_commission_report(self, trade, fill, report) -> None:
+        """Handle CommissionReport from IB (fires shortly AFTER execDetails).
+
+        IB delivers commission info on a separate event because the
+        number is computed server-side after the fill is booked. If
+        ``execDetailsEvent`` already had ``fill.commissionReport`` set,
+        our ``_on_exec_details`` captured the commission inline and the
+        handlers here are "extra" — dedup via ``exec_id`` to avoid
+        double-posting.
+        """
+        try:
+            ib_order_id = str(trade.order.orderId)
+        except Exception:
+            return
+        exec_id = getattr(fill.execution, "execId", "") or ""
+        commission_raw = getattr(report, "commission", 0) or 0
+        try:
+            commission = Decimal(str(commission_raw))
+        except Exception:
+            return
+        # Dedup. On reconnect IB sometimes redelivers the same report.
+        if exec_id and exec_id in self._seen_commission_execs:
+            logger.debug(
+                '{"event": "IB_COMMISSION_REPORT_DEDUPED", '
+                '"ib_order_id": "%s", "exec_id": "%s"}',
+                ib_order_id, exec_id,
+            )
+            return
+        if exec_id:
+            self._seen_commission_execs.add(exec_id)
+
+        logger.info(
+            '{"event": "IB_COMMISSION_REPORT", "ib_order_id": "%s", '
+            '"exec_id": "%s", "commission": "%s"}',
+            ib_order_id, exec_id, commission,
+        )
+
+        # Fire per-order callbacks then global. Handlers do DB updates
+        # only — never gate anything waiting for commission.
+        for cb in self._commission_callbacks.get(ib_order_id, []):
+            _spawn_background(cb(ib_order_id, exec_id, commission))
+        for cb in self._commission_callbacks.get("_GLOBAL", []):
+            _spawn_background(cb(ib_order_id, exec_id, commission))
+
+    def register_commission_callback(
+        self, callback, ib_order_id: str | None = None,
+    ) -> None:
+        """Register a callback for CommissionReport events.
+
+        Args:
+            callback: async callable taking (ib_order_id, exec_id, commission).
+            ib_order_id: Scope to a single order, or None for the _GLOBAL
+                bucket that fires for every order. Per-order callbacks are
+                NOT auto-removed on terminal — commission can arrive after
+                the order is marked Filled.
+        """
+        key = ib_order_id or "_GLOBAL"
+        self._commission_callbacks.setdefault(key, []).append(callback)
 
     def _on_order_status(self, trade: Trade) -> None:
         """Handle order status change event from IB and dispatch to callbacks.
