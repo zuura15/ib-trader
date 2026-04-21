@@ -204,6 +204,12 @@ export function stopBot(botId: string) {
   return request<{ bot_id: string; status: string }>(`/bots/${botId}/stop`, { method: 'POST' });
 }
 
+export function resetBot(botId: string) {
+  return request<{ bot_id: string; state: string; message?: string }>(
+    `/bots/${botId}/reset`, { method: 'POST' },
+  );
+}
+
 // --- Templates ---
 
 export interface TemplateResponse {

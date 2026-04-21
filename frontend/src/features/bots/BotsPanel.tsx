@@ -84,6 +84,21 @@ function forceStop(botId: string) {
     .finally(() => setTimeout(() => setPending(botId, null), 2000));
 }
 
+function resetBot(botId: string) {
+  if (!window.confirm('Reset this bot from ERRORED back to OFF? You will still need to Start it afterward.')) return;
+  setPending(botId, 'Resetting...');
+  // The runner requires a stop-before-reset when the task is still
+  // registered; call stop first, then reset. Both are idempotent.
+  fetch(`/api/bots/${botId}/stop`, { method: 'POST' })
+    .catch(() => {})
+    .then(() => fetch(`/api/bots/${botId}/reset`, { method: 'POST' }))
+    .then((r) => {
+      if (r && !r.ok) r.json().then((d) => alert(d.detail || 'Reset failed'));
+    })
+    .catch(() => {})
+    .finally(() => setTimeout(() => setPending(botId, null), 2000));
+}
+
 function forceBuy(botId: string) {
   setPending(botId, 'Placing...');
   fetch(`/api/bots/${botId}/force-buy`, { method: 'POST' })
@@ -410,6 +425,22 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         FORCE STOP
                       </button>
                     )}
+                    {bot.status === 'error' && (
+                      <button
+                        onClick={() => resetBot(bot.id)}
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
+                        style={{
+                          background: 'var(--badge-blue-bg)',
+                          color: 'var(--accent-blue)',
+                          border: '1px solid var(--accent-blue)',
+                          cursor: 'pointer',
+                        }}
+                        data-testid={`bot-reset-${bot.id}`}
+                        title="Clear ERRORED and reset to OFF so the bot can be STARTed again"
+                      >
+                        RESET
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -568,6 +599,22 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         title="Emergency stop"
                       >
                         ABORT
+                      </button>
+                    )}
+                    {bot.status === 'error' && (
+                      <button
+                        onClick={() => resetBot(bot.id)}
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
+                        style={{
+                          background: 'var(--badge-blue-bg)',
+                          color: 'var(--accent-blue)',
+                          border: '1px solid var(--accent-blue)',
+                          cursor: 'pointer',
+                        }}
+                        data-testid={`bot-reset-${bot.id}`}
+                        title="Clear ERRORED and reset to OFF"
+                      >
+                        RESET
                       </button>
                     )}
                   </td>
