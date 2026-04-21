@@ -90,6 +90,19 @@ class InsyncClient(IBClientBase):
         # Seen exec_ids for commission-dedup: IB occasionally re-delivers
         # the same CommissionReport on reconnect.
         self._seen_commission_execs: set[str] = set()
+        # Per-order asyncio locks. Every dispatched callback (fill,
+        # status, commission) for a given ib_order_id acquires this
+        # lock before running, so IB events for the same order are
+        # processed strictly in arrival order even when individual
+        # handlers yield mid-flight. Different orders remain parallel.
+        # asyncio.Lock serves waiters FIFO, so tasks created in IB's
+        # dispatch order acquire in IB's dispatch order. Locks are
+        # retained for the life of the engine — per-order memory
+        # overhead is negligible and late events (e.g. a commission
+        # arriving after terminal) must find the same lock to
+        # maintain ordering against any fills that were still in
+        # flight when the status flipped.
+        self._order_locks: dict[str, asyncio.Lock] = {}
         # Maps ib_order_id -> Trade object for amendment support
         self._active_trades: dict[str, Trade] = {}
         # Maps con_id -> fully-qualified Contract ready for order placement.
@@ -939,6 +952,36 @@ class InsyncClient(IBClientBase):
         "Filled", "Cancelled", "Inactive", "ApiCancelled",
     })
 
+    def _get_order_lock(self, ib_order_id: str) -> asyncio.Lock:
+        """Return the per-order asyncio.Lock for ``ib_order_id``, creating
+        it lazily on first use. Lazy creation avoids loop-binding issues
+        during construction and only pays for orders that actually see
+        traffic."""
+        lock = self._order_locks.get(ib_order_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._order_locks[ib_order_id] = lock
+        return lock
+
+    async def _dispatch_ordered(
+        self, ib_order_id: str, cb, *args,
+    ) -> None:
+        """Run ``cb(*args)`` under the per-order lock.
+
+        Every IB-event callback (fill / status / commission) for a given
+        ``ib_order_id`` funnels through this wrapper, so they execute
+        strictly in the order they were scheduled — which is IB's
+        dispatch order, since ib_async invokes our sync event handlers
+        in arrival order and each handler wraps callbacks via
+        ``_spawn_background`` immediately. Without this lock, a handler
+        that yields (e.g. ``await order_writer.add(...)``) can be
+        overtaken by the next event's handler, letting a status=Filled
+        terminalize the ledger before a still-queued fill has
+        accumulated — which left orphan positions in IB in live trading.
+        """
+        async with self._get_order_lock(ib_order_id):
+            await cb(*args)
+
     def _on_exec_details(self, trade: Trade, fill: Fill) -> None:
         """Handle fill event from IB and dispatch to registered callbacks.
 
@@ -965,10 +1008,17 @@ class InsyncClient(IBClientBase):
         )
 
         # Dispatch to order-specific callbacks, then global callbacks.
+        # Every dispatch for this ib_order_id funnels through the
+        # per-order lock so fills/statuses for the same order run in
+        # IB's arrival order even when individual handlers yield.
         for cb in self._fill_callbacks.get(ib_order_id, []):
-            _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, qty_filled, avg_price, commission,
+            ))
         for cb in self._fill_callbacks.get("_GLOBAL", []):
-            _spawn_background(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, qty_filled, avg_price, commission,
+            ))
 
     def _on_commission_report(self, trade, fill, report) -> None:
         """Handle CommissionReport from IB (fires shortly AFTER execDetails).
@@ -1008,11 +1058,18 @@ class InsyncClient(IBClientBase):
         )
 
         # Fire per-order callbacks then global. Handlers do DB updates
-        # only — never gate anything waiting for commission.
+        # only — never gate anything waiting for commission. Funnel
+        # through the per-order lock so commission writes stay ordered
+        # relative to any still-in-flight fill/status handlers for the
+        # same ib_order_id.
         for cb in self._commission_callbacks.get(ib_order_id, []):
-            _spawn_background(cb(ib_order_id, exec_id, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, exec_id, commission,
+            ))
         for cb in self._commission_callbacks.get("_GLOBAL", []):
-            _spawn_background(cb(ib_order_id, exec_id, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, exec_id, commission,
+            ))
 
     def register_commission_callback(
         self, callback, ib_order_id: str | None = None,
@@ -1078,10 +1135,18 @@ class InsyncClient(IBClientBase):
             return
 
         # Dispatch to order-specific callbacks, then global callbacks.
+        # Funnel through the per-order lock — critical here, because a
+        # terminal status that overtakes a still-queued fill would
+        # terminalize the ledger with under-counted fills and leave
+        # orphan position in IB (PSQ incident, 2026-04-21).
         for cb in self._status_callbacks.get(ib_order_id, []):
-            _spawn_background(cb(ib_order_id, status))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, status,
+            ))
         for cb in self._status_callbacks.get("_GLOBAL", []):
-            _spawn_background(cb(ib_order_id, status))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, status,
+            ))
 
         # Auto-cleanup after terminal status dispatch.
         if status in self._TERMINAL_STATUSES:
