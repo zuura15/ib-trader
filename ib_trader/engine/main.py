@@ -536,16 +536,53 @@ async def _position_poll_loop(ctx: AppContext) -> None:
     Interval is ``position_poll_interval_seconds`` in settings.yaml (default 60).
     """
     interval = ctx.settings.get("position_poll_interval_seconds", 60)
+    timeout = float(ctx.settings.get("order_terminal_timeout_seconds", 300))
     while True:
         await asyncio.sleep(interval)
         try:
             count = await _refresh_positions_cache(ctx)
-            # Sweep stale held-cancel entries from the order ledger
+            # Watchdog — surface orders that IB has not terminalized
+            # within the timeout as a user-acknowledgeable panic alert.
+            # The ledger itself never self-derives a terminal; that's
+            # IB's job. This loop is the escalation path when IB stalls.
             if hasattr(ctx, '_order_ledger'):
-                ctx._order_ledger.sweep_stale(max_age_seconds=300)
+                stuck = ctx._order_ledger.check_stuck(timeout_seconds=timeout)
+                for entry in stuck:
+                    _alert_stuck_order(ctx, entry, timeout)
             logger.debug('{"event": "POSITION_POLL", "count": %d}', count)
         except Exception:
             logger.exception('{"event": "POSITION_POLL_ERROR"}')
+
+
+def _alert_stuck_order(ctx: AppContext, entry, timeout_seconds: float) -> None:
+    """Fire a WARNING alert for an order IB hasn't terminalized in time."""
+    import time
+    from ib_trader.logging_.alerts import fire_and_forget_alert
+
+    age_s = int(time.monotonic() - entry.created_at)
+    msg = (
+        f"IB has not sent a terminal status for order {entry.ib_order_id} "
+        f"({entry.symbol} {entry.side}, filled {entry.filled_qty}/"
+        f"{entry.target_qty}) after {age_s}s. Reconcile manually — the "
+        f"ledger will not self-terminate."
+    )
+    fire_and_forget_alert(
+        redis=ctx.redis,
+        trigger="ORDER_TERMINAL_TIMEOUT",
+        message=msg,
+        severity="WARNING",
+        symbol=entry.symbol,
+        ib_order_id=entry.ib_order_id,
+        extra={
+            "order_ref": entry.order_ref,
+            "side": entry.side,
+            "target_qty": str(entry.target_qty),
+            "filled_qty": str(entry.filled_qty),
+            "last_status": entry.last_status,
+            "age_seconds": age_s,
+            "timeout_seconds": int(timeout_seconds),
+        },
+    )
 
 
 async def _event_relay_loop(ctx: AppContext) -> None:

@@ -85,6 +85,12 @@ heartbeat_interval_seconds: 30
 heartbeat_stale_threshold_seconds: 300
 poll_interval_seconds: 60
 position_poll_interval_seconds: 60
+# Maximum time the ledger will wait for IB to send a terminal status
+# for a placed order before raising ORDER_TERMINAL_TIMEOUT as a
+# user-acknowledgeable WARNING. The ledger never self-terminates —
+# IB is the only source of terminal events. If IB stalls, the user
+# reconciles manually.
+order_terminal_timeout_seconds: 300
 bot_runner_internal_port: 8082
 reconciliation_interval_seconds: 3600
 db_integrity_check_interval_seconds: 21600

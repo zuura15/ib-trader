@@ -23,31 +23,64 @@ def test_register_emits_submitted_progress(ledger):
     assert events[0]["filled_qty"] == "0"
 
 
-def test_single_full_fill_emits_progress_and_terminal(ledger):
+def test_record_fill_never_emits_terminal(ledger):
+    """Invariant: the ledger NEVER derives a terminal event from fill
+    data, even when the accumulated fills equal target_qty and IB
+    reports remaining=0. Terminal events only come from IB via
+    ``record_status``. This protects against event-dispatch races
+    where ``trade.orderStatus.remaining`` reads stale across SMART-split
+    fills — the previous behavior terminalized prematurely and left
+    orphan positions in IB."""
     ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
     events = ledger.record_fill(
         "100", qty=Decimal("10"), price=Decimal("12.73"),
         commission=Decimal("0.50"), remaining=Decimal("0"),
+        total_qty=Decimal("10"),
     )
-    assert len(events) == 2
-    progress, terminal = events[0], events[1]
-    assert progress["terminal"] is False
-    assert progress["last_fill_qty"] == "10"
-    assert terminal["terminal"] is True
-    assert terminal["status"] == "Filled"
-    assert terminal["filled_qty"] == "10"
-    assert terminal["avg_price"] == "12.73"
-    assert terminal["total_commission"] == "0.50"
+    assert len(events) == 1  # progress only — no terminal
+    assert events[0]["terminal"] is False
+    assert events[0]["filled_qty"] == "10"
+    assert events[0]["status"] == "Filled"  # status-flag only, NOT terminal
+    assert events[0]["last_fill_qty"] == "10"
+    # Entry still present — terminal comes via record_status("Filled")
+    assert ledger.get("100") is not None
 
 
-def test_partial_fills_accumulate(ledger):
+def test_terminal_only_fires_on_status_filled(ledger):
+    """Full lifecycle: fills accumulate as progress, then IB's
+    orderStatus("Filled") produces the single terminal event."""
+    ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
+    ledger.record_fill(
+        "100", qty=Decimal("3"), price=Decimal("12.70"),
+        commission=Decimal("0.10"), remaining=Decimal("7"),
+    )
+    ledger.record_fill(
+        "100", qty=Decimal("7"), price=Decimal("12.80"),
+        commission=Decimal("0.40"), remaining=Decimal("0"),
+    )
+    # No terminal yet — IB's Filled hasn't arrived.
+    assert ledger.get("100") is not None
+
+    events = ledger.record_status("100", "Filled")
+    assert len(events) == 1
+    assert events[0]["terminal"] is True
+    assert events[0]["status"] == "Filled"
+    assert events[0]["filled_qty"] == "10"
+    # Weighted avg (3*12.70 + 7*12.80) / 10 = 12.77
+    assert Decimal(events[0]["avg_price"]) == Decimal("12.77")
+    assert Decimal(events[0]["total_commission"]) == Decimal("0.50")
+    # Entry evicted on terminal.
+    assert ledger.get("100") is None
+
+
+def test_partial_fills_accumulate_as_progress(ledger):
     ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
 
     events1 = ledger.record_fill(
         "100", qty=Decimal("3"), price=Decimal("12.70"),
         commission=Decimal("0.10"), remaining=Decimal("7"),
     )
-    assert len(events1) == 1  # progress only
+    assert len(events1) == 1
     assert events1[0]["terminal"] is False
     assert events1[0]["filled_qty"] == "3"
     assert events1[0]["status"] == "PartiallyFilled"
@@ -56,13 +89,9 @@ def test_partial_fills_accumulate(ledger):
         "100", qty=Decimal("7"), price=Decimal("12.80"),
         commission=Decimal("0.40"), remaining=Decimal("0"),
     )
-    assert len(events2) == 2  # progress + terminal
-    terminal = events2[1]
-    assert terminal["terminal"] is True
-    assert terminal["filled_qty"] == "10"
-    # Weighted avg: (3*12.70 + 7*12.80) / 10 = 127.7/10 = 12.77
-    assert Decimal(terminal["avg_price"]) == Decimal("12.77")
-    assert Decimal(terminal["total_commission"]) == Decimal("0.50")
+    assert len(events2) == 1
+    assert events2[0]["terminal"] is False
+    assert events2[0]["filled_qty"] == "10"
 
 
 def test_cancel_with_zero_fills_from_submitted_is_held(ledger):
@@ -137,23 +166,29 @@ def test_untracked_inactive_no_orderref_is_terminal(ledger):
     assert events[0]["terminal"] is True
 
 
-def test_untracked_fill_creates_entry(ledger):
+def test_untracked_fill_creates_entry_without_terminal(ledger):
+    """Fill for an unregistered order synthesizes a ledger entry but
+    does NOT terminalize. IB's orderStatus terminal is still required."""
     events = ledger.record_fill(
         "888", qty=Decimal("5"), price=Decimal("100"),
         commission=Decimal("0"), order_ref="ext", symbol="AAPL",
         side="BUY", remaining=Decimal("0"),
     )
-    assert any(e["terminal"] for e in events)
-    terminal = next(e for e in events if e["terminal"])
-    assert terminal["filled_qty"] == "5"
+    assert len(events) == 1
+    assert events[0]["terminal"] is False
+    assert events[0]["filled_qty"] == "5"
+    assert ledger.get("888") is not None
 
 
-def test_ledger_evicts_on_terminal(ledger):
+def test_ledger_evicts_on_status_terminal(ledger):
     ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
     ledger.record_fill(
         "100", qty=Decimal("10"), price=Decimal("12.73"),
         commission=Decimal("0"), remaining=Decimal("0"),
     )
+    # Still present until IB says terminal.
+    assert ledger.get("100") is not None
+    ledger.record_status("100", "Filled")
     assert ledger.get("100") is None
 
 
@@ -167,49 +202,62 @@ def test_order_ref_passthrough(ledger):
         assert e["orderRef"] == "IBT:test-ford:F:B:42"
 
 
-def test_smart_split_does_not_terminal_on_first_partial(ledger):
-    """When IB fires two execDetails back-to-back for a SMART-split order,
-    both events update trade.orderStatus.remaining to 0 synchronously before
-    any on_fill task runs. The first fill's callback therefore reads
-    remaining=0 prematurely. The ledger must not terminalize at that point —
-    it should wait until accumulated fills reach target_qty. Otherwise the
-    second fill is rejected as "late after terminal" and the bot-side
-    accounting under-counts the actual position (PSQ bug: 346-share buy
-    filled as 100 + 246, bot tracked only 100, 246 shares orphaned in IB).
-    """
+def test_smart_split_fills_never_self_terminal(ledger):
+    """Regression for the PSQ orphan bug. IB fires two execDetails for a
+    SMART-split order back-to-back; both update trade.orderStatus.remaining
+    to 0 synchronously before any on_fill task runs. The first fill's
+    callback therefore reads remaining=0 prematurely. The ledger must NOT
+    terminalize — fills are progress-only. Terminal flows from IB's
+    orderStatus("Filled") that arrives afterward."""
     ledger.register("1899", "ref", "PSQ", "STK", 692767261, "BUY", Decimal("346"))
-    # Fill 1: 100 shares. Engine reads live remaining from orderStatus which
-    # has already been updated to 0 by fill 2's status update.
     events1 = ledger.record_fill(
         "1899", qty=Decimal("100"), price=Decimal("28.855"),
         commission=Decimal("0"),
-        remaining=Decimal("0"),  # <- racy, not authoritative
+        remaining=Decimal("0"),  # racy read, not authoritative
         total_qty=Decimal("346"),
     )
-    assert len(events1) == 1, "first partial must NOT emit terminal yet"
+    assert len(events1) == 1
     assert events1[0]["terminal"] is False
-    assert events1[0]["status"] == "PartiallyFilled"
-    assert events1[0]["filled_qty"] == "100"
-
-    # Fill 2: 246 shares arrives, accumulating to target=346.
     events2 = ledger.record_fill(
         "1899", qty=Decimal("246"), price=Decimal("28.855"),
         commission=Decimal("0"),
         remaining=Decimal("0"),
         total_qty=Decimal("346"),
     )
-    assert len(events2) == 2, "second fill must emit progress + terminal"
-    assert events2[1]["terminal"] is True
-    assert events2[1]["filled_qty"] == "346"
+    assert len(events2) == 1
+    assert events2[0]["terminal"] is False
+    assert events2[0]["filled_qty"] == "346"
+    # IB's terminal status is what actually evicts the entry.
+    term = ledger.record_status("1899", "Filled")
+    assert len(term) == 1
+    assert term[0]["terminal"] is True
+    assert term[0]["filled_qty"] == "346"
 
 
-def test_untracked_fill_still_terminals_on_remaining_zero(ledger):
-    """Fallback path — when target_qty isn't known (unregistered order,
-    no total_qty plumbed), remaining==0 is still honored as terminal."""
-    events = ledger.record_fill(
-        "5000", qty=Decimal("5"), price=Decimal("100"),
-        commission=Decimal("0"), order_ref="ext", symbol="AAPL",
-        side="BUY", remaining=Decimal("0"),  # no total_qty
-    )
-    # Entry synthesized with target=qty+remaining=5, filled_qty hits target.
-    assert any(e["terminal"] for e in events)
+def test_check_stuck_surfaces_entries_past_timeout(ledger):
+    """Orders IB hasn't terminalized within the timeout are returned
+    by check_stuck so the engine watchdog can alert on them."""
+    import time
+    ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
+    # Backdate the entry so it looks stuck.
+    ledger._entries["100"].created_at = time.monotonic() - 600
+    stuck = ledger.check_stuck(timeout_seconds=300)
+    assert len(stuck) == 1
+    assert stuck[0].ib_order_id == "100"
+    # Entry stays — stuck entries are NOT silently evicted.
+    assert ledger.get("100") is not None
+
+
+def test_check_stuck_alerts_each_entry_only_once(ledger):
+    """Same stuck entry must not re-alert on every watchdog tick."""
+    import time
+    ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
+    ledger._entries["100"].created_at = time.monotonic() - 600
+    assert len(ledger.check_stuck(timeout_seconds=300)) == 1
+    # Second call — already alerted, suppressed.
+    assert ledger.check_stuck(timeout_seconds=300) == []
+
+
+def test_check_stuck_ignores_fresh_entries(ledger):
+    ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
+    assert ledger.check_stuck(timeout_seconds=300) == []

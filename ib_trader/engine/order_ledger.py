@@ -53,6 +53,10 @@ class _LedgerEntry:
     fills: list[_Fill] = field(default_factory=list)
     last_status: str = "PendingSubmit"
     created_at: float = field(default_factory=lambda: __import__('time').monotonic())
+    # True once the engine's timeout watchdog has raised a panic alert
+    # for this entry. Prevents the same stuck entry from re-alerting on
+    # every watchdog tick.
+    stuck_alerted: bool = False
 
     @property
     def filled_qty(self) -> Decimal:
@@ -150,32 +154,29 @@ class OrderLedger:
         remaining: Decimal = Decimal("-1"),
         total_qty: Decimal = Decimal("-1"),
     ) -> list[dict]:
-        """Record a partial or complete fill.
+        """Record a partial or complete fill — ALWAYS non-terminal.
+
+        The ledger never derives a terminal event from fill data. Terminal
+        events are only emitted by ``record_status`` when IB delivers an
+        explicit terminal status (Filled, Cancelled, Inactive, ApiCancelled).
+        If IB never sends one, the engine's watchdog (``check_stuck``)
+        surfaces the stuck order as a panic alert instead. This keeps
+        the ledger from second-guessing IB — fill timing, split routing,
+        and event-dispatch races can all mis-trigger a self-derived
+        terminal, which in practice corrupted bot position tracking.
+
+        Returns a single progress event with ``last_fill_*`` populated.
 
         If the entry doesn't exist yet (e.g., order placed by a prior
         engine session or by another IB client), a best-effort entry is
-        created from the fill metadata.
-
-        ``total_qty`` is the original order size (``trade.order.totalQuantity``).
-        Preferred over ``qty + remaining`` for computing the entry's
-        target_qty because IB updates ``orderStatus.remaining`` across
-        all fills of a SMART-split order before any on_fill task runs —
-        so by the time the first fill's callback reads remaining, it can
-        already be 0 even though more fills are coming. Falls back to
-        ``qty + remaining`` for paths that don't plumb totalQuantity
-        (reconciler reconstructions, older callers).
-
-        Returns one or two events:
-        - Always: a progress event with last_fill_* populated
-        - If this fill completes the order (filled_qty >= target_qty or
-          remaining==0 with filled matching target): also a terminal event
+        created from the fill metadata. ``total_qty`` is preferred for
+        target_qty; ``qty + remaining`` is the fallback.
         """
-        # Short-circuit: the order was already terminalized earlier
-        # (this is a LATE fill from IBEOS / split-venue delivery, or a
-        # duplicate from IB firing execDetails + orderStatus("Filled")
-        # for the same fill). Emit nothing — the terminal was already
-        # delivered downstream; a second terminal with per-fill qty
-        # would corrupt the bot's cumulative position tracking.
+        # A fill arriving after the entry was evicted (IB already sent a
+        # terminal status) indicates late delivery — IBEOS overnight
+        # exec-details, duplicate callbacks, or split-venue quirks.
+        # Log loudly and drop: the terminal has already been relayed
+        # downstream; re-emitting anything would double-count.
         if ib_order_id in self._recently_evicted:
             logger.warning(
                 '{"event": "ORDER_LEDGER_LATE_FILL_AFTER_TERMINAL", '
@@ -208,38 +209,16 @@ class OrderLedger:
 
         entry.fills.append(_Fill(qty=qty, price=price, commission=commission, exec_id=exec_id))
 
-        events: list[dict] = []
-
-        # Always emit a progress event for the partial
-        events.append(self._make_event(
+        status = "PartiallyFilled"
+        if entry.target_qty > 0 and entry.filled_qty >= entry.target_qty:
+            status = "Filled"
+        return [self._make_event(
             entry,
             terminal=False,
-            status="PartiallyFilled" if entry.filled_qty < entry.target_qty else "Filled",
+            status=status,
             last_fill_qty=qty,
             last_fill_price=price,
-        ))
-
-        # Terminal gate — when target_qty is known (static from
-        # trade.order.totalQuantity plumbed in by the engine), trust
-        # accumulated fills over remaining. IB updates
-        # trade.orderStatus.remaining across ALL fills of a SMART-split
-        # order synchronously during event dispatch, so by the time
-        # the FIRST fill's on_fill task runs, `remaining` is already 0
-        # even though more fills are still queued. Gating on remaining==0
-        # here would terminalize at the first partial and reject the
-        # later split fills as "late after terminal", leaving an orphan
-        # position in IB. Fall back to remaining==0 only when we don't
-        # have a reliable target (unregistered order path).
-        target_known = entry.target_qty > 0
-        is_terminal = (
-            (target_known and entry.filled_qty >= entry.target_qty)
-            or (entry.last_status in _TERMINAL_STATUSES)
-            or (not target_known and remaining == Decimal("0"))
-        )
-        if is_terminal:
-            events.append(self._make_terminal(entry))
-
-        return events
+        )]
 
     def record_status(
         self,
@@ -321,17 +300,39 @@ class OrderLedger:
     def get(self, ib_order_id: str) -> Optional[_LedgerEntry]:
         return self._entries.get(ib_order_id)
 
-    def sweep_stale(self, max_age_seconds: float = 300) -> int:
-        """Evict held entries older than max_age_seconds. Returns count evicted."""
+    def check_stuck(self, timeout_seconds: float) -> list[_LedgerEntry]:
+        """Return entries older than ``timeout_seconds`` that IB has not
+        yet terminalized.
+
+        The caller (engine watchdog) raises a user-facing panic alert for
+        each returned entry and marks it as alerted so the same entry does
+        not re-alert on every tick. Entries are NOT evicted — they stay in
+        the ledger so the user can inspect/acknowledge. The engine relies
+        on IB as the eventual source of truth; a stuck entry is an
+        escalation path for the human, not a cleanup hook.
+
+        Also drops any ``_recently_evicted`` IDs older than the timeout
+        window (the set is only useful for the brief period after a
+        terminal to deduplicate late fills).
+        """
         import time
-        cutoff = time.monotonic() - max_age_seconds
-        stale = [oid for oid, e in self._entries.items() if e.created_at < cutoff]
-        for oid in stale:
-            logger.info('{"event": "ORDER_LEDGER_STALE_EVICTED", "ib_order_id": "%s"}', oid)
-            del self._entries[oid]
-        # Also clear the recently_evicted set (no longer needed after sweep interval)
+        cutoff = time.monotonic() - timeout_seconds
+        stuck: list[_LedgerEntry] = []
+        for entry in self._entries.values():
+            if entry.stuck_alerted:
+                continue
+            if entry.created_at >= cutoff:
+                continue
+            # Fully-filled entries whose status flip we're still waiting
+            # on count as stuck — IB should have sent Filled by now.
+            entry.stuck_alerted = True
+            stuck.append(entry)
+        # The duplicate-late-fill guard is only load-bearing for the few
+        # seconds after a terminal; beyond the timeout window, any
+        # genuinely late fill belongs in a reconciler DISCREPANCY alert,
+        # not silent suppression.
         self._recently_evicted.clear()
-        return len(stale)
+        return stuck
 
     def _make_event(
         self,
