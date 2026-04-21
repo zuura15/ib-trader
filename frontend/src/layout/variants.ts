@@ -98,6 +98,7 @@ export const variantA: IJsonModel = {
             weight: 45,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],
@@ -119,8 +120,9 @@ export const variantB: IJsonModel = {
       size: 200,
       children: [
         { type: 'tab', name: 'Logs', component: 'logs' },
-              { type: 'tab', name: 'Bot Log', component: 'bot-log' },
-              { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
+        { type: 'tab', name: 'Errors', component: 'errors' },
+        { type: 'tab', name: 'Bot Log', component: 'bot-log' },
+        { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
         { type: 'tab', name: 'Console', component: 'console' },
         { type: 'tab', name: 'Help', component: 'help' },
       ],
@@ -199,6 +201,7 @@ export const variantC: IJsonModel = {
             weight: 35,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],
@@ -294,6 +297,7 @@ export const variantD: IJsonModel = {
             weight: 65,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],

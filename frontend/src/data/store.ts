@@ -538,6 +538,11 @@ export const useStore = create<AppStore>((set, get) => ({
           totalCommission: t.total_commission,
           openedAt: t.opened_at,
           closedAt: t.closed_at,
+          entryQty: t.entry_qty ?? null,
+          entryPrice: t.entry_price ?? null,
+          exitQty: t.exit_qty ?? null,
+          exitPrice: t.exit_price ?? null,
+          orderType: t.order_type ?? null,
         })),
       });
     }

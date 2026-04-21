@@ -100,6 +100,29 @@ const mockBots = [
 ];
 
 const forceBuyHits = { count: 0, last_bot_id: null };
+const forceSellHits = { count: 0, last_bot_id: null };
+
+// Per-bot simulated position state — keyed by bot_id. Empty object means
+// "bot is FLAT/OFF and has no position" (the real backend returns an
+// empty Redis doc in that case; the frontend treats absent qty as 0).
+//
+// Schema mirrors the real ib_trader state doc:
+//   state: OFF / AWAITING_ENTRY_TRIGGER / ENTRY_ORDER_PLACED /
+//          AWAITING_EXIT_TRIGGER / EXIT_ORDER_PLACED / ERRORED
+//   qty, entry_price, symbol as strings (Decimal-safe wire format).
+const botStates = new Map();
+
+function setBotState(botId, doc) {
+  botStates.set(botId, doc);
+}
+
+function getBotState(botId) {
+  return botStates.get(botId) || {};
+}
+
+function clearBotState(botId) {
+  botStates.delete(botId);
+}
 
 // ── HTTP Server ──
 
@@ -255,27 +278,35 @@ const server = http.createServer(async (req, res) => {
     return json(res, mockBots);
   }
 
-  // Per-bot runtime state (position_state, entry_price, hwm…). Empty for
-  // the mock stack — the frontend handles the no-state case gracefully.
+  // Per-bot runtime state (position_state, entry_price, qty…). Returns
+  // the current simulated state — empty for bots with no position.
   const stateMatch = path.match(/^\/api\/bots\/([^/]+)\/state$/);
   if (stateMatch && method === 'GET') {
-    return json(res, {});
+    return json(res, getBotState(stateMatch[1]));
   }
 
-  // Bot lifecycle endpoints: start / stop / force-buy / force-stop.
-  // These mutate mockBots and broadcast a WS diff on channel "bots" so
-  // the frontend's store.handleDiff picks up the status flip.
-  const lifecycleMatch = path.match(/^\/api\/bots\/([^/]+)\/(start|stop|force-buy|force-stop)$/);
+  // Bot lifecycle endpoints: start / stop / force-buy / force-sell / force-stop.
+  // These mutate mockBots, update position state, and broadcast both a WS diff
+  // on channel "bots" (for the bot status card) AND a bot_state message
+  // (for the position line / force-sell button visibility).
+  const lifecycleMatch = path.match(/^\/api\/bots\/([^/]+)\/(start|stop|force-buy|force-sell|force-stop)$/);
   if (lifecycleMatch && method === 'POST') {
     const [, botId, action] = lifecycleMatch;
     const bot = mockBots.find(b => b.id === botId);
     if (!bot) return json(res, { detail: 'Bot not found' }, 404);
+    const symbol = bot.symbols_json ? JSON.parse(bot.symbols_json)[0] : '';
 
     if (action === 'start') {
       bot.status = 'RUNNING';
       bot.last_heartbeat = new Date().toISOString();
+      // Fresh start: bot is AWAITING_ENTRY_TRIGGER, no position.
+      setBotState(botId, {
+        state: 'AWAITING_ENTRY_TRIGGER', position_state: 'AWAITING_ENTRY_TRIGGER',
+        symbol,
+      });
     } else if (action === 'stop') {
       bot.status = 'STOPPED';
+      clearBotState(botId);
     } else if (action === 'force-stop') {
       bot.status = 'ERROR';
       bot.error_message = 'Force-stopped by operator';
@@ -284,9 +315,32 @@ const server = http.createServer(async (req, res) => {
       forceBuyHits.last_bot_id = botId;
       bot.last_action = 'FORCE_BUY';
       bot.last_action_at = new Date().toISOString();
+      // Simulate the entry-order lifecycle collapsing to an instant fill.
+      // Real backend: AWAITING_ENTRY_TRIGGER → ENTRY_ORDER_PLACED → fill →
+      // AWAITING_EXIT_TRIGGER with qty/entry_price set. The mock jumps
+      // straight to the filled state so tests can assert the headline.
+      setBotState(botId, {
+        state: 'AWAITING_EXIT_TRIGGER', position_state: 'AWAITING_EXIT_TRIGGER',
+        symbol, qty: '15', entry_price: '180.25',
+        entry_time: new Date().toISOString(),
+      });
+    } else if (action === 'force-sell') {
+      forceSellHits.count += 1;
+      forceSellHits.last_bot_id = botId;
+      bot.last_action = 'FORCE_SELL';
+      bot.last_action_at = new Date().toISOString();
+      // Simulate the exit-order lifecycle collapsing to an instant fill:
+      // AWAITING_EXIT_TRIGGER → EXIT_ORDER_PLACED → fill → flat.
+      setBotState(botId, {
+        state: 'AWAITING_ENTRY_TRIGGER', position_state: 'AWAITING_ENTRY_TRIGGER',
+        symbol,
+      });
     }
 
     broadcastBotUpdate(bot);
+    // Also push the state change so PositionLine / ForceSellButton
+    // update immediately without waiting for their next REST fetch.
+    broadcastBotState(botId, symbol);
     return json(res, { bot_id: botId, action, status: bot.status.toLowerCase() });
   }
 
@@ -294,6 +348,9 @@ const server = http.createServer(async (req, res) => {
   // the HTTP POST without racing the WS diff.
   if (path === '/api/_test/force-buy-hits' && method === 'GET') {
     return json(res, forceBuyHits);
+  }
+  if (path === '/api/_test/force-sell-hits' && method === 'GET') {
+    return json(res, forceSellHits);
   }
 
   // Test-only reset: restores the default bot fixture so tests that
@@ -309,7 +366,15 @@ const server = http.createServer(async (req, res) => {
     mockBots[1].last_action_at = null;
     forceBuyHits.count = 0;
     forceBuyHits.last_bot_id = null;
+    forceSellHits.count = 0;
+    forceSellHits.last_bot_id = null;
+    botStates.clear();
     for (const bot of mockBots) broadcastBotUpdate(bot);
+    // Re-broadcast cleared state so any mounted PositionLine clears.
+    for (const bot of mockBots) {
+      const symbol = bot.symbols_json ? JSON.parse(bot.symbols_json)[0] : '';
+      if (symbol) broadcastBotState(bot.id, symbol);
+    }
     return json(res, { ok: true });
   }
 
@@ -336,9 +401,17 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
+// Per-connection subscriptions: ws → Set of "<bot_ref>:<symbol>" keys
+// so we only push bot_state updates to clients that asked for them.
+const wsBotSubs = new WeakMap();
+
 wss.on('connection', (ws) => {
   wsClients.add(ws);
-  ws.on('close', () => wsClients.delete(ws));
+  wsBotSubs.set(ws, new Set());
+  ws.on('close', () => {
+    wsClients.delete(ws);
+    wsBotSubs.delete(ws);
+  });
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
@@ -354,12 +427,58 @@ wss.on('connection', (ws) => {
             bots: mockBots,
           },
         }));
+      } else if (msg.type === 'subscribe_bot') {
+        // PositionLine + ForceSellButton subscribe via bot_ref + symbol.
+        // The real backend keys bot state by ref_id — the mock keys by
+        // bot.id but we resolve back to the bot so the state wire format
+        // matches what the components expect.
+        const subs = wsBotSubs.get(ws);
+        if (subs && msg.bot_ref && msg.symbol) {
+          subs.add(`${msg.bot_ref}:${msg.symbol}`);
+          // Push the current state immediately so the subscriber
+          // doesn't need a second round-trip to render.
+          const bot = mockBots.find(b => b.ref_id === msg.bot_ref);
+          if (bot) {
+            const strategy = getBotState(bot.id);
+            ws.send(JSON.stringify({
+              type: 'bot_state',
+              bot_id: bot.id,
+              bot_ref: msg.bot_ref,
+              symbol: msg.symbol,
+              strategy,
+            }));
+          }
+        }
       } else if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
       }
     } catch {}
   });
 });
+
+// Broadcast a bot's current position state. Only fires to clients that
+// explicitly subscribed via subscribe_bot — mirrors the real backend,
+// which fans out per-bot state on the bot_state channel.
+function broadcastBotState(botId, symbol) {
+  const bot = mockBots.find(b => b.id === botId);
+  if (!bot) return;
+  const botRef = bot.ref_id;
+  if (!botRef) return;
+  const key = `${botRef}:${symbol}`;
+  const strategy = getBotState(botId);
+  const payload = JSON.stringify({
+    type: 'bot_state',
+    bot_id: botId,
+    bot_ref: botRef,
+    symbol,
+    strategy,
+  });
+  for (const ws of wsClients) {
+    if (ws.readyState !== 1) continue;
+    const subs = wsBotSubs.get(ws);
+    if (subs && subs.has(key)) ws.send(payload);
+  }
+}
 
 // Broadcast a per-row diff on the "bots" channel so the frontend store
 // applies the new status via handleDiff. The wire format matches

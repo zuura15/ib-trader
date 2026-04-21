@@ -63,11 +63,11 @@ async def submit_command(body: CommandRequest):
             sf.remove()
 
     try:
-        # Must exceed the engine's internal wait windows. Market / bid-ask
-        # orders block for up to ~30s waiting on the fill_event; mid orders
-        # can run the full reprice_duration_seconds (~10s by default) plus
-        # overhead. 120s gives headroom without being an unbounded hang.
-        async with httpx.AsyncClient(timeout=120) as client:
+        # Must cover the engine's worst-case wait: total_order_wait
+        # (active + passive = 120s) PLUS cancel_settle_timeout_seconds
+        # (120s) on a partial that the passive phase couldn't close.
+        # 260s = 240s + 20s buffer.
+        async with httpx.AsyncClient(timeout=260) as client:
             if verb in ("buy", "sell"):
                 symbol = parts[1] if len(parts) > 1 else ""
                 qty = parts[2] if len(parts) > 2 else "1"

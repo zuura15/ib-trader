@@ -2,11 +2,25 @@ max_order_size_shares: 5000
 max_retries: 3
 retry_delay_seconds: 2
 retry_backoff_multiplier: 2.0
-reprice_interval_seconds: 1
-reprice_duration_seconds: 10
-# How long to wait for an immediate fill on bid/ask GTC orders before moving on.
-# The order stays live in IB after this window; daemon reconciler catches the fill.
-bid_ask_wait_seconds: 30
+# Unified order-wait policy (MID, BID, ASK, MARKET).
+# Active phase: walker repricing for MID. BID/ASK/MARKET have no walker —
+# they treat the combined active+passive as one wait.
+# Passive phase: hold the last-amended limit and wait for IB terminal.
+# Total give-up window = active + passive. If the order hasn't reached
+# a terminal state by then, the engine cancels the residual.
+# LIMIT is fire-and-forget (GTC) and exempt.
+# SMART_MARKET keeps its own staged knobs below.
+reprice_steps: 10
+reprice_active_duration_seconds: 30
+reprice_passive_wait_seconds: 90
+# Derived in code:
+#   reprice_interval_seconds = active / steps          = 3
+#   total_order_wait_seconds = active + passive        = 120
+
+# SMART_MARKET's MKT residual leg (order.py:_execute_smart_market_order).
+# Stays small because SMART_MARKET already staged-escalated through the
+# walker and cancel phases — the residual MKT is meant to fail fast.
+market_order_wait_seconds: 30
 # After we send a cancel to IB, how long to wait for IB to either confirm the
 # cancel or deliver more fills first. Short default (10s) covers the typical
 # case; bump if your Gateway/market session runs slower (overnight IBEOS can
@@ -37,15 +51,27 @@ stoic_mode_max_seconds: 300
 bot_order_rate_limit_count: 5
 bot_order_rate_limit_window_seconds: 2.0
 ib_host: 127.0.0.1
-# Paper trading is the default. Gateway paper listens on 4002, live on 4001.
-# Passing --paper (or setting IB_PORT_PAPER in .env) keeps paper semantics
-# explicit; passing --live (or setting IB_PORT) switches to the live Gateway.
+# Gateway-mode auto-detection. On startup the engine/REPL probe each
+# candidate port in order and connect to the first one that responds, then
+# classify the session as paper/live from the managedAccounts prefix
+# (DU* = paper, else live). Default order probes live first so a running
+# paper Gateway is only selected when live isn't up. Swap entries to prefer
+# paper, or list a single port to pin one mode.
+# Ports: 4001 Gateway live, 4002 Gateway paper, 7496 TWS live, 7497 TWS paper.
+ib_port_candidates:
+  - 4001
+  - 4002
+ib_probe_timeout: 2.0
+# Legacy single-port override. If set, the app still probes but typically
+# only one port will be up. Left here for environments that ran with a
+# hand-configured port.
 ib_port: 4002
 ib_client_id: 1
 ib_min_call_interval_ms: 100
 # IB market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen.
 # Paper accounts must use 3 to avoid error 10197 (competing live session).
-# Live accounts with real-time subscriptions should use 1.
+# Live accounts with real-time subscriptions should use 1. Auto-detect
+# overrides this per-session based on the classified mode.
 ib_market_data_type: 3
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"

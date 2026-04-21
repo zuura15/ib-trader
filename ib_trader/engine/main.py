@@ -12,8 +12,8 @@ The engine:
   5. Hosts the internal HTTP API for order placement
 
 Usage:
-    ib-engine                # defaults, IB broker
-    ib-engine --paper        # paper trading
+    ib-engine                      # auto-detect paper vs live from Gateway
+    ib-engine --force-mode live    # assert the Gateway must be live, else exit
     ib-engine --db trader.db
 """
 import asyncio
@@ -65,11 +65,17 @@ def _spawn_background(coro) -> asyncio.Task:
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml",
               help="Symbols whitelist path")
 @click.option(
-    "--paper/--live", "paper",
-    default=True,
-    help="Paper trading (default) — pass --live to target the live Gateway.",
+    "--force-mode",
+    type=click.Choice(["paper", "live"]),
+    default=None,
+    help=(
+        "Assert the detected Gateway mode must match this value. "
+        "Without this flag the engine auto-detects from the Gateway's "
+        "managedAccounts (DU*=paper, else live)."
+    ),
 )
-def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool):
+def main(db: str, env: str, settings_path: str, symbols_path: str,
+         force_mode: str | None):
     """IB Trader Engine Service — central command execution loop."""
     setup_logging()
 
@@ -78,23 +84,45 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool):
     settings = load_settings(settings_path)
     symbols = load_symbols(symbols_path)
 
-    # Override with env values. Paper is the default; --live opts in to the
-    # live Gateway. settings.yaml carries the paper defaults (port 4002,
-    # market data type 3) so env overrides are additive.
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", settings.get("ib_port", 4002)))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", settings.get("ib_market_data_type", 3)))
-        account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
-    else:
-        settings["ib_port"] = int(env_vars.get("IB_PORT", 4001))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", 1))
-        account_id = env_vars["IB_ACCOUNT_ID"]
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", 1))
-    # Remember the mode choice so downstream code (API /status, UI
-    # header) can report what the engine is actually connected to
-    # instead of guessing from the .env account-id prefix.
-    settings["account_mode"] = "paper" if paper else "live"
+
+    # Probe the Gateway and detect paper/live from managedAccounts before
+    # the engine enters its main loop. This sets settings["ib_port"],
+    # settings["ib_market_data_type"], settings["account_mode"], and
+    # returns the account_id to trade under.
+    from ib_trader.engine.connect import (
+        load_candidates, probe_gateway, pick_account, pick_market_data_type,
+    )
+    candidates = load_candidates(settings)
+    probe_timeout = float(settings.get("ib_probe_timeout", 2.0))
+    try:
+        result = asyncio.run(probe_gateway(
+            settings["ib_host"], candidates, settings["ib_client_id"],
+            timeout=probe_timeout,
+        ))
+    except RuntimeError as e:
+        raise SystemExit(str(e)) from e
+
+    if force_mode and result.mode != force_mode:
+        raise SystemExit(
+            f"--force-mode={force_mode!r} but Gateway reports mode={result.mode!r} "
+            f"(accounts={result.accounts}). Refusing to start."
+        )
+
+    account_id = pick_account(result.mode, env_vars, result.accounts)
+    settings["ib_port"] = result.port
+    settings["ib_market_data_type"] = pick_market_data_type(result.mode, env_vars, settings)
+    settings["account_mode"] = result.mode
+    logger.info(
+        '{"event": "ENGINE_MODE_DETECTED", "mode": "%s", "port": %d, '
+        '"label": "%s", "account_id": "%s"}',
+        result.mode, result.port, result.label, account_id,
+    )
+    print(
+        f"[ENGINE] Detected {result.mode} mode on {result.label} "
+        f"(port {result.port}), account {account_id}."
+    )
 
     # Check DB permissions
     if Path(db).exists():
@@ -187,10 +215,6 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # a connect() success alone doesn't confirm we can place orders
         # on the account we think we're using.
         _validate_account_id(ctx)
-
-        # Also fail fast if the Gateway port vs account prefix disagree
-        # (e.g. paper port 4002 but account_id doesn't start with "DU").
-        _validate_account_mode(ctx)
 
         print("[ENGINE] Connected to IB Gateway.")
 
@@ -394,32 +418,6 @@ def _validate_account_id(ctx: AppContext) -> None:
         '"managed_accounts": %s}',
         ctx.account_id, json.dumps(managed),
     )
-
-
-def _validate_account_mode(ctx: AppContext) -> None:
-    """Sanity-check the paper/live declaration against the IB account type.
-
-    IB paper accounts begin with "DU"; live accounts are "U" + digits.
-    A mismatch (e.g. --paper flag but the configured account is a live
-    U-account, or vice versa) usually means .env wasn't updated when the
-    flag was. Refuse to start rather than silently trading on the wrong
-    surface.
-    """
-    acct = ctx.account_id
-    mode = ctx.settings.get("account_mode", "unknown")
-    is_paper_acct = acct.startswith("DU")
-    if mode == "paper" and not is_paper_acct:
-        raise SystemExit(
-            f"--paper selected but account_id {acct!r} does not start with "
-            f"'DU'. Either set IB_ACCOUNT_ID_PAPER in .env to the real "
-            f"paper account, or pass --live if you really meant to trade "
-            f"the live account."
-        )
-    if mode == "live" and is_paper_acct:
-        raise SystemExit(
-            f"--live selected but account_id {acct!r} starts with 'DU' "
-            f"(paper). Either fix IB_ACCOUNT_ID in .env or pass --paper."
-        )
 
 
 def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
@@ -905,17 +903,101 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
         except Exception:
             logger.exception('{"event": "TICK_PUBLISHER_ERROR"}')
 
+    # Per-symbol timestamp of the last pendingTickersEvent we saw. Used by
+    # the heartbeat loop below to report which tickers have gone silent
+    # even though ib_async still has them in its tickers() set.
+    last_pending_event_ts: dict[str, float] = {}
+
     def on_pending_tickers(tickers) -> None:
         # ib_async fires this synchronously; schedule per-ticker async work.
+        import time as _t
+        now_mono = _t.monotonic()
         for t in tickers:
+            contract = getattr(t, "contract", None)
+            sym = getattr(contract, "symbol", None) if contract is not None else None
+            if sym:
+                last_pending_event_ts[sym] = now_mono
             _spawn_background(_publish_one(t))
 
     ctx.ib._ib.pendingTickersEvent += on_pending_tickers
     logger.info('{"event": "TICK_PUBLISHER_WIRED"}')
 
+    async def _heartbeat() -> None:
+        """Periodic snapshot of every ticker ib_async is holding.
+
+        Written so the next STALE_QUOTES stall can be diagnosed from the
+        log alone: on each tick we record the ticker's con_id, last
+        bid/ask/last, and seconds since our last `pendingTickersEvent`
+        for that symbol. If a symbol appears in this list with a large
+        ``silent_s`` value, ib_async still has the ticker but is no
+        longer firing events for it — distinct from losing the ticker
+        entirely (which would cause the row to disappear).
+        """
+        import time as _t
+        interval = float(ctx.settings.get("tick_heartbeat_interval_seconds", 30))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                ib = getattr(ctx.ib, "_ib", None)
+                if ib is None:
+                    continue
+                try:
+                    tickers = list(ib.tickers())
+                except Exception as e:
+                    logger.debug("ib.tickers() failed", exc_info=e)
+                    continue
+                now_mono = _t.monotonic()
+                rows: list[dict] = []
+                for t in tickers:
+                    contract = getattr(t, "contract", None)
+                    if contract is None:
+                        continue
+                    sym = getattr(contract, "symbol", None)
+                    if not sym:
+                        continue
+                    last_seen = last_pending_event_ts.get(sym)
+                    silent_s = round(now_mono - last_seen, 1) if last_seen else None
+                    def _f(attr):
+                        v = getattr(t, attr, None)
+                        if v is None:
+                            return None
+                        try:
+                            fv = float(v)
+                            # ib_async uses NaN for missing fields
+                            if fv != fv:  # NaN check
+                                return None
+                            return fv
+                        except (TypeError, ValueError):
+                            return None
+                    rows.append({
+                        "symbol": sym,
+                        "con_id": getattr(contract, "conId", None),
+                        "sec_type": getattr(contract, "secType", None),
+                        "bid": _f("bid"),
+                        "ask": _f("ask"),
+                        "last": _f("last"),
+                        "silent_s": silent_s,
+                    })
+                logger.info(
+                    '{"event": "TICK_PUBLISHER_HEARTBEAT", "ticker_count": %d, '
+                    '"tickers": %s}',
+                    len(rows), json.dumps(rows),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('{"event": "TICK_PUBLISHER_HEARTBEAT_ERROR"}')
+
+    hb_task = asyncio.create_task(_heartbeat())
+
     try:
         await asyncio.Event().wait()
     finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except (asyncio.CancelledError, Exception) as e:
+            logger.debug("tick heartbeat cancel", exc_info=e)
         try:
             ctx.ib._ib.pendingTickersEvent -= on_pending_tickers
         except Exception as e:

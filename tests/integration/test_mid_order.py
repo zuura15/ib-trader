@@ -19,8 +19,9 @@ from ib_trader.engine.exceptions import IBOrderRejectedError
 @pytest.fixture
 def fast_settings(ctx):
     """Make reprice settings very fast for testing."""
-    ctx.settings["reprice_interval_seconds"] = 0.01
-    ctx.settings["reprice_duration_seconds"] = 0.1
+    ctx.settings["reprice_steps"] = 10
+    ctx.settings["reprice_active_duration_seconds"] = 0.1
+    ctx.settings["reprice_passive_wait_seconds"] = 0.1
     return ctx
 
 
@@ -157,7 +158,7 @@ class TestOrderPlacementUnacknowledged:
 
 class TestMidOrderCancelOnTimeout:
     async def test_cancel_on_timeout(self, fast_settings):
-        """Mid order with no fill is canceled after reprice_duration_seconds."""
+        """Mid order with no fill is canceled after the total_order_wait window."""
         ctx = fast_settings
         cmd = BuyCommand(
             symbol="MSFT", qty=Decimal("5"), dollars=None,

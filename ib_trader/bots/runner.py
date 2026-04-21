@@ -231,7 +231,7 @@ async def run_bot_runner(session_factory: scoped_session,
     2. Cleans up crashed tasks every 5s
     """
     from ib_trader.bots import registry_config
-    from ib_trader.bots.fsm import FSM, BotEvent, BotState, EventType
+    from ib_trader.bots.lifecycle import BotState, force_off_state
 
     if running_tasks is None:
         running_tasks = {}
@@ -268,23 +268,34 @@ async def run_bot_runner(session_factory: scoped_session,
         BotState.ERRORED,
     }
     for defn in all_defs:
-        fsm = FSM(defn.id, redis)
-        try:
-            cur = await fsm.current_state()
-        except Exception:
-            logger.exception(
-                '{"event": "BOT_STARTUP_STATE_LOAD_FAILED", "bot_id": "%s"}',
-                defn.id,
-            )
-            continue
+        # Read the bot's current lifecycle state from Redis without an
+        # instance. No FSM dispatch — the panic path is a pure Redis
+        # write via ``force_off_state``.
+        cur = BotState.OFF
+        if redis is not None:
+            try:
+                from ib_trader.redis.state import StateStore
+                doc = await StateStore(redis).get(f"bot:{defn.id}") or {}
+                try:
+                    cur = BotState(doc.get("state", BotState.OFF.value))
+                except ValueError:
+                    cur = BotState.OFF
+            except Exception:
+                logger.exception(
+                    '{"event": "BOT_STARTUP_STATE_LOAD_FAILED", "bot_id": "%s"}',
+                    defn.id,
+                )
+                continue
 
         if cur in _PANIC_STATES:
             await _panic_alert_on_startup(redis, defn, cur)
             try:
-                await fsm.dispatch(BotEvent(EventType.STOP))
+                await force_off_state(
+                    defn.id, redis, reason="startup_forced_off_with_panic",
+                )
             except Exception:
                 logger.exception(
-                    '{"event": "BOT_FORCE_OFF_DISPATCH_FAILED", "bot_id": "%s"}',
+                    '{"event": "BOT_FORCE_OFF_FAILED", "bot_id": "%s"}',
                     defn.id,
                 )
             logger.warning(
@@ -295,10 +306,12 @@ async def run_bot_runner(session_factory: scoped_session,
         elif cur != BotState.OFF:
             # AWAITING_ENTRY_TRIGGER — silent force OFF, no alert.
             try:
-                await fsm.dispatch(BotEvent(EventType.STOP))
+                await force_off_state(
+                    defn.id, redis, reason="startup_forced_off",
+                )
             except Exception:
                 logger.exception(
-                    '{"event": "BOT_FORCE_OFF_DISPATCH_FAILED", "bot_id": "%s"}',
+                    '{"event": "BOT_FORCE_OFF_FAILED", "bot_id": "%s"}',
                     defn.id,
                 )
             logger.info(
@@ -318,13 +331,39 @@ async def run_bot_runner(session_factory: scoped_session,
                 if task.done():
                     exc = task.exception() if not task.cancelled() else None
                     if exc:
-                        try:
-                            await FSM(bot_id, redis).dispatch(BotEvent(
-                                EventType.CRASH,
-                                payload={"message": str(exc)},
-                            ))
-                        except Exception:
-                            logger.exception('{"event": "FSM_CRASH_DISPATCH_FAILED", "bot_id": "%s"}', bot_id)
+                        # Bot task crashed mid-session. Invoke the bot's
+                        # on_crash method if the instance is still around;
+                        # fall back to a direct Redis write if not.
+                        bot = bot_instances.get(bot_id)
+                        if bot is not None:
+                            try:
+                                await bot.on_crash(message=str(exc))
+                            except Exception:
+                                logger.exception(
+                                    '{"event": "BOT_CRASH_HANDLER_FAILED", '
+                                    '"bot_id": "%s"}', bot_id,
+                                )
+                        else:
+                            # No instance — write ERRORED directly.
+                            try:
+                                from ib_trader.redis.state import StateStore
+                                from ib_trader.bots.lifecycle import (
+                                    BotState, bot_doc_key, now_iso,
+                                )
+                                store = StateStore(redis)
+                                doc = await store.get(bot_doc_key(bot_id)) or {}
+                                doc.update({
+                                    "state": BotState.ERRORED.value,
+                                    "error_reason": "task_crashed",
+                                    "error_message": str(exc),
+                                    "updated_at": now_iso(),
+                                })
+                                await store.set(bot_doc_key(bot_id), doc)
+                            except Exception:
+                                logger.exception(
+                                    '{"event": "BOT_CRASH_STATE_WRITE_FAILED", '
+                                    '"bot_id": "%s"}', bot_id,
+                                )
                         print(f"[BOTS] CRASH  bot_id={bot_id}: {exc}")
                     del running_tasks[bot_id]
                     bot_instances.pop(bot_id, None)

@@ -47,6 +47,14 @@ class TradeResponse(BaseModel):
     total_commission: str | None = None
     opened_at: datetime
     closed_at: datetime | None = None
+    # Augmented fill detail from the transaction legs — populated by
+    # /api/trades so the Trades panel can render a data-rich row
+    # (qty, entry/exit price, P&L%) without a second API call.
+    entry_qty: str | None = None         # ib_filled_qty on the entry fill
+    entry_price: str | None = None       # ib_avg_fill_price on the entry fill
+    exit_qty: str | None = None          # ib_filled_qty summed across CLOSE legs
+    exit_price: str | None = None        # weighted avg across CLOSE fills
+    order_type: str | None = None        # order_type on the entry leg (mid/market/...)
 
 
 class OrderResponse(BaseModel):

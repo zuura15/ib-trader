@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 
-from ib_trader.bots.fsm import BotState
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import (
     StrategyManifest, Subscription, StrategyContext,
     BarCompleted, QuoteUpdate, OrderFilled, PlaceOrder, LogSignal,

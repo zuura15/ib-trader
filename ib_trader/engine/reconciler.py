@@ -165,11 +165,15 @@ class Reconciler:
                 from ib_trader.bots import registry_config
                 defn = registry_config.get_by_name(bot_ref)
                 if defn:
-                    from ib_trader.bots.fsm import FSM, BotState
-                    fsm = FSM(defn.id, self._redis)
-                    fsm_state = await fsm.current_state()
+                    from ib_trader.bots.lifecycle import BotState, bot_doc_key
+                    from ib_trader.redis.state import StateStore
+                    doc = await StateStore(self._redis).get(bot_doc_key(defn.id)) or {}
+                    try:
+                        fsm_state = BotState(doc.get("state", BotState.OFF.value))
+                    except ValueError:
+                        fsm_state = BotState.OFF
                     if fsm_state in (BotState.OFF, BotState.ERRORED):
-                        # FSM._h_stop already cleared position fields; the
+                        # force_off_state cleared position fields; the
                         # reconciler does not write to bot:<id> directly.
                         continue
 

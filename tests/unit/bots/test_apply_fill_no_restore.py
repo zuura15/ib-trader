@@ -15,7 +15,7 @@ from decimal import Decimal
 import pytest
 
 from ib_trader.bots.runtime import StrategyBotRunner
-from ib_trader.bots.fsm import BotState
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import StrategyContext
 
 

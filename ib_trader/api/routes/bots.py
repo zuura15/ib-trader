@@ -15,7 +15,7 @@ from ib_trader.api.deps import get_session_factory, get_redis
 from ib_trader.data.models import BotStatus
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
 from ib_trader.bots.definition import BotDefinition
-from ib_trader.bots.fsm import FSM, BotState
+from ib_trader.bots.lifecycle import BotState, bot_doc_key
 from ib_trader.bots.state import BotStateStore
 
 logger = logging.getLogger(__name__)
@@ -153,13 +153,17 @@ def _serialize_bot_from_defn(
 
 
 async def _fetch_fsm_docs(redis, bot_ids: list[str]) -> dict[str, dict]:
-    """Read each bot's FSM doc. Empty dict per bot if Redis is down."""
+    """Read each bot's lifecycle doc. Empty dict per bot if Redis is down."""
     if redis is None:
         return {bid: {"state": BotState.OFF.value} for bid in bot_ids}
     import asyncio as _asyncio
-    fsms = [FSM(bid, redis) for bid in bot_ids]
-    docs = await _asyncio.gather(*[f.load() for f in fsms])
-    return {bid: doc for bid, doc in zip(bot_ids, docs, strict=True)}
+    from ib_trader.redis.state import StateStore
+    store = StateStore(redis)
+    docs = await _asyncio.gather(*[store.get(bot_doc_key(bid)) for bid in bot_ids])
+    return {
+        bid: (doc or {"state": BotState.OFF.value})
+        for bid, doc in zip(bot_ids, docs, strict=True)
+    }
 
 
 # FSM states that indicate the bot is actively running (not OFF / ERRORED).
@@ -385,16 +389,15 @@ async def force_buy(bot_id: str, redis=Depends(get_redis)):
     """Force-buy — proxies to the runner.
 
     The runner's handler synchronously walks the full order lifecycle
-    (PlaceOrder → engine → IB → reprice loop). The engine's reprice
-    window is 10s and IB fill latency adds a few more, so the timeout
-    has to comfortably exceed that — 30s keeps us safely above the
-    steady-state submission path while still failing loud if the
-    runner truly hangs.
+    (PlaceOrder → engine → IB → reprice loop). Worst case is
+    total_order_wait (120s) + cancel_settle_timeout_seconds (120s) on
+    a partial — 260s keeps us above that while still failing loud if
+    the runner truly hangs.
     """
     _get_defn_or_404(bot_id)
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
+        async with httpx.AsyncClient(timeout=260) as c:
             resp = await c.post(f"{_runner_url()}/bots/{bot_id}/force-buy")
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -404,8 +407,53 @@ async def force_buy(bot_id: str, redis=Depends(get_redis)):
     except httpx.ReadTimeout as e:
         raise HTTPException(
             status_code=504,
-            detail="Bot runner did not respond within 30s; the order may still be in flight — check the positions and orders panes before retrying.",
+            detail="Bot runner did not respond within 260s; the order may still be in flight — check the positions and orders panes before retrying.",
         ) from e
+
+
+@router.post("/{bot_id}/force-sell", status_code=202)
+async def force_sell(bot_id: str, redis=Depends(get_redis)):
+    """Force-sell — proxies to the runner.
+
+    Same lifecycle + timeout as force-buy: the runner delegates to the
+    strategy's ``build_exit_actions`` so the resulting SELL is identical
+    to an organic exit (smart_market), which includes a reprice window.
+    """
+    _get_defn_or_404(bot_id)
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=260) as c:
+            resp = await c.post(f"{_runner_url()}/bots/{bot_id}/force-sell")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
+    except httpx.ReadTimeout as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Bot runner did not respond within 260s; the SELL may still be in flight — check the positions and orders panes before retrying.",
+        ) from e
+
+
+@router.post("/{bot_id}/reset", status_code=202)
+async def reset_bot(bot_id: str, redis=Depends(get_redis)):
+    """Reset a crashed or errored bot's state doc back to a clean OFF.
+
+    Required before re-STARTing a bot that's in ERRORED or has
+    lingering position fields. Proxies to the runner's internal
+    ``/bots/{id}/reset`` which uses the ``force_off_state`` helper.
+    """
+    _get_defn_or_404(bot_id)
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.post(f"{_runner_url()}/bots/{bot_id}/reset")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
 
 
 @router.get("/{bot_id}/events")

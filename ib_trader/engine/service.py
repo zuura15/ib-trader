@@ -124,9 +124,15 @@ class _ListRenderer:
         self._append(message, severity)
 
     def update_order_row(self, serial, data) -> None:
-        # Capture the serial when the order row is updated
+        # Capture structured fields the /engine/orders caller relies on.
+        # Bots use ``ib_order_id`` to dispatch PlaceExitOrder to the FSM and
+        # to key stoic-mode release on the terminal order event — losing it
+        # here causes duplicate orders (ib_trader/bots/runtime.py:441,1209).
         if serial is not None:
             self.metadata["serial"] = serial
+        ib_order_id = data.get("ib_order_id") if isinstance(data, dict) else None
+        if ib_order_id is not None and ib_order_id != "":
+            self.metadata["ib_order_id"] = str(ib_order_id)
 
     def update_header(self, **kwargs) -> None:
         pass

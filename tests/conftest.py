@@ -207,8 +207,10 @@ def ctx(session_factory, mock_ib):
         "max_retries": 3,
         "retry_delay_seconds": 2,
         "retry_backoff_multiplier": 2.0,
-        "reprice_interval_seconds": 0.01,  # Fast for tests
-        "reprice_duration_seconds": 0.1,
+        "reprice_steps": 10,
+        "reprice_active_duration_seconds": 0.1,
+        "reprice_passive_wait_seconds": 0.1,
+        "market_order_wait_seconds": 1.0,  # Fast SMART_MARKET residual timeout
         "ib_host": "127.0.0.1",
         "ib_port": 7497,
         "ib_client_id": 1,

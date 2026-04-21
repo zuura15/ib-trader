@@ -70,6 +70,12 @@ export interface TradeResponse {
   total_commission: string | null;
   opened_at: string;
   closed_at: string | null;
+  // Augmented fill detail from the backend (entry/exit leg fills).
+  entry_qty: string | null;
+  entry_price: string | null;
+  exit_qty: string | null;
+  exit_price: string | null;
+  order_type: string | null;
 }
 
 export function getTrades(status?: string) {

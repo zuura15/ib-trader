@@ -19,7 +19,7 @@ import pandas as pd
 
 from signals_lib.time_filters import passes_session_filter
 
-from ib_trader.bots.fsm import BotState
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import (
     StrategyManifest, Subscription, StrategyContext,
     MarketEvent, Action,
@@ -258,7 +258,7 @@ class SawtoothRsiStrategy:
         else:
             qty = 1
 
-        order_strategy = self.config.get("order_strategy", "mid")
+        order_strategy = self.config.get("order_strategy", "smart_market")
 
         actions.append(LogSignal(
             event_type=LogEventType.SIGNAL,
@@ -360,7 +360,7 @@ class SawtoothRsiStrategy:
         hard_sl_price = entry_price * (1 - hard_sl_pct)
 
         if current_price <= hard_sl_price:
-            return actions + self._trigger_exit(
+            return actions + self.build_exit_actions(
                 ctx, ExitType.HARD_STOP_LOSS,
                 f"bid={current_price} <= hard_sl={hard_sl_price} (pnl={float(pnl_pct):.4%})",
             )
@@ -382,7 +382,7 @@ class SawtoothRsiStrategy:
                 entry_time = _parse_aware_dt(entry_time_str)
                 elapsed_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
                 if elapsed_minutes >= int(time_stop_minutes):
-                    return actions + self._trigger_exit(
+                    return actions + self.build_exit_actions(
                         ctx, ExitType.TIME_STOP,
                         f"elapsed={elapsed_minutes:.0f}min >= {int(time_stop_minutes)}min",
                     )
@@ -421,7 +421,7 @@ class SawtoothRsiStrategy:
             else:
                 trail_stop = Decimal(str(state.get("current_stop", "0")))
                 if trail_stop > 0 and current_price <= trail_stop:
-                    return actions + self._trigger_exit(
+                    return actions + self.build_exit_actions(
                         ctx, ExitType.TRAILING_STOP,
                         f"bid={current_price} <= trail_stop={trail_stop} "
                         f"(hwm={hwm}, pnl={float(pnl_pct):.4%})",
@@ -429,12 +429,14 @@ class SawtoothRsiStrategy:
 
         return actions
 
-    def _trigger_exit(self, ctx: StrategyContext, exit_type: ExitType,
-                      detail: str) -> list[Action]:
+    def build_exit_actions(self, ctx: StrategyContext, exit_type: ExitType,
+                           detail: str) -> list[Action]:
         """Generate actions for an exit trigger.
 
-        Always places the SELL order — the bot has symbol and qty,
-        that's all it needs. No serial gating.
+        Called both by the strategy's internal exit policies and by the
+        runtime's force-sell path (with ``exit_type=FORCE_EXIT``). Always
+        places the SELL order — the bot has symbol and qty, that's all it
+        needs. No serial gating.
         """
         symbol = self.config["symbol"]
         entry_price = ctx.state.get("entry_price")

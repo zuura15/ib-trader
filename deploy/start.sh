@@ -6,8 +6,8 @@
 #   .venv/bin/ib-daemon        (in its own terminal)
 #
 # Usage:
-#   ./deploy/start.sh          # live trading (default)
-#   ./deploy/start.sh --paper  # paper trading
+#   ./deploy/start.sh                    # auto-detect paper vs live from Gateway
+#   ./deploy/start.sh --force-mode live  # assert Gateway is live, else exit
 #
 # To stop everything:
 #   ./deploy/stop.sh
@@ -22,10 +22,8 @@ PIDFILE="$DIR/logs/.pids"
 
 mkdir -p "$LOGS"
 
-PAPER=""
-if [ "$1" = "--paper" ]; then
-    PAPER="--paper"
-fi
+# Pass through any extra args (e.g. --force-mode live) to the engine/daemon.
+EXTRA_ARGS=("$@")
 
 # Kill any leftover processes from a previous run
 "$DIR/deploy/stop.sh" 2>/dev/null || true
@@ -35,7 +33,7 @@ echo ""
 
 # Start engine
 echo "[1/3] Starting Engine..."
-$VENV/ib-engine $PAPER >> "$LOGS/engine.log" 2>&1 &
+$VENV/ib-engine "${EXTRA_ARGS[@]}" >> "$LOGS/engine.log" 2>&1 &
 echo $! >> "$PIDFILE"
 ENGINE_PID=$!
 
@@ -71,4 +69,4 @@ echo ""
 echo "Stop all:  ./deploy/stop.sh"
 echo ""
 echo "NOTE: Daemon has a TUI — run it separately in its own terminal:"
-echo "  .venv/bin/ib-daemon $PAPER"
+echo "  .venv/bin/ib-daemon ${EXTRA_ARGS[*]}"

@@ -324,11 +324,18 @@ async def _fetch_channel_data_async(
     if channel == "bots" and data:
         try:
             import asyncio as _asyncio
-            from ib_trader.bots.fsm import FSM, BotState
+            from ib_trader.bots.lifecycle import BotState, bot_doc_key
             from ib_trader.bots.state import BotStateStore
+            from ib_trader.redis.state import StateStore
             bss = BotStateStore(redis)
-            fsms = [FSM(d["id"], redis) for d in data]
-            docs = await _asyncio.gather(*[f.load() for f in fsms]) if redis else [{} for _ in data]
+            if redis is not None:
+                _store = StateStore(redis)
+                docs = await _asyncio.gather(
+                    *[_store.get(bot_doc_key(d["id"])) for d in data]
+                )
+                docs = [doc or {} for doc in docs]
+            else:
+                docs = [{} for _ in data]
             heartbeats = await _asyncio.gather(
                 *[bss.get_heartbeat(d["id"]) for d in data]
             ) if redis else [None] * len(data)
@@ -482,11 +489,22 @@ def _parse_log_entries(lines: list[str]) -> list[dict]:
             continue
         try:
             entry = json.loads(ln)
+            # Keep the standard fields, and forward every remaining
+            # structured key under "fields" so the frontend can render
+            # them inline (e.g. PAGER_ALERT_RAISED carries trigger,
+            # symbol, alert_id that would otherwise be lost).
+            standard = {"timestamp", "level", "event", "message", "exc_info"}
+            fields = {
+                k: v for k, v in entry.items()
+                if k not in standard and v is not None and v != ""
+            }
             entries.append({
                 "timestamp": entry.get("timestamp", ""),
                 "level": entry.get("level", "INFO"),
                 "event": entry.get("event", entry.get("message", "")),
                 "message": entry.get("message", entry.get("event", "")),
+                "fields": fields,
+                "exc_info": entry.get("exc_info") or "",
             })
         except json.JSONDecodeError:
             entries.append({
@@ -494,6 +512,8 @@ def _parse_log_entries(lines: list[str]) -> list[dict]:
                 "level": "INFO",
                 "event": "log",
                 "message": ln,
+                "fields": {},
+                "exc_info": "",
             })
     return entries
 

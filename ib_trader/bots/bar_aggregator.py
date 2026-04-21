@@ -46,7 +46,16 @@ class BarAggregator:
         """
         completed = []
         for bar in raw_bars:
-            ts = bar["timestamp_utc"]
+            # Bars come in from the Redis bar:*:5s stream with
+            # timestamp_utc as an ISO-8601 string (JSON-decoded). Normalize
+            # to datetime here so _last_seen_ts stays consistent with its
+            # annotation and to_state_dict()'s .isoformat() call doesn't
+            # crash. Accept a datetime too in case a caller already parsed.
+            ts_raw = bar["timestamp_utc"]
+            if isinstance(ts_raw, datetime):
+                ts = ts_raw
+            else:
+                ts = datetime.fromisoformat(ts_raw)
             if self._last_seen_ts is not None and ts <= self._last_seen_ts:
                 continue  # dedup on restart
             self._last_seen_ts = ts

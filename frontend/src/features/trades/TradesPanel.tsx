@@ -33,6 +33,11 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
         totalCommission: t.total_commission,
         openedAt: t.opened_at,
         closedAt: t.closed_at,
+        entryQty: t.entry_qty,
+        entryPrice: t.entry_price,
+        exitQty: t.exit_qty,
+        exitPrice: t.exit_price,
+        orderType: t.order_type,
       })));
     }).catch(() => {});
   }, [dataMode, refreshTick, setTradeGroups]);
@@ -114,7 +119,11 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
               <th>Symbol</th>
               <th>Dir</th>
               <th>Status</th>
-              {!compact && <th>P&L</th>}
+              {!compact && <th>Type</th>}
+              <th>Qty</th>
+              <th>Entry</th>
+              {!compact && <th>Exit</th>}
+              <th>P&L</th>
               <th>Opened</th>
               {!compact && <th>Closed</th>}
             </tr>
@@ -122,13 +131,21 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
           <tbody>
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={compact ? 4 : 7} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
+                <td colSpan={compact ? 7 : 11} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
                   No trades
                 </td>
               </tr>
             ) : filtered.map((t) => {
               const badge = statusBadge[t.status] || defaultBadge;
               const pnl = t.realizedPnl ? parseFloat(t.realizedPnl) : null;
+              const qty = t.entryQty ? parseFloat(t.entryQty) : null;
+              const entryPx = t.entryPrice ? parseFloat(t.entryPrice) : null;
+              const exitPx = t.exitPrice ? parseFloat(t.exitPrice) : null;
+              // % P&L derived from realized $ and cost basis — only
+              // meaningful when the close has a price and we know qty.
+              const pnlPct = pnl !== null && entryPx && qty && entryPx > 0
+                ? (pnl / (entryPx * qty)) * 100
+                : null;
               return (
                 <tr
                   key={t.id}
@@ -144,13 +161,36 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
                   </td>
                   <td><span className={`badge ${badge.cls}`}>{badge.label}</span></td>
                   {!compact && (
-                    <td className="font-mono" style={{
-                      color: pnl === null ? 'var(--text-muted)'
-                        : pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
-                    }}>
-                      {pnl !== null ? (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2) : '—'}
+                    <td className="font-mono" style={{ color: 'var(--text-muted)' }}>
+                      {t.orderType || '—'}
                     </td>
                   )}
+                  <td className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {qty !== null ? (qty === Math.floor(qty) ? qty.toString() : qty.toFixed(4)) : '—'}
+                  </td>
+                  <td className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {entryPx !== null ? `$${entryPx.toFixed(2)}` : '—'}
+                  </td>
+                  {!compact && (
+                    <td className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                      {exitPx !== null ? `$${exitPx.toFixed(2)}` : '—'}
+                    </td>
+                  )}
+                  <td className="font-mono" style={{
+                    color: pnl === null ? 'var(--text-muted)'
+                      : pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+                  }}>
+                    {pnl !== null ? (
+                      <>
+                        {(pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2)}
+                        {pnlPct !== null && (
+                          <span style={{ opacity: 0.75, marginLeft: 4 }}>
+                            ({pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%)
+                          </span>
+                        )}
+                      </>
+                    ) : '—'}
+                  </td>
                   <td style={{ color: 'var(--text-muted)', fontSize: 11 }}>
                     {formatDateTime(t.openedAt)}
                   </td>

@@ -33,14 +33,13 @@ lint-secrets:
 
 typecheck: lint-types
 
-# Default `make dev` targets the LIVE IB Gateway (port 4001, IB_ACCOUNT_ID).
-# Pass PAPER=1 to flip the engine onto the paper Gateway (port 4002,
-# IB_ACCOUNT_ID_PAPER). Only ib-engine takes the --paper/--live flag; the
+# `make dev` auto-detects paper vs live from the running Gateway. Pass
+# FORCE_MODE=paper or FORCE_MODE=live to assert and fail fast on mismatch.
 # API and bots processes connect via engine's internal API and inherit mode.
-IB_MODE_FLAG := $(if $(PAPER),--paper,--live)
+IB_MODE_FLAG := $(if $(FORCE_MODE),--force-mode $(FORCE_MODE),)
 
 dev:
-	@echo "Starting all services in $(if $(PAPER),PAPER,LIVE) mode... (Ctrl+C to stop all)"
+	@echo "Starting all services (auto-detect $(if $(FORCE_MODE),forced=$(FORCE_MODE),mode))... (Ctrl+C to stop all)"
 	@mkdir -p run/redis-data logs
 	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
 		echo "[DEV] Redis already running."; \

@@ -23,20 +23,53 @@ const levelLabel: Record<string, string> = {
   error: 'ERR', ERROR: 'ERR',
 };
 
-interface LogEntry {
+export interface LogEntry {
   id: string;
   timestamp: string;
   level: string;
   event: string;
   message: string;
+  fields?: Record<string, unknown>;
+  exc_info?: string;
 }
 
-export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
+export interface LogStreamProps {
+  /** Max rows to retain in memory / render. */
+  maxLines?: number;
+  /** Panel title (default "Logs"). */
+  title?: string;
+  /** Panel accent color for the header dot. */
+  accent?: 'amber' | 'red' | 'cyan' | 'green' | 'blue' | 'purple';
+  /** Only show rows whose level matches one of these. */
+  levelFilter?: string[];
+  /** Empty-state message override. */
+  emptyHint?: string;
+}
+
+/**
+ * Streaming log viewer rendered as free-flowing log lines:
+ *   HH:MM:SS  LVL  [event]  message  key=value key=value
+ *
+ * Structured fields (trigger, bot_id, symbol, alert_id, etc.) that the
+ * backend forwards in ``fields`` are rendered inline after the message
+ * so entries like PAGER_ALERT_RAISED — whose "message" field is empty
+ * but whose structured payload carries all the useful info — are
+ * readable instead of appearing as bare event names.
+ *
+ * Used by the Logs tab (all levels) and the Errors tab (ERROR only) via
+ * the ``levelFilter`` prop.
+ */
+export function LogStream({
+  maxLines = 200,
+  title = 'Logs',
+  accent = 'amber',
+  levelFilter,
+  emptyHint,
+}: LogStreamProps) {
   const dataMode = useStore((s) => s.dataMode);
   const mockLogs = useStore((s) => s.logs);
   const [liveLogs, setLiveLogs] = useState<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const autoScroll = useRef(true);
   const lastTimestamp = useRef<string>('');
   const idCounter = useRef(0);
 
@@ -56,7 +89,7 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
     let closed = false;
 
     const appendEntries = (
-      raw: Array<{ timestamp: string; level: string; event: string; message: string }>,
+      raw: Array<Partial<LogEntry> & { timestamp: string; level: string; event: string; message: string }>,
     ) => {
       if (!raw || raw.length === 0) return;
       const newEntries: LogEntry[] = raw.map((e) => ({
@@ -65,6 +98,8 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
         level: e.level,
         event: e.event,
         message: e.message,
+        fields: e.fields || undefined,
+        exc_info: e.exc_info || undefined,
       }));
       const last = raw[raw.length - 1]?.timestamp;
       if (last) lastTimestamp.current = last;
@@ -102,7 +137,7 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
     };
   }, [dataMode, maxLines]);
 
-  const logsRaw = dataMode === 'live' ? liveLogs : mockLogs.map(l => ({
+  const logsRaw: LogEntry[] = dataMode === 'live' ? liveLogs : mockLogs.map(l => ({
     id: l.id,
     timestamp: l.timestamp instanceof Date ? l.timestamp.toISOString() : String(l.timestamp),
     level: l.level,
@@ -110,8 +145,16 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
     message: l.message,
   }));
 
+  // Apply level filter before reversing for display.
+  const filterSet = levelFilter
+    ? new Set(levelFilter.flatMap((l) => [l, l.toLowerCase(), l.toUpperCase()]))
+    : null;
+  const filtered = filterSet
+    ? logsRaw.filter((l) => filterSet.has(l.level || 'info'))
+    : logsRaw;
+
   // Newest first — reverse so latest entry is at the top
-  const logs = [...logsRaw].reverse();
+  const logs = [...filtered].reverse();
 
   // Always scroll to top (newest) when new entries arrive
   useEffect(() => {
@@ -120,25 +163,34 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
     }
   }, [logs.length]);
 
+  const defaultEmpty = dataMode === 'live' ? 'Loading logs...' : 'No log entries';
+
   return (
-    <PanelShell title="Logs" accent="amber" right={
-      <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{logs.length} entries</span>
+    <PanelShell title={title} accent={accent} right={
+      <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{logs.length} entries</span>
     }>
-      <div ref={scrollRef} className="h-full overflow-y-auto p-1 font-mono text-sm leading-[1.6]">
+      <div ref={scrollRef} className="h-full overflow-y-auto p-1 font-mono text-base leading-[1.7]">
         {logs.length === 0 ? (
-          <div style={{ color: 'var(--text-muted)', padding: 20, textAlign: 'center' }}>
-            {dataMode === 'live' ? 'Loading logs...' : 'No log entries'}
+          <div style={{ color: 'var(--text-muted)', padding: 20, textAlign: 'center', fontSize: 14 }}>
+            {emptyHint ?? defaultEmpty}
           </div>
         ) : logs.map((log) => {
           const lvl = log.level || 'info';
           const color = levelColor[lvl] || 'var(--text-secondary)';
           const label = levelLabel[lvl] || lvl.substring(0, 3).toUpperCase();
           const ts = log.timestamp ? formatTime(log.timestamp) : '';
-
+          const msgColor =
+            lvl === 'error' || lvl === 'ERROR' ? 'var(--accent-red)'
+            : lvl === 'warning' || lvl === 'WARNING' ? 'var(--accent-yellow)'
+            : 'var(--text-primary)';
+          const fieldEntries = log.fields
+            ? Object.entries(log.fields).filter(([, v]) =>
+                v !== null && v !== undefined && v !== '' && typeof v !== 'object')
+            : [];
           return (
             <div
               key={log.id}
-              className="flex gap-2 px-1"
+              className="flex flex-wrap gap-2 px-1"
               style={{ borderRadius: 2 }}
               onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--row-hover)')}
               onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
@@ -149,17 +201,42 @@ export function LogStream({ maxLines = 200 }: { maxLines?: number }) {
               <span style={{ color: 'var(--text-muted)' }} className="shrink-0">{ts}</span>
               <span style={{ color }} className="shrink-0 font-semibold">{label}</span>
               <span style={{ color: 'var(--text-muted)' }} className="shrink-0">[{log.event || 'log'}]</span>
-              <span style={{
-                color: lvl === 'error' || lvl === 'ERROR' ? 'var(--accent-red)'
-                  : lvl === 'warning' || lvl === 'WARNING' ? 'var(--accent-yellow)'
-                  : 'var(--text-primary)',
-              }}>
-                {log.message}
-              </span>
+              {log.message ? (
+                <span style={{ color: msgColor }}>{log.message}</span>
+              ) : null}
+              {fieldEntries.map(([k, v]) => (
+                <span key={k} style={{ color: 'var(--text-secondary)' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{k}</span>=<span>{String(v)}</span>
+                </span>
+              ))}
+              {log.exc_info ? (
+                <pre className="w-full mt-1 whitespace-pre-wrap text-[13px]"
+                  style={{ color: 'var(--accent-red)', opacity: 0.85 }}>
+                  {log.exc_info}
+                </pre>
+              ) : null}
             </div>
           );
         })}
       </div>
     </PanelShell>
+  );
+}
+
+/**
+ * Convenience wrapper: the Errors tab is just LogStream filtered to ERROR
+ * level with a red accent and `exc_info` rendered inline so stack traces
+ * (e.g. SMART_MARKET_AMEND_FAILED) are visible without digging into the
+ * on-disk log file.
+ */
+export function ErrorStream({ maxLines = 200 }: { maxLines?: number }) {
+  return (
+    <LogStream
+      maxLines={maxLines}
+      title="Errors"
+      accent="red"
+      levelFilter={['error', 'ERROR']}
+      emptyHint="No errors — everything nominal."
+    />
   );
 }

@@ -1,6 +1,6 @@
 import type { TabNode } from 'flexlayout-react';
 import { CommandConsole } from '../features/console/CommandConsole';
-import { LogStream } from '../features/logs/LogStream';
+import { LogStream, ErrorStream } from '../features/logs/LogStream';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
 import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
@@ -22,6 +22,8 @@ export function componentFactory(node: TabNode) {
       return <CommandConsole compact={config.compact} />;
     case 'logs':
       return <LogStream maxLines={config.maxLines} />;
+    case 'errors':
+      return <ErrorStream maxLines={config.maxLines} />;
     case 'orders':
       return <OrdersPanel compact={config.compact} />;
     case 'positions':

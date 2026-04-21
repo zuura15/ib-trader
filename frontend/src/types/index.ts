@@ -122,6 +122,12 @@ export interface TradeGroup {
   totalCommission: string | null;
   openedAt: string;
   closedAt: string | null;
+  // Augmented fill detail (set by /api/trades from the entry/exit legs).
+  entryQty: string | null;
+  entryPrice: string | null;
+  exitQty: string | null;
+  exitPrice: string | null;
+  orderType: string | null;
 }
 
 export interface CommandEntry {

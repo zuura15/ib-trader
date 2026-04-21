@@ -103,3 +103,26 @@ class TestBarAggregator:
         completed = agg.add_bars(bars)
         assert len(completed) == 2
         assert agg.bar_count == 2
+
+    def test_accepts_iso_string_timestamps_and_serializes(self):
+        # Runtime ingests bars from the Redis bar:*:5s stream where
+        # timestamp_utc is a JSON-decoded ISO-8601 string, not a datetime.
+        # Must not crash on to_state_dict (regression: .isoformat() on str
+        # raised AttributeError in BOT_DISPATCH_ERROR).
+        base = datetime(2026, 4, 9, 10, 0, 0, tzinfo=timezone.utc)
+        agg = BarAggregator(target_seconds=10, lookback_bars=5)
+        from datetime import timedelta
+        bars = [
+            {
+                "timestamp_utc": (base + timedelta(seconds=i * 5)).isoformat(),
+                "open": 100.0, "high": 101.0, "low": 99.0,
+                "close": 100.5, "volume": 10,
+            }
+            for i in range(3)
+        ]
+        agg.add_bars(bars)
+        state = agg.to_state_dict()  # would crash before the fix
+        assert state["last_seen_ts"] == (base + timedelta(seconds=10)).isoformat()
+        # Round-trip through from_state_dict should also work.
+        restored = BarAggregator.from_state_dict(state)
+        assert restored._last_seen_ts == base + timedelta(seconds=10)

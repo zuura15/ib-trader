@@ -311,7 +311,7 @@ class ExecutionMiddleware:
 
         url = f"{self._engine_url}/engine/orders"
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=260) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             result = resp.json()
@@ -401,7 +401,13 @@ class MiddlewarePipeline:
                 raise
 
             # Capture command ID if execution middleware submitted an order
-            if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id:
+            # `is not None` (not truthy): an empty string from the engine
+            # still signals an order was submitted, and skipping FSM dispatch
+            # causes duplicate orders because the stoic-mode flag is cleared
+            # in runtime.py's finally block. See engine/service.py fix that
+            # now populates ib_order_id so this rarely matters, but keeping
+            # the check explicit prevents the class of bug from re-emerging.
+            if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id is not None:
                 self.last_cmd_id = mw.last_cmd_id
                 mw.last_cmd_id = None  # consume it
         return actions

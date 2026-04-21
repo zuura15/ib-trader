@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from ib_trader.bots.fsm import FSM, BotEvent, BotState, EventType
+from ib_trader.bots.lifecycle import BotState, force_off_state
 from ib_trader.bots.runner import _panic_alert_on_startup
 
 
@@ -126,24 +126,26 @@ async def test_panic_alert_no_redis_logs_but_doesnt_crash():
 
 
 @pytest.mark.asyncio
-async def test_force_stop_transitions_all_active_states_to_off(redis):
-    """STOP event must move every active FSM state back to OFF with
-    position fields cleared."""
+async def test_force_off_state_resets_all_active_states(redis):
+    """``force_off_state`` must write OFF + clear position fields
+    regardless of the prior state. This is the helper the startup
+    panic path and the /reset endpoint both call."""
+    from ib_trader.redis.state import StateStore
+    store = StateStore(redis)
     for state in (BotState.AWAITING_ENTRY_TRIGGER,
                   BotState.ENTRY_ORDER_PLACED,
                   BotState.AWAITING_EXIT_TRIGGER,
                   BotState.EXIT_ORDER_PLACED,
                   BotState.ERRORED):
-        fsm = FSM(bot_id=f"bot-{state.value}", redis=redis)
-        await fsm.save({
+        key = f"bot:bot-{state.value}"
+        await store.set(key, {
             "state": state.value,
             "qty": "5",
             "entry_price": "99.99",
         })
-        result = await fsm.dispatch(BotEvent(EventType.STOP))
-        assert result is not None, f"STOP must be valid from {state.value}"
-        doc = await fsm.load()
+        await force_off_state(f"bot-{state.value}", redis, reason="test")
+        doc = await store.get(key)
         assert doc["state"] == BotState.OFF.value
-        # Position-anchor fields are cleared by _h_stop.
+        # Position-anchor fields are cleared.
         assert doc.get("qty") in (None, "0")
         assert doc.get("entry_price") is None

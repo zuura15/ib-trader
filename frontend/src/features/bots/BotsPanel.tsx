@@ -94,6 +94,80 @@ function forceBuy(botId: string) {
     .finally(() => setTimeout(() => setPending(botId, null), 2000));
 }
 
+function forceSell(botId: string) {
+  setPending(botId, 'Selling...');
+  fetch(`/api/bots/${botId}/force-sell`, { method: 'POST' })
+    .then((r) => {
+      if (!r.ok) r.json().then((d) => alert(d.detail || 'Force sell failed'));
+    })
+    .catch(() => {})
+    .finally(() => setTimeout(() => setPending(botId, null), 2000));
+}
+
+/**
+ * Renders the FORCE SELL button only when the bot currently holds a position.
+ * Polls /api/bots/{id}/state and subscribes to bot_state WS updates so the
+ * button appears the moment the entry fills and disappears on exit.
+ */
+function ForceSellButton({ botId, symbol, botRef, compact = false }: {
+  botId: string; symbol: string; botRef?: string; compact?: boolean;
+}) {
+  const [hasPosition, setHasPosition] = useState(false);
+
+  useEffect(() => {
+    const applyState = (s: BotPositionState) => {
+      const qty = s.qty ? parseFloat(s.qty) : 0;
+      const pos = s.position_state || s.state || 'FLAT';
+      setHasPosition(
+        qty > 0 && pos !== 'FLAT' && pos !== 'OFF' && pos !== 'AWAITING_ENTRY_TRIGGER',
+      );
+    };
+
+    fetch(`/api/bots/${botId}/state`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then(applyState)
+      .catch(() => {});
+
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      if (botRef) ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'bot_state' && msg.symbol === symbol && msg.strategy) {
+          applyState(msg.strategy);
+        }
+      } catch {}
+    };
+    return () => ws.close();
+  }, [botId, symbol, botRef]);
+
+  if (!hasPosition) return null;
+
+  const baseClass = compact
+    ? 'text-[13px] px-2 py-0.5 rounded font-semibold ml-1'
+    : 'text-[13px] px-2 py-0.5 rounded font-semibold';
+
+  return (
+    <button
+      onClick={() => forceSell(botId)}
+      className={baseClass}
+      style={{
+        background: 'var(--badge-red-bg)',
+        color: 'var(--accent-red)',
+        border: '1px solid var(--accent-red)',
+        cursor: 'pointer',
+      }}
+      data-testid={`bot-force-sell-${botId}`}
+      title="Close the bot's position immediately via the same exit path the strategy uses"
+    >
+      {compact ? 'SELL' : 'FORCE SELL'}
+    </button>
+  );
+}
+
 function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string; botRef?: string }) {
   const [state, setState] = useState<BotPositionState>({});
   const [livePrice, setLivePrice] = useState<number>(0);
@@ -136,10 +210,20 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
   }, [botId, symbol, botRef]);
 
   const posState = state.position_state || state.state || 'FLAT';
-  if (posState === 'FLAT' || posState === 'OFF' || posState === 'AWAITING_ENTRY_TRIGGER') return null;
+  const qty = state.qty ? parseFloat(state.qty) : 0;
+  // Don't render a position headline when there isn't a position to show.
+  // ENTRY_ORDER_PLACED has `qty=0` for 3-4s while the entry order is in flight;
+  // the `qty === 0` check also defends against any future state that could
+  // transiently report zero.
+  if (
+    qty === 0 ||
+    posState === 'FLAT' ||
+    posState === 'OFF' ||
+    posState === 'AWAITING_ENTRY_TRIGGER' ||
+    posState === 'ENTRY_ORDER_PLACED'
+  ) return null;
 
   const entry = state.entry_price ? parseFloat(state.entry_price) : 0;
-  const qty = state.qty ? parseFloat(state.qty) : 0;
   const hwm = state.high_water_mark ? parseFloat(state.high_water_mark) : 0;
   const hardStop = state.hard_stop ? parseFloat(state.hard_stop)
     : (entry > 0 ? entry * (1 - 0.003) : 0);
@@ -166,8 +250,13 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
   const val = (color?: string) => ({ color: color || 'var(--text-primary)' }) as const;
 
   return (
-    <div className="mt-1 px-2 py-2 rounded text-[10px] font-mono"
-      style={{ background: 'var(--bg-root)', border: '1px solid var(--border-default)', overflowWrap: 'break-word' }}>
+    <div className="mt-1 px-2 py-2 rounded text-[13px] font-mono"
+      style={{ background: 'var(--bg-root)', border: '1px solid var(--border-default)', overflowWrap: 'break-word' }}
+      data-testid={`position-line-${botId}`}
+      data-symbol={symbol}
+      data-qty={qty}
+      data-entry={entry.toFixed(2)}
+      data-position-state={posState}>
       {/* Row 1: Position headline + P&L */}
       <div className="flex flex-wrap gap-x-4 gap-y-1 items-center mb-1">
         <span style={val("var(--text-primary)")}>
@@ -237,7 +326,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
   if (large) {
     return (
       <PanelShell title="Bots" accent="purple" right={
-        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{bots.length} registered</span>
+        <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{bots.length} registered</span>
       }>
         <div className="h-full overflow-auto p-2 grid grid-cols-1 gap-2">
           {bots.map((bot) => {
@@ -265,12 +354,12 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                    <span className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
                       {bot.strategy}
                     </span>
                     <button
                       onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
-                      className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                      className="text-[13px] px-2 py-0.5 rounded font-semibold"
                       disabled={!!getPending(bot.id)}
                       style={{
                         background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
@@ -286,7 +375,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     {bot.status === 'running' && (
                       <button
                         onClick={() => forceBuy(bot.id)}
-                        className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
                         style={{
                           background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
                           color: 'var(--accent-yellow)',
@@ -298,10 +387,17 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         FORCE BUY
                       </button>
                     )}
+                    {bot.status === 'running' && bot.symbols[0] && (
+                      <ForceSellButton
+                        botId={bot.id}
+                        symbol={bot.symbols[0]}
+                        botRef={bot.refId}
+                      />
+                    )}
                     {bot.status === 'running' && (
                       <button
                         onClick={() => forceStop(bot.id)}
-                        className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
                         style={{
                           background: 'var(--badge-red-bg)',
                           color: 'var(--accent-red)',
@@ -319,21 +415,21 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
 
                 <div className="grid grid-cols-4 gap-3 text-xs mb-2">
                   <div>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Heartbeat</div>
+                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Heartbeat</div>
                     <div className="font-mono" style={{ color: bot.status === 'error' ? 'var(--accent-red)' : 'var(--text-primary)' }}>
                       {formatAge(bot.lastHeartbeat)} ago
                     </div>
                   </div>
                   <div>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Trades Today</div>
+                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Trades Today</div>
                     <div className="font-mono" style={{ color: 'var(--text-primary)' }}>{bot.tradesToday}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>P&L Today</div>
+                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>P&L Today</div>
                     <div className={`font-mono ${pnlClass(bot.pnlToday)}`}>{formatCurrency(bot.pnlToday)}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Uptime</div>
+                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Uptime</div>
                     <div className="font-mono" style={{ color: 'var(--text-primary)' }}>{bot.uptime > 0 ? formatDuration(bot.uptime) : '—'}</div>
                   </div>
                 </div>
@@ -356,7 +452,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     </div>
                   )}
                   {bot.errorMessage && (
-                    <div className="mt-1 p-1.5 rounded text-[11px]"
+                    <div className="mt-1 p-1.5 rounded text-[14px]"
                       style={{ background: 'var(--badge-red-bg)', color: 'var(--accent-red)' }}>
                       {bot.errorMessage}
                     </div>
@@ -381,7 +477,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
   // Compact table view
   return (
     <PanelShell title="Bots" accent="purple" right={
-      <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{bots.length} registered</span>
+      <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{bots.length} registered</span>
     }>
       <div className="h-full overflow-auto">
         <table className="data-table">
@@ -422,7 +518,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   <td>
                     <button
                       onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
-                      className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                      className="text-[13px] px-2 py-0.5 rounded font-semibold"
                       disabled={!!getPending(bot.id)}
                       style={{
                         background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
@@ -438,7 +534,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     {bot.status === 'running' && (
                       <button
                         onClick={() => forceBuy(bot.id)}
-                        className="text-[10px] px-2 py-0.5 rounded font-semibold ml-1"
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
                         style={{
                           background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
                           color: 'var(--accent-yellow)',
@@ -450,10 +546,18 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         FORCE
                       </button>
                     )}
+                    {bot.status === 'running' && bot.symbols[0] && (
+                      <ForceSellButton
+                        botId={bot.id}
+                        symbol={bot.symbols[0]}
+                        botRef={bot.refId}
+                        compact
+                      />
+                    )}
                     {bot.status === 'running' && (
                       <button
                         onClick={() => forceStop(bot.id)}
-                        className="text-[10px] px-2 py-0.5 rounded font-semibold ml-1"
+                        className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
                         style={{
                           background: 'var(--badge-red-bg)',
                           color: 'var(--accent-red)',

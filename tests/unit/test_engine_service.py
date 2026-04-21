@@ -87,3 +87,22 @@ class TestListRenderer:
         r.update_order_row(1, {})
         r.update_header(ib_connected=True)
         assert r.messages == []
+
+    def test_update_order_row_captures_serial_and_ib_order_id(self):
+        # Bots rely on ib_order_id surfacing through the /engine/orders
+        # response to dispatch PlaceExitOrder to the FSM and key stoic-mode
+        # release on the terminal event. Dropping it caused duplicate SELLs
+        # in prod (see ib_trader/bots/runtime.py:441,1209 and the bug
+        # observed 2026-04-20 on ctr-uso).
+        r = _ListRenderer()
+        r.update_order_row(42, {"symbol": "USO", "side": "SELL", "ib_order_id": "186"})
+        assert r.metadata["serial"] == 42
+        assert r.metadata["ib_order_id"] == "186"
+
+    def test_update_order_row_ignores_empty_ib_order_id(self):
+        # Don't shadow a previously-captured real id with a later empty one.
+        r = _ListRenderer()
+        r.update_order_row(42, {"ib_order_id": "186"})
+        r.update_order_row(42, {})
+        r.update_order_row(42, {"ib_order_id": ""})
+        assert r.metadata["ib_order_id"] == "186"

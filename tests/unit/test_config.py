@@ -17,8 +17,9 @@ max_order_size_shares: 10
 max_retries: 3
 retry_delay_seconds: 2
 retry_backoff_multiplier: 2.0
-reprice_interval_seconds: 1
-reprice_duration_seconds: 10
+reprice_steps: 10
+reprice_active_duration_seconds: 30
+reprice_passive_wait_seconds: 90
 ib_host: 127.0.0.1
 ib_port: 7497
 ib_client_id: 1

@@ -1,8 +1,10 @@
 """Unit tests for engine account-ID validation on startup.
 
-Covers _validate_account_id (Gateway-managedAccounts check) and
-_validate_account_mode (paper/live flag vs account prefix sanity).
-Both run immediately after IB.connect() in engine.main.run_engine.
+Covers _validate_account_id (Gateway-managedAccounts check). The old
+_validate_account_mode (paper/live flag vs account prefix sanity) was
+removed when the engine switched to auto-detecting mode from the Gateway
+— see ADR 015. See tests/unit/test_gateway_mode_detection.py for the
+replacement coverage.
 """
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ib_trader.engine.main import _validate_account_id, _validate_account_mode
+from ib_trader.engine.main import _validate_account_id
 
 
 class _FakeIB:
@@ -53,27 +55,5 @@ class TestValidateAccountId:
             _validate_account_id(ctx)
 
     def test_multiple_managed_accounts_any_match(self):
-        # Some Gateway sessions expose multiple accounts (master + subs);
-        # as long as configured is one of them, we accept.
         ctx = _ctx("DU1234567", _FakeIB(managed=["DU0000000", "DU1234567"]))
         _validate_account_id(ctx)
-
-
-class TestValidateAccountMode:
-    def test_paper_flag_with_du_account_passes(self):
-        ctx = _ctx("DU1234567", _FakeIB(), mode="paper")
-        _validate_account_mode(ctx)
-
-    def test_live_flag_with_u_account_passes(self):
-        ctx = _ctx("U9876543", _FakeIB(), mode="live")
-        _validate_account_mode(ctx)
-
-    def test_paper_flag_with_live_account_raises(self):
-        ctx = _ctx("U9876543", _FakeIB(), mode="paper")
-        with pytest.raises(SystemExit, match="does not start with 'DU'"):
-            _validate_account_mode(ctx)
-
-    def test_live_flag_with_paper_account_raises(self):
-        ctx = _ctx("DU1234567", _FakeIB(), mode="live")
-        with pytest.raises(SystemExit, match="starts with 'DU'"):
-            _validate_account_mode(ctx)

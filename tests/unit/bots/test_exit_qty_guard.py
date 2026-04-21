@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from ib_trader.bots.fsm import BotState
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategies.close_trend_rsi import CloseTrendRsiStrategy
 from ib_trader.bots.strategies.sawtooth_rsi import SawtoothRsiStrategy
 from ib_trader.bots.strategy import QuoteUpdate, StrategyContext

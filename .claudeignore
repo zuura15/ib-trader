@@ -1,0 +1,36 @@
+# Dirs Claude never needs to traverse. Prevents Glob / directory-walk tools
+# from descending into hundreds of MB of dependency and artifact files.
+
+# Python env (380M)
+.venv/
+
+# Node dependencies
+**/node_modules/
+
+# Frontend build artifacts
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+**/dist/
+
+# Coverage / pytest artifacts
+htmlcov/
+.coverage
+.pytest_cache/
+__pycache__/
+*.pyc
+ib_trader.egg-info/
+
+# Runtime / local state (27M of rotated logs)
+logs/
+run/
+
+# SQLite DB files
+*.db
+*.db-shm
+*.db-wal
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

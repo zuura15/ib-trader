@@ -20,7 +20,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
-from ib_trader.bots.fsm import BotState
+from ib_trader.bots.lifecycle import BotState
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +44,7 @@ class ExitType(str, enum.Enum):
     TRAILING_STOP  = "TRAILING_STOP"
     TIME_STOP      = "TIME_STOP"
     TAKE_PROFIT    = "TAKE_PROFIT"   # reserved for future policies
+    FORCE_EXIT     = "FORCE_EXIT"    # operator-triggered manual override
 
 
 class LogEventType(str, enum.Enum):
@@ -280,4 +281,15 @@ class Strategy(Protocol):
 
     async def on_stop(self, ctx: StrategyContext) -> list[Action]:
         """Called when the bot is stopped. Return cleanup actions."""
+        ...
+
+    def build_exit_actions(self, ctx: StrategyContext, exit_type: "ExitType",
+                           detail: str) -> list["Action"]:
+        """Build the actions that close the current position.
+
+        Called both by the strategy's own exit policies (trailing stop,
+        hard stop, time stop) and by the runtime's force-sell path so that
+        an operator-triggered exit produces bit-identical orders to an
+        organic one — they differ only in ``exit_type``.
+        """
         ...

@@ -65,11 +65,85 @@ function applyTabSelection(model: Model, map: Record<string, string>): void {
   });
 }
 
+// Tabs that were added to the default layout after a user may already
+// have a persisted model. For each entry we inject the tab into the
+// tabset that contains `anchor` if the tab isn't already anywhere in the
+// model. Keeps a user's customized layout intact on upgrade rather than
+// forcing a reset.
+const MIGRATED_TABS: Array<{ component: string; name: string; anchor: string }> = [
+  { component: 'errors', name: 'Errors', anchor: 'logs' },
+];
+
+function migrateLayoutJson(raw: any): any {
+  if (!raw || typeof raw !== 'object') return raw;
+
+  // Collect every tab component present anywhere in the model.
+  const present = new Set<string>();
+  const visit = (node: any) => {
+    if (!node) return;
+    if (node.type === 'tab' && node.component) present.add(node.component);
+    if (Array.isArray(node.children)) node.children.forEach(visit);
+  };
+  visit(raw.layout);
+  if (Array.isArray(raw.borders)) raw.borders.forEach(visit);
+
+  for (const mig of MIGRATED_TABS) {
+    if (present.has(mig.component)) continue;
+
+    // Find the parent tabset (or border) whose direct children contain the
+    // anchor tab, and append the new tab there.
+    const injectInto = (node: any): boolean => {
+      if (!node) return false;
+      const isTabContainer =
+        node.type === 'tabset' || node.type === 'border';
+      if (isTabContainer && Array.isArray(node.children)) {
+        const idx = node.children.findIndex(
+          (c: any) => c && c.type === 'tab' && c.component === mig.anchor,
+        );
+        if (idx >= 0) {
+          node.children.splice(idx + 1, 0, {
+            type: 'tab',
+            name: mig.name,
+            component: mig.component,
+          });
+          return true;
+        }
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+          if (injectInto(child)) return true;
+        }
+      }
+      return false;
+    };
+    let injected = injectInto(raw.layout);
+    if (!injected && Array.isArray(raw.borders)) {
+      for (const b of raw.borders) {
+        if (injectInto(b)) { injected = true; break; }
+      }
+    }
+    if (DEBUG_TAB_PERSIST) {
+      console.log('[tabs] migration', mig.component, injected ? 'injected' : 'anchor-not-found');
+    }
+  }
+  return raw;
+}
+
 function loadModel(variant: LayoutVariant): Model {
   let model: Model;
   try {
     const saved = localStorage.getItem(STORAGE_PREFIX + variant);
-    model = saved ? Model.fromJson(JSON.parse(saved)) : Model.fromJson(variantDefaults[variant]);
+    if (saved) {
+      const migrated = migrateLayoutJson(JSON.parse(saved));
+      model = Model.fromJson(migrated);
+      // Persist the migrated JSON so the injection runs exactly once per
+      // added tab, even if the user never interacts with the new tab.
+      try {
+        localStorage.setItem(STORAGE_PREFIX + variant, JSON.stringify(migrated));
+      } catch { /* quota — ignore */ }
+    } else {
+      model = Model.fromJson(variantDefaults[variant]);
+    }
   } catch (e) {
     if (DEBUG_TAB_PERSIST) console.warn('[tabs] model load failed, using default', e);
     model = Model.fromJson(variantDefaults[variant]);

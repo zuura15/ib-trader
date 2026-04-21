@@ -9,6 +9,7 @@ from ib_trader.data.repository import (
     TradeRepository, HeartbeatRepository, AlertRepository,
 )
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
 
 # Module-level session factory — set by app.py lifespan on startup.
 _session_factory: scoped_session | None = None
@@ -41,6 +42,10 @@ def get_alerts() -> AlertRepository:
 
 def get_pending_commands() -> PendingCommandRepository:
     return PendingCommandRepository(get_session_factory())
+
+
+def get_transactions() -> TransactionRepository:
+    return TransactionRepository(get_session_factory())
 
 
 # --- Redis dependency ---

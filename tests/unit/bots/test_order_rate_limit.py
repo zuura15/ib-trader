@@ -19,10 +19,7 @@ from decimal import Decimal
 def _make_runner(**config) -> StrategyBotRunner:
     """Minimal runner shell — enough for _check_order_rate_limit."""
     runner = StrategyBotRunner.__new__(StrategyBotRunner)
-    runner._order_submit_in_flight = False
     runner._pending_cmd_id = None
-    runner._awaiting_terminal_ib_order_id = None
-    runner._stoic_mode_set_at = 0.0
     runner._recent_submit_times = []
     runner.bot_id = "test-bot"
     runner.strategy_config = {"symbol": "QQQ"}

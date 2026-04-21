@@ -396,15 +396,21 @@ SESSION
 @click.option("--settings", "settings_path", default="config/settings.yaml", help="Settings YAML path")
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml", help="Symbols YAML path")
 @click.option(
-    "--paper/--live", "paper",
-    default=True,
-    help="Paper trading (default). Pass --live to connect to the live Gateway.",
+    "--force-mode",
+    type=click.Choice(["paper", "live"]),
+    default=None,
+    help=(
+        "Assert the detected Gateway mode must match this value. Without "
+        "this flag the REPL auto-detects from the Gateway's managedAccounts."
+    ),
 )
-def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) -> None:
+def main(db: str, env: str, settings_path: str, symbols_path: str,
+         force_mode: str | None) -> None:
     """IB Trader — interactive trading session for Interactive Brokers.
 
     Start once and trade from the prompt. Type 'help' for commands.
-    Defaults to paper trading. Pass --live to connect to the live Gateway.
+    Auto-detects paper vs live from the Gateway's managedAccounts
+    (DU*=paper, else live).
     """
     setup_logging()
 
@@ -416,19 +422,46 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) 
         print(f"\u2717 Configuration error: {e}")
         sys.exit(1)
 
-    # settings.yaml defaults to paper (port 4002, market data type 3). The
-    # --paper / --live flags + IB_PORT_PAPER / IB_PORT env vars are opt-in
-    # overrides.
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", settings.get("ib_port", 4002)))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", settings.get("ib_market_data_type", 3)))
-        account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
-    else:
-        settings["ib_port"] = int(env_vars.get("IB_PORT", 4001))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", 1))
-        account_id = env_vars["IB_ACCOUNT_ID"]
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
+
+    # Probe the Gateway and detect paper/live before constructing the
+    # IB client. See ib_trader.engine.connect for details.
+    import asyncio as _asyncio
+    from ib_trader.engine.connect import (
+        load_candidates, probe_gateway, pick_account, pick_market_data_type,
+    )
+    candidates = load_candidates(settings)
+    probe_timeout = float(settings.get("ib_probe_timeout", 2.0))
+    try:
+        result = _asyncio.run(probe_gateway(
+            settings["ib_host"], candidates, settings["ib_client_id"],
+            timeout=probe_timeout,
+        ))
+    except RuntimeError as e:
+        print(f"\u2717 {e}")
+        sys.exit(1)
+
+    if force_mode and result.mode != force_mode:
+        print(
+            f"\u2717 --force-mode={force_mode!r} but Gateway reports "
+            f"mode={result.mode!r} (accounts={result.accounts})."
+        )
+        sys.exit(1)
+
+    account_id = pick_account(result.mode, env_vars, result.accounts)
+    settings["ib_port"] = result.port
+    settings["ib_market_data_type"] = pick_market_data_type(result.mode, env_vars, settings)
+    settings["account_mode"] = result.mode
+    logger.info(
+        '{"event": "REPL_MODE_DETECTED", "mode": "%s", "port": %d, '
+        '"label": "%s", "account_id": "%s"}',
+        result.mode, result.port, result.label, account_id,
+    )
+    print(
+        f"Detected {result.mode} mode on {result.label} "
+        f"(port {result.port}), account {account_id}."
+    )
 
     # Check DB file permissions if it exists
     if Path(db).exists():
