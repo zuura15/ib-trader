@@ -10,6 +10,7 @@ from ib_trader.data.repository import (
 )
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
+from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 
 # Module-level session factory — set by app.py lifespan on startup.
 _session_factory: scoped_session | None = None
@@ -46,6 +47,10 @@ def get_pending_commands() -> PendingCommandRepository:
 
 def get_transactions() -> TransactionRepository:
     return TransactionRepository(get_session_factory())
+
+
+def get_bot_trades() -> BotTradeRepository:
+    return BotTradeRepository(get_session_factory())
 
 
 # --- Redis dependency ---

@@ -393,9 +393,10 @@ class SawtoothRsiStrategy:
         trail_activated = state.get("trail_activated", False)
         hwm = Decimal(str(state.get("high_water_mark") or current_price))
 
+        prior_reset_count = int(state.get("trail_reset_count") or 0)
         if not trail_activated:
             if pnl_pct >= trail_activation:
-                # Activate the trail
+                # Activate the trail — counts as the first "reset"
                 hwm = current_price
                 trail_stop = hwm * (1 - trail_width)
                 actions.append(LogSignal(
@@ -408,6 +409,7 @@ class SawtoothRsiStrategy:
                     "trail_activated": True,
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
         else:
             # Trail is active — ratchet up or trigger
@@ -417,6 +419,7 @@ class SawtoothRsiStrategy:
                 actions.append(UpdateState({
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
             else:
                 trail_stop = Decimal(str(state.get("current_stop", "0")))

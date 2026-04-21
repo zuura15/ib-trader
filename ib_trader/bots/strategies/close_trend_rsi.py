@@ -366,6 +366,7 @@ class CloseTrendRsiStrategy:
         trail_activated = state.get("trail_activated", False)
         hwm = Decimal(str(state.get("high_water_mark") or current_price))
 
+        prior_reset_count = int(state.get("trail_reset_count") or 0)
         if not trail_activated:
             if pnl_pct >= trail_activation:
                 hwm = current_price
@@ -380,6 +381,7 @@ class CloseTrendRsiStrategy:
                     "trail_activated": True,
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
         else:
             if current_price > hwm:
@@ -388,6 +390,7 @@ class CloseTrendRsiStrategy:
                 actions.append(UpdateState({
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
             else:
                 trail_stop = Decimal(str(state.get("current_stop", "0")))

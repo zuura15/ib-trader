@@ -70,6 +70,7 @@ export const variantA: IJsonModel = {
             children: [
               { type: 'tab', name: 'Orders', component: 'orders' },
               { type: 'tab', name: 'Trades', component: 'trades' },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
             ],
           },
         ],

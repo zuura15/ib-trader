@@ -326,6 +326,39 @@ class BotEvent(Base):
     recorded_at    = Column(DateTime, nullable=False)
 
 
+class BotTrade(Base):
+    """Synthesized per-bot-execution record — one row per entry-to-exit round-trip.
+
+    Created by ``StrategyBotRunner._handle_record_trade_closed`` when a bot's
+    exit fully fills. Populated from the bot's state doc (entry_price,
+    entry_time) plus the exit fill event (exit_price, exit_time, realized_pnl).
+
+    The orders / transactions tables still track individual order legs; this
+    table is the "round trip" view consumed by the Bot Trades panel.
+    """
+
+    __tablename__ = "bot_trades"
+
+    id                 = Column(String(36), primary_key=True, default=_uuid)
+    bot_id             = Column(String(36), nullable=False, index=True)
+    bot_name           = Column(String(100), nullable=True)
+    symbol             = Column(String(20), nullable=False)
+    direction          = Column(String(5), nullable=False)    # LONG / SHORT
+    entry_price        = Column(Numeric(18, 4), nullable=False)
+    entry_qty          = Column(Numeric(18, 4), nullable=False)
+    entry_time         = Column(DateTime, nullable=False)
+    exit_price         = Column(Numeric(18, 4), nullable=True)
+    exit_qty           = Column(Numeric(18, 4), nullable=True)
+    exit_time          = Column(DateTime, nullable=True)
+    realized_pnl       = Column(Numeric(18, 8), nullable=True)
+    commission         = Column(Numeric(18, 8), nullable=True)
+    trail_reset_count  = Column(Integer, nullable=False, default=0)
+    duration_seconds   = Column(Integer, nullable=True)       # exit_time - entry_time, seconds
+    entry_serial       = Column(Integer, nullable=True)       # trade_group.serial_number of entry
+    exit_serial        = Column(Integer, nullable=True)       # trade_group.serial_number of exit
+    created_at         = Column(DateTime, nullable=False)
+
+
 class OrderTemplate(Base):
     """Saved order template for quick-fire orders from the GUI."""
 

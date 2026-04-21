@@ -187,11 +187,18 @@ class TradeRepository(TradeRepositoryBase):
             trade.closed_at = _now_utc()
         s.commit()
 
-    def update_pnl(self, trade_id: str, pnl: Decimal, commission: Decimal) -> None:
-        """Update realized P&L and total commission for a trade group."""
+    def update_pnl(self, trade_id: str, pnl: Decimal | None, commission: Decimal) -> None:
+        """Update realized P&L and total commission for a trade group.
+
+        ``pnl=None`` skips the P&L write — for entry fills we want the
+        commission recorded without overwriting the OPEN trade's
+        realized_pnl with a meaningless zero. The close-path callers
+        still pass the computed P&L explicitly.
+        """
         s = self._session()
         trade = s.query(TradeGroup).filter(TradeGroup.id == trade_id).one()
-        trade.realized_pnl = pnl
+        if pnl is not None:
+            trade.realized_pnl = pnl
         trade.total_commission = commission
         s.commit()
 

@@ -611,14 +611,29 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         try:
             order_ref, symbol, sec_type, con_id, side = _get_trade_meta(ib_order_id)
 
-            # Get remaining qty from the active trade if available
+            # Read the ORIGINAL order total qty (not the live-updated
+            # remaining) so the ledger can compute target_qty correctly
+            # even when multiple execDetailsEvents fire in quick
+            # succession. Using `qty + orderStatus.remaining` races
+            # because IB updates orderStatus.remaining to 0 for ALL
+            # fills of a SMART-split order before any on_fill task gets
+            # to read it — which caused the ledger to evict the entry
+            # mid-order and emit a second terminal event with only the
+            # second fill's per-fill qty. totalQuantity is static once
+            # the order is placed, so it's always correct.
+            total_qty = Decimal("-1")
             remaining = Decimal("-1")
             if hasattr(ctx.ib, '_active_trades'):
                 trade = ctx.ib._active_trades.get(ib_order_id)
-                if trade and hasattr(trade, 'orderStatus'):
-                    rem = getattr(trade.orderStatus, 'remaining', -1)
-                    if rem >= 0:
-                        remaining = Decimal(str(rem))
+                if trade:
+                    if hasattr(trade, 'order'):
+                        tq = getattr(trade.order, 'totalQuantity', None)
+                        if tq is not None:
+                            total_qty = Decimal(str(tq))
+                    if hasattr(trade, 'orderStatus'):
+                        rem = getattr(trade.orderStatus, 'remaining', -1)
+                        if rem >= 0:
+                            remaining = Decimal(str(rem))
 
             events = ledger.record_fill(
                 ib_order_id,
@@ -631,6 +646,7 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 con_id=con_id,
                 side=side,
                 remaining=remaining,
+                total_qty=total_qty,
             )
 
             for event in events:

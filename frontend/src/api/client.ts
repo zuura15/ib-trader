@@ -83,6 +83,36 @@ export function getTrades(status?: string) {
   return request<TradeResponse[]>(`/trades${qs}`);
 }
 
+// --- Bot Trades ---
+
+export interface BotTradeResponse {
+  id: string;
+  bot_id: string;
+  bot_name: string | null;
+  symbol: string;
+  direction: string;
+  entry_price: string;
+  entry_qty: string;
+  entry_time: string;
+  exit_price: string | null;
+  exit_qty: string | null;
+  exit_time: string | null;
+  realized_pnl: string | null;
+  commission: string | null;
+  trail_reset_count: number;
+  duration_seconds: number | null;
+  entry_serial: number | null;
+  exit_serial: number | null;
+  created_at: string;
+}
+
+export function getBotTrades(botId?: string, limit: number = 500) {
+  const params = new URLSearchParams();
+  if (botId) params.set("bot_id", botId);
+  params.set("limit", String(limit));
+  return request<BotTradeResponse[]>(`/bot-trades?${params}`);
+}
+
 // --- Orders ---
 
 export interface OrderResponse {

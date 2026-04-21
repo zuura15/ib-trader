@@ -50,6 +50,7 @@ from ib_trader.bots.middleware import (
     PersistenceMiddleware, ExecutionMiddleware, ManualEntryMiddleware,
 )
 from ib_trader.data.repositories.bot_repository import BotEventRepository
+from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ class StrategyBotRunner(BotBase):
 
         # Repos for middleware
         self._bot_events_repo = BotEventRepository(session_factory)
+        self._bot_trades_repo = BotTradeRepository(session_factory)
         self._session_factory = session_factory
 
     # ------------------------------------------------------------------
@@ -851,6 +853,8 @@ class StrategyBotRunner(BotBase):
                     "high_water_mark": str(price),
                     "current_stop": None,
                     "trail_activated": False,
+                    "trail_reset_count": 0,          # reset for this trade
+                    "entry_serial": doc.get("serial"),
                 }
                 await self._apply_transition(
                     doc, BotState.AWAITING_EXIT_TRIGGER, patch, "on_entry_filled",
@@ -925,18 +929,32 @@ class StrategyBotRunner(BotBase):
                     (price - entry_price) * position_qty
                     if entry_price > 0 else Decimal("0")
                 )
+                # Snapshot fields needed for the bot-trade record before
+                # clear_position_fields() wipes them.
+                record_close_args = {
+                    "realized_pnl": str(realized_pnl),
+                    "serial": doc.get("serial"),
+                    "symbol": symbol,
+                    "direction": "LONG",
+                    "entry_price": str(entry_price),
+                    "entry_qty": str(position_qty),
+                    "entry_time": doc.get("entry_time"),
+                    "exit_price": str(price),
+                    "exit_qty": str(qty),
+                    "commission": str(commission),
+                    "trail_reset_count": int(doc.get("trail_reset_count") or 0),
+                    "entry_serial": doc.get("entry_serial") or doc.get("serial"),
+                    "exit_serial": doc.get("serial"),
+                }
                 patch = {
                     **clear_position_fields(),
                     "last_realized_pnl": str(realized_pnl),
                     "exit_retries": 0,
+                    "trail_reset_count": 0,  # Reset for next trade
                 }
                 await self._apply_transition(
                     doc, BotState.AWAITING_ENTRY_TRIGGER, patch, "on_exit_filled",
                 )
-                record_close_args = {
-                    "realized_pnl": str(realized_pnl),
-                    "serial": doc.get("serial"),
-                }
                 notify_kind = "filled"
                 retry_args = None
                 escalated = False
@@ -1324,28 +1342,114 @@ class StrategyBotRunner(BotBase):
             })
 
     async def _handle_record_trade_closed(self, args: dict) -> None:
-        """Record realized P&L + trade count when an exit fully fills.
+        """Record realized P&L + trade count + bot-trade row when an exit
+        fully fills.
 
-        Driven by the FSM's ``_h_exit_filled`` handler which already
-        computes ``realized_pnl = (price - entry_price) * order_qty``
-        before clearing the position fields. This is the ONLY place that
-        record_pnl / record_trade are called for closed trades — the
-        legacy in-line record in ``_apply_fill`` has been removed so we
-        don't double-count.
+        Driven by ``on_exit_filled`` which already computes
+        ``realized_pnl = (price - entry_price) * order_qty`` before
+        clearing the position fields.
 
-        Counters live in Redis (``bot:stats:<bot_id>``) so they survive
-        a runner restart.
+        Three side effects:
+        1. ``_risk_mw.record_pnl`` — daily loss-cap tracker (Redis).
+        2. ``_risk_mw.record_trade`` — daily trade-count tracker (Redis).
+        3. ``bot_trades`` SQLite row — one per entry-to-exit round-trip,
+           read by the Bot Trades panel via ``GET /api/bot-trades``.
         """
-        if not self._risk_mw:
-            return
         realized_pnl_str = args.get("realized_pnl") or "0"
         try:
             pnl = Decimal(realized_pnl_str)
         except (ValueError, TypeError):
             pnl = Decimal("0")
-        if pnl != 0:
-            await self._risk_mw.record_pnl(pnl)
-        await self._risk_mw.record_trade()
+
+        if self._risk_mw:
+            if pnl != 0:
+                await self._risk_mw.record_pnl(pnl)
+            await self._risk_mw.record_trade()
+
+        # --- bot_trades row ---
+        # Only write when we have the full round-trip context (symbol,
+        # entry_price, exit_price). Earlier callers that pre-date the
+        # expanded args schema pass just {realized_pnl, serial} — for
+        # those we skip the row rather than write a degenerate entry.
+        symbol = args.get("symbol")
+        entry_price_str = args.get("entry_price")
+        exit_price_str = args.get("exit_price")
+        if not (symbol and entry_price_str and exit_price_str):
+            return
+        try:
+            entry_time = args.get("entry_time")
+            if isinstance(entry_time, str):
+                try:
+                    entry_time_dt = datetime.fromisoformat(entry_time)
+                except ValueError:
+                    entry_time_dt = None
+            else:
+                entry_time_dt = entry_time
+            if entry_time_dt is None:
+                entry_time_dt = datetime.now(timezone.utc)
+            if entry_time_dt.tzinfo is None:
+                entry_time_dt = entry_time_dt.replace(tzinfo=timezone.utc)
+            exit_time_dt = datetime.now(timezone.utc)
+            duration = int(
+                (exit_time_dt - entry_time_dt).total_seconds()
+            ) if entry_time_dt else None
+
+            from ib_trader.data.models import BotTrade
+            row = BotTrade(
+                bot_id=self.bot_id,
+                bot_name=self.name if hasattr(self, "name") else None,
+                symbol=symbol,
+                direction=args.get("direction", "LONG"),
+                entry_price=Decimal(entry_price_str),
+                entry_qty=Decimal(args.get("entry_qty") or "0"),
+                entry_time=entry_time_dt,
+                exit_price=Decimal(exit_price_str),
+                exit_qty=Decimal(args.get("exit_qty") or "0"),
+                exit_time=exit_time_dt,
+                realized_pnl=pnl,
+                commission=Decimal(args.get("commission") or "0"),
+                trail_reset_count=int(args.get("trail_reset_count") or 0),
+                duration_seconds=duration,
+                entry_serial=args.get("entry_serial"),
+                exit_serial=args.get("exit_serial"),
+                created_at=exit_time_dt,
+            )
+            self._bot_trades_repo.create(row)
+            logger.info(
+                '{"event": "BOT_TRADE_RECORDED", "bot_id": "%s", '
+                '"symbol": "%s", "realized_pnl": "%s", "duration_s": %s, '
+                '"trail_resets": %d}',
+                self.bot_id, symbol, pnl, duration or 0,
+                int(args.get("trail_reset_count") or 0),
+            )
+
+            # Also stamp the EXIT trade_group's realized_pnl so the
+            # Trades panel (which reads from trade_groups.realized_pnl)
+            # shows the bot's round-trip P&L on the exit row. The entry
+            # trade_group stays with realized_pnl=NULL (it's still the
+            # "entry leg" of a synthesized round-trip, not a close).
+            exit_serial = args.get("exit_serial")
+            if exit_serial is not None:
+                try:
+                    from ib_trader.data.repository import TradeRepository
+                    trade_repo = TradeRepository(self._session_factory)
+                    exit_tg = trade_repo.get_by_serial(int(exit_serial))
+                    if exit_tg is not None:
+                        trade_repo.update_pnl(
+                            exit_tg.id, pnl,
+                            Decimal(args.get("commission") or "0"),
+                        )
+                except Exception:
+                    logger.exception(
+                        '{"event": "BOT_TRADE_EXIT_PNL_UPDATE_FAILED", '
+                        '"bot_id": "%s", "exit_serial": %s}',
+                        self.bot_id, exit_serial,
+                    )
+        except Exception:
+            logger.exception(
+                '{"event": "BOT_TRADE_WRITE_FAILED", "bot_id": "%s"}',
+                self.bot_id,
+            )
 
     async def on_startup(self, open_positions: list) -> None:
         """Initialize strategy, aggregator, middleware, and restore state."""

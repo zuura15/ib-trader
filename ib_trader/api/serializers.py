@@ -57,6 +57,30 @@ class TradeResponse(BaseModel):
     order_type: str | None = None        # order_type on the entry leg (mid/market/...)
 
 
+class BotTradeResponse(BaseModel):
+    """One synthesized bot entry-to-exit round-trip."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    bot_id: str
+    bot_name: str | None = None
+    symbol: str
+    direction: str                        # LONG / SHORT
+    entry_price: str                      # Decimal as string
+    entry_qty: str
+    entry_time: datetime
+    exit_price: str | None = None
+    exit_qty: str | None = None
+    exit_time: datetime | None = None
+    realized_pnl: str | None = None
+    commission: str | None = None
+    trail_reset_count: int = 0
+    duration_seconds: int | None = None
+    entry_serial: int | None = None
+    exit_serial: int | None = None
+    created_at: datetime
+
+
 class OrderResponse(BaseModel):
     """Serialized order leg."""
     model_config = ConfigDict(from_attributes=True)

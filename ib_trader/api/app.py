@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.api.deps import set_session_factory
-from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, templates, positions, logs, watchlist
+from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, bot_trades, templates, positions, logs, watchlist
 from ib_trader.api import ws
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,7 @@ def create_app(
     app.include_router(system.router)
     app.include_router(positions.router)
     app.include_router(bots.router)
+    app.include_router(bot_trades.router)
     app.include_router(templates.router)
     app.include_router(logs.router)
     app.include_router(watchlist.router)

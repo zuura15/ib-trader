@@ -130,6 +130,27 @@ export interface TradeGroup {
   orderType: string | null;
 }
 
+export interface BotTrade {
+  id: string;
+  botId: string;
+  botName: string | null;
+  symbol: string;
+  direction: string;
+  entryPrice: string;
+  entryQty: string;
+  entryTime: string;
+  exitPrice: string | null;
+  exitQty: string | null;
+  exitTime: string | null;
+  realizedPnl: string | null;
+  commission: string | null;
+  trailResetCount: number;
+  durationSeconds: number | null;
+  entrySerial: number | null;
+  exitSerial: number | null;
+  createdAt: string;
+}
+
 export interface CommandEntry {
   id: string;
   command: string;

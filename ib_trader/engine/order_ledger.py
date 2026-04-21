@@ -148,6 +148,7 @@ class OrderLedger:
         con_id: int = 0,
         side: str = "",
         remaining: Decimal = Decimal("-1"),
+        total_qty: Decimal = Decimal("-1"),
     ) -> list[dict]:
         """Record a partial or complete fill.
 
@@ -155,13 +156,45 @@ class OrderLedger:
         engine session or by another IB client), a best-effort entry is
         created from the fill metadata.
 
+        ``total_qty`` is the original order size (``trade.order.totalQuantity``).
+        Preferred over ``qty + remaining`` for computing the entry's
+        target_qty because IB updates ``orderStatus.remaining`` across
+        all fills of a SMART-split order before any on_fill task runs —
+        so by the time the first fill's callback reads remaining, it can
+        already be 0 even though more fills are coming. Falls back to
+        ``qty + remaining`` for paths that don't plumb totalQuantity
+        (reconciler reconstructions, older callers).
+
         Returns one or two events:
         - Always: a progress event with last_fill_* populated
-        - If this fill makes remaining=0 (or IB previously signaled a
-          terminal status): also a terminal event
+        - If this fill completes the order (filled_qty >= target_qty or
+          remaining==0 with filled matching target): also a terminal event
         """
+        # Short-circuit: the order was already terminalized earlier
+        # (this is a LATE fill from IBEOS / split-venue delivery, or a
+        # duplicate from IB firing execDetails + orderStatus("Filled")
+        # for the same fill). Emit nothing — the terminal was already
+        # delivered downstream; a second terminal with per-fill qty
+        # would corrupt the bot's cumulative position tracking.
+        if ib_order_id in self._recently_evicted:
+            logger.warning(
+                '{"event": "ORDER_LEDGER_LATE_FILL_AFTER_TERMINAL", '
+                '"ib_order_id": "%s", "symbol": "%s", "qty": "%s", '
+                '"price": "%s", "reason": "already_terminal"}',
+                ib_order_id, symbol, qty, price,
+            )
+            return []
+
         entry = self._entries.get(ib_order_id)
         if entry is None:
+            # Prefer the authoritative total_qty (static once placed).
+            # Fall back to qty+remaining for callers that don't plumb it.
+            if total_qty > 0:
+                target = total_qty
+            elif remaining == Decimal("-1"):
+                target = qty
+            else:
+                target = qty + remaining
             entry = _LedgerEntry(
                 ib_order_id=ib_order_id,
                 order_ref=order_ref,
@@ -169,7 +202,7 @@ class OrderLedger:
                 sec_type=sec_type,
                 con_id=con_id,
                 side=side,
-                target_qty=qty if remaining == Decimal("-1") else qty + remaining,
+                target_qty=target,
             )
             self._entries[ib_order_id] = entry
 

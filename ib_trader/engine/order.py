@@ -887,7 +887,8 @@ async def _execute_mid_order(
                            trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                            correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
                            commission=final_commission)
-                ctx.trades.update_pnl(trade_group.id, Decimal("0"), final_commission)
+                # pnl=None — entry partials shouldn't clobber realized_pnl.
+                ctx.trades.update_pnl(trade_group.id, None, final_commission)
                 _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
                            qty, ib_order_id=_safe_int(ib_order_id),
                            trade_serial=trade_group.serial_number, is_terminal=True,
@@ -1788,7 +1789,12 @@ async def _handle_fill(
     avg_price: Decimal, commission: Decimal, cmd, con_id: int, ctx: AppContext,
 ) -> None:
     """Record a complete fill and place profit taker if configured."""
-    ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
+    # pnl=None preserves the trade_group's realized_pnl (stays NULL for
+    # entries; the close path owns P&L writes). Previously we wrote
+    # Decimal("0") here which clobbered bot-driven trade_groups with a
+    # meaningless zero and made the Trades panel read "$0.00" for every
+    # row. Commission still updates normally.
+    ctx.trades.update_pnl(trade_group.id, None, commission)
 
     _write_txn(ctx, TransactionAction.FILLED, order_ctx.symbol, order_ctx.side,
                order_ctx.order_type, qty_filled,
@@ -2086,7 +2092,8 @@ async def _handle_partial(
                trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
                commission=commission)
-    ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
+    # pnl=None — partials on the entry side shouldn't clobber realized_pnl.
+    ctx.trades.update_pnl(trade_group.id, None, commission)
     _write_txn(ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
                order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
