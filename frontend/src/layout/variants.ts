@@ -143,8 +143,9 @@ export const variantB: IJsonModel = {
             children: [
               { type: 'tab', name: 'Positions', component: 'positions' },
               { type: 'tab', name: 'Watchlist', component: 'watchlist' },
-              { type: 'tab', name: 'Watchlist', component: 'watchlist' },
               { type: 'tab', name: 'Orders', component: 'orders' },
+              { type: 'tab', name: 'Trades', component: 'trades' },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
             ],
           },
           {
@@ -218,6 +219,8 @@ export const variantC: IJsonModel = {
             weight: 35,
             children: [
               { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
+              { type: 'tab', name: 'Trades', component: 'trades', config: { compact: true } },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
             ],
           },
           {
@@ -291,6 +294,8 @@ export const variantD: IJsonModel = {
               { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
               { type: 'tab', name: 'Positions', component: 'positions', config: { compact: true } },
               { type: 'tab', name: 'Watchlist', component: 'watchlist', config: { compact: true } },
+              { type: 'tab', name: 'Trades', component: 'trades', config: { compact: true } },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
             ],
           },
           {

@@ -72,6 +72,10 @@ function applyTabSelection(model: Model, map: Record<string, string>): void {
 // forcing a reset.
 const MIGRATED_TABS: Array<{ component: string; name: string; anchor: string }> = [
   { component: 'errors', name: 'Errors', anchor: 'logs' },
+  // Anchor on 'orders' — present in every variant, unlike 'trades'
+  // which only appears in variant A. This way users on any variant get
+  // the new tab injected next to their Orders tabset.
+  { component: 'bot-trades', name: 'Bot Trades', anchor: 'orders' },
 ];
 
 function migrateLayoutJson(raw: any): any {
