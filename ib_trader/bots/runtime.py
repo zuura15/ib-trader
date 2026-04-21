@@ -855,6 +855,13 @@ class StrategyBotRunner(BotBase):
                     "trail_activated": False,
                     "trail_reset_count": 0,          # reset for this trade
                     "entry_serial": doc.get("serial"),
+                    # Snapshot the entry order's ib_order_id NOW — once the
+                    # exit is placed, doc["ib_order_id"] is overwritten with
+                    # the exit's id and the entry reference is lost. Needed
+                    # at close time to resolve trade_serial from transactions
+                    # so commission (which lands keyed on ib_order_id) can
+                    # be matched back to the right bot_trade row.
+                    "entry_ib_order_id": doc.get("ib_order_id"),
                 }
                 await self._apply_transition(
                     doc, BotState.AWAITING_EXIT_TRIGGER, patch, "on_entry_filled",
@@ -945,6 +952,8 @@ class StrategyBotRunner(BotBase):
                     "trail_reset_count": int(doc.get("trail_reset_count") or 0),
                     "entry_serial": doc.get("entry_serial") or doc.get("serial"),
                     "exit_serial": doc.get("serial"),
+                    "entry_ib_order_id": doc.get("entry_ib_order_id"),
+                    "exit_ib_order_id": doc.get("ib_order_id"),
                 }
                 patch = {
                     **clear_position_fields(),
@@ -1341,6 +1350,41 @@ class StrategyBotRunner(BotBase):
                 "residual_qty": str(qty),
             })
 
+    def _resolve_trade_serial(self, ib_order_id) -> int | None:
+        """Return ``trade_serial`` from the FILLED/PARTIAL_FILL
+        transaction row for ``ib_order_id``, or None if we can't find
+        one. Used at bot_trade creation time to link the row to the
+        trade group so late commission reports can match.
+        """
+        if ib_order_id in (None, "", 0, "0"):
+            return None
+        try:
+            order_id_int = int(ib_order_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            from ib_trader.data.models import (
+                TransactionEvent, TransactionAction,
+            )
+            s = self._session_factory()
+            ev = (
+                s.query(TransactionEvent)
+                .filter(
+                    TransactionEvent.ib_order_id == order_id_int,
+                    TransactionEvent.action.in_([
+                        TransactionAction.FILLED,
+                        TransactionAction.PARTIAL_FILL,
+                    ]),
+                )
+                .first()
+            )
+            return ev.trade_serial if ev is not None else None
+        except Exception:
+            logger.debug(
+                "resolve_trade_serial failed", exc_info=True,
+            )
+            return None
+
     async def _handle_record_trade_closed(self, args: dict) -> None:
         """Record realized P&L + trade count + bot-trade row when an exit
         fully fills.
@@ -1394,6 +1438,19 @@ class StrategyBotRunner(BotBase):
                 (exit_time_dt - entry_time_dt).total_seconds()
             ) if entry_time_dt else None
 
+            # Resolve entry/exit trade_serials by ib_order_id so late-
+            # arriving commission callbacks (which key on ib_order_id →
+            # trade_serial) can find this row and update it in place.
+            # The bot's own "serial" state is effectively never populated
+            # today, but transactions.trade_serial IS populated by the
+            # engine's _handle_fill path — so look it up from there.
+            entry_serial = self._resolve_trade_serial(
+                args.get("entry_ib_order_id")
+            ) or args.get("entry_serial")
+            exit_serial = self._resolve_trade_serial(
+                args.get("exit_ib_order_id")
+            ) or args.get("exit_serial")
+
             from ib_trader.data.models import BotTrade
             row = BotTrade(
                 bot_id=self.bot_id,
@@ -1410,8 +1467,8 @@ class StrategyBotRunner(BotBase):
                 commission=Decimal(args.get("commission") or "0"),
                 trail_reset_count=int(args.get("trail_reset_count") or 0),
                 duration_seconds=duration,
-                entry_serial=args.get("entry_serial"),
-                exit_serial=args.get("exit_serial"),
+                entry_serial=entry_serial,
+                exit_serial=exit_serial,
                 created_at=exit_time_dt,
             )
             self._bot_trades_repo.create(row)
