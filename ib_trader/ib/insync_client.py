@@ -876,6 +876,19 @@ class InsyncClient(IBClientBase):
         10340, # ManualOrderIndicator not supported (delayed warning, not an error)
     })
 
+    # Benign order-race codes — the order already terminalized by the
+    # time our code tried to amend/cancel. The engine's walker and
+    # close paths catch these cleanly (e.g. SMART_MARKET_AMEND_RACE),
+    # so they're noise, not failures. Logged at WARNING; NOT written
+    # to _order_errors so the PendingSubmit wait loop and bid/ask
+    # rejection detector don't surface a spurious rejection.
+    _BENIGN_ORDER_RACE_CODES: frozenset[int] = frozenset({
+        104,    # Cannot modify a filled order
+        105,    # Order does not match any existing order
+        135,    # Can't find order with id
+        10147,  # OrderId is not an active order
+    })
+
     def _on_error(self, reqId: int, errorCode: int, errorString: str, *_) -> None:
         """Handle IB error events.
 
@@ -893,6 +906,7 @@ class InsyncClient(IBClientBase):
         """
         ib_order_id = str(reqId)
         is_info = errorCode in self._INFO_CODES
+        is_benign_race = errorCode in self._BENIGN_ORDER_RACE_CODES
         if ib_order_id in self._active_trades:
             # INFO-class codes (e.g. 10340 ManualOrderIndicator) still
             # reference an active order but must NOT be treated as a
@@ -901,6 +915,17 @@ class InsyncClient(IBClientBase):
             if is_info:
                 logger.info(
                     '{"event": "IB_NOTICE", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+            elif is_benign_race:
+                # Expected race when our walker/close path amends or
+                # cancels an order that IB just terminalized. The engine
+                # side handles these via SMART_MARKET_AMEND_RACE (or the
+                # close-path guard) and returns cleanly — this is a
+                # diagnostic, not an error.
+                logger.warning(
+                    '{"event": "IB_ORDER_RACE", "ib_order_id": "%s", '
+                    '"code": %d, "msg": "%s"}',
                     ib_order_id, errorCode, errorString,
                 )
             else:

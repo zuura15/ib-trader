@@ -1820,6 +1820,17 @@ class StrategyBotRunner(BotBase):
 
         # ── Quote tick ─────────────────────────────────────────────────
         if stream_name == quote_stream:
+            # Stale-quote liveness: update BEFORE the state gate so the
+            # timestamp stays fresh during AWAITING_ENTRY_TRIGGER / *_ORDER_PLACED
+            # too. Otherwise a long wait for the next entry trigger leaves
+            # _last_quote_time frozen, and the moment the bot transitions
+            # into AWAITING_EXIT_TRIGGER the watchdog reads an ancient
+            # value and false-positives as BOT_CRASH. Liveness is an
+            # observation of the quote stream, independent of whether
+            # the strategy chooses to act on it.
+            self._last_quote_time = time.monotonic()
+            self._quote_stale_logged = False
+
             # State gate: strategy only runs in AWAITING_EXIT_TRIGGER.
             # ENTRY_ORDER_PLACED / EXIT_ORDER_PLACED reach here too while
             # an order is in flight — the state check alone is sufficient
@@ -1849,8 +1860,6 @@ class StrategyBotRunner(BotBase):
                 last=last,
                 timestamp=ts,
             )
-            self._last_quote_time = time.monotonic()
-            self._quote_stale_logged = False
             actions = await self.strategy.on_event(quote, self.ctx)
             if actions:
                 await self._run_pipeline(actions)
