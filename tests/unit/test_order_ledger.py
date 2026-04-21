@@ -165,3 +165,51 @@ def test_order_ref_passthrough(ledger):
     )
     for e in events:
         assert e["orderRef"] == "IBT:test-ford:F:B:42"
+
+
+def test_smart_split_does_not_terminal_on_first_partial(ledger):
+    """When IB fires two execDetails back-to-back for a SMART-split order,
+    both events update trade.orderStatus.remaining to 0 synchronously before
+    any on_fill task runs. The first fill's callback therefore reads
+    remaining=0 prematurely. The ledger must not terminalize at that point —
+    it should wait until accumulated fills reach target_qty. Otherwise the
+    second fill is rejected as "late after terminal" and the bot-side
+    accounting under-counts the actual position (PSQ bug: 346-share buy
+    filled as 100 + 246, bot tracked only 100, 246 shares orphaned in IB).
+    """
+    ledger.register("1899", "ref", "PSQ", "STK", 692767261, "BUY", Decimal("346"))
+    # Fill 1: 100 shares. Engine reads live remaining from orderStatus which
+    # has already been updated to 0 by fill 2's status update.
+    events1 = ledger.record_fill(
+        "1899", qty=Decimal("100"), price=Decimal("28.855"),
+        commission=Decimal("0"),
+        remaining=Decimal("0"),  # <- racy, not authoritative
+        total_qty=Decimal("346"),
+    )
+    assert len(events1) == 1, "first partial must NOT emit terminal yet"
+    assert events1[0]["terminal"] is False
+    assert events1[0]["status"] == "PartiallyFilled"
+    assert events1[0]["filled_qty"] == "100"
+
+    # Fill 2: 246 shares arrives, accumulating to target=346.
+    events2 = ledger.record_fill(
+        "1899", qty=Decimal("246"), price=Decimal("28.855"),
+        commission=Decimal("0"),
+        remaining=Decimal("0"),
+        total_qty=Decimal("346"),
+    )
+    assert len(events2) == 2, "second fill must emit progress + terminal"
+    assert events2[1]["terminal"] is True
+    assert events2[1]["filled_qty"] == "346"
+
+
+def test_untracked_fill_still_terminals_on_remaining_zero(ledger):
+    """Fallback path — when target_qty isn't known (unregistered order,
+    no total_qty plumbed), remaining==0 is still honored as terminal."""
+    events = ledger.record_fill(
+        "5000", qty=Decimal("5"), price=Decimal("100"),
+        commission=Decimal("0"), order_ref="ext", symbol="AAPL",
+        side="BUY", remaining=Decimal("0"),  # no total_qty
+    )
+    # Entry synthesized with target=qty+remaining=5, filled_qty hits target.
+    assert any(e["terminal"] for e in events)

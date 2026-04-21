@@ -219,11 +219,22 @@ class OrderLedger:
             last_fill_price=price,
         ))
 
-        # Check for terminal: remaining==0 from IB OR we've accumulated target
+        # Terminal gate — when target_qty is known (static from
+        # trade.order.totalQuantity plumbed in by the engine), trust
+        # accumulated fills over remaining. IB updates
+        # trade.orderStatus.remaining across ALL fills of a SMART-split
+        # order synchronously during event dispatch, so by the time
+        # the FIRST fill's on_fill task runs, `remaining` is already 0
+        # even though more fills are still queued. Gating on remaining==0
+        # here would terminalize at the first partial and reject the
+        # later split fills as "late after terminal", leaving an orphan
+        # position in IB. Fall back to remaining==0 only when we don't
+        # have a reliable target (unregistered order path).
+        target_known = entry.target_qty > 0
         is_terminal = (
-            (remaining == Decimal("0"))
-            or (entry.filled_qty >= entry.target_qty)
+            (target_known and entry.filled_qty >= entry.target_qty)
             or (entry.last_status in _TERMINAL_STATUSES)
+            or (not target_known and remaining == Decimal("0"))
         )
         if is_terminal:
             events.append(self._make_terminal(entry))
