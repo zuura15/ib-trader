@@ -91,13 +91,14 @@ position_poll_interval_seconds: 60
 # IB is the only source of terminal events. If IB stalls, the user
 # reconciles manually.
 order_terminal_timeout_seconds: 300
-# Max age of the engine-wide market-data heartbeat key before a bot
-# in AWAITING_EXIT_TRIGGER halts itself as BOT_CRASH. The heartbeat
-# ticks whenever ANY tracked symbol publishes a quote, so this is a
-# "is the engine receiving market data at all" check — NOT a
-# per-symbol freshness check. Bots monitoring illiquid symbols (PSQ
-# etc.) no longer false-positive during natural quiet periods.
-market_data_heartbeat_stale_halt_seconds: 120
+# Max age of the QUOTE-STREAM heartbeat key before a bot in
+# AWAITING_EXIT_TRIGGER halts itself as BOT_CRASH. The heartbeat
+# ticks whenever ANY tracked symbol publishes a quote — a "is the
+# quote stream as a whole alive?" check, NOT per-symbol freshness.
+# Distinct from the engine process heartbeat (SQLite `heartbeats`
+# ENGINE row). Bots on illiquid symbols (PSQ, etc.) won't false-halt
+# during natural quiet periods on their specific symbol.
+quotes_heartbeat_stale_halt_seconds: 120
 bot_runner_internal_port: 8082
 reconciliation_interval_seconds: 3600
 db_integrity_check_interval_seconds: 21600

@@ -65,11 +65,11 @@ def _parse_aware_dt(s: str) -> datetime:
     return dt
 _QUOTE_CHECK_INTERVAL = 1.0  # seconds between exit quote checks
 _STALE_QUOTE_WARN_SECONDS = 45   # engine polls every 30s, so 45s = missed one poll
-# Halt threshold is the engine-wide market-data heartbeat default;
-# overridden per-deployment by settings.market_data_heartbeat_stale_halt_seconds.
-# The previous per-symbol halt wasn't reliable — illiquid symbols (PSQ, etc.)
-# go 120s+ between ticks during quiet sessions without anything being wrong.
-_DEFAULT_HEARTBEAT_STALE_HALT_SECONDS = 120
+# Halt threshold for the quote-stream heartbeat. Overridden per-deployment
+# by settings.quotes_heartbeat_stale_halt_seconds. This is NOT a per-symbol
+# check — it's "is the quote stream as a whole alive?". Per-symbol silence
+# is fine on low-liquidity instruments (PSQ, etc.).
+_DEFAULT_QUOTES_HEARTBEAT_HALT_SECONDS = 120
 
 class StrategyBotRunner(BotBase):
     """BotBase adapter that runs a Strategy via the runtime.
@@ -2165,16 +2165,16 @@ class StrategyBotRunner(BotBase):
             await self._run_pipeline(actions)
 
     async def _read_heartbeat_age(self) -> tuple[bool, float | None, dict]:
-        """Return (present, age_seconds, raw_payload) for the engine's
-        market-data heartbeat key. Age is None if the key is absent or
-        the timestamp can't be parsed.
+        """Return (present, age_seconds, raw_payload) for the quote-stream
+        heartbeat key. Age is None if the key is absent or the timestamp
+        can't be parsed. This is NOT the engine process heartbeat.
         """
         redis = self.config.get("_redis")
         if redis is None:
             return False, None, {"redis": "unavailable"}
         try:
             from ib_trader.redis.state import StateStore, StateKeys
-            hb = await StateStore(redis).get(StateKeys.market_data_heartbeat())
+            hb = await StateStore(redis).get(StateKeys.quotes_heartbeat())
         except Exception as e:
             return False, None, {"redis_get_error": str(e)}
         if not hb:
@@ -2259,8 +2259,8 @@ class StrategyBotRunner(BotBase):
         symbol = self.strategy_config.get("symbol", "")
         halt_threshold = float(
             self.config.get(
-                "market_data_heartbeat_stale_halt_seconds",
-                _DEFAULT_HEARTBEAT_STALE_HALT_SECONDS,
+                "quotes_heartbeat_stale_halt_seconds",
+                _DEFAULT_QUOTES_HEARTBEAT_HALT_SECONDS,
             )
         )
 
@@ -2278,7 +2278,7 @@ class StrategyBotRunner(BotBase):
                 hb_age if (hb_present and hb_age is not None) else per_symbol_elapsed
             )
             logger.error(
-                '{"event": "STALE_QUOTE_HALT_DIAG", "bot_id": "%s", '
+                '{"event": "STALE_QUOTE_STREAM_HALT_DIAG", "bot_id": "%s", '
                 '"symbol": "%s", "elapsed_s": %.1f, '
                 '"heartbeat_present": %s, "halt_threshold_s": %.1f, '
                 '"probe": %s}',
@@ -2289,7 +2289,7 @@ class StrategyBotRunner(BotBase):
             actions = [LogSignal(
                 event_type=LogEventType.ERROR,
                 message=(
-                    f"Market-data heartbeat stale ({effective_elapsed:.0f}s) "
+                    f"Quote-stream heartbeat stale ({effective_elapsed:.0f}s) "
                     f"— halting bot"
                 ),
                 payload={
@@ -2300,7 +2300,7 @@ class StrategyBotRunner(BotBase):
             )]
             await self._run_pipeline(actions)
             try:
-                await self.on_crash(message="STALE_MARKET_DATA_HEARTBEAT")
+                await self.on_crash(message="STALE_QUOTE_STREAM")
             except Exception:
                 logger.exception(
                     '{"event": "STALE_QUOTE_CRASH_DISPATCH_FAILED", "bot_id": "%s"}',

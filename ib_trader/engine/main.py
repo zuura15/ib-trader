@@ -966,7 +966,6 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
 
     state = StateStore(redis)
     writers: dict[str, StreamWriter] = {}
-    last_values: dict[str, tuple] = {}  # symbol → (bid, ask, last) dedup
 
     async def _publish_one(ticker) -> None:
         try:
@@ -993,10 +992,16 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
             if bid is None and ask is None and last is None:
                 return
 
-            current = (bid, ask, last)
-            if current == last_values.get(symbol):
-                return
-            last_values[symbol] = current
+            # No price-tuple dedup. Identical prices across ticks are
+            # perfectly valid market data — a repeated trade at the same
+            # last, or a book that held firm while size changed on the
+            # opposite side. Deduping on (bid, ask, last) silently dropped
+            # ticks on narrow-band symbols (PSQ et al.), leaving the
+            # quote stream and the per-symbol :latest key stale for
+            # minutes even though IB was pushing ticks continuously.
+            # ib_async only surfaces a ticker via pendingTickersEvent
+            # when it has new data, so there's no real duplicate to
+            # dedup against here.
 
             if symbol not in writers:
                 writers[symbol] = StreamWriter(
@@ -1032,15 +1037,17 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                 quote_data,
                 ttl=StateKeys.QUOTE_TTL,
             )
-            # Engine-wide market-data liveness heartbeat. Any tick for
-            # any tracked symbol keeps this key fresh. Bots halt when
-            # they see this key stale — distinct from "my specific
-            # symbol is quiet", which can happen naturally on illiquid
-            # instruments (PSQ, etc.) without indicating an outage.
+            # Quote-stream liveness heartbeat. Any IB tick for any
+            # tracked symbol keeps this key fresh — purely about "are
+            # quotes flowing at all", so bots can halt when the whole
+            # stream stalls instead of false-alarming on one quiet
+            # symbol. This is NOT the engine process heartbeat (that
+            # lives under the SQLite `heartbeats` ENGINE row and is
+            # driven independently); the two concerns are decoupled.
             await state.set(
-                StateKeys.market_data_heartbeat(),
+                StateKeys.quotes_heartbeat(),
                 {"ts": quote_data["ts"], "symbol": symbol},
-                ttl=StateKeys.MARKET_DATA_HEARTBEAT_TTL,
+                ttl=StateKeys.QUOTES_HEARTBEAT_TTL,
             )
         except Exception:
             logger.exception('{"event": "TICK_PUBLISHER_ERROR"}')

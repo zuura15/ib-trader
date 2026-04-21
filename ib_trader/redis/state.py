@@ -79,14 +79,22 @@ class StateKeys:
         return f"quote:{symbol}:latest"
 
     @staticmethod
-    def market_data_heartbeat() -> str:
+    def quotes_heartbeat() -> str:
         """Single key updated by the engine's quote publisher on every IB
-        tick for any tracked symbol. Bots read this to detect an engine
-        or market-data outage — distinct from a specific symbol just
-        going quiet. Liquidity per symbol varies widely (PSQ can go 120s+
-        between ticks mid-session), so per-symbol freshness is a poor
-        halt signal. This key ticks whenever ANY symbol does."""
-        return "market_data:heartbeat"
+        quote tick for any tracked symbol. Purpose: give bots a way to
+        decide whether the QUOTE STREAM is alive as a whole, separate
+        from any one symbol's natural tick cadence. Illiquid symbols
+        (PSQ etc.) can go 120 s+ between ticks mid-session without
+        anything being wrong, so per-symbol freshness is a poor halt
+        signal; this key ticks whenever ANY subscribed symbol does.
+
+        This is NOT the engine process heartbeat (that lives on the
+        ``heartbeats`` SQLite table / ``ENGINE`` row and is updated
+        independently by the engine itself). The two are intentionally
+        decoupled: the engine can be alive but market data could stall
+        (IB subscription dropped, gateway hung on the md side) — bots
+        care about the latter, not the former."""
+        return "quotes:heartbeat"
 
     @staticmethod
     def position(bot_ref: str, symbol: str) -> str:
@@ -208,7 +216,7 @@ class StateKeys:
     # Heartbeat outlives the default bot halt threshold (120 s) so the
     # key only disappears when the engine is genuinely offline — a
     # missing key IS the halt signal, not a false positive.
-    MARKET_DATA_HEARTBEAT_TTL = 600
+    QUOTES_HEARTBEAT_TTL = 600
     HEARTBEAT_TTL = 120
     BOT_HEARTBEAT_TTL = 300          # 5 min — bot supervisor fires every 10s
     BOT_LAST_ACTION_TTL = 300        # 5 min — UI surface, not decision input

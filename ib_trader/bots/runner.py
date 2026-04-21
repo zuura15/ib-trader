@@ -197,9 +197,9 @@ async def _create_and_start_bot(
     try:
         from ib_trader.config.loader import load_settings
         _settings = load_settings("config/settings.yaml")
-        if "market_data_heartbeat_stale_halt_seconds" in _settings:
-            config["market_data_heartbeat_stale_halt_seconds"] = \
-                _settings["market_data_heartbeat_stale_halt_seconds"]
+        if "quotes_heartbeat_stale_halt_seconds" in _settings:
+            config["quotes_heartbeat_stale_halt_seconds"] = \
+                _settings["quotes_heartbeat_stale_halt_seconds"]
     except Exception:
         logger.debug("settings_load_failed", exc_info=True)
     bot = strategy_cls(defn.id, config, session_factory)
