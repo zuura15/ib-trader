@@ -1,0 +1,46 @@
+# Close-Price Trend RSI Strategy Configuration — GLD
+# Buys dips within confirmed uptrends detected on close-price line graph.
+# More responsive than sawtooth in tight price ranges.
+
+name: close_trend_rsi_reversal
+ref_id: ctr-gld
+version: "1.0"
+
+# Symbol and sizing
+symbol: GLD
+max_position_value: 50000     # $50K max per trade
+max_shares: 120               # GLD trades around $430 → ~116 shares fits $50K
+order_strategy: smart_market  # aggressive-mid walker → MKT residual; timing beats 1-2¢ on entry
+
+# Bar configuration
+bar_size_seconds: 180         # 3-minute bars
+lookback_bars: 20             # ~60 min of 3-min bars, prefilled on startup
+
+# Entry conditions (ALL must be true)
+entry:
+  trend_detector: close_trend   # "close_trend" or "sawtooth"
+  peak_window: 2                # bars each side for peak/valley confirmation
+  trend_points: 2               # min ascending peaks AND valleys
+  max_valley_bars_ago: 5        # must be near a recent valley
+  max_rsi: 60                   # RSI(14) must be below this
+
+# Exit rules
+exit:
+  hard_stop_loss_pct: 0.001       # -0.1% from entry, always active
+  trail_activation_pct: 0.0005    # +0.05% gain before trail activates
+  trail_width_pct: 0.0015         # 0.15% below high-water mark
+  time_stop_minutes: 108          # keyed from fill timestamp
+  entry_timeout_seconds: 30       # cancel unfilled entry after this
+  exit_price: bid                 # which quote field triggers stops
+
+# Session filters
+session_filter:
+  skip_close_transition: true     # skip 1:00-2:00 PM PT
+  skip_turn_minutes: 5            # skip 5 min before/after hour/half-hour
+
+# Risk controls
+risk:
+  max_daily_loss_pct: 0.02        # 2% of account ($1000)
+  max_concurrent_positions: 1
+  max_trades_per_day: 10
+  account_value: "50000"
