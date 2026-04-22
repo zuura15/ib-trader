@@ -1484,28 +1484,43 @@ class StrategyBotRunner(BotBase):
                 int(args.get("trail_reset_count") or 0),
             )
 
-            # Also stamp the EXIT trade_group's realized_pnl so the
-            # Trades panel (which reads from trade_groups.realized_pnl)
-            # shows the bot's round-trip P&L on the exit row. The entry
-            # trade_group stays with realized_pnl=NULL (it's still the
-            # "entry leg" of a synthesized round-trip, not a close).
-            exit_serial = args.get("exit_serial")
-            if exit_serial is not None:
-                try:
-                    from ib_trader.data.repository import TradeRepository
-                    trade_repo = TradeRepository(self._session_factory)
+            # Stamp both trade_groups so the Trades panel (which reads
+            # trade_groups.realized_pnl / status) no longer shows the
+            # bot's round-trips as perpetually OPEN with null P&L.
+            #   - EXIT trade_group gets the round-trip P&L (realized
+            #     when the close leg fills — matches the engine's
+            #     execute_close semantics).
+            #   - ENTRY trade_group is marked CLOSED with P&L=0 so it
+            #     doesn't linger as OPEN, and summing realized_pnl
+            #     across CLOSED rows gives the round-trip total.
+            # Use the already-resolved entry_serial / exit_serial
+            # locals computed just above — args["exit_serial"] is
+            # always None (bot doc never populates "serial").
+            try:
+                from ib_trader.data.repository import TradeRepository
+                from ib_trader.data.models import TradeStatus
+                trade_repo = TradeRepository(self._session_factory)
+                if exit_serial is not None:
                     exit_tg = trade_repo.get_by_serial(int(exit_serial))
                     if exit_tg is not None:
                         trade_repo.update_pnl(
                             exit_tg.id, pnl,
                             Decimal(args.get("commission") or "0"),
                         )
-                except Exception:
-                    logger.exception(
-                        '{"event": "BOT_TRADE_EXIT_PNL_UPDATE_FAILED", '
-                        '"bot_id": "%s", "exit_serial": %s}',
-                        self.bot_id, exit_serial,
-                    )
+                        trade_repo.update_status(exit_tg.id, TradeStatus.CLOSED)
+                if entry_serial is not None:
+                    entry_tg = trade_repo.get_by_serial(int(entry_serial))
+                    if entry_tg is not None:
+                        trade_repo.update_pnl(
+                            entry_tg.id, Decimal("0"), Decimal("0"),
+                        )
+                        trade_repo.update_status(entry_tg.id, TradeStatus.CLOSED)
+            except Exception:
+                logger.exception(
+                    '{"event": "BOT_TRADE_GROUP_UPDATE_FAILED", '
+                    '"bot_id": "%s", "entry_serial": %s, "exit_serial": %s}',
+                    self.bot_id, entry_serial, exit_serial,
+                )
         except Exception:
             logger.exception(
                 '{"event": "BOT_TRADE_WRITE_FAILED", "bot_id": "%s"}',
