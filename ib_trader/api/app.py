@@ -43,6 +43,23 @@ def create_app(
     async def lifespan(app: FastAPI):
         set_session_factory(session_factory)
 
+        # Populate the in-memory bot registry from config/bots/*.yaml.
+        # Without this, registry_config.get_by_name() returns None for
+        # every lookup — the WebSocket `subscribe_bot` handler silently
+        # aborts on that, which breaks the Bots-pane SharesCell and
+        # ForceSellButton live updates. The bot runner does its own
+        # load(); the API server had been missing this call.
+        try:
+            from ib_trader.bots import registry_config
+            defns = registry_config.load()
+            logger.info(
+                '{"event": "API_BOT_REGISTRY_LOADED", "count": %d}', len(defns),
+            )
+        except Exception as e:
+            logger.warning(
+                '{"event": "API_BOT_REGISTRY_LOAD_FAILED", "error": "%s"}', str(e),
+            )
+
         # Connect to Redis for real-time data
         try:
             from ib_trader.config.loader import load_settings
