@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useStore } from '../../data/store';
 import { formatAge } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
@@ -400,13 +400,14 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
             return (
               <div
                 key={bot.id}
-                className="rounded border p-2 flex items-center gap-3 flex-wrap"
+                className="rounded border p-2"
                 style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-default)' }}
                 data-testid={`bot-row-${bot.id}`}
                 data-bot-id={bot.id}
                 data-bot-name={bot.name}
                 data-bot-status={bot.status}
               >
+                <div className="flex items-center gap-3 flex-wrap">
                 <span style={{ color: cfg.var }} className="text-sm" title={cfg.label}>{cfg.dot}</span>
                 <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>{bot.name}</span>
                 <span className="font-mono text-[13px]" style={{ color: 'var(--text-secondary)' }}>{symbol}</span>
@@ -489,6 +490,14 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     RESET
                   </button>
                 </div>
+                </div>
+                {/* Position details — PositionLine self-gates to null when
+                    the bot is flat, so this only materializes while a
+                    position is open. Top row stays uncluttered in the
+                    common case; detail appears exactly when useful. */}
+                {bot.symbols[0] && (
+                  <PositionLine botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                )}
               </div>
             );
           })}
@@ -519,8 +528,8 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
               const cfg = statusConfig[bot.status];
               const symbol = bot.symbols[0] || '—';
               return (
+                <React.Fragment key={bot.id}>
                 <tr
-                  key={bot.id}
                   data-testid={`bot-row-${bot.id}`}
                   data-bot-id={bot.id}
                   data-bot-name={bot.name}
@@ -610,6 +619,14 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     </button>
                   </td>
                 </tr>
+                {bot.symbols[0] && (
+                  <tr>
+                    <td colSpan={6} style={{ padding: 0 }}>
+                      <PositionLine botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               );
             })}
           </tbody>
