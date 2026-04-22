@@ -4,7 +4,6 @@ All Decimal fields serialize as strings to avoid float precision loss.
 All datetimes serialize as ISO 8601 UTC strings.
 """
 from datetime import datetime
-from decimal import Decimal
 from pydantic import BaseModel, ConfigDict
 
 
@@ -12,12 +11,14 @@ class CommandRequest(BaseModel):
     """Request body for POST /api/commands."""
     command: str
     broker: str = "ib"
+    command_id: str | None = None  # Client-supplied id; keys the live-output Redis stream so the frontend can subscribe before the POST returns.
 
 
 class CommandResponse(BaseModel):
-    """Response for command submission (202 Accepted)."""
+    """Response for command submission."""
     command_id: str
     status: str
+    output: str | None = None  # Set when synchronous (read-only commands or completed orders)
 
 
 class CommandStatusResponse(BaseModel):
@@ -46,6 +47,38 @@ class TradeResponse(BaseModel):
     total_commission: str | None = None
     opened_at: datetime
     closed_at: datetime | None = None
+    # Augmented fill detail from the transaction legs — populated by
+    # /api/trades so the Trades panel can render a data-rich row
+    # (qty, entry/exit price, P&L%) without a second API call.
+    entry_qty: str | None = None         # ib_filled_qty on the entry fill
+    entry_price: str | None = None       # ib_avg_fill_price on the entry fill
+    exit_qty: str | None = None          # ib_filled_qty summed across CLOSE legs
+    exit_price: str | None = None        # weighted avg across CLOSE fills
+    order_type: str | None = None        # order_type on the entry leg (mid/market/...)
+
+
+class BotTradeResponse(BaseModel):
+    """One synthesized bot entry-to-exit round-trip."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    bot_id: str
+    bot_name: str | None = None
+    symbol: str
+    direction: str                        # LONG / SHORT
+    entry_price: str                      # Decimal as string
+    entry_qty: str
+    entry_time: datetime
+    exit_price: str | None = None
+    exit_qty: str | None = None
+    exit_time: datetime | None = None
+    realized_pnl: str | None = None
+    commission: str | None = None
+    trail_reset_count: int = 0
+    duration_seconds: int | None = None
+    entry_serial: int | None = None
+    exit_serial: int | None = None
+    created_at: datetime
 
 
 class OrderResponse(BaseModel):

@@ -8,8 +8,8 @@
 #   tail -f logs/bots.log
 #
 # Usage:
-#   ./deploy/tmux-dev.sh          # paper trading (default)
-#   ./deploy/tmux-dev.sh --live   # live trading
+#   ./deploy/tmux-dev.sh                    # auto-detect paper/live from Gateway
+#   ./deploy/tmux-dev.sh --force-mode live  # assert live; error if not
 #
 # Layout (Window 1 "main"):
 #   ┌──────────────────┬──────────────────┐
@@ -32,9 +32,9 @@ FRONTEND_DIR="$DIR/frontend"
 
 mkdir -p "$LOGS"
 
-PAPER="--paper"
-if [ "$1" = "--live" ]; then
-    PAPER=""
+# Pass through any extra flags (e.g. --force-mode live) to engine/daemon.
+EXTRA_ARGS="$*"
+if [[ "$EXTRA_ARGS" == *"--force-mode live"* ]]; then
     echo "WARNING: Starting in LIVE trading mode!"
     read -p "Press Enter to confirm or Ctrl+C to abort..."
 fi
@@ -46,7 +46,7 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 tmux new-session -d -s "$SESSION" -n "main" -c "$DIR"
 tmux select-pane -T "ENGINE"
-tmux send-keys -t "$SESSION" "$VENV/ib-engine $PAPER 2>&1 | tee $LOGS/engine.log" Enter
+tmux send-keys -t "$SESSION" "$VENV/ib-engine $EXTRA_ARGS 2>&1 | tee $LOGS/engine.log" Enter
 
 # Split right: API server
 tmux split-window -h -t "$SESSION" -c "$DIR"
@@ -57,7 +57,7 @@ tmux send-keys -t "$SESSION" "sleep 2 && $VENV/ib-api 2>&1 | tee $LOGS/api.log" 
 tmux select-pane -t "$SESSION:main.0"
 tmux split-window -v -t "$SESSION" -c "$DIR"
 tmux select-pane -T "DAEMON"
-tmux send-keys -t "$SESSION" "sleep 3 && $VENV/ib-daemon $PAPER 2>&1 | tee $LOGS/daemon.log" Enter
+tmux send-keys -t "$SESSION" "sleep 3 && $VENV/ib-daemon $EXTRA_ARGS 2>&1 | tee $LOGS/daemon.log" Enter
 
 # Split bottom-right: frontend
 tmux select-pane -t "$SESSION:main.2"

@@ -55,6 +55,12 @@ class MockIBClient(IBClientBase):
     async def disconnect(self) -> None:
         self.connected = False
 
+    def managed_accounts(self) -> list[str]:
+        """Tests default to a single paper account. Override via attribute
+        (``mock_ib.mock_managed_accounts = [...]``) when a test needs to
+        exercise mismatch detection."""
+        return getattr(self, "mock_managed_accounts", ["DU0000000"])
+
     async def qualify_contract(self, symbol, sec_type="STK", exchange="SMART", currency="USD") -> dict:
         await self._throttle()
         return self._qualify_result
@@ -64,13 +70,14 @@ class MockIBClient(IBClientBase):
         return self._market_snapshot
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         await self._throttle()
         ib_id = str(self._next_order_id)
         self._next_order_id += 1
         self.placed_orders.append({
             "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
             "side": side, "qty": qty, "price": price, "tif": tif,
+            "order_ref": order_ref,
         })
         self._order_statuses[ib_id] = {
             "status": "Submitted",
@@ -80,13 +87,15 @@ class MockIBClient(IBClientBase):
         }
         return ib_id
 
-    async def place_market_order(self, con_id, symbol, side, qty, outside_rth=True) -> str:
+    async def place_market_order(self, con_id, symbol, side, qty,
+                                 outside_rth=True, order_ref=None) -> str:
         await self._throttle()
         ib_id = str(self._next_order_id)
         self._next_order_id += 1
         self.placed_orders.append({
             "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
             "side": side, "qty": qty, "type": "MARKET",
+            "order_ref": order_ref,
         })
         self._order_statuses[ib_id] = {
             "status": "Submitted",
@@ -198,8 +207,10 @@ def ctx(session_factory, mock_ib):
         "max_retries": 3,
         "retry_delay_seconds": 2,
         "retry_backoff_multiplier": 2.0,
-        "reprice_interval_seconds": 0.01,  # Fast for tests
-        "reprice_duration_seconds": 0.1,
+        "reprice_steps": 10,
+        "reprice_active_duration_seconds": 0.1,
+        "reprice_passive_wait_seconds": 0.1,
+        "market_order_wait_seconds": 1.0,  # Fast SMART_MARKET residual timeout
         "ib_host": "127.0.0.1",
         "ib_port": 7497,
         "ib_client_id": 1,

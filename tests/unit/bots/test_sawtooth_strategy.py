@@ -1,15 +1,14 @@
 """Tests for the Sawtooth RSI Reversal strategy."""
 
-import asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 import numpy as np
-import pandas as pd
 import pytest
 
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import (
-    StrategyContext, PositionState,
+    StrategyContext,
     BarCompleted, QuoteUpdate, OrderFilled, OrderRejected,
     PlaceOrder, UpdateState, LogSignal,
 )
@@ -51,10 +50,13 @@ def _default_config() -> dict:
     }
 
 
-def _make_ctx(state: dict | None = None) -> StrategyContext:
+def _make_ctx(
+    state: dict | None = None,
+    fsm_state: BotState = BotState.AWAITING_ENTRY_TRIGGER,
+) -> StrategyContext:
     return StrategyContext(
-        state=state or {"position_state": "FLAT"},
-        position_state=PositionState.FLAT,
+        state=state or {},
+        fsm_state=fsm_state,
         bot_id="test-bot",
         config=_default_config(),
     )
@@ -100,7 +102,7 @@ class TestSawtoothRsiStrategy:
         assert any(isinstance(a, LogSignal) and a.event_type == "STATE" for a in actions)
 
     @pytest.mark.asyncio
-    async def test_bar_in_flat_state_produces_log(self):
+    async def test_bar_while_awaiting_entry_produces_log(self):
         strategy = SawtoothRsiStrategy(_default_config())
         ctx = _make_ctx()
         window = _make_bars_window(100, uptrend=False)
@@ -114,7 +116,7 @@ class TestSawtoothRsiStrategy:
         assert len(bar_logs) == 1
 
     @pytest.mark.asyncio
-    async def test_quote_ignored_in_flat_state(self):
+    async def test_quote_ignored_while_awaiting_entry(self):
         strategy = SawtoothRsiStrategy(_default_config())
         ctx = _make_ctx()
         event = QuoteUpdate(
@@ -125,18 +127,20 @@ class TestSawtoothRsiStrategy:
         assert actions == []
 
     @pytest.mark.asyncio
-    async def test_hard_stop_loss_triggers_in_open_state(self):
+    async def test_hard_stop_loss_triggers_while_awaiting_exit(self):
         strategy = SawtoothRsiStrategy(_default_config())
-        ctx = _make_ctx(state={
-            "position_state": "OPEN",
-            "entry_price": "500.00",
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-            "high_water_mark": "500.00",
-            "current_stop": "499.50",
-            "trail_activated": False,
-            "trade_serial": 47,
-            "qty": "10",
-        })
+        ctx = _make_ctx(
+            state={
+                "entry_price": "500.00",
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "high_water_mark": "500.00",
+                "current_stop": "499.50",
+                "trail_activated": False,
+                "trade_serial": 47,
+                "qty": "10",
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
 
         # Price below hard SL (-0.1% = 499.50)
         event = QuoteUpdate(
@@ -145,29 +149,31 @@ class TestSawtoothRsiStrategy:
         )
         actions = await strategy.on_event(event, ctx)
 
-        # Should trigger exit
         exit_logs = [a for a in actions if isinstance(a, LogSignal)
                      and a.event_type == "EXIT_CHECK"]
-        state_updates = [a for a in actions if isinstance(a, UpdateState)]
         orders = [a for a in actions if isinstance(a, PlaceOrder)]
 
         assert len(exit_logs) >= 1
         assert "HARD_STOP_LOSS" in exit_logs[0].message
-        assert any(u.state.get("position_state") == "EXITING" for u in state_updates)
+        assert len(orders) == 1
+        assert orders[0].side == "SELL"
+        assert orders[0].origin == "exit"
 
     @pytest.mark.asyncio
     async def test_trail_activation(self):
         strategy = SawtoothRsiStrategy(_default_config())
-        ctx = _make_ctx(state={
-            "position_state": "OPEN",
-            "entry_price": "500.00",
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-            "high_water_mark": "500.00",
-            "current_stop": "499.50",
-            "trail_activated": False,
-            "trade_serial": 47,
-            "qty": "10",
-        })
+        ctx = _make_ctx(
+            state={
+                "entry_price": "500.00",
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "high_water_mark": "500.00",
+                "current_stop": "499.50",
+                "trail_activated": False,
+                "trade_serial": 47,
+                "qty": "10",
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
 
         # Price at +0.05% = 500.25 — should activate trail
         event = QuoteUpdate(
@@ -184,12 +190,12 @@ class TestSawtoothRsiStrategy:
         assert any(u.state.get("trail_activated") is True for u in state_updates)
 
     @pytest.mark.asyncio
-    async def test_fill_transitions_to_open(self):
+    async def test_fill_records_trade_state(self):
         strategy = SawtoothRsiStrategy(_default_config())
-        ctx = _make_ctx(state={
-            "position_state": "ENTERING",
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-        })
+        ctx = _make_ctx(
+            state={"entry_time": datetime.now(timezone.utc).isoformat()},
+            fsm_state=BotState.ENTRY_ORDER_PLACED,
+        )
 
         event = OrderFilled(
             trade_serial=47, symbol="META", side="BUY",
@@ -199,13 +205,18 @@ class TestSawtoothRsiStrategy:
         actions = await strategy.on_event(event, ctx)
 
         state_updates = [a for a in actions if isinstance(a, UpdateState)]
-        assert any(u.state.get("position_state") == "OPEN" for u in state_updates)
+        # Strategy writes trade-scoped state (entry_price, qty, etc.) —
+        # the FSM transition to AWAITING_EXIT_TRIGGER is the runtime's
+        # job, not the strategy's.
         assert any(u.state.get("entry_price") == "500.00" for u in state_updates)
+        assert any(u.state.get("qty") == "10" for u in state_updates)
+        # position_state is a deleted concept — should never be written.
+        assert not any("position_state" in u.state for u in state_updates)
 
     @pytest.mark.asyncio
-    async def test_rejection_returns_to_flat(self):
+    async def test_rejection_clears_trade_scoped_fields(self):
         strategy = SawtoothRsiStrategy(_default_config())
-        ctx = _make_ctx(state={"position_state": "ENTERING"})
+        ctx = _make_ctx(fsm_state=BotState.ENTRY_ORDER_PLACED)
 
         event = OrderRejected(
             trade_serial=None, symbol="META",
@@ -214,23 +225,82 @@ class TestSawtoothRsiStrategy:
         actions = await strategy.on_event(event, ctx)
 
         state_updates = [a for a in actions if isinstance(a, UpdateState)]
-        assert any(u.state.get("position_state") == "FLAT" for u in state_updates)
+        # Strategy clears trade-scoped fields; FSM handles the lifecycle
+        # transition back to AWAITING_ENTRY_TRIGGER via EntryCancelled.
+        assert any(u.state.get("trade_serial") is None for u in state_updates)
+        assert not any("position_state" in u.state for u in state_updates)
+
+    @pytest.mark.asyncio
+    async def test_recovers_from_rejected_exit_and_re_triggers_on_next_tick(self):
+        """Regression for bug #1: a rejected SELL must not strand the bot.
+
+        Scenario:
+          1. Bot hit a stop earlier, fired a SELL, FSM → EXIT_ORDER_PLACED.
+          2. IB rejected the SELL (e.g. market order during ETH).
+          3. Runtime dispatches EXIT_CANCELLED to FSM → AWAITING_EXIT_TRIGGER.
+          4. Next quote tick with a stop-triggering price must fire another
+             SELL PlaceOrder — the bot is not trapped in a dead EXITING state.
+        """
+        strategy = SawtoothRsiStrategy(_default_config())
+
+        # Step 1: while the SELL was in flight, fsm_state is EXIT_ORDER_PLACED.
+        # _on_quote should be a no-op in that state.
+        ctx_pre = _make_ctx(
+            state={
+                "entry_price": "500.00",
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "high_water_mark": "500.00",
+                "current_stop": "499.50",
+                "trail_activated": False,
+                "trade_serial": 47,
+                "qty": "10",
+            },
+            fsm_state=BotState.EXIT_ORDER_PLACED,
+        )
+        bad_quote = QuoteUpdate(
+            symbol="META", bid=Decimal("499.00"), ask=Decimal("499.50"),
+            last=Decimal("499.25"), timestamp=datetime.now(timezone.utc),
+        )
+        pre = await strategy.on_event(bad_quote, ctx_pre)
+        assert pre == [], "quote tick while EXIT_ORDER_PLACED must be a no-op"
+
+        # Step 3+4: after EXIT_CANCELLED recovery, fsm_state is
+        # AWAITING_EXIT_TRIGGER again. Same quote now retriggers the stop.
+        ctx_post = _make_ctx(
+            state={
+                "entry_price": "500.00",
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "high_water_mark": "500.00",
+                "current_stop": "499.50",
+                "trail_activated": False,
+                "trade_serial": 47,
+                "qty": "10",
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
+        post = await strategy.on_event(bad_quote, ctx_post)
+        orders = [a for a in post if isinstance(a, PlaceOrder)]
+        assert len(orders) == 1
+        assert orders[0].side == "SELL"
+        assert orders[0].origin == "exit"
 
     @pytest.mark.asyncio
     async def test_time_stop(self):
         strategy = SawtoothRsiStrategy(_default_config())
         # Entry 2 hours ago — past the 108-min time stop
         entry_time = datetime.now(timezone.utc) - timedelta(hours=2)
-        ctx = _make_ctx(state={
-            "position_state": "OPEN",
-            "entry_price": "500.00",
-            "entry_time": entry_time.isoformat(),
-            "high_water_mark": "500.50",
-            "current_stop": "499.75",
-            "trail_activated": True,
-            "trade_serial": 47,
-            "qty": "10",
-        })
+        ctx = _make_ctx(
+            state={
+                "entry_price": "500.00",
+                "entry_time": entry_time.isoformat(),
+                "high_water_mark": "500.50",
+                "current_stop": "499.75",
+                "trail_activated": True,
+                "trade_serial": 47,
+                "qty": "10",
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
 
         event = QuoteUpdate(
             symbol="META", bid=Decimal("500.30"), ask=Decimal("500.80"),

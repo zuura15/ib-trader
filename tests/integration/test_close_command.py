@@ -67,7 +67,7 @@ class TestCloseCommand:
 
     async def test_close_buy_entry_places_sell(self, ctx):
         """Close of a BUY entry places a SELL closing order."""
-        trade, entry = await _setup_filled_trade(ctx, serial=1, side="BUY")
+        _trade, _entry = await _setup_filled_trade(ctx, serial=1, side="BUY")
         cmd = CloseCommand(serial=1, strategy="market", profit_amount=None, take_profit_price=None)
 
         await execute_close(cmd, ctx)
@@ -80,7 +80,7 @@ class TestCloseCommand:
 
     async def test_close_sell_entry_places_buy(self, ctx):
         """Close of a SELL (short) entry places a BUY to cover."""
-        trade, entry = await _setup_filled_trade(ctx, serial=2, side="SELL")
+        _trade, _entry = await _setup_filled_trade(ctx, serial=2, side="SELL")
         cmd = CloseCommand(serial=2, strategy="market", profit_amount=None, take_profit_price=None)
 
         await execute_close(cmd, ctx)
@@ -90,7 +90,7 @@ class TestCloseCommand:
 
     async def test_close_cancels_profit_taker(self, ctx):
         """Close cancels any linked profit taker before placing closing order."""
-        trade, entry_corr = await _setup_filled_trade(ctx, serial=3, side="BUY")
+        trade, _entry_corr = await _setup_filled_trade(ctx, serial=3, side="BUY")
 
         # Add a profit taker leg as non-terminal transaction
         pt_correlation_id = str(uuid.uuid4())
@@ -112,7 +112,7 @@ class TestCloseCommand:
 
     async def test_close_mid_strategy_places_limit(self, ctx):
         """Close with mid strategy places a limit order at mid price."""
-        trade, entry = await _setup_filled_trade(ctx, serial=4, side="BUY")
+        _trade, _entry = await _setup_filled_trade(ctx, serial=4, side="BUY")
         ctx.ib._market_snapshot = {
             "bid": Decimal("100.00"),
             "ask": Decimal("100.10"),

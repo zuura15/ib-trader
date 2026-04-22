@@ -28,7 +28,7 @@ from textual.widgets import DataTable, Footer, Input, RichLog, Static
 
 from ib_trader.config.context import AppContext
 from ib_trader.repl.output_router import (
-    OutputPane, OutputSeverity, OutputRouter, RendererProtocol
+    OutputPane, OutputSeverity, OutputRouter
 )
 from ib_trader.repl.pane_config import PaneName, load_pane_configs
 
@@ -181,7 +181,7 @@ class IBTraderApp(App):
 
     ALLOW_SELECT = True
 
-    BINDINGS = [
+    BINDINGS = [  # noqa: RUF012 — Textual framework expects class-level list
         ("ctrl+c", "quit_clean", "Quit"),
     ]
 
@@ -238,8 +238,8 @@ class IBTraderApp(App):
         # Focus the command input immediately.
         try:
             self.query_one("#command-input", Input).focus()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("command-input focus failed", exc_info=e)
 
         # Attach the renderer — flushes any buffered startup messages.
         renderer = TextualRenderer(self)
@@ -262,21 +262,21 @@ class IBTraderApp(App):
             if wid:
                 try:
                     self.query_one(f"#{wid}").styles.height = config.height
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("pane height set failed for %s", wid, exc_info=e)
 
     def _init_tables(self) -> None:
         """Add column headers to DataTable widgets."""
         try:
             tbl = self.query_one("#orders-pane", DataTable)
             tbl.add_columns("#", "Symbol", "Side", "Qty", "Price", "Status", "IB ID")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("orders-pane init failed", exc_info=e)
         try:
             tbl = self.query_one("#positions-pane", DataTable)
             tbl.add_columns("#", "Symbol", "Dir", "Qty", "Entry @", "PT / Close", "Comm", "Status")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("positions-pane init failed", exc_info=e)
 
     def _apply_border_titles(self) -> None:
         """Set border titles on pane widgets after mount."""
@@ -289,8 +289,8 @@ class IBTraderApp(App):
         for selector, title in titles.items():
             try:
                 self.query_one(selector).border_title = title
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("border title set failed for %s", selector, exc_info=e)
 
     # ------------------------------------------------------------------
     # Textual event handlers
@@ -428,8 +428,8 @@ class IBTraderApp(App):
                     last_poll_ok=self._last_poll_ok,
                     poll_stale=self._last_poll_failed,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("header update failed", exc_info=e)
 
         # Refresh positions/orders tables on startup.
         await self._refresh_tables()
@@ -517,8 +517,8 @@ class IBTraderApp(App):
             # Refresh the positions/orders pane after every command.
             try:
                 await self._refresh_tables()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("post-command table refresh failed", exc_info=e)
 
     async def _heartbeat_loop(self) -> None:
         """Write REPL heartbeat to SQLite at configured interval."""
@@ -557,8 +557,8 @@ class IBTraderApp(App):
                         last_poll_ok=self._last_poll_ok,
                         poll_stale=self._last_poll_failed,
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("header tick update failed", exc_info=e)
 
             # Full IB poll + table refresh at poll_interval_seconds
             if tick >= header_ticks_per_poll:
@@ -663,28 +663,29 @@ class IBTraderApp(App):
             # Enrich with live IB status if available
             ib_status = self._ctx.ib.get_live_order_status(txn.ib_order_id) if txn.ib_order_id else None
             display_status = ib_status if ib_status else txn.action.value
-            price_str = f"${txn.limit_price}" if txn.limit_price else "\u2014"
+            em_dash = "\u2014"
+            price_str = f"${txn.limit_price}" if txn.limit_price else em_dash
 
             tbl.add_row(
-                f"#{txn.trade_serial or '\u2014'}",
+                f"#{txn.trade_serial or em_dash}",
                 txn.symbol,
                 txn.side,
                 str(txn.quantity),
                 price_str,
                 display_status,
-                txn.ib_order_id or "\u2014",
+                txn.ib_order_id or em_dash,
             )
 
     async def _clean_exit(self) -> None:
         """Write final heartbeat deletion, disconnect, and exit."""
         try:
             self._ctx.heartbeats.delete("REPL")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("heartbeat delete on exit failed", exc_info=e)
         try:
             await self._ctx.ib.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("IB disconnect on exit failed", exc_info=e)
         logger.info('{"event": "REPL_EXIT_CLEAN", "pid": %d}', self._pid)
         self.exit()
 
@@ -770,14 +771,15 @@ async def _cmd_orders(ctx: AppContext, router: OutputRouter) -> None:
 
     lines = [f"{'#':<6} {'Symbol':<8} {'Side':<5} {'Qty':<8} {'Price':<12} {'Status':<14} {'IB ID'}",
              "-" * 70]
+    em_dash = "\u2014"
     for txn in open_orders:
         ib_status = ctx.ib.get_live_order_status(txn.ib_order_id) if txn.ib_order_id else None
         display_status = ib_status if ib_status else txn.action.value
-        price_str = f"${txn.limit_price}" if txn.limit_price else "\u2014"
-        serial = f"#{txn.trade_serial}" if txn.trade_serial else "\u2014"
+        price_str = f"${txn.limit_price}" if txn.limit_price else em_dash
+        serial = f"#{txn.trade_serial}" if txn.trade_serial else em_dash
         lines.append(
             f"{serial:<6} {txn.symbol:<8} {txn.side:<5} "
-            f"{str(txn.quantity):<8} {price_str:<12} {display_status:<14} {txn.ib_order_id or '\u2014'}"
+            f"{txn.quantity!s:<8} {price_str:<12} {display_status:<14} {txn.ib_order_id or em_dash}"
         )
     router.emit("\n".join(lines), pane=OutputPane.COMMAND, severity=OutputSeverity.INFO)
 

@@ -89,7 +89,8 @@ interface AppStore {
   watchlist: WatchlistItem[];
   watchlistGeneratedAt: string | null;
   setWatchlist: (items: WatchlistItem[], generatedAt: string | null) => void;
-  initWatchlistPolling: () => void;
+  updateWatchlistQuote: (symbol: string, data: Record<string, unknown>) => void;
+  initWatchlist: () => void;
 
   // Scenarios (mock mode only)
   activeScenario: ScenarioName;
@@ -233,10 +234,58 @@ export const useStore = create<AppStore>((set, get) => ({
     }));
 
     if (DATA_MODE === 'live') {
+      // Subscribe to the live command-output Redis stream *before* the POST
+      // so we don't race the first XADD from the engine. Every line gets
+      // appended to the command bubble as it arrives; the final `done`
+      // marker unregisters the handler.
+      let liveOutput = '';
+      const unsubscribe = wsManager.subscribeCommandOutput(id, (msg) => {
+        const data = msg.data;
+        if (data.type === 'line' && data.message) {
+          liveOutput = liveOutput ? `${liveOutput}\n${data.message}` : data.message;
+          get().updateCommand(id, {
+            status: 'running' as CommandStatus,
+            output: liveOutput,
+          });
+        } else if (data.type === 'done') {
+          const isFailure = data.status === 'FAILURE';
+          get().updateCommand(id, {
+            status: (isFailure ? 'failure' : 'success') as CommandStatus,
+            output: liveOutput || data.error || undefined,
+            completedAt: new Date(),
+          });
+        }
+      });
+
       // Submit to API, then poll for completion
-      submitCommand(cmd).then(async (resp) => {
+      submitCommand(cmd, id).then(async (resp) => {
         const serverId = resp.command_id;
-        console.log(`[store] Command submitted: ${cmd} → server id=${serverId}`);
+        console.log(`[store] Command submitted: ${cmd} → server id=${serverId} status=${resp.status}`);
+
+        // Synchronous response: command already done (read-only commands or
+        // immediate-fail orders). Skip polling.
+        if (resp.status === 'completed' || (resp as any).output) {
+          // If the live stream already delivered terminal output, keep it;
+          // otherwise fall back to the HTTP-response text.
+          const current = get().commands.find((c) => c.id === id);
+          const alreadyTerminal = current?.status === 'success' || current?.status === 'failure';
+          if (!alreadyTerminal) {
+            store.updateCommand(id, {
+              id: serverId,
+              status: 'success' as CommandStatus,
+              output: (resp as any).output,
+              completedAt: new Date(),
+            });
+          }
+          unsubscribe();
+          if ((resp as any).output) {
+            store.addLogMessage('info', 'command.success',
+              `${cmd}: ${(resp as any).output}`);
+          }
+          set((s) => ({ positionRefreshTick: (s as any).positionRefreshTick + 1 || 1 }));
+          return;
+        }
+
         // Update local entry to use server ID so future updates match
         set((s) => ({
           commands: s.commands.map(c =>
@@ -301,6 +350,7 @@ export const useStore = create<AppStore>((set, get) => ({
           completedAt: new Date(),
         });
       }).catch((err) => {
+        unsubscribe();
         store.updateCommand(id, {
           status: 'failure' as CommandStatus,
           output: `API error: ${err.message}`,
@@ -338,25 +388,75 @@ export const useStore = create<AppStore>((set, get) => ({
   watchlist: [],
   watchlistGeneratedAt: null,
   setWatchlist: (items, generatedAt) => set({ watchlist: items, watchlistGeneratedAt: generatedAt }),
-  initWatchlistPolling: () => {
-    if (DATA_MODE !== 'live') return;
-    const poll = () => {
-      fetch(`/api/watchlist?_t=${Date.now()}`, { cache: 'no-store' })
-        .then(r => r.ok ? r.json() : { items: [], generated_at: null })
-        .then((data: { items: WatchlistItem[]; generated_at: string | null }) => {
-          get().setWatchlist(data.items || [], data.generated_at || null);
-        })
-        .catch(() => {});
+  updateWatchlistQuote: (symbol, data) => set((s) => {
+    const pick = (k: string) => {
+      const v = (data as Record<string, unknown>)[k];
+      return v === undefined || v === null ? undefined : String(v);
     };
-    poll();
-    let timer = setInterval(poll, 5000);
-    document.addEventListener('visibilitychange', () => {
-      clearInterval(timer);
-      if (!document.hidden) {
-        poll();
-        timer = setInterval(poll, 5000);
-      }
-    });
+    return {
+      watchlist: s.watchlist.map(item => item.symbol === symbol ? {
+        ...item,
+        last: pick('last') ?? item.last,
+        change: pick('change') ?? item.change,
+        change_pct: pick('change_pct') ?? item.change_pct,
+        volume: pick('volume') ?? item.volume,
+        avg_volume: pick('avg_volume') ?? item.avg_volume,
+        high: pick('high') ?? item.high,
+        low: pick('low') ?? item.low,
+        high_52w: pick('high_52w') ?? item.high_52w,
+        low_52w: pick('low_52w') ?? item.low_52w,
+      } : item),
+    };
+  }),
+  initWatchlist: () => {
+    if (DATA_MODE !== 'live') return;
+
+    // One-shot snapshot → then per-symbol quote subscriptions on a
+    // dedicated WS connection. Every IB tick updates the matching
+    // watchlist entry in place; no poll, no refresh cadence.
+    fetch(`/api/watchlist?_t=${Date.now()}`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : { items: [], generated_at: null })
+      .then((data: { items: WatchlistItem[]; generated_at: string | null }) => {
+        const items = data.items || [];
+        get().setWatchlist(items, data.generated_at || null);
+
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const url = `${proto}//${window.location.host}/ws`;
+        let ws: WebSocket | null = null;
+        let retry: ReturnType<typeof setTimeout> | null = null;
+        let closed = false;
+
+        const open = () => {
+          if (closed) return;
+          ws = new WebSocket(url);
+          ws.onopen = () => {
+            for (const item of items) {
+              ws?.send(JSON.stringify({ type: 'subscribe_quote', symbol: item.symbol }));
+            }
+          };
+          ws.onmessage = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === 'quote' && typeof msg.symbol === 'string' && msg.data) {
+                get().updateWatchlistQuote(msg.symbol, msg.data);
+              }
+            } catch { /* ignore malformed frames */ }
+          };
+          ws.onclose = () => {
+            if (!closed) retry = setTimeout(open, 2000);
+          };
+          ws.onerror = () => { /* onclose handles reconnect */ };
+        };
+        open();
+
+        // Close the WS on page unload so we don't leak open subscriptions.
+        window.addEventListener('beforeunload', () => {
+          closed = true;
+          if (retry) clearTimeout(retry);
+          if (ws) { ws.onclose = null; ws.close(); }
+        });
+      })
+      .catch(() => {});
   },
 
   activeScenario: 'healthy',
@@ -422,29 +522,6 @@ export const useStore = create<AppStore>((set, get) => ({
 
     // Load templates from API on init
     store.loadTemplatesFromAPI();
-
-    // Poll system status every 10 seconds to keep header live
-    const pollStatus = () => {
-      fetch('/api/status')
-        .then(r => r.ok ? r.json() : null)
-        .then(status => {
-          if (!status) return;
-          store.updateGlobal({
-            connectionStatus: status.connection_status || 'disconnected',
-            accountMode: status.account_mode || 'unknown',
-            accountId: status.account_id || '',
-            serviceHealth: status.service_health || {},
-            staleData: false,
-            realizedPnl: status.realized_pnl || 0,
-            sessionUptime: status.engine_uptime_seconds || 0,
-          });
-        })
-        .catch(() => {
-          store.updateGlobal({ connectionStatus: 'disconnected' });
-        });
-    };
-    pollStatus();
-    setInterval(pollStatus, 10000);
   },
 
   handleSnapshot: (data) => {
@@ -461,6 +538,11 @@ export const useStore = create<AppStore>((set, get) => ({
           totalCommission: t.total_commission,
           openedAt: t.opened_at,
           closedAt: t.closed_at,
+          entryQty: t.entry_qty ?? null,
+          entryPrice: t.entry_price ?? null,
+          exitQty: t.exit_qty ?? null,
+          exitPrice: t.exit_price ?? null,
+          orderType: t.order_type ?? null,
         })),
       });
     }
@@ -525,6 +607,12 @@ export const useStore = create<AppStore>((set, get) => ({
         });
       }
     }
+    if (data.status) {
+      applyStatusPayload(get().updateGlobal, data.status as any[]);
+    }
+    if (data.bots) {
+      set({ bots: (data.bots as any[]).map(mapApiBotData) });
+    }
   },
 
   handleDiff: (channel, diff) => {
@@ -538,6 +626,64 @@ export const useStore = create<AppStore>((set, get) => ({
           completedAt: cmd.completed_at ? new Date(cmd.completed_at) : undefined,
         });
       }
+    } else if (channel === 'status') {
+      // Status ships as a single-row channel; any touch (added or updated)
+      // carries the whole latest payload.
+      const row = (diff.updated?.[0] || diff.added?.[0]) as any;
+      if (row) applyStatusPayload(get().updateGlobal, [row]);
+    } else if (channel === 'bots') {
+      // Apply per-row deltas rather than refetching.
+      set((s) => {
+        let next = s.bots;
+        const removedIds = new Set((diff.removed as any[]).map((r) => r.id));
+        if (removedIds.size) next = next.filter((b) => !removedIds.has(b.id));
+        const addOrUpdate = [
+          ...(diff.added as any[] | undefined ?? []),
+          ...(diff.updated as any[] | undefined ?? []),
+        ].map(mapApiBotData);
+        const byId = new Map(next.map((b) => [b.id, b] as const));
+        for (const b of addOrUpdate) byId.set(b.id, b);
+        return { bots: Array.from(byId.values()) };
+      });
     }
   },
 }));
+
+function applyStatusPayload(
+  updateGlobal: (partial: Partial<GlobalState>) => void,
+  rows: any[],
+): void {
+  const status = rows[0];
+  if (!status) return;
+  updateGlobal({
+    connectionStatus: status.connection_status || 'disconnected',
+    accountMode: status.account_mode || 'unknown',
+    accountId: status.account_id || '',
+    serviceHealth: status.service_health || {},
+    staleData: false,
+    realizedPnl: status.realized_pnl || 0,
+    sessionUptime: status.engine_uptime_seconds || 0,
+  });
+}
+
+function mapApiBotData(b: any): Bot {
+  // Mirror features/bots/BotsPanel.tsx:mapApiBot. Keep these two in sync —
+  // the WS channel and the REST endpoint both feed this shape.
+  return {
+    id: b.id,
+    name: b.name,
+    strategy: b.strategy,
+    status: (b.status || 'stopped').toLowerCase(),
+    lastHeartbeat: b.last_heartbeat ? new Date(b.last_heartbeat) : new Date(),
+    lastSignal: b.last_signal || undefined,
+    lastAction: b.last_action || undefined,
+    lastActionTime: b.last_action_at ? new Date(b.last_action_at) : undefined,
+    errorMessage: b.error_message || undefined,
+    tradesTotal: b.trades_total || 0,
+    tradesToday: b.trades_today || 0,
+    pnlToday: parseFloat(b.pnl_today) || 0,
+    symbols: b.symbols_json ? JSON.parse(b.symbols_json) : [],
+    refId: b.ref_id,
+    uptime: 0,
+  } as Bot;
+}

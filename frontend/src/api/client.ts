@@ -47,10 +47,10 @@ export interface CommandStatusResponse {
   completed_at: string | null;
 }
 
-export function submitCommand(command: string, broker = 'ib') {
+export function submitCommand(command: string, commandId?: string, broker = 'ib') {
   return request<CommandSubmitResponse>('/commands', {
     method: 'POST',
-    body: JSON.stringify({ command, broker }),
+    body: JSON.stringify({ command, broker, command_id: commandId }),
   });
 }
 
@@ -70,11 +70,47 @@ export interface TradeResponse {
   total_commission: string | null;
   opened_at: string;
   closed_at: string | null;
+  // Augmented fill detail from the backend (entry/exit leg fills).
+  entry_qty: string | null;
+  entry_price: string | null;
+  exit_qty: string | null;
+  exit_price: string | null;
+  order_type: string | null;
 }
 
 export function getTrades(status?: string) {
   const qs = status ? `?status=${status}` : '';
   return request<TradeResponse[]>(`/trades${qs}`);
+}
+
+// --- Bot Trades ---
+
+export interface BotTradeResponse {
+  id: string;
+  bot_id: string;
+  bot_name: string | null;
+  symbol: string;
+  direction: string;
+  entry_price: string;
+  entry_qty: string;
+  entry_time: string;
+  exit_price: string | null;
+  exit_qty: string | null;
+  exit_time: string | null;
+  realized_pnl: string | null;
+  commission: string | null;
+  trail_reset_count: number;
+  duration_seconds: number | null;
+  entry_serial: number | null;
+  exit_serial: number | null;
+  created_at: string;
+}
+
+export function getBotTrades(botId?: string, limit: number = 500) {
+  const params = new URLSearchParams();
+  if (botId) params.set("bot_id", botId);
+  params.set("limit", String(limit));
+  return request<BotTradeResponse[]>(`/bot-trades?${params}`);
 }
 
 // --- Orders ---
@@ -166,6 +202,12 @@ export function startBot(botId: string) {
 
 export function stopBot(botId: string) {
   return request<{ bot_id: string; status: string }>(`/bots/${botId}/stop`, { method: 'POST' });
+}
+
+export function resetBot(botId: string) {
+  return request<{ bot_id: string; state: string; message?: string }>(
+    `/bots/${botId}/reset`, { method: 'POST' },
+  );
 }
 
 // --- Templates ---

@@ -1,6 +1,6 @@
 import type { TabNode } from 'flexlayout-react';
 import { CommandConsole } from '../features/console/CommandConsole';
-import { LogStream } from '../features/logs/LogStream';
+import { LogStream, ErrorStream } from '../features/logs/LogStream';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
 import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
@@ -8,6 +8,7 @@ import { BotsPanel } from '../features/bots/BotsPanel';
 import { BotLogStream } from '../features/bots/BotLogStream';
 import { BotActivity } from '../features/bots/BotActivity';
 import { TradesPanel } from '../features/trades/TradesPanel';
+import { BotTradesPanel } from '../features/bots/BotTradesPanel';
 import { OrderTemplatesPanel } from '../features/templates/OrderTemplatesPanel';
 import { ScenarioPanel } from '../features/scenarios/ScenarioPanel';
 import { HelpPanel } from '../features/help/HelpPanel';
@@ -22,6 +23,8 @@ export function componentFactory(node: TabNode) {
       return <CommandConsole compact={config.compact} />;
     case 'logs':
       return <LogStream maxLines={config.maxLines} />;
+    case 'errors':
+      return <ErrorStream maxLines={config.maxLines} />;
     case 'orders':
       return <OrdersPanel compact={config.compact} />;
     case 'positions':
@@ -30,6 +33,8 @@ export function componentFactory(node: TabNode) {
       return <AlertsPanel />;
     case 'trades':
       return <TradesPanel compact={config.compact} />;
+    case 'bot-trades':
+      return <BotTradesPanel compact={config.compact} />;
     case 'templates':
       return <OrderTemplatesPanel />;
     case 'bots':

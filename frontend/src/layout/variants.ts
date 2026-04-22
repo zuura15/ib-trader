@@ -70,6 +70,7 @@ export const variantA: IJsonModel = {
             children: [
               { type: 'tab', name: 'Orders', component: 'orders' },
               { type: 'tab', name: 'Trades', component: 'trades' },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
             ],
           },
         ],
@@ -98,6 +99,7 @@ export const variantA: IJsonModel = {
             weight: 45,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],
@@ -119,8 +121,9 @@ export const variantB: IJsonModel = {
       size: 200,
       children: [
         { type: 'tab', name: 'Logs', component: 'logs' },
-              { type: 'tab', name: 'Bot Log', component: 'bot-log' },
-              { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
+        { type: 'tab', name: 'Errors', component: 'errors' },
+        { type: 'tab', name: 'Bot Log', component: 'bot-log' },
+        { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
         { type: 'tab', name: 'Console', component: 'console' },
         { type: 'tab', name: 'Help', component: 'help' },
       ],
@@ -140,8 +143,9 @@ export const variantB: IJsonModel = {
             children: [
               { type: 'tab', name: 'Positions', component: 'positions' },
               { type: 'tab', name: 'Watchlist', component: 'watchlist' },
-              { type: 'tab', name: 'Watchlist', component: 'watchlist' },
               { type: 'tab', name: 'Orders', component: 'orders' },
+              { type: 'tab', name: 'Trades', component: 'trades' },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
             ],
           },
           {
@@ -199,6 +203,7 @@ export const variantC: IJsonModel = {
             weight: 35,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],
@@ -214,6 +219,8 @@ export const variantC: IJsonModel = {
             weight: 35,
             children: [
               { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
+              { type: 'tab', name: 'Trades', component: 'trades', config: { compact: true } },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
             ],
           },
           {
@@ -287,6 +294,8 @@ export const variantD: IJsonModel = {
               { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
               { type: 'tab', name: 'Positions', component: 'positions', config: { compact: true } },
               { type: 'tab', name: 'Watchlist', component: 'watchlist', config: { compact: true } },
+              { type: 'tab', name: 'Trades', component: 'trades', config: { compact: true } },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
             ],
           },
           {
@@ -294,6 +303,7 @@ export const variantD: IJsonModel = {
             weight: 65,
             children: [
               { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
             ],

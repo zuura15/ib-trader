@@ -9,11 +9,12 @@ from sqlalchemy import (
     Column, String, Integer, Numeric, Boolean,
     DateTime, Enum, ForeignKey, Text
 )
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase
 import enum
 
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    """Declarative base for all ORM models."""
 
 
 def _uuid() -> str:
@@ -302,17 +303,60 @@ class Bot(Base):
 
 
 class BotEvent(Base):
-    """Append-only audit log for bot activity. Never updated after insert."""
+    """Append-only audit log for bot activity. Never updated after insert.
+
+    Denormalized: carries bot_name / strategy / config_version so old
+    events stay readable after the source YAML is edited or deleted.
+    The FK to `bots.id` has been dropped — bot identity is now
+    authoritative in `config/bots/*.yaml`, and a missing bots row is no
+    longer an integrity violation.
+    """
 
     __tablename__ = "bot_events"
 
-    id           = Column(Integer, primary_key=True, autoincrement=True)
-    bot_id       = Column(String(36), ForeignKey("bots.id"), nullable=False)
-    event_type   = Column(String(50), nullable=False)    # STARTED, STOPPED, SIGNAL, ACTION, ERROR, HEARTBEAT
-    message      = Column(Text, nullable=True)
-    payload_json = Column(Text, nullable=True)           # Structured JSON for machine-readable data
-    trade_serial = Column(Integer, nullable=True)
-    recorded_at  = Column(DateTime, nullable=False)
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    bot_id         = Column(String(36), nullable=False, index=True)
+    bot_name       = Column(String(100), nullable=True, index=True)
+    strategy       = Column(String(100), nullable=True)
+    config_version = Column(String(32), nullable=True)
+    event_type     = Column(String(50), nullable=False)    # STARTED, STOPPED, SIGNAL, ACTION, ERROR, HEARTBEAT
+    message        = Column(Text, nullable=True)
+    payload_json   = Column(Text, nullable=True)           # Structured JSON for machine-readable data
+    trade_serial   = Column(Integer, nullable=True)
+    recorded_at    = Column(DateTime, nullable=False)
+
+
+class BotTrade(Base):
+    """Synthesized per-bot-execution record — one row per entry-to-exit round-trip.
+
+    Created by ``StrategyBotRunner._handle_record_trade_closed`` when a bot's
+    exit fully fills. Populated from the bot's state doc (entry_price,
+    entry_time) plus the exit fill event (exit_price, exit_time, realized_pnl).
+
+    The orders / transactions tables still track individual order legs; this
+    table is the "round trip" view consumed by the Bot Trades panel.
+    """
+
+    __tablename__ = "bot_trades"
+
+    id                 = Column(String(36), primary_key=True, default=_uuid)
+    bot_id             = Column(String(36), nullable=False, index=True)
+    bot_name           = Column(String(100), nullable=True)
+    symbol             = Column(String(20), nullable=False)
+    direction          = Column(String(5), nullable=False)    # LONG / SHORT
+    entry_price        = Column(Numeric(18, 4), nullable=False)
+    entry_qty          = Column(Numeric(18, 4), nullable=False)
+    entry_time         = Column(DateTime, nullable=False)
+    exit_price         = Column(Numeric(18, 4), nullable=True)
+    exit_qty           = Column(Numeric(18, 4), nullable=True)
+    exit_time          = Column(DateTime, nullable=True)
+    realized_pnl       = Column(Numeric(18, 8), nullable=True)
+    commission         = Column(Numeric(18, 8), nullable=True)
+    trail_reset_count  = Column(Integer, nullable=False, default=0)
+    duration_seconds   = Column(Integer, nullable=True)       # exit_time - entry_time, seconds
+    entry_serial       = Column(Integer, nullable=True)       # trade_group.serial_number of entry
+    exit_serial        = Column(Integer, nullable=True)       # trade_group.serial_number of exit
+    created_at         = Column(DateTime, nullable=False)
 
 
 class OrderTemplate(Base):
@@ -332,39 +376,3 @@ class OrderTemplate(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
-class MarketBar(Base):
-    """Raw 5-second bars streamed from IB for bot consumption.
-
-    Written by the engine's subscribe_bars command. Read by bot runtime.
-    Auto-purged after 24 hours.
-    """
-
-    __tablename__ = "market_bars"
-
-    id            = Column(Integer, primary_key=True, autoincrement=True)
-    symbol        = Column(String(20), nullable=False, index=True)
-    bar_seconds   = Column(Integer, nullable=False, default=5)
-    timestamp_utc = Column(DateTime, nullable=False, index=True)
-    open          = Column(Numeric(18, 8), nullable=False)
-    high          = Column(Numeric(18, 8), nullable=False)
-    low           = Column(Numeric(18, 8), nullable=False)
-    close         = Column(Numeric(18, 8), nullable=False)
-    volume        = Column(Integer, nullable=False, default=0)
-    created_at    = Column(DateTime, nullable=False)
-
-
-class MarketQuote(Base):
-    """Latest streaming quote per symbol. One row per symbol, updated in place.
-
-    Written by the engine every ~2 seconds from reqMktData streaming ticker.
-    Read by bot runtime for near-real-time exit monitoring.
-    """
-
-    __tablename__ = "market_quotes"
-
-    symbol        = Column(String(20), primary_key=True)
-    bid           = Column(Numeric(18, 8), nullable=True)
-    ask           = Column(Numeric(18, 8), nullable=True)
-    last          = Column(Numeric(18, 8), nullable=True)
-    volume        = Column(Integer, nullable=True)
-    updated_at    = Column(DateTime, nullable=False)

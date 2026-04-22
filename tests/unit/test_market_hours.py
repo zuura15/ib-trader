@@ -4,7 +4,6 @@ All times are constructed in US/Eastern to match IB session windows.
 Session schedule per IB official docs:
   https://www.interactivebrokers.com/en/trading/us-overnight-trading.php
 """
-import pytest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 

@@ -34,6 +34,8 @@ env/
 .coverage
 htmlcov/
 *.xml
+frontend/test-results/
+frontend/playwright-report/
 
 # Editor
 .vscode/
@@ -51,6 +53,9 @@ site/
 # Runtime
 run/
 *.pid
+
+# Local tooling (Redis binaries, etc.)
+.local/
 
 # Node modules (frontend prototypes)
 node_modules/

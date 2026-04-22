@@ -4,14 +4,14 @@ GET  /api/watchlist         — live market data for watchlist symbols
 GET  /api/watchlist/symbols — current symbol list from config
 PUT  /api/watchlist/symbols — update symbol list in config
 """
-import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ib_trader.api.deps import get_redis
 from ib_trader.config.loader import load_watchlist, save_watchlist
 
 logger = logging.getLogger(__name__)
@@ -24,20 +24,78 @@ _MAX_SYMBOLS = 50
 
 
 @router.get("")
-def get_watchlist():
-    """Return live watchlist data from the engine's JSON cache."""
+async def get_watchlist(redis=Depends(get_redis)):
+    """Return live watchlist data from Redis."""
+    if redis is None:
+        return JSONResponse(
+            content={"error": "Redis not available"},
+            status_code=503,
+        )
+
     try:
-        data = json.loads(_WATCHLIST_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {"generated_at": None, "items": []}
+        data = await _watchlist_from_redis(redis)
+        if data is None:
+            data = {"generated_at": None, "items": []}
+    except Exception:
+        logger.exception('{"event": "REDIS_WATCHLIST_ERROR"}')
+        return JSONResponse(
+            content={"error": "Redis read failed"},
+            status_code=503,
+        )
 
     return JSONResponse(
         content=data,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-        },
+        headers={"Cache-Control": "no-store, max-age=0"},
     )
+
+
+async def _watchlist_from_redis(redis) -> dict | None:
+    """Read watchlist quotes from Redis keys."""
+    from datetime import datetime, timezone
+    from ib_trader.redis.state import StateStore
+    from ib_trader.config.loader import load_watchlist
+
+    symbols = load_watchlist(_WATCHLIST_YAML)
+    if not symbols:
+        return None
+
+    store = StateStore(redis)
+    items = []
+    for sym in symbols:
+        quote = await store.get(f"quote:{sym}:latest")
+        if quote:
+            def _fmt(v):
+                return str(v) if v is not None else None
+            def _fmt_int(v):
+                return str(int(v)) if v is not None else None
+
+            items.append({
+                "symbol": sym,
+                "last": _fmt(quote.get("last")),
+                "change": _fmt(quote.get("change")),
+                "change_pct": _fmt(quote.get("change_pct")),
+                "volume": _fmt_int(quote.get("volume")),
+                "avg_volume": _fmt_int(quote.get("avg_volume")),
+                "high": _fmt(quote.get("high")),
+                "low": _fmt(quote.get("low")),
+                "high_52w": _fmt(quote.get("high_52w")),
+                "low_52w": _fmt(quote.get("low_52w")),
+                "error": None,
+            })
+        else:
+            items.append({
+                "symbol": sym,
+                "last": None, "change": None, "change_pct": None,
+                "volume": None, "avg_volume": None,
+                "high": None, "low": None,
+                "high_52w": None, "low_52w": None,
+                "error": None,
+            })
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
 
 
 @router.get("/symbols")

@@ -196,9 +196,9 @@ sudo bash deploy/setup.sh
 sudo systemctl start ib-engine ib-api ib-daemon
 
 # Background processes with log tailing
-./deploy/start.sh              # live
-./deploy/start.sh --paper      # paper trading
-./deploy/stop.sh               # stop all
+./deploy/start.sh                        # auto-detect paper/live from Gateway
+./deploy/start.sh --force-mode paper     # assert paper; exit if live is detected
+./deploy/stop.sh                         # stop all
 ```
 
 ## Key Design Principles

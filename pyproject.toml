@@ -26,6 +26,7 @@ dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
     "httpx>=0.27",
+    "redis[hiredis]>=5.0",
 ]
 
 [project.scripts]
@@ -53,10 +54,55 @@ addopts = "--ignore=tests/smoke"
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+# Functional rules only — correctness, bugs, security, async. No style.
+select = [
+    "F",      # pyflakes: undefined names, unused imports (kills dead migration code)
+    "B",      # flake8-bugbear: mutable defaults, unused loop vars, except-pass, etc.
+    "S",      # flake8-bandit: hardcoded secrets, unsafe subprocess, pickle, eval
+    "ASYNC",  # flake8-async: blocking calls in async, asyncio correctness
+    "RUF",    # ruff-specific correctness rules
+    "PLE",    # pylint errors only (no conventions/warnings/refactor)
+]
+ignore = [
+    "S101",     # assert used — fine in tests
+    "S311",     # random module — not used for crypto in this project
+    "B008",     # function call in default arg — FastAPI's Depends() needs this
+    "RUF001",   # ambiguous unicode in strings — em-dashes are intentional
+    "RUF002",   # ambiguous unicode in docstrings — em-dashes are intentional
+    "RUF003",   # ambiguous unicode in comments — em-dashes are intentional
+    "ASYNC109", # timeout param — API surfaces (broker contracts) vs asyncio.timeout style
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S", "B"]           # tests allowed to be looser
+"migrations/**/*.py" = ["S", "B", "F"] # alembic boilerplate
+"scripts/**/*.py" = ["S"]              # dev scripts allowed subprocess/etc
+
 [tool.mypy]
 python_version = "3.11"
-strict = false
 ignore_missing_imports = true
+# Bug-catching flags, not annotation-forcing. Skips disallow_untyped_defs et al.
+# which generate noise without finding bugs. Keeps the checks that catch real
+# correctness issues: None-deref via Optional-safety, unreachable code, etc.
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_redundant_casts = true
+warn_unreachable = true
+warn_unused_configs = true
+warn_unused_ignores = true
+extra_checks = true
+
+# SQLAlchemy old-style Column() API cannot be fully typed without migrating
+# models to Mapped[T] + mapped_column(). Until that migration lands, silence
+# these modules — Column[T]/T arg-type noise is not actionable bug-signal.
+[[tool.mypy.overrides]]
+module = [
+    "ib_trader.data.*",
+    "ib_trader.engine.order",
+]
+ignore_errors = true
 
 [tool.coverage.run]
 source = ["ib_trader"]
@@ -89,3 +135,115 @@ omit = [
 
 [tool.coverage.report]
 fail_under = 90
+
+# ----------------------------------------------------------------------------
+# import-linter: enforce architectural boundaries so migration leftovers
+# (e.g. SQLite repo imports on the bot hot-path) are caught automatically.
+# ----------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = ["ib_trader"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Bot hot-path must not read SQLite for live decisions (use Redis / engine HTTP)"
+type = "forbidden"
+source_modules = [
+    "ib_trader.bots.runtime",
+    "ib_trader.bots.middleware",
+    "ib_trader.bots.base",
+    "ib_trader.bots.fsm",
+    "ib_trader.bots.runner",
+    "ib_trader.bots.strategies",
+]
+# CLAUDE.md permits SQLite archival writes (bot event audit history).
+# BotEventRepository lives in data.repositories.bot_repository, so that
+# module is allowed. What's forbidden is the live-decision reads: pending
+# commands (superseded by engine HTTP API) and transaction history.
+forbidden_modules = [
+    "ib_trader.data.repositories.pending_command_repository",
+    "ib_trader.data.repositories.transaction_repository",
+    "ib_trader.data.repository",
+]
+ignore_imports = [
+    # TODO(redis-positions): RiskMiddleware.max_positions still reads open
+    # trades from SQLite. Remove these once it reads from Redis position
+    # state or IB directly.
+    "ib_trader.bots.base -> ib_trader.data.repository",
+    "ib_trader.bots.middleware -> ib_trader.data.repository",
+    # TODO(ib-recovery): runner crash-recovery path reads TradeRepository
+    # at startup to rehydrate open positions. Startup-only, not hot-path.
+    # Migrate to query IB positions directly per CLAUDE.md.
+    "ib_trader.bots.runner -> ib_trader.data.repository",
+]
+
+[[tool.importlinter.contracts]]
+name = "insync_client may only be imported by DI entry points"
+type = "forbidden"
+# Source = all ib_trader subpackages EXCEPT ib_trader.ib (which owns insync_client).
+source_modules = [
+    "ib_trader.api",
+    "ib_trader.bots",
+    "ib_trader.broker",
+    "ib_trader.config",
+    "ib_trader.daemon",
+    "ib_trader.data",
+    "ib_trader.engine",
+    "ib_trader.logging_",
+    "ib_trader.redis",
+    "ib_trader.repl",
+]
+forbidden_modules = ["ib_trader.ib.insync_client"]
+ignore_imports = [
+    "ib_trader.engine.main -> ib_trader.ib.insync_client",
+    "ib_trader.repl.main -> ib_trader.ib.insync_client",
+    "ib_trader.daemon.main -> ib_trader.ib.insync_client",
+    "ib_trader.broker.ib.client -> ib_trader.ib.insync_client",
+]
+
+[[tool.importlinter.contracts]]
+name = "output_router must have no project imports (pure TUI-decoupling protocol)"
+type = "forbidden"
+source_modules = ["ib_trader.repl.output_router"]
+forbidden_modules = [
+    "ib_trader.api",
+    "ib_trader.bots",
+    "ib_trader.broker",
+    "ib_trader.config",
+    "ib_trader.daemon",
+    "ib_trader.data",
+    "ib_trader.engine",
+    "ib_trader.ib",
+    "ib_trader.logging_",
+    "ib_trader.redis",
+]
+
+[[tool.importlinter.contracts]]
+name = "textual must not leak into business logic (TUI confined to *.tui modules)"
+type = "forbidden"
+# TUI entry points (daemon.main, repl.main) legitimately reach textual via tui.py.
+# This contract guards business-logic packages where textual has no place.
+source_modules = [
+    "ib_trader.api",
+    "ib_trader.bots",
+    "ib_trader.broker",
+    "ib_trader.config",
+    "ib_trader.daemon.reconciler",
+    "ib_trader.daemon.integrity",
+    "ib_trader.daemon.monitor",
+    "ib_trader.data",
+    "ib_trader.engine",
+    "ib_trader.ib",
+    "ib_trader.logging_",
+    "ib_trader.redis",
+    "ib_trader.repl.commands",
+    "ib_trader.repl.output_router",
+    "ib_trader.repl.pane_config",
+]
+forbidden_modules = ["textual"]
+
+[dependency-groups]
+dev = [
+    "detect-secrets>=1.5.0",
+    "import-linter>=2.11",
+    "types-pyyaml>=6.0.12.20260408",
+]

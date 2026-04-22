@@ -6,7 +6,6 @@ No reprice loop runs for these orders.
 Assertions use TransactionEvent rows instead of Order rows.
 """
 import asyncio
-import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy
@@ -164,7 +163,8 @@ class TestBidOrderFlow:
             "ask": Decimal("100.10"),
             "last": Decimal("100.05"),
         }
-        ctx.settings["reprice_duration_seconds"] = 0.05  # Not used for bid
+        ctx.settings["reprice_active_duration_seconds"] = 0.05  # Not used for bid
+        ctx.settings["reprice_passive_wait_seconds"] = 0.05
 
         cmd = BuyCommand(
             symbol="MSFT",
@@ -205,7 +205,8 @@ class TestPreSubmittedFlow:
             "ask": Decimal("100.10"),
             "last": Decimal("100.05"),
         }
-        ctx.settings["bid_ask_wait_seconds"] = 0.05
+        ctx.settings["reprice_active_duration_seconds"] = 0.025
+        ctx.settings["reprice_passive_wait_seconds"] = 0.025
         cmd = BuyCommand(
             symbol="MSFT",
             qty=Decimal("1"),
@@ -245,7 +246,8 @@ class TestPreSubmittedFlow:
             "ask": Decimal("100.10"),
             "last": Decimal("100.05"),
         }
-        ctx.settings["bid_ask_wait_seconds"] = 0.05
+        ctx.settings["reprice_active_duration_seconds"] = 0.025
+        ctx.settings["reprice_passive_wait_seconds"] = 0.025
         cmd = BuyCommand(
             symbol="MSFT",
             qty=Decimal("1"),

@@ -15,7 +15,7 @@ from alembic import context
 # Ensure the project root is on sys.path so ib_trader can be imported.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ib_trader.data.models import Base  # noqa: E402
+from ib_trader.data.models import Base
 
 config = context.config
 

@@ -1,8 +1,13 @@
 """Abstract bot base class.
 
 Bots are strategies that run in the bot runner process. They submit
-commands to the engine via the pending_commands table and read market
-state from SQLite. They NEVER hold broker connections directly.
+orders through the engine's internal HTTP API (see middleware.py) and
+read live state from Redis. They NEVER hold broker connections directly.
+
+Live state lives in Redis (quotes, positions, bot runtime status) and
+in IB (orders, fills, broker-held positions). SQLite is archival only
+— bot event audit history is written here, but never read to make a
+live decision.
 
 Lifecycle:
   STOPPED → (start) → RUNNING → (tick loop) → RUNNING
@@ -10,24 +15,16 @@ Lifecycle:
   RUNNING → (stop) → STOPPED
   ERROR → (start) → RUNNING
 """
-import asyncio
 import json
 import logging
-import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from sqlalchemy.orm import scoped_session
 
-from ib_trader.data.models import (
-    PendingCommand, PendingCommandStatus, BotEvent, Bot,
-    TransactionAction, LegType,
-)
-from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
-from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
+from ib_trader.data.models import BotEvent
+from ib_trader.data.repositories.bot_repository import BotEventRepository
 from ib_trader.data.repository import TradeRepository
-from ib_trader.data.repositories.transaction_repository import TransactionRepository
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +36,9 @@ def _now_utc() -> datetime:
 class BotBase(ABC):
     """Abstract base class for trading bots.
 
-    Subclasses implement on_tick() with their strategy logic.
-    Use self.place_order() to submit commands to the engine.
-    Use self.get_open_positions() to read current positions.
+    Subclasses implement on_tick() with their strategy logic. Orders go
+    through the middleware pipeline (ExecutionMiddleware → engine HTTP
+    API). Bot event audit log is the only SQLite surface here.
     """
 
     def __init__(self, bot_id: str, config: dict,
@@ -50,141 +47,54 @@ class BotBase(ABC):
         self.config = config
         self.tick_interval: int = config.get("tick_interval_seconds", 10)
 
-        # Repositories — bot reads/writes SQLite directly
-        self._bots = BotRepository(session_factory)
+        # Archival: bot event audit log (CLAUDE.md allows archival writes).
         self._bot_events = BotEventRepository(session_factory)
-        self._pending_commands = PendingCommandRepository(session_factory)
+
+        # TODO(redis-positions): RiskMiddleware.max_positions still reads
+        # open trade groups from SQLite. Migrate to Redis position state
+        # or IB positions so this field can go away.
         self._trades = TradeRepository(session_factory)
-        self._transactions = TransactionRepository(session_factory)
+
+        # Redis-backed runtime state (status, last_action, heartbeat,
+        # kill_switch, error_message). ``config['_redis']`` is populated
+        # by the runner from the process-wide client.
+        from ib_trader.bots.state import BotStateStore
+        self._state = BotStateStore(config.get("_redis"))
 
     @abstractmethod
     async def on_tick(self) -> None:
         """Called every tick_interval_seconds.
 
         Implement strategy logic here: read market state, decide, act.
-        Use self.place_order() to submit orders to the engine.
         """
         ...
 
-    async def on_startup(self, open_positions: list) -> None:
-        """Called when the bot starts (or restarts after crash).
+    async def on_startup(self, open_positions: list) -> None:  # noqa: B027 — optional override
+        """Called when the bot starts (or restarts after crash)."""
 
-        Override to handle crash recovery: check for existing positions
-        from a previous incarnation and decide whether to keep or close them.
-
-        Args:
-            open_positions: List of TradeGroup objects that were opened by
-                            this bot (identified via pending_commands source).
-        """
-        pass
-
-    async def on_stop(self) -> None:
-        """Called when the bot is stopped. Override for cleanup."""
-        pass
+    async def on_stop(self) -> None:  # noqa: B027 — optional override
+        """Called when the bot is stopped."""
 
     # --- Helper Methods ---
 
-    async def place_order(self, command: str, broker: str = "ib") -> str:
-        """Submit a command to the engine via pending_commands.
+    async def update_action(self, action: str) -> None:
+        """Record this bot's last action in Redis."""
+        await self._state.set_last_action(self.bot_id, action)
 
-        Args:
-            command: Raw command string (e.g., "buy AAPL 10 mid --profit 500").
-            broker: Which broker to use.
+    async def read_last_action(self) -> str | None:
+        """Read the last_action string from Redis."""
+        data = await self._state.get_last_action(self.bot_id)
+        if not data:
+            return None
+        return data.get("action")
 
-        Returns:
-            Command ID (UUID string) for tracking.
-        """
-        cmd = PendingCommand(
-            source=f"bot:{self.bot_id}",
-            broker=broker,
-            command_text=command,
-            submitted_at=_now_utc(),
-        )
-        self._pending_commands.insert(cmd)
-        self.log_event("ACTION", message=command,
-                       payload={"command_id": cmd.id, "broker": broker})
-        return cmd.id
+    async def clear_last_action(self) -> None:
+        """Clear the Redis last_action key."""
+        await self._state.clear_last_action(self.bot_id)
 
-    async def wait_for_command(self, cmd_id: str, timeout: float = 60) -> dict | None:
-        """Poll pending_commands until the command completes or timeout.
-
-        Args:
-            cmd_id: Command ID from place_order().
-            timeout: Max seconds to wait.
-
-        Returns:
-            Dict with status, output, error — or None on timeout.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            cmd = self._pending_commands.get(cmd_id)
-            if cmd and cmd.status in (PendingCommandStatus.SUCCESS,
-                                       PendingCommandStatus.FAILURE):
-                return {
-                    "status": cmd.status.value,
-                    "output": cmd.output,
-                    "error": cmd.error,
-                }
-            await asyncio.sleep(0.5)
-        return None
-
-    async def wait_for_fill(self, trade_serial: int,
-                             timeout: float = 120) -> dict | None:
-        """Poll trade_groups/orders until the entry order fills or timeout.
-
-        Use after wait_for_command() succeeds — command completion means the
-        order was placed, not necessarily filled.
-
-        Returns:
-            Trade dict with fill details, or None on timeout.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            trade = self._trades.get_by_serial(trade_serial)
-            if trade:
-                txns = self._transactions.get_for_trade(trade.id)
-                entry_fills = [
-                    t for t in txns
-                    if t.leg_type == LegType.ENTRY
-                    and t.action in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL)
-                ]
-                if entry_fills:
-                    fill = entry_fills[0]
-                    return {
-                        "trade_id": trade.id,
-                        "serial": trade.serial_number,
-                        "symbol": trade.symbol,
-                        "status": trade.status.value,
-                        "entry_fill_price": str(fill.ib_avg_fill_price),
-                        "entry_qty_filled": str(fill.ib_filled_qty),
-                    }
-            await asyncio.sleep(1)
-        return None
-
-    def get_open_positions(self) -> list:
-        """Read open trade groups from SQLite."""
-        return self._trades.get_open()
-
-    def update_signal(self, signal: str) -> None:
-        """Update this bot's last_signal in the bots table."""
-        self._bots.update_signal(self.bot_id, signal)
-
-    def update_action(self, action: str) -> None:
-        """Update this bot's last_action in the bots table."""
-        self._bots.update_action(self.bot_id, action)
-
-    def read_last_action(self) -> str | None:
-        """Read this bot's last_action from the bots table."""
-        bot = self._bots.get(self.bot_id)
-        return bot.last_action if bot else None
-
-    def clear_last_action(self) -> None:
-        """Clear this bot's last_action (set to None)."""
-        self._bots.update_action_raw(self.bot_id, None)
-
-    def update_heartbeat(self) -> None:
-        """Update this bot's heartbeat timestamp."""
-        self._bots.update_heartbeat(self.bot_id)
+    async def update_heartbeat(self) -> None:
+        """Update this bot's heartbeat timestamp in Redis."""
+        await self._state.update_heartbeat(self.bot_id)
 
     def log_event(self, event_type: str, message: str | None = None,
                   payload: dict | None = None,

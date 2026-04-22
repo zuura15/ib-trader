@@ -1,0 +1,12 @@
+id: 74239b7e-aaf3-4eaa-8756-25713d8ac8df
+name: "Sawtooth RSI \u2014 META"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/sawtooth_rsi.yaml
+  symbol: META
+symbols:
+- META

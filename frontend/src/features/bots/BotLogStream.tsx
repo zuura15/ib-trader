@@ -99,9 +99,9 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
         });
         Promise.all(promises).then((results) => {
           const merged = results.flat();
-          // Sort by recorded_at ascending
-          merged.sort((a, b) => (a.recorded_at || '').localeCompare(b.recorded_at || ''));
-          setLogs(merged.slice(-maxLines));
+          // Sort by recorded_at descending (newest first)
+          merged.sort((a, b) => (b.recorded_at || '').localeCompare(a.recorded_at || ''));
+          setLogs(merged.slice(0, maxLines));
         });
       } else {
         const params = new URLSearchParams({ limit: String(maxLines) });
@@ -121,11 +121,11 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
     return () => clearInterval(interval);
   }, [selectedBotId, filterType, maxLines, bots]);
 
-  // Auto-scroll to bottom (newest) — use last event id as trigger
-  const lastLogId = logs.length > 0 ? logs[logs.length - 1]?.id : 0;
+  // Scroll to top (newest first)
+  const lastLogId = logs.length > 0 ? logs[0]?.id : 0;
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTop = 0;
     }
   }, [lastLogId]);
 
@@ -137,15 +137,15 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
         <select
           value={selectedBotId}
           onChange={(e) => setSelectedBotId(e.target.value)}
-          className="text-[10px] bg-transparent border rounded px-1"
-          style={{ borderColor: 'var(--border-default)', color: 'var(--text-secondary)' }}
+          className="bg-transparent border rounded px-1"
+          style={{ fontSize: 13, borderColor: 'var(--border-default)', color: 'var(--text-secondary)' }}
         >
           <option value="all">All Bots</option>
           {bots.map((b) => (
             <option key={b.id} value={b.id}>{b.name}</option>
           ))}
         </select>
-        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{logs.length} events</span>
+        <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{logs.length} events</span>
       </div>
     }>
       <div className="flex flex-col h-full">
@@ -156,8 +156,8 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
           if (!lastError) return null;
           const errorBot = lastError.bot_id ? botLabel(lastError.bot_id) : '';
           return (
-            <div className="shrink-0 px-2 py-1.5 text-[11px] font-mono border-b flex items-center gap-2"
-              style={{ background: 'rgba(239,68,68,0.1)', borderColor: 'var(--accent-red)', color: 'var(--accent-red)' }}>
+            <div className="shrink-0 px-2 py-1.5 font-mono border-b flex items-center gap-2"
+              style={{ fontSize: 14, background: 'rgba(239,68,68,0.1)', borderColor: 'var(--accent-red)', color: 'var(--accent-red)' }}>
               <span className="font-bold">ERROR</span>
               {errorBot && <span className="opacity-70">[{errorBot}]</span>}
               <span>{lastError.message}</span>
@@ -171,8 +171,9 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
             <button
               key={f || 'all'}
               onClick={() => setFilterType(f)}
-              className="text-[10px] px-1.5 py-0.5 rounded"
+              className="px-1.5 py-0.5 rounded"
               style={{
+                fontSize: 13,
                 background: filterType === f ? 'var(--bg-accent, var(--accent-blue))' : 'transparent',
                 color: filterType === f ? 'var(--text-primary)' : 'var(--text-muted)',
                 border: `1px solid ${filterType === f ? 'var(--accent-blue)' : 'var(--border-default)'}`,
@@ -184,7 +185,7 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
         </div>
 
         {/* Log entries */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto p-1 font-mono text-xs leading-[1.7]">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto p-1 font-mono leading-[1.7]" style={{ fontSize: 15 }}>
           {logs.length === 0 ? (
             <div style={{ color: 'var(--text-muted)', padding: 20, textAlign: 'center' }}>
               {selectedBotId ? 'No events yet. Start the bot to see output.' : 'No bots registered.'}
@@ -198,16 +199,17 @@ export function BotLogStream({ maxLines = 300 }: { maxLines?: number }) {
               <div key={log.id} className="flex gap-1.5 px-1" style={{ borderRadius: 2 }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--row-hover)')}
                 onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
-                <span style={{ color: 'var(--text-muted)' }} className="shrink-0 w-[55px]">{ts}</span>
+                <span style={{ color: 'var(--text-muted)' }} className="shrink-0 w-[69px]">{ts}</span>
                 {log.bot_id && (
                   <span
-                    className="shrink-0 w-[36px] text-center rounded text-[9px] font-bold"
+                    className="shrink-0 w-[45px] text-center rounded font-bold"
                     style={{
+                      fontSize: 11,
                       color: botColorMap[log.bot_id] || 'var(--text-muted)',
                     }}
                   >{botLabel(log.bot_id)}</span>
                 )}
-                <span style={{ color, fontWeight: 600 }} className="shrink-0 w-[36px]">{label}</span>
+                <span style={{ color, fontWeight: 600 }} className="shrink-0 w-[45px]">{label}</span>
                 <span style={{
                   color: log.event_type === 'ERROR' || log.event_type === 'RISK'
                     ? 'var(--accent-red)'

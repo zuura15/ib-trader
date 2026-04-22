@@ -43,7 +43,7 @@ class TestReconciliation:
 
     async def test_reconciles_externally_canceled_order(self, ctx):
         """Order open in transactions but canceled in IB gets RECONCILED row."""
-        trade = _make_open_transaction(ctx, 5000, serial=1)
+        _make_open_transaction(ctx, 5000, serial=1)
 
         # Mock IB: order shows as Cancelled (int key matches txn.ib_order_id)
         ctx.ib._order_statuses[5000] = {
@@ -64,7 +64,7 @@ class TestReconciliation:
 
     async def test_reconciles_externally_filled_order(self, ctx):
         """Order open in transactions but filled in IB gets RECONCILED row with fill data."""
-        trade = _make_open_transaction(ctx, 6000, serial=2)
+        _make_open_transaction(ctx, 6000, serial=2)
 
         ctx.ib._order_statuses[6000] = {
             "status": "Filled",

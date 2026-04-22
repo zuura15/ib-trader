@@ -3,12 +3,20 @@ import { useStore } from '../../data/store';
 import { formatTime } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
-const ACTIVITY_TYPES = ['SIGNAL', 'ORDER', 'FILL', 'CLOSED', 'STARTED', 'STOPPED', 'ERROR', 'RISK'];
+// Event types surfaced in the Bot Activity feed. Anything the engine or
+// bot writes to bot_events with one of these types shows up here.
+const ACTIVITY_TYPES = [
+  'SIGNAL', 'ORDER', 'FILL', 'CLOSED', 'STARTED', 'STOPPED',
+  'ERROR', 'RISK', 'REPRICE', 'EXIT_CHECK', 'CANCELLED',
+];
 
 const typeStyle: Record<string, { color: string; icon: string }> = {
   SIGNAL: { color: 'var(--accent-green)', icon: '▲' },
   ORDER: { color: 'var(--accent-blue)', icon: '→' },
+  REPRICE: { color: 'var(--accent-yellow)', icon: '↻' },
   FILL: { color: 'var(--accent-green)', icon: '✓' },
+  CANCELLED: { color: 'var(--text-muted)', icon: '⊘' },
+  EXIT_CHECK: { color: 'var(--accent-cyan, var(--accent-blue))', icon: '↘' },
   CLOSED: { color: 'var(--accent-cyan, var(--accent-blue))', icon: '◼' },
   STARTED: { color: 'var(--accent-green)', icon: '●' },
   STOPPED: { color: 'var(--text-muted)', icon: '○' },
@@ -77,7 +85,7 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
           seen.add(e.id);
           return true;
         });
-        unique.sort((a, b) => (a.recorded_at || '').localeCompare(b.recorded_at || ''));
+        unique.sort((a, b) => (b.recorded_at || '').localeCompare(a.recorded_at || ''));
         setEntries(unique.slice(0, maxLines));
       });
     };
@@ -87,19 +95,19 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
     return () => clearInterval(interval);
   }, [bots, maxLines]);
 
-  // Auto-scroll to bottom (newest at bottom)
-  const lastEntryId = entries.length > 0 ? entries[entries.length - 1]?.id : 0;
+  // Scroll to top (newest first)
+  const lastEntryId = entries.length > 0 ? entries[0]?.id : 0;
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTop = 0;
     }
   }, [lastEntryId]);
 
   return (
     <PanelShell title="Bot Activity" accent="green" right={
-      <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{entries.length} events</span>
+      <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{entries.length} events</span>
     }>
-      <div ref={scrollRef} className="h-full overflow-y-auto p-1">
+      <div ref={scrollRef} className="h-full overflow-y-auto p-1" style={{ fontSize: 15 }}>
         {entries.length === 0 ? (
           <div style={{ color: 'var(--text-muted)', padding: 20, textAlign: 'center' }}>
             No activity yet
@@ -121,26 +129,26 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
           }
 
           return (
-            <div key={entry.id} className="flex items-start gap-2 px-2 py-1.5 text-xs border-b"
+            <div key={entry.id} className="flex items-start gap-2 px-2 py-1.5 border-b"
               style={{ borderColor: 'var(--border-default)' }}
               onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--row-hover)')}
               onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}>
 
               {/* Icon */}
-              <span style={{ color: style.color, fontSize: 12, lineHeight: '16px' }} className="shrink-0">
+              <span style={{ color: style.color, fontSize: 15, lineHeight: '20px' }} className="shrink-0">
                 {style.icon}
               </span>
 
               {/* Content */}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="font-mono text-[10px]" style={{ color: 'var(--text-muted)' }}>{ts}</span>
+                  <span className="font-mono" style={{ fontSize: 13, color: 'var(--text-muted)' }}>{ts}</span>
                   {entry.bot_id && (
-                    <span className="text-[9px] font-bold" style={{ color: botColorMap[entry.bot_id] || 'var(--text-muted)' }}>
+                    <span className="font-bold" style={{ fontSize: 11, color: botColorMap[entry.bot_id] || 'var(--text-muted)' }}>
                       {botLabel(entry.bot_id)}
                     </span>
                   )}
-                  <span className="text-[10px] font-semibold" style={{ color: style.color }}>
+                  <span className="font-semibold" style={{ fontSize: 13, color: style.color }}>
                     {entry.event_type}
                   </span>
                   {pnlStr && (
@@ -158,8 +166,8 @@ export function BotActivity({ maxLines = 200 }: { maxLines?: number }) {
 
               {/* Trade serial badge */}
               {entry.trade_serial != null && entry.trade_serial > 0 && (
-                <span className="shrink-0 text-[9px] font-mono px-1 rounded"
-                  style={{ background: 'var(--bg-root)', color: 'var(--text-muted)', border: '1px solid var(--border-default)' }}>
+                <span className="shrink-0 font-mono px-1 rounded"
+                  style={{ fontSize: 11, background: 'var(--bg-root)', color: 'var(--text-muted)', border: '1px solid var(--border-default)' }}>
                   #{entry.trade_serial}
                 </span>
               )}

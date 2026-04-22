@@ -1,5 +1,4 @@
 """Unit tests for OutputRouter, OutputPane, OutputSeverity, and RendererProtocol."""
-import pytest
 from unittest.mock import MagicMock
 
 from ib_trader.repl.output_router import (

@@ -4,12 +4,11 @@ Tests the complete limit order path: place at user-specified price,
 confirm IB acceptance, return immediately. No reprice loop, no timeout.
 Assertions use TransactionEvent rows instead of Order rows.
 """
-import asyncio
 import pytest
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand, SellCommand, Strategy
-from ib_trader.data.models import TransactionAction, TradeStatus, LegType
+from ib_trader.data.models import TransactionAction, TradeStatus
 from ib_trader.engine.order import execute_order
 
 
@@ -100,8 +99,8 @@ class TestLimitOrderPlacement:
         # Set up mock to report fill immediately
         original_place = ctx.ib.place_limit_order
 
-        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             # Simulate immediate fill
             ctx.ib._order_statuses[ib_id] = {
                 "status": "Filled",
@@ -136,8 +135,8 @@ class TestLimitOrderPlacement:
         # Make orders rejected immediately
         original_place = ctx.ib.place_limit_order
 
-        async def place_rejected(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_rejected(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             ctx.ib._order_statuses[ib_id]["status"] = "Cancelled"
             return ib_id
 
@@ -177,8 +176,8 @@ class TestLimitOrderPlacement:
         """Limit order with immediate fill should place profit taker."""
         original_place = ctx.ib.place_limit_order
 
-        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC"):
-            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif)
+        async def place_and_fill(con_id, symbol, side, qty, price, outside_rth=True, tif="GTC", order_ref=None):
+            ib_id = await original_place(con_id, symbol, side, qty, price, outside_rth=outside_rth, tif=tif, order_ref=order_ref)
             ctx.ib._order_statuses[ib_id] = {
                 "status": "Filled",
                 "qty_filled": qty,

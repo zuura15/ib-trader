@@ -23,7 +23,7 @@ from ib_trader.data.models import (
 )
 from ib_trader.engine.exceptions import IBOrderRejectedError, SafetyLimitError, TradeNotFoundError
 from ib_trader.engine.market_hours import (
-    is_ib_session_active, is_overnight_session, presubmitted_reason, session_label,
+    is_ib_session_active, is_outside_rth, presubmitted_reason, session_label,
 )
 
 
@@ -43,6 +43,7 @@ class _OrderContext:
     strike: Decimal | None = None
     right: str | None = None
     ib_order_id: str | None = None
+    order_ref: str | None = None  # IB orderRef tag (IBT:{bot_ref}:{symbol}:{side}:{serial})
 
 
 def _session_tif() -> str:
@@ -63,6 +64,23 @@ from ib_trader.repl.commands import BuyCommand, SellCommand, CloseCommand, Strat
 logger = logging.getLogger(__name__)
 
 
+def _reprice_interval(settings) -> float:
+    """Seconds between walker amendments. Derived so it can't drift from
+    the active duration / step count."""
+    steps = int(settings.get("reprice_steps", 10))
+    active = float(settings.get("reprice_active_duration_seconds", 30))
+    return active / steps
+
+
+def _total_order_wait(settings) -> float:
+    """Active + passive = the engine's "give up" window for MID / BID /
+    ASK / MARKET. Derived to avoid drift across the two phases."""
+    return (
+        float(settings.get("reprice_active_duration_seconds", 30))
+        + float(settings.get("reprice_passive_wait_seconds", 90))
+    )
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -70,6 +88,19 @@ def _now_utc() -> datetime:
 def _now_display() -> str:
     """Local time formatted for user-visible output (not logs/DB — those stay UTC)."""
     return datetime.now().strftime('%H:%M:%S')
+
+
+def _fmt_qty(q) -> str:
+    """Format a quantity for display: whole numbers strip the trailing ``.0``
+    so '621.0' shows as '621'. Fractional quantities (future options /
+    crypto) keep their decimals."""
+    try:
+        d = Decimal(str(q))
+    except Exception:
+        return str(q)
+    if d == d.to_integral_value():
+        return str(int(d))
+    return str(d)
 
 
 def _safe_int(val) -> int | None:
@@ -221,6 +252,9 @@ async def execute_order(
     direction = "LONG" if side == "BUY" else "SHORT"
     correlation_id = str(uuid.uuid4())
 
+    # Expose the serial to the renderer for structured API responses
+    ctx.router.update_order_row(serial, {"symbol": cmd.symbol, "side": side})
+
     # Build trade_config JSON with profit taker / stop loss parameters
     _trade_cfg: dict = {}
     if cmd.profit_amount is not None:
@@ -240,6 +274,13 @@ async def execute_order(
     )
     trade_group = ctx.trades.create(trade_group)
 
+    # Encode orderRef AFTER serial allocation (bot_ref comes from the command)
+    order_ref = None
+    if hasattr(cmd, 'bot_ref') and cmd.bot_ref:
+        from ib_trader.engine.order_ref import encode as encode_order_ref
+        side_code = "B" if side == "BUY" else "S"
+        order_ref = encode_order_ref(cmd.bot_ref, cmd.symbol, side_code, serial)
+
     order_ctx = _OrderContext(
         trade_id=trade_group.id,
         trade_serial=serial,
@@ -250,6 +291,7 @@ async def execute_order(
         leg_type=LegType.ENTRY,
         correlation_id=correlation_id,
         security_type="STK",
+        order_ref=order_ref,
     )
 
     if cmd.stop_loss:
@@ -271,6 +313,8 @@ async def execute_order(
             await _execute_mid_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         elif cmd.strategy in (Strategy.BID, Strategy.ASK):
             await _execute_bid_ask_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
+        elif cmd.strategy == Strategy.SMART_MARKET:
+            await _execute_smart_market_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         else:
             await _execute_market_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
     except Exception as e:
@@ -348,10 +392,14 @@ async def _execute_limit_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
 
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
@@ -361,10 +409,11 @@ async def _execute_limit_order(
                price_placed=price,
                raw_response=json.dumps({
                    "ib_order_id": ib_order_id, "price": str(price), "strategy": "limit",
+                   "order_ref": order_ctx.order_ref,
                }))
 
     # Register fill/status callbacks so SQLite gets updated on fill
-    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
+    ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
     async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
         if fill_ib_id == ib_order_id:
@@ -464,9 +513,7 @@ async def _execute_mid_order(
 ) -> None:
     """Place a mid-price limit order with reprice loop."""
     settings = ctx.settings
-    total_steps = int(
-        settings["reprice_duration_seconds"] / settings["reprice_interval_seconds"]
-    )
+    total_steps = int(settings.get("reprice_steps", 10))
 
     snapshot = await ctx.ib.get_market_snapshot(con_id)
     bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
@@ -501,10 +548,14 @@ async def _execute_mid_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, mid, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, mid, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
 
     # PLACE_ACCEPTED — IB returned an order ID
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
@@ -523,12 +574,20 @@ async def _execute_mid_order(
     # get_order_status()'s trade.fills by the time we check after the reprice
     # loop.  Storing them here ensures the FILLED printout shows the real value.
     _fill_commission: Decimal | None = None
+    _fill_running_qty: Decimal = Decimal("0")
 
     async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
-        nonlocal _fill_commission
+        nonlocal _fill_commission, _fill_running_qty
         if fill_ib_id == ib_order_id:
             _fill_commission = commission
+            _fill_running_qty += _qty
             ctx.tracker.notify_filled(fill_ib_id)
+            ctx.router.emit(
+                f"[{_now_display()}] Filled {_fmt_qty(_qty)} @ ${_avg} "
+                f"({_fmt_qty(_fill_running_qty)}/{_fmt_qty(qty)})",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_PARTIAL_FILL_DISPLAY",
+            )
 
     async def on_status(status_ib_id: str, status: str):
         if status_ib_id == ib_order_id and status in ("Cancelled", "Inactive"):
@@ -678,8 +737,9 @@ async def _execute_mid_order(
             side=side,
             ctx=ctx,
             total_steps=total_steps,
-            interval_seconds=float(settings["reprice_interval_seconds"]),
+            interval_seconds=_reprice_interval(settings),
             initial_price=mid,
+            target_qty=qty,
             trade_id=order_ctx.trade_id,
             leg_type=order_ctx.leg_type,
             security_type=order_ctx.security_type,
@@ -687,18 +747,40 @@ async def _execute_mid_order(
         )
     )
 
-    # Await fill or timeout
-    total_duration = float(settings["reprice_duration_seconds"])
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=total_duration + 2)
-    except asyncio.TimeoutError:
-        pass
+    # Two-phase wait: walker runs for the active duration, then we hold
+    # at the last-amended price for the passive duration while IB
+    # finishes delivering any residual. `_handle_partial` / cancel paths
+    # only fire if the combined window expires with residual unfilled.
+    active_duration = float(settings["reprice_active_duration_seconds"])
+    await _await_full_fill_or_timeout(
+        track, ib_order_id, qty, active_duration + 2, ctx,
+    )
 
     reprice_task.cancel()
     try:
         await reprice_task
     except asyncio.CancelledError:
         pass
+
+    # Passive phase: walker is done. Hold the limit at the last amended
+    # price and give IB more time to deliver any residual. Partial-fill
+    # callbacks keep updating track.fill_event / qty_filled in the
+    # background.
+    _status_mid = await ctx.ib.get_order_status(ib_order_id)
+    _filled_so_far = _status_mid.get("qty_filled") or Decimal("0")
+    if _filled_so_far < qty and not track.is_canceled:
+        passive_wait = float(settings["reprice_passive_wait_seconds"])
+        if passive_wait > 0:
+            ctx.router.emit(
+                f"[{_now_display()}] Walker complete \u2014 holding at "
+                f"last amended price, waiting up to {int(passive_wait)}s "
+                f"for residual\u2026",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_PASSIVE_WAIT_DISPLAY",
+            )
+            await _await_full_fill_or_timeout(
+                track, ib_order_id, qty, passive_wait, ctx,
+            )
 
     # Determine outcome.
     # Use concrete fill data from IB rather than track.is_filled alone:
@@ -726,7 +808,7 @@ async def _execute_mid_order(
 
         if _ib_final_status == "Inactive":
             _err = ctx.ib.get_order_error(ib_order_id)
-            reason = _err or f"IB set order Inactive"
+            reason = _err or "IB set order Inactive"
             if _why_held:
                 reason += f" (whyHeld: {_why_held!r})"
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
@@ -756,50 +838,57 @@ async def _execute_mid_order(
             )
         else:
             # Normal reprice window expired with no fill.
-            # CRITICAL: Cancel-vs-fill race condition.
-            # IB may fill the order between our cancel request and the
-            # cancel confirmation. We must check for fills AFTER cancelling
-            # and before marking the order as expired.
+            # Cancel-vs-fill race: IB may fill (or partial-fill) between our
+            # cancel request and the cancel confirmation. Emit an "Attempting
+            # cancel" status to the user, then let the shared helper wait
+            # for IB to pick one outcome.
+            ctx.router.emit(
+                f"\u27f3 Attempting to cancel #{trade_group.serial_number} "
+                f"(no fill within {int(_total_order_wait(settings))}s)\u2026",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_CANCEL_ATTEMPT_DISPLAY",
+            )
             _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, cmd.symbol, side, "LIMIT",
                        qty, ib_order_id=_safe_int(ib_order_id),
                        trade_serial=trade_group.serial_number,
                        trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                        correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
-            await ctx.ib.cancel_order(ib_order_id)
 
-            # Wait briefly for the cancel/fill race to resolve.
-            # IB can take several seconds to confirm cancel vs fill.
-            _CANCEL_SETTLE_SECONDS = 3.0
-            _CANCEL_SETTLE_POLL = 0.3
-            settled_as_fill = False
-            for _ in range(int(_CANCEL_SETTLE_SECONDS / _CANCEL_SETTLE_POLL)):
-                await asyncio.sleep(_CANCEL_SETTLE_POLL)
-                status_dict = await ctx.ib.get_order_status(ib_order_id)
-                ib_status = status_dict.get("status", "")
-                ib_filled = status_dict.get("qty_filled", Decimal("0"))
+            settle_timeout = float(ctx.settings.get("cancel_settle_timeout_seconds", 120))
+            resolution, final_qty, final_avg, final_commission, _ib_status = \
+                await _cancel_and_await_resolution(
+                    ctx, ib_order_id, qty, track=track, timeout=settle_timeout,
+                    heartbeat_label=f"Cancel pending #{trade_group.serial_number} \u2014",
+                )
 
-                if ib_filled and ib_filled > 0:
-                    # Fill arrived after cancel — the order actually filled!
-                    logger.warning(
-                        '{"event": "CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
-                        '"symbol": "%s", "qty_filled": "%s", "resolution": "filled"}',
-                        ib_order_id, cmd.symbol, str(ib_filled),
-                    )
-                    avg_price = status_dict.get("avg_fill_price") or Decimal("0")
-                    commission = status_dict.get("commission") or Decimal("0")
-                    await _handle_fill(
-                        order_ctx, trade_group, ib_filled, avg_price,
-                        commission, cmd, con_id, ctx,
-                    )
-                    settled_as_fill = True
-                    break
-
-                if ib_status in ("Cancelled", "Inactive"):
-                    # Cancel confirmed — no fill happened.
-                    break
-
-            if not settled_as_fill:
-                ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+            if resolution == "filled":
+                logger.warning(
+                    '{"event": "CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+                    '"symbol": "%s", "qty_filled": "%s", "resolution": "filled"}',
+                    ib_order_id, cmd.symbol, str(final_qty),
+                )
+                await _handle_fill(
+                    order_ctx, trade_group, final_qty,
+                    final_avg or Decimal("0"), final_commission,
+                    cmd, con_id, ctx,
+                )
+            elif final_qty > 0:
+                # Late partial fill landed during the cancel settle window.
+                logger.warning(
+                    '{"event": "CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+                    '"symbol": "%s", "qty_filled": "%s", "resolution": "partial"}',
+                    ib_order_id, cmd.symbol, str(final_qty),
+                )
+                _write_txn(ctx, TransactionAction.PARTIAL_FILL, cmd.symbol, side, "LIMIT",
+                           qty, ib_order_id=_safe_int(ib_order_id),
+                           ib_filled_qty=final_qty, ib_avg_fill_price=final_avg,
+                           trade_serial=trade_group.serial_number,
+                           ib_responded_at=_now_utc(),
+                           trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                           correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+                           commission=final_commission)
+                # pnl=None — entry partials shouldn't clobber realized_pnl.
+                ctx.trades.update_pnl(trade_group.id, None, final_commission)
                 _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
                            qty, ib_order_id=_safe_int(ib_order_id),
                            trade_serial=trade_group.serial_number, is_terminal=True,
@@ -807,16 +896,33 @@ async def _execute_mid_order(
                            trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                            correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
                 ctx.router.emit(
-                    f"\u2717 EXPIRED: 0/{qty} filled | reprice window closed "
-                    f"({settings['reprice_duration_seconds']}s)\n"
+                    f"\u26a0 PARTIAL: {final_qty}/{qty} filled @ avg "
+                    f"${final_avg} (cancel beat remainder)\n"
+                    f"  Commission: ${final_commission}\n"
+                    f"  Serial: #{trade_group.serial_number}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                    event="ORDER_PARTIAL_DISPLAY",
+                )
+            else:
+                ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+                _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
+                           qty, ib_order_id=_safe_int(ib_order_id),
+                           trade_serial=trade_group.serial_number, is_terminal=True,
+                           ib_responded_at=_now_utc(),
+                           trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                           correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
+                cancel_note = "cancel confirmed" if resolution == "cancelled" else "cancel ack timeout"
+                ctx.router.emit(
+                    f"\u2717 EXPIRED: 0/{qty} filled | order window closed "
+                    f"({int(_total_order_wait(settings))}s, {cancel_note})\n"
                     f"  Serial: #{trade_group.serial_number}",
                     pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
                     event="ORDER_EXPIRED_DISPLAY",
                 )
                 logger.info(
                     '{"event": "ORDER_EXPIRED", "correlation_id": "%s", "serial": %d, '
-                    '"reason": "reprice_timeout_no_fill"}',
-                    order_ctx.correlation_id, trade_group.serial_number,
+                    '"reason": "reprice_timeout_no_fill", "cancel_resolution": "%s"}',
+                    order_ctx.correlation_id, trade_group.serial_number, resolution,
                 )
 
     ctx.tracker.unregister(ib_order_id)
@@ -871,10 +977,14 @@ async def _execute_bid_ask_order(
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     ib_order_id = await ctx.ib.place_limit_order(
-        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif()
+        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
     )
 
     order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
 
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
@@ -886,13 +996,28 @@ async def _execute_bid_ask_order(
 
     track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
-    _fill_commission: Decimal | None = None
+    # Capture fill-level data from the callback so we don't have to re-read
+    # trade.orderStatus, which lags execDetailsEvent. On a fast fill the fill
+    # callback runs well before orderStatus.filled / avgFillPrice are updated;
+    # re-reading them races and reports qty_filled=0 even though the order
+    # actually filled, which then falls through to "PreSubmitted" → NOT_ROUTED.
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
 
-    async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
-        nonlocal _fill_commission
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
-            _fill_commission = commission
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
+            ctx.router.emit(
+                f"[{_now_display()}] Filled {_fmt_qty(q)} @ ${avg} "
+                f"({_fmt_qty(_fill_qty)}/{_fmt_qty(qty)})",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_PARTIAL_FILL_DISPLAY",
+            )
 
     async def on_status(status_ib_id: str, status: str):
         if status_ib_id == ib_order_id and status in ("Cancelled", "Inactive"):
@@ -901,20 +1026,26 @@ async def _execute_bid_ask_order(
     ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
     ctx.ib.register_status_callback(on_status, ib_order_id=ib_order_id)
 
-    # Wait briefly to catch immediate fills (e.g. ask buy fills at once).
-    # If not filled within bid_ask_wait_seconds, leave the GTC order live —
-    # daemon reconciler will update the DB when IB eventually reports the fill.
-    bid_ask_wait = float(ctx.settings.get("bid_ask_wait_seconds", 30))
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=bid_ask_wait)
-    except asyncio.TimeoutError:
-        pass
+    # Wait for the full give-up window (active + passive). BID/ASK has no
+    # walker, so the whole interval is effectively passive: place at the
+    # quote and wait for IB. Partial-aware waiter loops across split fills.
+    # If still unfilled at the end, the GTC order stays live in IB and the
+    # daemon reconciler picks up any late fill.
+    await _await_full_fill_or_timeout(
+        track, ib_order_id, qty, _total_order_wait(ctx.settings), ctx,
+    )
 
     status = await ctx.ib.get_order_status(ib_order_id)
     ib_status = status["status"]
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = _fill_commission if _fill_commission is not None else (status["commission"] or Decimal("0"))
+    # Prefer the fill-callback values (authoritative once fill_event is set).
+    # Fall back to trade.orderStatus for the partial / no-fill paths.
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = (_fill_notional / _fill_qty) if _fill_qty > 0 else None
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+    commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty:
@@ -927,7 +1058,7 @@ async def _execute_bid_ask_order(
         _err = ctx.ib.get_order_error(ib_order_id) or ""
         _why = status.get("why_held") or ""
         if ib_status == "Inactive":
-            reason = _err or f"IB set order Inactive"
+            reason = _err or "IB set order Inactive"
             if _why:
                 reason += f" (whyHeld: {_why!r})"
             event_label = "INACTIVE"
@@ -1003,6 +1134,535 @@ async def _execute_bid_ask_order(
     ctx.tracker.unregister(ib_order_id)
 
 
+def _slippage_floor(trigger_price: Decimal, side: str, max_slip_pct: Decimal) -> Decimal:
+    """Compute the worst price we're willing to walk to on SMART_MARKET
+    during ETH. For SELL this is the lowest (trigger × (1 - pct)); for
+    BUY it's the highest (trigger × (1 + pct))."""
+    if side == "SELL":
+        return (trigger_price * (Decimal("1") - max_slip_pct)).quantize(Decimal("0.01"))
+    return (trigger_price * (Decimal("1") + max_slip_pct)).quantize(Decimal("0.01"))
+
+
+def _apply_cap(step_price: Decimal, floor_price: Decimal, side: str) -> Decimal:
+    """Clamp a proposed step price to the slippage floor. Returns the
+    more conservative of the two so we never cross the cap."""
+    if side == "SELL":
+        # SELL floor is the LOWEST price we're willing to accept —
+        # clamp step_price up to floor_price if it's below.
+        return max(step_price, floor_price)
+    # BUY floor is the HIGHEST — clamp step_price down to floor.
+    return min(step_price, floor_price)
+
+
+async def _raise_eth_cap_alert(
+    ctx: AppContext, symbol: str, side: str, trigger_price: Decimal,
+    floor_price: Decimal, residual_qty: Decimal, ib_order_id: str,
+    trade_group: TradeGroup,
+) -> None:
+    """Raise CATASTROPHIC alert when SMART_MARKET ETH walker hits the
+    slippage cap. Writes to ``alerts:active`` + nudges the WS channel.
+    The order is left resting at the floor for human resolution."""
+    import uuid as _uuid
+    alert_id = str(_uuid.uuid4())
+    alert_dict = {
+        "id": alert_id,
+        "severity": "CATASTROPHIC",
+        "trigger": "EXIT_PRICE_CAP_REACHED",
+        "message": (
+            f"SMART_MARKET {side} for {residual_qty} {symbol} reached its "
+            f"slippage floor (${floor_price}) without filling. Order is "
+            f"resting at IB — manual intervention required."
+        ),
+        "symbol": symbol,
+        "side": side,
+        "trigger_price": str(trigger_price),
+        "floor_price": str(floor_price),
+        "residual_qty": str(residual_qty),
+        "ib_order_id": ib_order_id,
+        "trade_serial": trade_group.serial_number,
+        "created_at": _now_utc().isoformat(),
+        "pager": True,
+    }
+    redis = getattr(ctx, "redis", None)
+    if redis is None:
+        logger.error(
+            '{"event": "EXIT_PRICE_CAP_REACHED_NO_REDIS", "symbol": "%s", '
+            '"ib_order_id": "%s"}',
+            symbol, ib_order_id,
+        )
+        return
+    try:
+        from ib_trader.redis.state import StateKeys
+        await StateKeys.publish_alert(redis, alert_id, alert_dict)
+        from ib_trader.redis.streams import publish_activity
+        await publish_activity(redis, "alerts")
+    except Exception:
+        logger.exception(
+            '{"event": "EXIT_PRICE_CAP_ALERT_PUBLISH_FAILED", "symbol": "%s"}',
+            symbol,
+        )
+    ctx.router.emit(
+        f"\u26a0 EXIT CAP REACHED: {side} {residual_qty} {symbol} @ ${floor_price} — "
+        f"order resting at IB, manual intervention required.\n"
+        f"  Serial: #{trade_group.serial_number}",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
+        event="EXIT_PRICE_CAP_REACHED_DISPLAY",
+    )
+    logger.error(
+        '{"event": "EXIT_PRICE_CAP_REACHED", "symbol": "%s", "side": "%s", '
+        '"trigger_price": "%s", "floor_price": "%s", "residual_qty": "%s", '
+        '"ib_order_id": "%s", "trade_serial": %d}',
+        symbol, side, trigger_price, floor_price, residual_qty,
+        ib_order_id, trade_group.serial_number,
+    )
+
+
+async def _walk_limit_aggressive(
+    ctx: AppContext, con_id: int, ib_order_id: str, symbol: str, side: str,
+    trigger_price: Decimal, interval_seconds: float,
+    total_duration_seconds: float | None, floor_price: Decimal | None,
+    target_qty: Decimal,
+) -> dict:
+    """Reprice loop for SMART_MARKET.
+
+    Every ``interval_seconds`` (default ~100 ms) we read the current
+    mid and step the limit aggressively toward the far side (bid for
+    SELL, ask for BUY). Exits early on:
+      - track.fill_event set (filled or cancelled)
+      - full fill observed in order status
+      - ``total_duration_seconds`` elapsed (RTH)
+      - ``floor_price`` reached (ETH)
+
+    Returns a dict describing how we exited: ``{status, hit_cap,
+    last_sent_price, filled_qty}``.
+    """
+    from ib_trader.redis.state import StateKeys as _SK
+    loop = asyncio.get_event_loop()
+    deadline = (
+        loop.time() + total_duration_seconds
+        if total_duration_seconds is not None else None
+    )
+    track = ctx.tracker.get(ib_order_id)
+    last_sent = trigger_price
+
+    redis = getattr(ctx, "redis", None)
+    state_store = None
+    _quote_key = None
+    if redis is not None:
+        from ib_trader.redis.state import StateStore
+        state_store = StateStore(redis)
+        _quote_key = _SK.quote_latest(symbol)
+
+    async def _get_prices() -> tuple[Decimal, Decimal, Decimal]:
+        if state_store is not None and _quote_key is not None:
+            q = await state_store.get(_quote_key)
+            if q:
+                def _d(v):
+                    if v in (None, "", 0, "0"):
+                        return Decimal("0")
+                    return Decimal(str(v))
+                b, a, l = _d(q.get("bid")), _d(q.get("ask")), _d(q.get("last"))
+                if b > 0 or a > 0 or l > 0:
+                    return b, a, l
+        snap = await ctx.ib.get_market_snapshot(con_id)
+        return snap["bid"], snap["ask"], snap["last"]
+
+    while True:
+        if track and (track.is_filled or track.is_canceled):
+            return {"status": "filled_or_canceled", "hit_cap": False,
+                    "last_sent_price": last_sent}
+        if deadline is not None and loop.time() >= deadline:
+            return {"status": "duration_expired", "hit_cap": False,
+                    "last_sent_price": last_sent}
+
+        # Check current fill status — if IB filled during our nap, exit
+        # without another amend (amend on a filled order would error).
+        st = await ctx.ib.get_order_status(ib_order_id)
+        if (st.get("qty_filled") or Decimal("0")) >= target_qty:
+            return {"status": "filled", "hit_cap": False,
+                    "last_sent_price": last_sent}
+        if st.get("status") in ("Cancelled", "Inactive"):
+            return {"status": "cancelled", "hit_cap": False,
+                    "last_sent_price": last_sent}
+
+        # Sleep either until the next interval tick or the deadline,
+        # whichever is sooner. Wake immediately on a fill/cancel event.
+        wait = interval_seconds
+        if deadline is not None:
+            wait = min(wait, max(deadline - loop.time(), 0.0))
+        if track is not None:
+            try:
+                await asyncio.wait_for(track.fill_event.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(wait)
+
+        # Fetch quote, compute next step. We move the limit one IB tick
+        # toward the far side per iteration (or chase the quote if it's
+        # already beyond us). Floor clamps the furthest we'll go; the
+        # walker returns ``hit_cap=True`` once it's sitting at the floor.
+        bid, ask, last = await _get_prices()
+        if bid == 0 and ask == 0:
+            if last > 0:
+                bid = ask = last
+            else:
+                # No data — skip this tick rather than amend blindly.
+                continue
+        tick = Decimal("0.01")
+        if side == "SELL":
+            step_price = last_sent - tick
+            # If the market moved below us, chase it down in one jump.
+            if bid > 0 and bid < step_price:
+                step_price = bid
+        else:  # BUY
+            step_price = last_sent + tick
+            if ask > 0 and ask > step_price:
+                step_price = ask
+
+        if floor_price is not None:
+            step_price = _apply_cap(step_price, floor_price, side)
+            # We're "at the floor" when clamping left us exactly at
+            # floor_price AND we're already sitting there.
+            at_floor = (
+                step_price == floor_price
+                and last_sent == floor_price
+            )
+            if at_floor:
+                return {"status": "cap_reached", "hit_cap": True,
+                        "last_sent_price": last_sent}
+
+        step_price = step_price.quantize(Decimal("0.01"))
+        if step_price == last_sent:
+            continue
+
+        # Re-check order state immediately before amending. The top-of-loop
+        # check goes stale across the asyncio.wait_for + quote-fetch window
+        # (tens to hundreds of ms), during which IB can fill/cancel the
+        # order. Amending a terminal order triggers IB error 104 / 201 and
+        # an ib_async AssertionError — skip the amend entirely instead.
+        if track is not None and (track.is_filled or track.is_canceled):
+            return {
+                "status": "filled_or_canceled",
+                "hit_cap": False,
+                "last_sent_price": last_sent,
+            }
+        try:
+            _pre = await ctx.ib.get_order_status(ib_order_id)
+        except Exception:
+            _pre = {"status": "", "qty_filled": Decimal("0")}
+        _pre_st = _pre.get("status") or ""
+        if _pre_st in ("Filled", "Cancelled", "Inactive", "ApiCancelled"):
+            return {
+                "status": _pre_st.lower(),
+                "hit_cap": False,
+                "last_sent_price": last_sent,
+            }
+        if (_pre.get("qty_filled") or Decimal("0")) >= target_qty:
+            return {
+                "status": "filled",
+                "hit_cap": False,
+                "last_sent_price": last_sent,
+            }
+
+        try:
+            await ctx.ib.amend_order(ib_order_id, step_price)
+            last_sent = step_price
+        except Exception as amend_exc:
+            # Residual race — pre-check was clean but the order
+            # terminalised in the microseconds between our check and IB
+            # receiving the amend. Verify and return without looping. The
+            # two terminal branches below log at WARNING because this is
+            # the expected tail of the race window; only the "non-terminal
+            # but amend failed" branch remains ERROR-worthy.
+            try:
+                _check = await ctx.ib.get_order_status(ib_order_id)
+            except Exception:
+                _check = {"status": "", "qty_filled": Decimal("0")}
+            _st = _check.get("status") or ""
+            _qf = _check.get("qty_filled") or Decimal("0")
+            if _st in ("Filled", "Cancelled", "Inactive", "ApiCancelled") or _qf >= target_qty:
+                logger.warning(
+                    '{"event": "SMART_MARKET_AMEND_RACE", "ib_order_id": "%s", '
+                    '"status": "%s", "qty_filled": "%s"}',
+                    ib_order_id, _st, str(_qf),
+                )
+                return {
+                    "status": _st.lower() if _st else "filled",
+                    "hit_cap": False,
+                    "last_sent_price": last_sent,
+                }
+            # Order not terminal but amend failed — unexpected. Log full
+            # stack trace so we notice, and abort the walker rather than
+            # spin on a permanent failure mode.
+            logger.error(
+                '{"event": "SMART_MARKET_AMEND_FAILED", "ib_order_id": "%s", '
+                '"status": "%s", "qty_filled": "%s"}',
+                ib_order_id, _st, str(_qf),
+                exc_info=amend_exc,
+            )
+            return {
+                "status": "amend_failed",
+                "hit_cap": False,
+                "last_sent_price": last_sent,
+            }
+
+
+async def _execute_smart_market_order(
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
+    side: str, qty: Decimal, ctx: AppContext,
+) -> None:
+    """Session-aware aggressive-mid execution.
+
+    RTH: aggressive walker for ``smart_market_rth_duration_seconds``,
+    then cross to MKT for any residual.
+    ETH: aggressive walker with no time limit but capped at
+    ``trigger_price × (1 ± max_slippage_pct)``; raises CATASTROPHIC
+    alert if the cap is hit.
+    """
+    settings = ctx.settings
+    interval = float(settings.get("smart_market_reprice_interval_ms", 100)) / 1000.0
+    rth_duration = float(settings.get("smart_market_rth_duration_seconds", 10))
+    max_slip = Decimal(str(settings.get("smart_market_eth_max_slippage_pct", 0.005)))
+
+    snapshot = await ctx.ib.get_market_snapshot(con_id)
+    bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+    if bid == 0 and ask == 0:
+        if last == 0:
+            raise ValueError(
+                f"Cannot place SMART_MARKET for {cmd.symbol}: no market data "
+                "available (bid=0, ask=0, last=0)."
+            )
+        bid = ask = last
+    trigger_price = calc_mid(bid, ask)
+    floor_price = _slippage_floor(trigger_price, side, max_slip)
+    rth = not is_outside_rth()
+
+    ctx.router.emit(
+        f"Order #{trade_group.serial_number} \u2014 {side} {qty} {cmd.symbol} @ smart_market\n"
+        f"[{_now_display()}] Placed @ ${trigger_price} "
+        f"(bid: ${bid} ask: ${ask}) session={'RTH' if rth else 'ETH'}",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+        event="ORDER_PLACED_SMART_MARKET",
+    )
+
+    # 1. Place initial LMT at mid.
+    _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "LIMIT",
+               qty, limit_price=trigger_price,
+               trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id,
+               security_type=order_ctx.security_type)
+
+    ib_order_id = await ctx.ib.place_limit_order(
+        con_id, cmd.symbol, side, qty, trigger_price,
+        outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
+    )
+    order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
+    _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
+               qty, limit_price=trigger_price, ib_order_id=_safe_int(ib_order_id),
+               trade_serial=trade_group.serial_number,
+               ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id,
+               security_type=order_ctx.security_type,
+               price_placed=trigger_price)
+
+    track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
+    _fill_commission: Decimal | None = None
+
+    async def on_fill(fill_ib_id: str, _q: Decimal, _a: Decimal, commission: Decimal):
+        nonlocal _fill_commission
+        if fill_ib_id == ib_order_id:
+            _fill_commission = commission
+            ctx.tracker.notify_filled(fill_ib_id)
+
+    async def on_status(status_ib_id: str, status: str):
+        if status_ib_id == ib_order_id and status in ("Cancelled", "Inactive"):
+            ctx.tracker.notify_canceled(status_ib_id)
+
+    ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
+    ctx.ib.register_status_callback(on_status, ib_order_id=ib_order_id)
+
+    # 2. Walk toward the far side.
+    walk = await _walk_limit_aggressive(
+        ctx, con_id, ib_order_id, cmd.symbol, side, trigger_price,
+        interval_seconds=interval,
+        total_duration_seconds=rth_duration if rth else None,
+        floor_price=None if rth else floor_price,
+        target_qty=qty,
+    )
+
+    # 3. Post-walk decision.
+    status = await ctx.ib.get_order_status(ib_order_id)
+    qty_filled = status.get("qty_filled") or Decimal("0")
+    avg_price = status.get("avg_fill_price")
+    commission = _fill_commission if _fill_commission is not None else (
+        status.get("commission") or Decimal("0")
+    )
+
+    # Fully filled during the walk — happy path.
+    if qty_filled >= qty and avg_price is not None:
+        await _handle_fill(order_ctx, trade_group, qty_filled, avg_price,
+                           commission, cmd, con_id, ctx)
+        ctx.tracker.unregister(ib_order_id)
+        return
+
+    # ETH cap reached — leave the order resting, alert, return.
+    if walk.get("hit_cap"):
+        residual = qty - qty_filled
+        await _raise_eth_cap_alert(
+            ctx, cmd.symbol, side, trigger_price, floor_price, residual,
+            ib_order_id, trade_group,
+        )
+        # Do NOT unregister — callbacks stay so a late fill can still be recorded.
+        return
+
+    # RTH duration expired with residual — cancel the working limit, then
+    # submit a MKT for whatever's still outstanding.
+    if rth and walk.get("status") == "duration_expired":
+        ctx.router.emit(
+            f"\u27f3 SMART_MARKET: walker expired, crossing to MKT for residual "
+            f"({qty - qty_filled} of {qty})...",
+            pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+            event="SMART_MARKET_CROSS_TO_MARKET",
+        )
+        settle_timeout = float(settings.get("cancel_settle_timeout_seconds", 120))
+        resolution, final_qty, final_avg, final_comm, _ = \
+            await _cancel_and_await_resolution(
+                ctx, ib_order_id, qty, track=track, timeout=settle_timeout,
+                heartbeat_label=f"Cancel pending #{trade_group.serial_number} \u2014",
+            )
+        if final_comm > commission:
+            commission = final_comm
+        effective_avg = final_avg if final_avg is not None else avg_price
+
+        if final_qty >= qty:
+            await _handle_fill(order_ctx, trade_group, final_qty,
+                               effective_avg or trigger_price, commission,
+                               cmd, con_id, ctx)
+            ctx.tracker.unregister(ib_order_id)
+            return
+
+        residual = qty - final_qty
+        if residual <= 0:
+            ctx.tracker.unregister(ib_order_id)
+            return
+
+        # Submit the MKT for the remainder. Reuses _execute_market_order's
+        # place-market-order helper indirectly via ctx.ib.place_market_order.
+        try:
+            mkt_order_id = await ctx.ib.place_market_order(
+                con_id, cmd.symbol, side, residual,
+                outside_rth=True, order_ref=order_ctx.order_ref,
+            )
+        except Exception as e:
+            logger.exception(
+                '{"event": "SMART_MARKET_MKT_TERMINAL_FAILED", "symbol": "%s", "error": "%s"}',
+                cmd.symbol, str(e),
+            )
+            # Best we can do: record what we got so far as partial, leave
+            # the rest for operator attention.
+            if final_qty > 0 and effective_avg is not None:
+                await _handle_partial(
+                    order_ctx, trade_group, qty, final_qty,
+                    effective_avg, commission, cmd, con_id, ib_order_id, ctx,
+                )
+            ctx.tracker.unregister(ib_order_id)
+            raise
+
+        # Track & wait for the MKT to settle.
+        mkt_track = ctx.tracker.register(order_ctx.correlation_id, mkt_order_id, cmd.symbol)
+        _mkt_commission: Decimal | None = None
+
+        async def mkt_on_fill(fill_id: str, _q: Decimal, _a: Decimal, c: Decimal):
+            nonlocal _mkt_commission
+            if fill_id == mkt_order_id:
+                _mkt_commission = c
+                ctx.tracker.notify_filled(fill_id)
+
+        async def mkt_on_status(sid: str, st: str):
+            if sid == mkt_order_id and st in ("Cancelled", "Inactive"):
+                ctx.tracker.notify_canceled(sid)
+
+        ctx.ib.register_fill_callback(mkt_on_fill, ib_order_id=mkt_order_id)
+        ctx.ib.register_status_callback(mkt_on_status, ib_order_id=mkt_order_id)
+
+        await _await_full_fill_or_timeout(
+            mkt_track, mkt_order_id, residual,
+            float(settings.get("market_order_wait_seconds", 30)), ctx,
+        )
+        mkt_status = await ctx.ib.get_order_status(mkt_order_id)
+        mkt_filled = mkt_status.get("qty_filled") or Decimal("0")
+        mkt_avg = mkt_status.get("avg_fill_price")
+        mkt_comm = _mkt_commission if _mkt_commission is not None else (
+            mkt_status.get("commission") or Decimal("0")
+        )
+
+        # Combine the limit fills + the market fills into a single
+        # aggregate for the terminal txn.
+        total_filled = final_qty + mkt_filled
+        if total_filled > 0:
+            # Weighted average across both legs, protecting against missing avg.
+            num = Decimal("0")
+            denom = Decimal("0")
+            if final_qty > 0 and effective_avg is not None:
+                num += effective_avg * final_qty
+                denom += final_qty
+            if mkt_filled > 0 and mkt_avg is not None:
+                num += mkt_avg * mkt_filled
+                denom += mkt_filled
+            agg_avg = (num / denom).quantize(Decimal("0.01")) if denom > 0 else trigger_price
+            agg_comm = commission + mkt_comm
+            if total_filled >= qty:
+                await _handle_fill(order_ctx, trade_group, total_filled,
+                                   agg_avg, agg_comm, cmd, con_id, ctx)
+            else:
+                await _handle_partial(order_ctx, trade_group, qty, total_filled,
+                                      agg_avg, agg_comm, cmd, con_id, mkt_order_id, ctx)
+        else:
+            # Zero fills across both legs — same EXPIRED semantics as mid
+            # when nothing took. Write terminal CANCELLED and unregister.
+            ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+            _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
+                       qty, ib_order_id=_safe_int(ib_order_id),
+                       trade_serial=trade_group.serial_number, is_terminal=True,
+                       ib_responded_at=_now_utc(),
+                       trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                       correlation_id=order_ctx.correlation_id,
+                       security_type=order_ctx.security_type)
+            ctx.router.emit(
+                f"\u2717 EXPIRED: 0/{qty} filled (smart_market walker + MKT terminal)\n"
+                f"  Serial: #{trade_group.serial_number}",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                event="ORDER_EXPIRED_DISPLAY",
+            )
+
+        ctx.tracker.unregister(mkt_order_id)
+        ctx.tracker.unregister(ib_order_id)
+        return
+
+    # Any other exit path (e.g. walker exited due to external cancel):
+    # fall through to the standard partial / cancelled handling.
+    if qty_filled > 0 and avg_price is not None:
+        await _handle_partial(order_ctx, trade_group, qty, qty_filled,
+                              avg_price, commission, cmd, con_id, ib_order_id, ctx)
+    else:
+        ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+        _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
+                   qty, ib_order_id=_safe_int(ib_order_id),
+                   trade_serial=trade_group.serial_number, is_terminal=True,
+                   ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id,
+                   security_type=order_ctx.security_type)
+    ctx.tracker.unregister(ib_order_id)
+
+
 async def _execute_market_order(
     cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
     side: str, qty: Decimal, ctx: AppContext,
@@ -1013,8 +1673,8 @@ async def _execute_market_order(
     orders.  We auto-convert to an aggressive limit at the ask (BUY) or
     bid (SELL) so the order fills immediately at the best available price.
     """
-    if is_overnight_session():
-        # Overnight venue rejects market orders — convert to aggressive limit
+    if is_outside_rth():
+        # Outside RTH: exchanges reject market orders — convert to aggressive limit
         snapshot = await ctx.ib.get_market_snapshot(con_id)
         bid, ask = snapshot["bid"], snapshot["ask"]
         if bid == 0 and ask == 0:
@@ -1038,6 +1698,7 @@ async def _execute_market_order(
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, cmd.symbol, side, qty, aggressive_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=order_ctx.order_ref,
         )
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "LIMIT",
                    qty, limit_price=aggressive_price,
@@ -1051,7 +1712,10 @@ async def _execute_market_order(
                    qty, trade_serial=trade_group.serial_number,
                    trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                    correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
-        ib_order_id = await ctx.ib.place_market_order(con_id, cmd.symbol, side, qty, outside_rth=True)
+        ib_order_id = await ctx.ib.place_market_order(
+            con_id, cmd.symbol, side, qty, outside_rth=True,
+            order_ref=order_ctx.order_ref,
+        )
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "MARKET",
                    qty, ib_order_id=_safe_int(ib_order_id),
                    trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
@@ -1059,25 +1723,52 @@ async def _execute_market_order(
                    correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
     order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
 
     track = ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
 
-    async def on_fill(fill_ib_id: str, qty_filled: Decimal, avg_price: Decimal, commission: Decimal):
+    # Capture fill data directly from the callback — trade.orderStatus.filled
+    # and avgFillPrice lag the execDetailsEvent that fires this callback, so
+    # re-reading status races and reports qty_filled=0 on a fast fill.
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
+
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
+            ctx.router.emit(
+                f"[{_now_display()}] Filled {_fmt_qty(q)} @ ${avg} "
+                f"({_fmt_qty(_fill_qty)}/{_fmt_qty(qty)})",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_PARTIAL_FILL_DISPLAY",
+            )
 
     ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
 
-    # Market orders should fill quickly — wait up to 30 seconds
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        pass
+    # Market orders should fill quickly — wait up to the unified total
+    # order window (active + passive). Partial-aware waiter so a SMART
+    # split (fills arriving as 9 + 6, etc.) doesn't cause us to declare
+    # PARTIAL while the remainder is still en route.
+    await _await_full_fill_or_timeout(
+        track, ib_order_id, qty, _total_order_wait(ctx.settings), ctx,
+    )
 
     status = await ctx.ib.get_order_status(ib_order_id)
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = status["commission"] or Decimal("0")
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = _fill_notional / _fill_qty
+        commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+        commission = status["commission"] or Decimal("0")
 
     if qty_filled >= qty:
         await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
@@ -1098,7 +1789,12 @@ async def _handle_fill(
     avg_price: Decimal, commission: Decimal, cmd, con_id: int, ctx: AppContext,
 ) -> None:
     """Record a complete fill and place profit taker if configured."""
-    ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
+    # pnl=None preserves the trade_group's realized_pnl (stays NULL for
+    # entries; the close path owns P&L writes). Previously we wrote
+    # Decimal("0") here which clobbered bot-driven trade_groups with a
+    # meaningless zero and made the Trades panel read "$0.00" for every
+    # row. Commission still updates normally.
+    ctx.trades.update_pnl(trade_group.id, None, commission)
 
     _write_txn(ctx, TransactionAction.FILLED, order_ctx.symbol, order_ctx.side,
                order_ctx.order_type, qty_filled,
@@ -1112,7 +1808,7 @@ async def _handle_fill(
                commission=commission)
 
     ctx.router.emit(
-        f"\u2713 FILLED: {qty_filled} shares {order_ctx.symbol} @ ${avg_price} avg\n"
+        f"\u2713 FILLED: {_fmt_qty(qty_filled)} shares {order_ctx.symbol} @ ${avg_price} avg\n"
         f"  Commission: ${commission}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
@@ -1142,29 +1838,262 @@ async def _handle_fill(
         )
 
 
+async def _await_full_fill_or_timeout(
+    track, ib_order_id: str, target_qty: Decimal,
+    timeout: float, ctx: AppContext,
+) -> None:
+    """Wait for cumulative fill >= target_qty, cancel, or timeout.
+
+    ``tracker.notify_filled`` sets ``fill_event`` on EVERY partial fill, so
+    a naive ``await wait_for(fill_event.wait(), ...)`` returns on the first
+    partial and causes the caller to declare PARTIAL + cancel while IB is
+    still filling the remainder (live SMART routing frequently splits an
+    order across venues and reports fills incrementally). We instead loop:
+    wait, clear, re-check cumulative filled qty, and keep waiting until
+    full fill, cancel, or the window elapses.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(track.fill_event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return
+        track.fill_event.clear()
+        if track.is_canceled:
+            return
+        status = await ctx.ib.get_order_status(ib_order_id)
+        if status["qty_filled"] >= target_qty:
+            return
+
+
+async def _cancel_and_await_resolution(
+    ctx: AppContext, ib_order_id: str, target_qty: Decimal,
+    track=None, timeout: float = 10.0,
+    heartbeat_seconds: float = 5.0,
+    heartbeat_label: str = "",
+) -> tuple[str, Decimal, Decimal | None, Decimal, str]:
+    """Send a cancel and wait for IB to settle the cancel-vs-fill race.
+
+    IB's cancel is not instant: the order may already be at the exchange
+    being filled when we send the cancel. Outcomes we need to distinguish:
+      - the remainder fills before our cancel lands (promote to FILLED)
+      - IB confirms the cancel (genuine PARTIAL / EXPIRED)
+      - IB is slow to tell us either way (timeout)
+
+    Polls ``get_order_status`` on every event-wake (fill or status change)
+    plus a ~0.5 s fallback tick so a missed event can't strand us.
+
+    Returns ``(resolution, qty_filled, avg_fill_price, commission, ib_status)``
+    where ``resolution`` is one of ``"filled"``, ``"cancelled"``, ``"timeout"``.
+    """
+    # Dispatch the cancel under asyncio.shield so a client-side timeout
+    # on the caller (e.g. the API server's httpx client giving up on us)
+    # can't abort the IB cancel mid-throttle and leave the order live.
+    # If the outer task is cancelled while we're inside the throttle's
+    # asyncio.sleep, the shielded cancel continues to completion; the
+    # CancelledError is re-raised afterwards so the enclosing wait unwinds.
+    cancel_task = asyncio.ensure_future(ctx.ib.cancel_order(ib_order_id))
+    try:
+        await asyncio.shield(cancel_task)
+    except asyncio.CancelledError:
+        # Outer task cancelled. Let the cancel dispatch finish in the
+        # background — IB will still see the cancelOrder packet.
+        raise
+    except Exception:
+        logger.exception(
+            '{"event": "CANCEL_SUBMIT_FAILED", "ib_order_id": "%s"}', ib_order_id,
+        )
+
+    # Primary path: ib_async pushes orderStatus / execDetails callbacks,
+    # which set ``track.fill_event`` — the wait below returns immediately
+    # on any state change. ``get_order_status`` reads the locally cached
+    # ``trade.orderStatus`` so it's essentially free.
+    #
+    # Backstop: every ``_RESYNC_INTERVAL_S`` we call ``get_open_orders``
+    # (which fires ``reqAllOpenOrdersAsync`` under the hood). This forces
+    # IB to re-push full state for every live order — if a status or
+    # fill callback was ever dropped, this is where we'd pick it up.
+    _RESYNC_INTERVAL_S = 10.0
+    _RESYNC_CALL_TIMEOUT_S = 5.0
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    last_resync = loop.time()
+    last_heartbeat = loop.time()
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        # User-visible heartbeat so the command feed doesn't go silent
+        # while we wait for IB to confirm the cancel (can be 30s+ on
+        # overnight venues). Also keeps the WS consumer's stream warm.
+        if heartbeat_seconds > 0 and loop.time() - last_heartbeat >= heartbeat_seconds:
+            try:
+                _hb_status = await ctx.ib.get_order_status(ib_order_id)
+                _hb_filled = _hb_status.get("qty_filled") or Decimal("0")
+                prefix = f"{heartbeat_label} " if heartbeat_label else ""
+                ctx.router.emit(
+                    f"[{_now_display()}] {prefix}waiting for IB... "
+                    f"({_fmt_qty(_hb_filled)}/{_fmt_qty(target_qty)} filled)",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                    event="CANCEL_SETTLE_HEARTBEAT_DISPLAY",
+                )
+            except Exception:
+                logger.debug(
+                    "cancel-settle heartbeat emit failed", exc_info=True,
+                )
+            last_heartbeat = loop.time()
+        if loop.time() - last_resync >= _RESYNC_INTERVAL_S:
+            # Bound the resync call — if IB is in a weird state (e.g. IBEOS
+            # is mid-cancel and reqAllOpenOrdersAsync never returns) we must
+            # not block the waiter indefinitely. Skip this cycle and try
+            # again on the next interval.
+            try:
+                await asyncio.wait_for(
+                    ctx.ib.get_open_orders(),
+                    timeout=_RESYNC_CALL_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    '{"event": "CANCEL_SETTLE_RESYNC_TIMEOUT", '
+                    '"ib_order_id": "%s", "timeout_s": %.1f}',
+                    ib_order_id, _RESYNC_CALL_TIMEOUT_S,
+                )
+            except Exception:
+                logger.debug(
+                    "cancel-settle resync failed", exc_info=True,
+                )
+            last_resync = loop.time()
+        if track is not None:
+            try:
+                await asyncio.wait_for(
+                    track.fill_event.wait(), timeout=min(0.5, remaining),
+                )
+            except asyncio.TimeoutError:
+                pass
+            track.fill_event.clear()
+        else:
+            await asyncio.sleep(min(0.3, remaining))
+
+        status = await ctx.ib.get_order_status(ib_order_id)
+        filled = status.get("qty_filled") or Decimal("0")
+        ib_status = status.get("status") or ""
+        if filled >= target_qty:
+            return (
+                "filled", filled,
+                status.get("avg_fill_price"),
+                status.get("commission") or Decimal("0"),
+                ib_status,
+            )
+        if ib_status in ("Cancelled", "Inactive"):
+            return (
+                "cancelled", filled,
+                status.get("avg_fill_price"),
+                status.get("commission") or Decimal("0"),
+                ib_status,
+            )
+        # Also treat our tracker's cancel-notified flag as terminal. IBEOS
+        # sometimes flips status Cancelled → Submitted → Filled across tens
+        # of milliseconds; the status read above can land on a post-flip
+        # "Submitted" and miss the Cancelled window entirely. track.is_canceled
+        # is set the moment the status callback saw "Cancelled", so it's a
+        # more reliable signal that the cancel was acknowledged.
+        if track is not None and track.is_canceled:
+            return (
+                "cancelled", filled,
+                status.get("avg_fill_price"),
+                status.get("commission") or Decimal("0"),
+                ib_status,
+            )
+
+    status = await ctx.ib.get_order_status(ib_order_id)
+    ib_status = status.get("status") or ""
+    logger.warning(
+        '{"event": "CANCEL_SETTLE_TIMEOUT", "ib_order_id": "%s", "timeout_s": %.1f, '
+        '"ib_status": "%s", "qty_filled": "%s"}',
+        ib_order_id, timeout, ib_status, status.get("qty_filled") or Decimal("0"),
+    )
+    return (
+        "timeout",
+        status.get("qty_filled") or Decimal("0"),
+        status.get("avg_fill_price"),
+        status.get("commission") or Decimal("0"),
+        ib_status,
+    )
+
+
 async def _handle_partial(
     order_ctx: _OrderContext, trade_group: TradeGroup, qty_requested: Decimal,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
     cmd, con_id: int, ib_order_id: str, ctx: AppContext,
 ) -> None:
-    """Record a partial fill and cancel the remaining quantity in IB."""
-    _write_txn(ctx, TransactionAction.PARTIAL_FILL, order_ctx.symbol, order_ctx.side,
-               order_ctx.order_type, qty_requested,
-               ib_order_id=_safe_int(ib_order_id),
-               ib_filled_qty=qty_filled, ib_avg_fill_price=avg_price,
-               trade_serial=trade_group.serial_number,
-               ib_responded_at=_now_utc(),
-               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
-               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
-               commission=commission)
+    """Attempt to cancel the remainder, wait for IB's decision, then either
+    promote to FILLED (cancel lost the race) or finalize as PARTIAL."""
+    remainder = qty_requested - qty_filled
+
+    ctx.router.emit(
+        f"\u27f3 Attempting to cancel {remainder} remaining of "
+        f"#{trade_group.serial_number}\u2026",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+        event="ORDER_CANCEL_ATTEMPT_DISPLAY",
+    )
+
     _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, order_ctx.symbol, order_ctx.side,
                order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
                trade_serial=trade_group.serial_number,
                trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
-    await ctx.ib.cancel_order(ib_order_id)
-    ctx.trades.update_pnl(trade_group.id, Decimal("0"), commission)
+
+    track = ctx.tracker.get(ib_order_id)
+    settle_timeout = float(ctx.settings.get("cancel_settle_timeout_seconds", 120))
+    resolution, ib_reported_qty, ib_reported_avg, ib_reported_commission, _ib_status = \
+        await _cancel_and_await_resolution(
+            ctx, ib_order_id, qty_requested, track=track, timeout=settle_timeout,
+            heartbeat_label=f"Cancel pending #{trade_group.serial_number} \u2014",
+        )
+    # The caller already had partial-fill data from the execDetails callback;
+    # IB's orderStatus.filled can LAG those callbacks, so don't regress to a
+    # smaller number. Take whichever source reports more fills.
+    if ib_reported_qty > qty_filled:
+        final_qty = ib_reported_qty
+        effective_avg = ib_reported_avg if ib_reported_avg is not None else avg_price
+    else:
+        final_qty = qty_filled
+        effective_avg = avg_price
+    if ib_reported_commission > commission:
+        commission = ib_reported_commission
+
+    if resolution == "filled":
+        # The cancel lost the race — IB filled the remainder. Record it as
+        # a full fill so the trade group / positions / PnL reflect reality.
+        logger.warning(
+            '{"event": "CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+            '"serial": %d, "qty_filled": "%s", "resolution": "filled"}',
+            ib_order_id, trade_group.serial_number, str(final_qty),
+        )
+        await _handle_fill(
+            order_ctx, trade_group, final_qty, effective_avg, commission,
+            cmd, con_id, ctx,
+        )
+        return
+
+    # PARTIAL outcome. Use the final qty_filled (may be > the value we were
+    # called with if more fills arrived while we were waiting on the cancel).
+    _write_txn(ctx, TransactionAction.PARTIAL_FILL, order_ctx.symbol, order_ctx.side,
+               order_ctx.order_type, qty_requested,
+               ib_order_id=_safe_int(ib_order_id),
+               ib_filled_qty=final_qty, ib_avg_fill_price=effective_avg,
+               trade_serial=trade_group.serial_number,
+               ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               commission=commission)
+    # pnl=None — partials on the entry side shouldn't clobber realized_pnl.
+    ctx.trades.update_pnl(trade_group.id, None, commission)
     _write_txn(ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
                order_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
@@ -1173,10 +2102,11 @@ async def _handle_partial(
                trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
 
-    remainder = qty_requested - qty_filled
+    final_remainder = qty_requested - final_qty
+    cancel_note = "cancel confirmed" if resolution == "cancelled" else "cancel ack timeout"
     ctx.router.emit(
-        f"\u26a0 PARTIAL: {qty_filled}/{qty_requested} filled @ avg ${avg_price} | "
-        f"{remainder} shares canceled (timeout)\n"
+        f"\u26a0 PARTIAL: {final_qty}/{qty_requested} filled @ avg ${effective_avg} | "
+        f"{final_remainder} shares not filled ({cancel_note})\n"
         f"  Commission: ${commission}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
@@ -1184,8 +2114,9 @@ async def _handle_partial(
     )
     logger.info(
         '{"event": "ORDER_PARTIAL_FILL", "correlation_id": "%s", "serial": %d, '
-        '"qty_filled": "%s", "qty_requested": "%s"}',
-        order_ctx.correlation_id, trade_group.serial_number, qty_filled, qty_requested,
+        '"qty_filled": "%s", "qty_requested": "%s", "cancel_resolution": "%s"}',
+        order_ctx.correlation_id, trade_group.serial_number,
+        final_qty, qty_requested, resolution,
     )
 
     if cmd.take_profit_price or cmd.profit_amount:
@@ -1194,8 +2125,8 @@ async def _handle_partial(
         await place_profit_taker(
             trade_id=trade_group.id,
             entry_side=entry_side,
-            avg_fill_price=avg_price,
-            qty_filled=qty_filled,
+            avg_fill_price=effective_avg,
+            qty_filled=final_qty,
             profit_amount=cmd.profit_amount,
             take_profit_price=cmd.take_profit_price,
             con_id=con_id,
@@ -1215,6 +2146,7 @@ async def reprice_loop(
     total_steps: int,
     interval_seconds: float,
     initial_price: Decimal,
+    target_qty: Decimal,
     trade_id: str | None = None,
     leg_type: LegType | None = None,
     security_type: str | None = None,
@@ -1251,20 +2183,56 @@ async def reprice_loop(
         trade_serial: Trade serial number (for transaction linking).
     """
     last_sent_price: Decimal = initial_price
+    amend_count: int = 0  # incremented per actual amendment (not per loop step,
+                          # which includes dedup'd no-ops at tight spreads).
+
+    # Prefer the Redis quote cache (pushed by the engine's pendingTickersEvent
+    # handler) — no polling. Fall back to the IB snapshot API only when Redis
+    # is unavailable or the latest key is missing.
+    state_store = None
+    if getattr(ctx, "redis", None) is not None:
+        from ib_trader.redis.state import StateStore, StateKeys
+        state_store = StateStore(ctx.redis)
+        _quote_key = StateKeys.quote_latest(symbol)
+    else:
+        _quote_key = None
+
+    async def _get_prices() -> tuple[Decimal, Decimal, Decimal]:
+        if state_store is not None:
+            quote = await state_store.get(_quote_key)
+            if quote:
+                def _dec(v):
+                    if v in (None, "", 0, "0"):
+                        return Decimal("0")
+                    return Decimal(str(v))
+                b = _dec(quote.get("bid"))
+                a = _dec(quote.get("ask"))
+                l = _dec(quote.get("last"))
+                if b > 0 or a > 0 or l > 0:
+                    return b, a, l
+        snap = await ctx.ib.get_market_snapshot(con_id)
+        return snap["bid"], snap["ask"], snap["last"]
+
+    paused_on_fill_at_step: int | None = None
 
     for step in range(1, total_steps + 1):
         track = ctx.tracker.get(ib_order_id)
-        if track and (track.is_filled or track.is_canceled):
+        if track and track.is_filled:
+            paused_on_fill_at_step = step
+            break
+        if track and track.is_canceled:
             break
 
         await asyncio.sleep(interval_seconds)
 
         track = ctx.tracker.get(ib_order_id)
-        if track and (track.is_filled or track.is_canceled):
+        if track and track.is_filled:
+            paused_on_fill_at_step = step
+            break
+        if track and track.is_canceled:
             break
 
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+        bid, ask, last = await _get_prices()
 
         if bid == 0 and ask == 0:
             ref = last if last > 0 else Decimal("0")
@@ -1285,10 +2253,22 @@ async def reprice_loop(
                 '"step": %d, "price": "%s"}',
                 correlation_id, step, new_price,
             )
+            # Emit a tick line so the user sees the walker is alive even
+            # when the rounded step price matches what's already resting.
+            _tick_status = await ctx.ib.get_order_status(ib_order_id)
+            _tick_qf = _tick_status.get("qty_filled") or Decimal("0")
+            ctx.router.emit(
+                f"[{_now_display()}] Reprice tick {step}/{total_steps} \u2014 "
+                f"holding at ${new_price} "
+                f"(filled: {_fmt_qty(_tick_qf)}/{_fmt_qty(target_qty)})",
+                pane=OutputPane.LOG, severity=OutputSeverity.INFO,
+                event="REPRICE_TICK_UNCHANGED_DISPLAY",
+            )
             continue
 
         await ctx.ib.amend_order(ib_order_id, new_price)
         last_sent_price = new_price
+        amend_count += 1
 
         # Write amendment to SQLite
         now = datetime.now(timezone.utc)
@@ -1318,18 +2298,39 @@ async def reprice_loop(
 
         ctx.router.emit(
             f"[{_now_display()}] Amended \u2192 ${new_price} | "
-            f"step {step}/{total_steps} "
-            f"(still open: {qty_filled}/? filled)",
+            f"amend {amend_count} "
+            f"(filled: {_fmt_qty(qty_filled)}/{_fmt_qty(target_qty)})",
             pane=OutputPane.LOG, severity=OutputSeverity.INFO,
             event="REPRICE_STEP_DISPLAY",
         )
         logger.info(
             '{"event": "REPRICE_STEP", "correlation_id": "%s", "step": %d, "total": %d, '
-            '"bid": "%s", "ask": "%s", "new_price": "%s"}',
-            correlation_id, step, total_steps, bid, ask, new_price,
+            '"amend": %d, "bid": "%s", "ask": "%s", "new_price": "%s"}',
+            correlation_id, step, total_steps, amend_count, bid, ask, new_price,
         )
 
-    logger.info('{"event": "REPRICE_TIMEOUT", "correlation_id": "%s"}', correlation_id)
+    # Walker broke on a partial fill (deliberate price-preservation choice).
+    # Emit a line so the user sees why the reprice stream stopped; otherwise
+    # the command feed goes silent between the partial fill and the passive
+    # phase's "Walker complete" message.
+    if paused_on_fill_at_step is not None:
+        _paused_status = await ctx.ib.get_order_status(ib_order_id)
+        _paused_qf = _paused_status.get("qty_filled") or Decimal("0")
+        ctx.router.emit(
+            f"[{_now_display()}] Walker paused at step "
+            f"{paused_on_fill_at_step}/{total_steps} \u2014 order has fills, "
+            f"holding at ${last_sent_price} "
+            f"(filled: {_fmt_qty(_paused_qf)}/{_fmt_qty(target_qty)})",
+            pane=OutputPane.LOG, severity=OutputSeverity.INFO,
+            event="REPRICE_PAUSED_DISPLAY",
+        )
+
+    logger.info(
+        '{"event": "REPRICE_TIMEOUT", "correlation_id": "%s", "amends": %d, '
+        '"paused_on_fill_at_step": %s}',
+        correlation_id, amend_count,
+        paused_on_fill_at_step if paused_on_fill_at_step is not None else 'null',
+    )
 
 
 async def place_profit_taker(
@@ -1596,6 +2597,13 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # Create close _OrderContext
     close_correlation_id = str(uuid.uuid4())
+    # Encode orderRef for the close — use 'S' side regardless of underlying
+    close_order_ref = None
+    if hasattr(cmd, 'bot_ref') and cmd.bot_ref:
+        from ib_trader.engine.order_ref import encode as encode_order_ref
+        side_code = "S" if close_side == "SELL" else "B"
+        close_order_ref = encode_order_ref(cmd.bot_ref, entry_symbol, side_code, cmd.serial)
+
     close_ctx = _OrderContext(
         trade_id=trade_group.id,
         trade_serial=cmd.serial,
@@ -1606,6 +2614,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         leg_type=LegType.CLOSE,
         correlation_id=close_correlation_id,
         security_type="STK",
+        order_ref=close_order_ref,
     )
 
     logger.info(
@@ -1629,6 +2638,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1657,6 +2667,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1686,6 +2697,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         ib_order_id = await ctx.ib.place_limit_order(
             con_id, entry_symbol, close_side, qty_to_close, initial_price,
             outside_rth=True, tif=_session_tif(),
+            order_ref=close_ctx.order_ref,
         )
         close_ctx.ib_order_id = str(ib_order_id)
         _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
@@ -1702,7 +2714,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         # Market order — immediate execution expected.
         # During overnight session, Blue Ocean ATS rejects market orders.
         # Convert to aggressive limit at the bid (SELL) or ask (BUY).
-        if is_overnight_session():
+        if is_outside_rth():
             snapshot = await ctx.ib.get_market_snapshot(con_id)
             bid, ask = snapshot["bid"], snapshot["ask"]
             if bid == 0 and ask == 0:
@@ -1724,6 +2736,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             ib_order_id = await ctx.ib.place_limit_order(
                 con_id, entry_symbol, close_side, qty_to_close, initial_price,
                 outside_rth=True, tif=_session_tif(),
+                order_ref=close_ctx.order_ref,
             )
             _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "LIMIT", qty_to_close, limit_price=initial_price,
@@ -1733,7 +2746,8 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                        "MARKET", qty_to_close, trade_serial=cmd.serial, **_txn_common)
             ib_order_id = await ctx.ib.place_market_order(
-                con_id, entry_symbol, close_side, qty_to_close, outside_rth=True
+                con_id, entry_symbol, close_side, qty_to_close, outside_rth=True,
+                order_ref=close_ctx.order_ref,
             )
             _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, entry_symbol, close_side,
                        "MARKET", qty_to_close, ib_order_id=_safe_int(ib_order_id),
@@ -1747,13 +2761,25 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # ── Register tracker + callbacks ─────────────────────────────────────
     track = ctx.tracker.register(close_ctx.correlation_id, ib_order_id, entry_symbol)
-    _fill_commission: Decimal | None = None
+    # Authoritative fill values captured by the callback (trade.orderStatus
+    # lags execDetailsEvent — see engine/order.py _execute_bid_ask_order fix).
+    _fill_qty: Decimal = Decimal("0")
+    _fill_notional: Decimal = Decimal("0")
+    _fill_commission: Decimal = Decimal("0")
 
-    async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
-        nonlocal _fill_commission
+    async def on_fill(fill_ib_id: str, q: Decimal, avg: Decimal, commission: Decimal):
+        nonlocal _fill_qty, _fill_notional, _fill_commission
         if fill_ib_id == ib_order_id:
-            _fill_commission = commission
+            _fill_qty += q
+            _fill_notional += q * avg
+            _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
+            ctx.router.emit(
+                f"[{_now_display()}] Filled {_fmt_qty(q)} @ ${avg} "
+                f"({_fmt_qty(_fill_qty)}/{_fmt_qty(qty_to_close)})",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                event="ORDER_PARTIAL_FILL_DISPLAY",
+            )
 
     async def on_status(status_ib_id: str, status: str):
         if status_ib_id == ib_order_id and status in ("Cancelled", "Inactive"):
@@ -1801,12 +2827,14 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     if cmd.strategy == Strategy.LIMIT:
         # Check for immediate fill (aggressive limit that crossed the spread)
         status = await ctx.ib.get_order_status(ib_order_id)
-        qty_filled = status["qty_filled"]
-        avg_price = status["avg_fill_price"]
-        commission = (
-            _fill_commission if _fill_commission is not None
-            else (status["commission"] or Decimal("0"))
-        )
+        if _fill_qty > 0:
+            qty_filled = _fill_qty
+            avg_price = _fill_notional / _fill_qty
+            commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+        else:
+            qty_filled = status["qty_filled"]
+            avg_price = status["avg_fill_price"]
+            commission = status["commission"] or Decimal("0")
         if qty_filled > 0 and avg_price is not None and qty_filled >= qty_to_close:
             await _handle_close_fill(
                 close_ctx, trade_group, qty_filled,
@@ -1836,10 +2864,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     settings = ctx.settings
     reprice_task = None
     if cmd.strategy == Strategy.MID:
-        total_steps = int(
-            float(settings["reprice_duration_seconds"])
-            / float(settings["reprice_interval_seconds"])
-        )
+        total_steps = int(settings.get("reprice_steps", 10))
         reprice_task = asyncio.create_task(
             reprice_loop(
                 correlation_id=close_ctx.correlation_id,
@@ -1849,25 +2874,24 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 side=close_side,
                 ctx=ctx,
                 total_steps=total_steps,
-                interval_seconds=float(settings["reprice_interval_seconds"]),
+                interval_seconds=_reprice_interval(settings),
                 initial_price=initial_price,
+                target_qty=qty_to_close,
                 trade_id=close_ctx.trade_id,
                 leg_type=close_ctx.leg_type,
                 security_type=close_ctx.security_type,
                 trade_serial=cmd.serial,
             )
         )
-        wait_timeout = float(settings["reprice_duration_seconds"]) + 2
-    elif cmd.strategy in (Strategy.BID, Strategy.ASK):
-        wait_timeout = float(settings.get("bid_ask_wait_seconds", 30))
+        wait_timeout = float(settings["reprice_active_duration_seconds"]) + 2
     else:
-        wait_timeout = 30  # market order timeout
+        # BID / ASK / MARKET — single unified give-up window.
+        wait_timeout = _total_order_wait(settings)
 
     # ── Wait for fill or timeout ─────────────────────────────────────────
-    try:
-        await asyncio.wait_for(track.fill_event.wait(), timeout=wait_timeout)
-    except asyncio.TimeoutError:
-        pass
+    await _await_full_fill_or_timeout(
+        track, ib_order_id, qty_to_close, wait_timeout, ctx,
+    )
 
     if reprice_task:
         reprice_task.cancel()
@@ -1876,14 +2900,34 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         except asyncio.CancelledError:
             pass
 
+        # Passive phase (MID only): hold the last-amended limit and wait
+        # for IB to deliver residual fills. Mirrors `_execute_mid_order`.
+        _close_status = await ctx.ib.get_order_status(ib_order_id)
+        _close_filled = _close_status.get("qty_filled") or Decimal("0")
+        if _close_filled < qty_to_close and not track.is_canceled:
+            passive_wait = float(settings["reprice_passive_wait_seconds"])
+            if passive_wait > 0:
+                ctx.router.emit(
+                    f"[{_now_display()}] Walker complete \u2014 holding at "
+                    f"last amended price, waiting up to {int(passive_wait)}s "
+                    f"for residual\u2026",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                    event="ORDER_PASSIVE_WAIT_DISPLAY",
+                )
+                await _await_full_fill_or_timeout(
+                    track, ib_order_id, qty_to_close, passive_wait, ctx,
+                )
+
     # ── Determine outcome ────────────────────────────────────────────────
     status = await ctx.ib.get_order_status(ib_order_id)
-    qty_filled = status["qty_filled"]
-    avg_price = status["avg_fill_price"]
-    commission = (
-        _fill_commission if _fill_commission is not None
-        else (status["commission"] or Decimal("0"))
-    )
+    if _fill_qty > 0:
+        qty_filled = _fill_qty
+        avg_price = _fill_notional / _fill_qty
+        commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+    else:
+        qty_filled = status["qty_filled"]
+        avg_price = status["avg_fill_price"]
+        commission = status["commission"] or Decimal("0")
 
     # Fallback: if IB says the order is Filled but get_order_status still
     # reports 0 fills (race condition in ib_async's internal state), trust
@@ -1896,12 +2940,14 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         await asyncio.sleep(0.5)
         status = await ctx.ib.get_order_status(ib_order_id)
-        qty_filled = status["qty_filled"]
-        avg_price = status["avg_fill_price"]
-        commission = (
-            _fill_commission if _fill_commission is not None
-            else (status["commission"] or Decimal("0"))
-        )
+        if _fill_qty > 0:
+            qty_filled = _fill_qty
+            avg_price = _fill_notional / _fill_qty
+            commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
+        else:
+            qty_filled = status["qty_filled"]
+            avg_price = status["avg_fill_price"]
+            commission = status["commission"] or Decimal("0")
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty_to_close:

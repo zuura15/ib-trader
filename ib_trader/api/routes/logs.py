@@ -5,11 +5,9 @@ Supports ?limit=N (default 100) and ?after=<iso_timestamp> for incremental polli
 """
 import json
 import os
-from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Query
 
-from ib_trader.api.deps import get_session_factory
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
 

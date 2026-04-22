@@ -8,7 +8,6 @@ This is a simple single-user auth scheme appropriate for a
 self-hosted trading platform. Not intended for multi-tenant use.
 """
 import logging
-import os
 
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware

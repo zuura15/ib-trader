@@ -9,6 +9,7 @@ CATASTROPHIC alerts: full red TUI, halts background loops, waits for Enter.
 WARNING alerts: amber indicator, loops continue.
 """
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -16,6 +17,8 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, Input
 from textual.reactive import reactive
 from textual import work
+
+logger = logging.getLogger(__name__)
 
 
 class DashboardWidget(Static):
@@ -121,7 +124,7 @@ class DaemonTUI(App):
     }
     """
 
-    BINDINGS = [
+    BINDINGS = [  # noqa: RUF012 — Textual framework expects class-level list
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -169,8 +172,8 @@ class DaemonTUI(App):
                 dashboard = self.query_one("#dashboard", Static)
                 self._update_dashboard(dashboard, data)
                 self._handle_alerts(data.get("alerts", []))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("daemon dashboard refresh failed", exc_info=e)
             await asyncio.sleep(self._refresh_seconds)
 
     def _update_dashboard(self, widget: Static, data: dict) -> None:
@@ -262,4 +265,4 @@ class DaemonTUI(App):
 
 
 # Import Decimal here to avoid circular import issues in update_content
-from decimal import Decimal  # noqa: E402
+from decimal import Decimal

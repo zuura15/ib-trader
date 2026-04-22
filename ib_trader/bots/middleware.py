@@ -10,19 +10,23 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from sqlalchemy.orm import scoped_session
+if TYPE_CHECKING:
+    from ib_trader.bots.state import BotStateStore
+
 
 from ib_trader.bots.strategy import (
     Action, PlaceOrder, CancelOrder, UpdateState, LogSignal,
-    StrategyContext, PositionState,
+    StrategyContext, LogEventType,
 )
-from ib_trader.data.models import PendingCommand, PendingCommandStatus, BotEvent
-from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
-from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
+from ib_trader.data.models import BotEvent
+from ib_trader.data.repositories.bot_repository import BotEventRepository
+# TODO(redis-positions): RiskMiddleware.max_positions reads open trades
+# from SQLite. Migrate to Redis position state or IB positions so this
+# import can be dropped from the bot hot-path.
 from ib_trader.data.repository import TradeRepository
 
 logger = logging.getLogger(__name__)
@@ -30,6 +34,68 @@ logger = logging.getLogger(__name__)
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Manual-Entry Middleware
+# ---------------------------------------------------------------------------
+
+class ManualEntryMiddleware:
+    """Blocks auto-BUY entries from a bot's strategy signals.
+
+    When a bot's YAML has ``manual_entry_only: true`` this middleware
+    filters out ``PlaceOrder(side="BUY", origin="strategy")`` actions —
+    i.e. the normal "my signal says buy" path. Every other action goes
+    through untouched, so the rest of production behaviour is preserved:
+
+      - ``origin="exit"``        — trailing stops, hard stops, time stops,
+                                   strategy-emitted sell-to-close.
+      - ``origin="manual_override"`` — operator FORCE_BUY signal (which
+                                   is routed outside ``on_event`` anyway).
+      - ``side="SELL"``          — never blocked here.
+
+    The point is to let a live test bot run the FULL production strategy
+    (exits, trailing stop, P&L display, middleware pipeline) while
+    keeping auto-entries off the wire, so the only real BUYs come from
+    a deliberate operator action.
+
+    When ``manual_entry_only`` is False (the default), the middleware is
+    a no-op pass-through.
+    """
+
+    def __init__(self, bot_id: str, manual_entry_only: bool = False) -> None:
+        self.bot_id = bot_id
+        self.enabled = bool(manual_entry_only)
+
+    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        if not self.enabled:
+            return actions
+        result: list[Action] = []
+        for action in actions:
+            if (
+                isinstance(action, PlaceOrder)
+                and action.side == "BUY"
+                and getattr(action, "origin", "strategy") == "strategy"
+            ):
+                # Drop the auto-entry, leave an audit breadcrumb so it's
+                # obvious from bot_events that the bot wanted to buy but
+                # the manual-entry gate stopped it.
+                result.append(LogSignal(
+                    event_type=LogEventType.MANUAL_ENTRY_ONLY,
+                    message=(
+                        f"Blocked strategy BUY for {action.symbol} "
+                        f"qty={action.qty} — manual_entry_only=true"
+                    ),
+                    payload={
+                        "symbol": action.symbol,
+                        "side": action.side,
+                        "qty": str(action.qty),
+                        "origin": getattr(action, "origin", "strategy"),
+                    },
+                ))
+                continue
+            result.append(action)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -41,32 +107,35 @@ class RiskMiddleware:
 
     Checks: kill switch, daily loss cap, max concurrent positions,
     max trades per day, max position value, max shares.
+
+    KILL_SWITCH and daily counters are sourced from Redis via
+    ``BotStateStore`` so they survive runner restarts. The previous
+    in-process counters reset to 0 on every restart, which silently
+    disabled the daily loss cap and the trades-per-day cap after a
+    crash. The kill-switch read is fail-closed.
     """
 
     def __init__(self, bot_id: str, risk_config: dict,
-                 bots_repo: BotRepository, trades_repo: TradeRepository) -> None:
+                 trades_repo: TradeRepository,
+                 state_store: BotStateStore) -> None:
         self.bot_id = bot_id
         self.config = risk_config
-        self._bots = bots_repo
         self._trades = trades_repo
-        self._trades_today: int = 0
-        self._pnl_today: Decimal = Decimal("0")
-        self._last_reset_date: date = date.today()
+        self._state = state_store
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
         """Filter actions through risk checks. Rejected PlaceOrders become LogSignals.
 
         SELL orders are NEVER blocked — exit protection is more important
         than risk limits. Only BUY orders go through risk checks.
         """
-        self._maybe_reset_daily()
-        result = []
+        result: list[Action] = []
         for action in actions:
             if isinstance(action, PlaceOrder) and action.side == "BUY":
-                ok, reason = self._can_trade(action)
+                ok, reason = await self._can_trade(action)
                 if not ok:
                     result.append(LogSignal(
-                        event_type="RISK",
+                        event_type=LogEventType.RISK,
                         message=f"Order blocked: {reason}",
                         payload={"symbol": action.symbol, "side": action.side,
                                  "qty": str(action.qty), "reason": reason},
@@ -75,31 +144,33 @@ class RiskMiddleware:
             result.append(action)
         return result
 
-    def record_trade(self) -> None:
-        """Increment daily trade counter after a fill."""
-        self._trades_today += 1
+    async def record_trade(self) -> None:
+        """Increment daily + lifetime trade counters in Redis."""
+        await self._state.record_trade(self.bot_id)
 
-    def record_pnl(self, pnl: Decimal) -> None:
-        """Update daily P&L after a close."""
-        self._pnl_today += pnl
+    async def record_pnl(self, pnl: Decimal) -> None:
+        """Add realized P&L to today's running total in Redis."""
+        await self._state.record_pnl(self.bot_id, pnl)
 
-    def _can_trade(self, order: PlaceOrder) -> tuple[bool, str]:
+    async def _can_trade(self, order: PlaceOrder) -> tuple[bool, str]:
         """Check all risk rules. Returns (ok, reason)."""
-        # Kill switch
-        bot = self._bots.get(self.bot_id)
-        if bot and getattr(bot, "error_message", None) == "KILL_SWITCH":
+        if await self._state.is_kill_switch_engaged(self.bot_id):
             return False, "kill_switch_active"
+
+        stats = await self._state.get_stats(self.bot_id)
+        trades_today = int(stats.get("trades_today") or 0)
+        pnl_today = Decimal(str(stats.get("pnl_today") or "0"))
 
         # Daily loss cap
         max_loss = Decimal(str(self.config.get("max_daily_loss_pct", 0.02)))
         account_value = Decimal(str(self.config.get("account_value", "10000")))
-        if self._pnl_today < -(max_loss * account_value):
-            return False, f"daily_loss_cap ({self._pnl_today})"
+        if pnl_today < -(max_loss * account_value):
+            return False, f"daily_loss_cap ({pnl_today})"
 
         # Max trades per day
         max_trades = self.config.get("max_trades_per_day", 10)
-        if self._trades_today >= max_trades:
-            return False, f"max_trades_per_day ({self._trades_today}/{max_trades})"
+        if trades_today >= max_trades:
+            return False, f"max_trades_per_day ({trades_today}/{max_trades})"
 
         # Max concurrent positions
         max_positions = self.config.get("max_concurrent_positions", 1)
@@ -123,14 +194,6 @@ class RiskMiddleware:
 
         return True, ""
 
-    def _maybe_reset_daily(self) -> None:
-        """Reset daily counters at midnight."""
-        today = date.today()
-        if today != self._last_reset_date:
-            self._trades_today = 0
-            self._pnl_today = Decimal("0")
-            self._last_reset_date = today
-
 
 # ---------------------------------------------------------------------------
 # Logging Middleware
@@ -139,12 +202,15 @@ class RiskMiddleware:
 class LoggingMiddleware:
     """Writes LogSignal actions to the bot_events audit trail."""
 
-    def __init__(self, bot_id: str, bot_events_repo: BotEventRepository) -> None:
+    def __init__(self, bot_id: str, bot_events_repo: BotEventRepository,
+                 redis=None) -> None:
         self.bot_id = bot_id
         self._events = bot_events_repo
+        self._redis = redis
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
         """Write LogSignal actions to DB. Pass all actions through."""
+        wrote = False
         for action in actions:
             if isinstance(action, LogSignal):
                 self._events.insert(BotEvent(
@@ -155,6 +221,10 @@ class LoggingMiddleware:
                     trade_serial=action.trade_serial,
                     recorded_at=_now_utc(),
                 ))
+                wrote = True
+        if wrote and self._redis is not None:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(self._redis, "bot_events")
         return actions
 
 
@@ -163,28 +233,28 @@ class LoggingMiddleware:
 # ---------------------------------------------------------------------------
 
 class PersistenceMiddleware:
-    """Persists UpdateState actions to a JSON file."""
+    """Persists UpdateState actions via the runtime's single write path.
 
-    def __init__(self, bot_id: str, symbol: str, state_dir: Path) -> None:
+    Receives a ``write_fn`` callback from the runtime — the ONLY way
+    to write to the bot's Redis state key.  This middleware does not
+    hold a Redis handle for state writes, so direct ``store.set`` calls
+    are structurally impossible.
+    """
+
+    def __init__(self, bot_id: str, write_fn) -> None:
         self.bot_id = bot_id
-        self.symbol = symbol
-        self.state_dir = state_dir
+        self._write = write_fn
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Apply UpdateState actions to ctx.state and flush to disk."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Apply UpdateState actions via the write callback.
+
+        Async: awaits the Redis write to ensure state is persisted BEFORE
+        the next middleware (ExecutionMiddleware) places any orders.
+        """
         for action in actions:
             if isinstance(action, UpdateState):
-                ctx.state.update(action.state)
-                self._flush(ctx.state)
+                await self._write(action.state)
         return actions
-
-    def _flush(self, state: dict) -> None:
-        """Atomic write to JSON file."""
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        path = self.state_dir / f"{self.bot_id}-{self.symbol}.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, default=str))
-        tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -192,69 +262,76 @@ class PersistenceMiddleware:
 # ---------------------------------------------------------------------------
 
 class ExecutionMiddleware:
-    """Submits PlaceOrder and CancelOrder actions to the engine."""
+    """Submits PlaceOrder and CancelOrder actions to the engine via HTTP."""
 
     def __init__(self, bot_id: str,
-                 pending_commands_repo: PendingCommandRepository) -> None:
+                 engine_url: str | None = None,
+                 bot_ref: str | None = None) -> None:
         self.bot_id = bot_id
-        self._commands = pending_commands_repo
-        self.last_cmd_id: str | None = None  # ID of the last submitted command
+        self._engine_url = engine_url  # e.g., "http://127.0.0.1:8081"
+        self._bot_ref = bot_ref
+        self.last_cmd_id: str | None = None
+        self.last_order_ref: str | None = None
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Convert PlaceOrder/CancelOrder to pending_commands rows."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Convert PlaceOrder/CancelOrder to engine HTTP orders (async)."""
+        if not self._engine_url:
+            raise RuntimeError("Engine URL not configured — cannot place orders")
+
         for action in actions:
             if isinstance(action, PlaceOrder):
-                cmd_text = self._build_order_command(action, ctx)
-                cmd = PendingCommand(
-                    source=f"bot:{self.bot_id}",
-                    broker="ib",
-                    command_text=cmd_text,
-                    submitted_at=_now_utc(),
-                )
-                self._commands.insert(cmd)
-                self.last_cmd_id = cmd.id
-                logger.info('{"event": "BOT_ORDER_SUBMITTED", "bot_id": "%s", '
-                            '"command": "%s", "cmd_id": "%s"}',
-                            self.bot_id, cmd_text, cmd.id)
-
+                await self._submit_via_http(action, ctx)
             elif isinstance(action, CancelOrder):
-                cmd = PendingCommand(
-                    source=f"bot:{self.bot_id}",
-                    broker="ib",
-                    command_text=f"cancel {action.trade_serial}",
-                    submitted_at=_now_utc(),
-                )
-                self._commands.insert(cmd)
+                await self._cancel_via_http(action)
 
         return actions
 
-    def _build_order_command(self, order: PlaceOrder, ctx: StrategyContext) -> str:
-        """Convert a PlaceOrder action to a command string.
+    async def _submit_via_http(self, order: PlaceOrder, ctx: StrategyContext) -> None:
+        """Submit order via async HTTP POST to engine internal API.
 
-        SELL orders use 'close SERIAL STRATEGY' format to properly close
-        an existing position. BUY orders use 'buy SYMBOL QTY STRATEGY'.
+        All orders (BUY and SELL) go through /engine/orders. The bot
+        has symbol, qty, and order_type — it doesn't need to route
+        through /engine/close (which requires a SQLite trade serial).
         """
-        if order.side == "SELL":
-            # Use close command with the active trade serial
-            serial = ctx.state.get("trade_serial")
-            if serial:
-                return f"close {serial} {order.order_type}"
-            # Fallback: sell directly (shouldn't happen)
-            return f"sell {order.symbol} {order.qty} {order.order_type}"
+        import httpx
 
-        # BUY order
-        parts = ["buy", order.symbol, str(order.qty), order.order_type]
+        payload = {
+            "symbol": order.symbol,
+            "side": order.side,
+            "qty": str(order.qty),
+            "order_type": order.order_type,
+            "bot_ref": self._bot_ref,
+        }
+        if order.price is not None:
+            payload["price"] = str(order.price)
+        if order.params.get("profit_target") is not None:
+            payload["profit"] = str(order.params["profit_target"])
+        if order.params.get("stop_loss") is not None:
+            payload["stop_loss"] = str(order.params["stop_loss"])
 
-        if order.order_type == "limit" and order.price is not None:
-            parts.append(str(order.price))
+        url = f"{self._engine_url}/engine/orders"
 
-        for key, value in order.params.items():
-            if key == "profit_target" and value is not None:
-                parts.extend(["--profit", str(value)])
-            elif key == "stop_loss" and value is not None:
-                parts.extend(["--stop-loss", str(value)])
+        async with httpx.AsyncClient(timeout=260) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+            self.last_cmd_id = result.get("ib_order_id")
+            self.last_order_ref = result.get("order_ref")
+            logger.info(
+                '{"event": "BOT_ORDER_HTTP", "bot_id": "%s", "symbol": "%s", '
+                '"side": "%s", "order_ref": "%s"}',
+                self.bot_id, order.symbol, order.side, self.last_order_ref,
+            )
 
-        return " ".join(parts)
+    async def _cancel_via_http(self, action: CancelOrder) -> None:
+        """Cancel order via async HTTP POST to engine."""
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{self._engine_url}/engine/close",
+                json={"serial": action.trade_serial, "strategy": "market"},
+            )
+            resp.raise_for_status()
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +341,73 @@ class ExecutionMiddleware:
 class MiddlewarePipeline:
     """Runs actions through middleware in order."""
 
-    def __init__(self, middlewares: list) -> None:
+    def __init__(self, middlewares: list, rollback_fn=None) -> None:
         self._middlewares = middlewares
+        self._rollback_fn = rollback_fn
         self.last_cmd_id: str | None = None
 
-    def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
-        """Pass actions through each middleware sequentially."""
+    async def process(self, actions: list[Action], ctx: StrategyContext) -> list[Action]:
+        """Pass actions through each middleware sequentially.
+
+        Supports both sync and async middleware process() methods.
+        If ExecutionMiddleware fails, rolls back any state changes made
+        by PersistenceMiddleware to prevent stuck ENTERING/EXITING states.
+        """
+        import asyncio
+        state_snapshot = dict(ctx.state)  # Snapshot before pipeline runs
+
         for mw in self._middlewares:
-            actions = mw.process(actions, ctx)
+            try:
+                result = mw.process(actions, ctx)
+                if asyncio.iscoroutine(result):
+                    actions = await result
+                else:
+                    actions = result
+            except Exception:
+                # If execution failed, rollback state to pre-pipeline snapshot
+                if isinstance(mw, ExecutionMiddleware) and self._rollback_fn:
+                    try:
+                        await self._rollback_fn(state_snapshot)
+                    except Exception as rollback_err:
+                        # Rollback failure is serious — it means the
+                        # bot state doc may be inconsistent. Surface it
+                        # to the UI, not just DEBUG.
+                        try:
+                            from ib_trader.logging_.alerts import log_and_alert
+                            _redis = None
+                            if isinstance(mw, ExecutionMiddleware):
+                                _redis = getattr(mw, "_redis", None) or getattr(
+                                    mw, "config", {}
+                                ).get("_redis") if hasattr(mw, "config") else None
+                            await log_and_alert(
+                                redis=_redis,
+                                trigger="PIPELINE_ROLLBACK_FAILED",
+                                message=(
+                                    "Pipeline state rollback failed after "
+                                    "execution error — bot state may be "
+                                    f"inconsistent: {rollback_err!r}"
+                                ),
+                                severity="WARNING",
+                                exc_info=False,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "PIPELINE_ROLLBACK_FAILED",
+                                exc_info=rollback_err,
+                            )
+                    logger.warning(
+                        '{"event": "PIPELINE_STATE_ROLLBACK", "reason": "execution_failed"}'
+                    )
+                raise
+
             # Capture command ID if execution middleware submitted an order
-            if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id:
+            # `is not None` (not truthy): an empty string from the engine
+            # still signals an order was submitted, and skipping FSM dispatch
+            # causes duplicate orders because the stoic-mode flag is cleared
+            # in runtime.py's finally block. See engine/service.py fix that
+            # now populates ib_order_id so this rarely matters, but keeping
+            # the check explicit prevents the class of bug from re-emerging.
+            if isinstance(mw, ExecutionMiddleware) and mw.last_cmd_id is not None:
                 self.last_cmd_id = mw.last_cmd_id
                 mw.last_cmd_id = None  # consume it
         return actions

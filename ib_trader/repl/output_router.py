@@ -164,6 +164,18 @@ class OutputRouter:
         else:
             self._render(message, effective_pane, severity)
 
+    def update_order_row(self, serial: int, data: dict) -> None:
+        """Delegate to renderer if attached, otherwise no-op.
+
+        Also used by the engine's _ListRenderer to capture structured metadata
+        (serial number) for internal API responses.
+        """
+        if self._renderer is not None:
+            try:
+                self._renderer.update_order_row(serial, data)
+            except Exception as e:
+                logger.debug("update_order_row failed", exc_info=e)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

@@ -1,0 +1,12 @@
+id: 37e2afb6-9ae2-4f8f-85f9-aeb1e6a3ee35
+name: "Close Trend RSI — GLD"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/close_trend_gld.yaml
+  symbol: GLD
+symbols:
+- GLD

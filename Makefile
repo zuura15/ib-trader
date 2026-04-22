@@ -1,4 +1,4 @@
-.PHONY: install test smoke docs lint typecheck clean dev
+.PHONY: install test smoke docs lint lint-ruff lint-imports lint-types lint-secrets typecheck clean dev e2e-live e2e-live-keep
 
 install:
 	uv sync
@@ -12,20 +12,54 @@ smoke:
 docs:
 	uv run mkdocs serve
 
-lint:
+lint: lint-ruff lint-imports lint-types lint-secrets
+
+lint-ruff:
+	@echo "==> ruff (functional rules)"
 	uv run ruff check .
 
-typecheck:
-	uv run mypy ib_trader/
+lint-imports:
+	@echo "==> import-linter (architectural contracts)"
+	uv run lint-imports
+
+lint-types:
+	@echo "==> mypy (strict on hot-path modules)"
+	uv run python -m mypy ib_trader/
+
+lint-secrets:
+	@echo "==> detect-secrets (baseline diff)"
+	uv run python -m detect_secrets scan --baseline .secrets.baseline \
+		--exclude-files '\.venv/|node_modules/|\.git/|frontend/dist/|\.db$$|uv\.lock$$|package-lock\.json$$|logs/'
+
+typecheck: lint-types
+
+# `make dev` auto-detects paper vs live from the running Gateway. Pass
+# FORCE_MODE=paper or FORCE_MODE=live to assert and fail fast on mismatch.
+# API and bots processes connect via engine's internal API and inherit mode.
+IB_MODE_FLAG := $(if $(FORCE_MODE),--force-mode $(FORCE_MODE),)
 
 dev:
-	@echo "Starting all services... (Ctrl+C to stop all)"
-	@trap 'trap "" INT TERM; kill -TERM 0; wait; exit 0' INT TERM; \
-	uv run ib-engine & \
+	@echo "Starting all services (auto-detect $(if $(FORCE_MODE),forced=$(FORCE_MODE),mode))... (Ctrl+C to stop all)"
+	@mkdir -p run/redis-data logs
+	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
+		echo "[DEV] Redis already running."; \
+	else \
+		echo "[DEV] Starting Redis..."; \
+		.local/bin/redis-server config/redis.conf --daemonize yes; \
+		sleep 0.5; \
+	fi
+	@trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' INT TERM; \
+	uv run ib-engine $(IB_MODE_FLAG) & \
 	uv run ib-api & \
 	uv run ib-bots & \
 	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
 	wait
+
+e2e-live:
+	./scripts/e2e-live.sh
+
+e2e-live-keep:
+	IB_TRADER_E2E_KEEP_RUNNING=1 ./scripts/e2e-live.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

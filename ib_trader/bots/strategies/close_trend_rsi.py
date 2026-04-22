@@ -20,11 +20,13 @@ from signals_lib.channels import add_channel_features
 from signals_lib.time_filters import passes_session_filter, add_time_of_day_features
 from signals_lib.trend import add_close_trend_features
 
+from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import (
-    Strategy, StrategyManifest, Subscription, StrategyContext,
-    MarketEvent, Action, PositionState,
+    StrategyManifest, Subscription, StrategyContext,
+    MarketEvent, Action,
     BarCompleted, QuoteUpdate, OrderFilled, OrderRejected,
-    PlaceOrder, CancelOrder, UpdateState, LogSignal,
+    PlaceOrder, UpdateState, LogSignal,
+    ExitType, LogEventType, QuoteField,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,6 @@ class CloseTrendRsiStrategy:
             ],
             capabilities=["execution", "state_store"],
             state_schema={
-                "position_state": "str",
                 "trade_serial": "int|null",
                 "entry_price": "decimal|null",
                 "entry_time": "str|null",
@@ -77,7 +78,6 @@ class CloseTrendRsiStrategy:
     async def on_start(self, ctx: StrategyContext) -> list[Action]:
         if not ctx.state:
             ctx.state = {
-                "position_state": PositionState.FLAT.value,
                 "trade_serial": None,
                 "entry_price": None,
                 "entry_time": None,
@@ -86,13 +86,13 @@ class CloseTrendRsiStrategy:
                 "trail_activated": False,
             }
         return [LogSignal(
-            event_type="STATE",
-            message=f"Close-trend strategy started: position={ctx.state['position_state']}",
+            event_type=LogEventType.STATE,
+            message=f"Close-trend strategy started: fsm_state={ctx.fsm_state.value}",
             payload={"detector": "close_trend", "symbol": self.config["symbol"]},
         )]
 
     async def on_event(self, event: MarketEvent, ctx: StrategyContext) -> list[Action]:
-        pos = PositionState(ctx.state.get("position_state", "FLAT"))
+        pos = ctx.fsm_state
 
         if isinstance(event, BarCompleted):
             return self._on_bar(event, ctx, pos)
@@ -105,14 +105,14 @@ class CloseTrendRsiStrategy:
         return []
 
     async def on_stop(self, ctx: StrategyContext) -> list[Action]:
-        return [LogSignal(event_type="STATE", message="Close-trend strategy stopped")]
+        return [LogSignal(event_type=LogEventType.STATE, message="Close-trend strategy stopped")]
 
     # -------------------------------------------------------------------
     # Bar processing — entry signals
     # -------------------------------------------------------------------
 
     def _on_bar(self, event: BarCompleted, ctx: StrategyContext,
-                pos: PositionState) -> list[Action]:
+                pos: BotState) -> list[Action]:
         actions: list[Action] = []
         bar = event.bar
         symbol = self.config["symbol"]
@@ -145,7 +145,7 @@ class CloseTrendRsiStrategy:
         strength = _safe_float(last, "close_trend_strength")
 
         actions.append(LogSignal(
-            event_type="BAR",
+            event_type=LogEventType.BAR,
             message=f"{symbol} 3min close={bar.get('close')} rsi={rsi_val:.1f} "
                     f"trend={'UP' if trend_up == 1.0 else 'DOWN'} "
                     f"valley_ago={valley_ago:.0f} strength={strength:.0f}",
@@ -159,7 +159,7 @@ class CloseTrendRsiStrategy:
             },
         ))
 
-        if pos == PositionState.FLAT:
+        if pos == BotState.AWAITING_ENTRY_TRIGGER:
             entry_actions = self._check_entry(last, bar, ctx)
             actions.extend(entry_actions)
 
@@ -220,7 +220,7 @@ class CloseTrendRsiStrategy:
         if not all_pass:
             failed = {k: detail for k, (ok, detail) in conditions.items() if not ok}
             actions.append(LogSignal(
-                event_type="SKIP",
+                event_type=LogEventType.SKIP,
                 message=" | ".join(f"{k}=FAIL ({detail})" for k, detail in failed.items()),
                 payload={"conditions": {k: {"pass": ok, "detail": d}
                                          for k, (ok, d) in conditions.items()}},
@@ -238,10 +238,10 @@ class CloseTrendRsiStrategy:
         else:
             qty = 1
 
-        order_strategy = self.config.get("order_strategy", "mid")
+        order_strategy = self.config.get("order_strategy", "smart_market")
 
         actions.append(LogSignal(
-            event_type="SIGNAL",
+            event_type=LogEventType.SIGNAL,
             message=f"BUY — close-trend UP (rsi={rsi_val:.1f}, "
                     f"valley_ago={valley_ago:.0f}, "
                     f"strength={_safe_float(last, 'close_trend_strength'):.0f})",
@@ -256,7 +256,6 @@ class CloseTrendRsiStrategy:
         ))
 
         actions.append(UpdateState({
-            "position_state": PositionState.ENTERING.value,
             "entry_time": datetime.now(timezone.utc).isoformat(),
         }))
 
@@ -267,17 +266,63 @@ class CloseTrendRsiStrategy:
     # -------------------------------------------------------------------
 
     def _on_quote(self, event: QuoteUpdate, ctx: StrategyContext,
-                  pos: PositionState) -> list[Action]:
-        if pos != PositionState.OPEN:
+                  pos: BotState) -> list[Action]:
+        if pos != BotState.AWAITING_EXIT_TRIGGER:
             return []
 
         state = ctx.state
+        _redis = ctx.config.get("_redis") if isinstance(ctx.config, dict) else None
+
+        # Invariant guard: AWAITING_EXIT_TRIGGER implies we hold a
+        # non-zero position. If qty is 0/negative/invalid here, FSM
+        # state and position fields are out of sync (Apr 19 bug: FSM
+        # stuck at AWAITING_EXIT_TRIGGER while qty collapsed to 0,
+        # causing zero-qty SELLs to fire on every tick). Alert + bail.
+        from decimal import InvalidOperation
+        from ib_trader.logging_.alerts import fire_and_forget_alert
+        qty_raw = state.get("qty", "0")
+        try:
+            position_qty = Decimal(str(qty_raw))
+        except (ValueError, TypeError, InvalidOperation):
+            position_qty = Decimal("0")
+        if position_qty <= 0:
+            fire_and_forget_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED_QTY_ZERO",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER with qty={qty_raw!r}. "
+                    f"State doc is inconsistent — refusing to emit zero-qty SELL."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "qty", "value": str(qty_raw),
+                       "entry_price": str(state.get("entry_price"))},
+            )
+            return []
+
         entry_price = Decimal(str(state.get("entry_price", "0")))
         if entry_price <= 0:
+            # Invariant: AWAITING_EXIT_TRIGGER implies a filled entry with
+            # a positive entry_price. If we got here without one, state is
+            # inconsistent — surface it loudly (UI + log) instead of
+            # silently eating quote ticks forever.
+            fire_and_forget_alert(
+                redis=_redis,
+                trigger="BOT_INVARIANT_VIOLATED",
+                message=(
+                    f"Bot in AWAITING_EXIT_TRIGGER without a positive entry_price "
+                    f"(value={state.get('entry_price')!r}). Cannot evaluate exit logic."
+                ),
+                severity="WARNING",
+                bot_id=ctx.bot_id,
+                symbol=state.get("symbol"),
+                extra={"field": "entry_price", "value": str(state.get("entry_price"))},
+            )
             return []
 
         exit_cfg = self.config.get("exit", {})
-        price_field = exit_cfg.get("exit_price", "bid")
+        price_field = exit_cfg.get("exit_price", QuoteField.BID.value)
         current_price = getattr(event, price_field, event.bid)
         if current_price <= 0:
             return []
@@ -292,18 +337,28 @@ class CloseTrendRsiStrategy:
         hard_sl_pct = Decimal(str(exit_cfg.get("hard_stop_loss_pct", "0.001")))
         hard_sl_price = entry_price * (1 - hard_sl_pct)
         if current_price <= hard_sl_price:
-            return self._trigger_exit(ctx, "HARD_STOP_LOSS",
+            return actions + self.build_exit_actions(ctx, ExitType.HARD_STOP_LOSS,
                 f"bid={current_price} <= hard_sl={hard_sl_price} (pnl={float(pnl_pct):.4%})")
 
-        # Time stop
-        entry_time_str = state.get("entry_time")
-        if entry_time_str:
-            entry_time = _parse_aware_dt(entry_time_str)
-            time_stop_minutes = exit_cfg.get("time_stop_minutes", 108)
-            elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
-            if elapsed >= time_stop_minutes:
-                return self._trigger_exit(ctx, "TIME_STOP",
-                    f"elapsed={elapsed:.0f}min >= {time_stop_minutes}min")
+        # Time stop — opt-in per strategy config. If time_stop_minutes is
+        # absent, the whole check is skipped. If it's present, entry_time
+        # MUST be set (invariant of AWAITING_EXIT_TRIGGER).
+        time_stop_minutes = exit_cfg.get("time_stop_minutes")
+        if time_stop_minutes is not None:
+            entry_time_str = state.get("entry_time")
+            if not entry_time_str:
+                logger.warning(
+                    '{"event": "INVARIANT_VIOLATED", "bot_id": "%s", '
+                    '"field": "entry_time", "note": "time_stop configured but '
+                    'entry_time missing — skipping time-stop check this tick"}',
+                    ctx.bot_id,
+                )
+            else:
+                entry_time = _parse_aware_dt(entry_time_str)
+                elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+                if elapsed >= int(time_stop_minutes):
+                    return actions + self.build_exit_actions(ctx, ExitType.TIME_STOP,
+                        f"elapsed={elapsed:.0f}min >= {int(time_stop_minutes)}min")
 
         # Trailing stop
         trail_activation = Decimal(str(exit_cfg.get("trail_activation_pct", "0.0005")))
@@ -311,12 +366,13 @@ class CloseTrendRsiStrategy:
         trail_activated = state.get("trail_activated", False)
         hwm = Decimal(str(state.get("high_water_mark") or current_price))
 
+        prior_reset_count = int(state.get("trail_reset_count") or 0)
         if not trail_activated:
             if pnl_pct >= trail_activation:
                 hwm = current_price
                 trail_stop = hwm * (1 - trail_width)
                 actions.append(LogSignal(
-                    event_type="EXIT_CHECK",
+                    event_type=LogEventType.EXIT_CHECK,
                     message=f"TRAIL ACTIVATED hwm={hwm} stop={trail_stop}",
                     payload={"hwm": str(hwm), "trail_stop": str(trail_stop),
                              "pnl_pct": f"{float(pnl_pct):.4%}"},
@@ -325,6 +381,7 @@ class CloseTrendRsiStrategy:
                     "trail_activated": True,
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
         else:
             if current_price > hwm:
@@ -333,67 +390,70 @@ class CloseTrendRsiStrategy:
                 actions.append(UpdateState({
                     "high_water_mark": str(hwm),
                     "current_stop": str(trail_stop),
+                    "trail_reset_count": prior_reset_count + 1,
                 }))
             else:
                 trail_stop = Decimal(str(state.get("current_stop", "0")))
                 if trail_stop > 0 and current_price <= trail_stop:
-                    return self._trigger_exit(ctx, "TRAILING_STOP",
+                    return actions + self.build_exit_actions(ctx, ExitType.TRAILING_STOP,
                         f"bid={current_price} <= trail_stop={trail_stop} "
                         f"(hwm={hwm}, pnl={float(pnl_pct):.4%})")
 
         return actions
 
-    def _trigger_exit(self, ctx: StrategyContext, exit_type: str,
-                      detail: str) -> list[Action]:
+    def build_exit_actions(self, ctx: StrategyContext, exit_type: ExitType,
+                           detail: str) -> list[Action]:
+        """Generate actions for an exit trigger.
+
+        Called both by the strategy's internal exit policies and by the
+        runtime's force-sell path (with ``exit_type=FORCE_EXIT``). Always
+        places the SELL order — the bot has symbol and qty, that's all it
+        needs. No serial gating.
+        """
         symbol = self.config["symbol"]
-        serial = ctx.state.get("trade_serial")
 
-        actions: list[Action] = [
+        return [
             LogSignal(
-                event_type="EXIT_CHECK",
-                message=f"{exit_type}: {detail}",
-                payload={"exit_type": exit_type, "trade_serial": serial},
-                trade_serial=serial,
+                event_type=LogEventType.EXIT_CHECK,
+                message=f"{exit_type.value}: {detail}",
+                payload={"exit_type": exit_type.value},
             ),
-            UpdateState({"position_state": PositionState.EXITING.value}),
-        ]
-
-        if serial:
-            actions.append(PlaceOrder(
+            PlaceOrder(
                 symbol=symbol, side="SELL",
                 qty=Decimal(str(ctx.state.get("qty", 1))),
-                order_type="market",
-            ))
-
-        return actions
+                # Session-aware aggressive-mid exit (see sawtooth_rsi
+                # for the why; same rationale applies here).
+                order_type="smart_market",
+                origin="exit",
+            ),
+        ]
 
     # -------------------------------------------------------------------
     # Fill / Reject
     # -------------------------------------------------------------------
 
     def _on_fill(self, event: OrderFilled, ctx: StrategyContext,
-                 pos: PositionState) -> list[Action]:
+                 pos: BotState) -> list[Action]:
         actions: list[Action] = []
 
-        if pos == PositionState.ENTERING and event.side == "BUY":
+        if pos == BotState.ENTRY_ORDER_PLACED and event.side == "BUY":
             entry_price = event.fill_price
             exit_cfg = self.config.get("exit", {})
             hard_sl = entry_price * (1 - Decimal(str(exit_cfg.get("hard_stop_loss_pct", "0.001"))))
 
             actions.extend([
                 LogSignal(
-                    event_type="FILL",
+                    event_type=LogEventType.FILL,
                     message=f"BUY {event.qty} {event.symbol} @ {event.fill_price}",
                     payload={"fill_price": str(event.fill_price), "qty": str(event.qty)},
                     trade_serial=event.trade_serial,
                 ),
                 LogSignal(
-                    event_type="STATE",
+                    event_type=LogEventType.STATE,
                     message=f"entry={entry_price} hard_sl={hard_sl} trail=INACTIVE",
                     trade_serial=event.trade_serial,
                 ),
                 UpdateState({
-                    "position_state": PositionState.OPEN.value,
                     "trade_serial": event.trade_serial,
                     "entry_price": str(entry_price),
                     "entry_time": datetime.now(timezone.utc).isoformat(),
@@ -404,18 +464,17 @@ class CloseTrendRsiStrategy:
                 }),
             ])
 
-        elif pos == PositionState.EXITING and event.side == "SELL":
+        elif pos == BotState.EXIT_ORDER_PLACED and event.side == "SELL":
             entry_price = Decimal(str(ctx.state.get("entry_price", "0")))
             pnl = (event.fill_price - entry_price) * event.qty if entry_price > 0 else Decimal("0")
 
             actions.extend([
                 LogSignal(
-                    event_type="CLOSED",
+                    event_type=LogEventType.CLOSED,
                     message=f"{event.symbol} @ {event.fill_price} pnl={pnl:+.2f}",
                     trade_serial=ctx.state.get("trade_serial"),
                 ),
                 UpdateState({
-                    "position_state": PositionState.FLAT.value,
                     "trade_serial": None, "entry_price": None,
                     "entry_time": None, "high_water_mark": None,
                     "current_stop": None, "trail_activated": False,
@@ -426,11 +485,12 @@ class CloseTrendRsiStrategy:
         return actions
 
     def _on_rejected(self, event: OrderRejected, ctx: StrategyContext,
-                     pos: PositionState) -> list[Action]:
-        actions = [LogSignal(event_type="ERROR", message=f"Order rejected: {event.reason}")]
-        if pos == PositionState.ENTERING:
+                     pos: BotState) -> list[Action]:
+        actions: list[Action] = [
+            LogSignal(event_type=LogEventType.ERROR, message=f"Order rejected: {event.reason}"),
+        ]
+        if pos == BotState.ENTRY_ORDER_PLACED:
             actions.append(UpdateState({
-                "position_state": PositionState.FLAT.value,
                 "trade_serial": None, "entry_time": None,
             }))
         return actions

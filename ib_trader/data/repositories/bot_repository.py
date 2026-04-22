@@ -1,5 +1,4 @@
 """Repository for bot configuration and status persistence."""
-import json
 import logging
 from datetime import datetime, timezone
 

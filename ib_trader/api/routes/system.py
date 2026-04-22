@@ -1,13 +1,17 @@
 """System status endpoints.
 
 GET /api/status — heartbeats, alerts, system health, account info, P&L
+All live state reads from Redis. SQLite is not queried.
 """
+import json as _json
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
-from ib_trader.api.deps import get_heartbeats, get_alerts, get_session_factory
-from ib_trader.api.serializers import HeartbeatResponse, AlertResponse
-from ib_trader.data.repository import HeartbeatRepository, AlertRepository
+from ib_trader.api.deps import get_redis
+from ib_trader.redis.state import StateKeys, StateStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["system"])
 
@@ -15,89 +19,99 @@ _HEARTBEAT_STALE_SECONDS = 60
 
 
 @router.get("/status")
-def get_status(
-    heartbeats: HeartbeatRepository = Depends(get_heartbeats),
-    alerts: AlertRepository = Depends(get_alerts),
-    sf=Depends(get_session_factory),
-):
-    """Return full system status: heartbeats, health, account, P&L."""
+async def get_status(redis=Depends(get_redis)):
+    """Return full system status from Redis."""
     now = datetime.now(timezone.utc)
 
-    # Heartbeats
+    # Heartbeats from Redis hb:* keys
     hb_list = []
     service_health = {}
     engine_uptime_seconds = 0
 
-    for process_name in ("ENGINE", "DAEMON", "API", "BOT_RUNNER", "REPL"):
-        hb = heartbeats.get(process_name)
-        if hb:
-            last_seen = hb.last_seen_at
-            if last_seen.tzinfo is None:
-                last_seen = last_seen.replace(tzinfo=timezone.utc)
-            age = (now - last_seen).total_seconds()
-            alive = age < _HEARTBEAT_STALE_SECONDS
+    if redis:
+        for process_name in ("ENGINE", "DAEMON", "API", "BOT_RUNNER", "REPL"):
+            raw = await redis.get(StateKeys.process_heartbeat(process_name))
+            if raw:
+                try:
+                    doc = _json.loads(raw)
+                    ts_str = doc.get("ts", "")
+                    last_seen = datetime.fromisoformat(ts_str) if ts_str else now
+                    if last_seen.tzinfo is None:
+                        last_seen = last_seen.replace(tzinfo=timezone.utc)
+                    age = (now - last_seen).total_seconds()
+                    alive = age < _HEARTBEAT_STALE_SECONDS
 
-            hb_list.append({
-                "process": hb.process,
-                "last_seen_at": hb.last_seen_at.isoformat(),
-                "pid": hb.pid,
-                "alive": alive,
-                "age_seconds": round(age),
-            })
-            service_health[process_name.lower()] = alive
+                    hb_list.append({
+                        "process": process_name,
+                        "last_seen_at": ts_str,
+                        "pid": doc.get("pid"),
+                        "alive": alive,
+                        "age_seconds": round(age),
+                    })
+                    service_health[process_name.lower()] = alive
 
-            if process_name == "ENGINE" and alive:
-                engine_uptime_seconds = round(age)
+                    if process_name == "ENGINE" and alive:
+                        engine_uptime_seconds = round(age)
+                except Exception as e:
+                    logger.debug("failed to parse heartbeat for %s", process_name, exc_info=e)
 
-    # Connection status — derived from ENGINE heartbeat
+    # Connection status
     engine_alive = service_health.get("engine", False)
     connection_status = "connected" if engine_alive else "disconnected"
 
-    # Account mode — read from .env (always available), fall back to
-    # transaction history. The old approach only looked at open orders,
-    # so it showed "unknown" when no orders existed (fresh install, or
-    # Gateway was down).
-    from ib_trader.config.loader import load_env
+    # Account mode — prefer what the engine actually connected to (written
+    # to Redis at engine startup). Fall back to a best-effort .env parse
+    # only when the engine hasn't run yet; that path is an educated guess,
+    # not a source of truth.
     account_mode = "unknown"
     acct = ""
-    try:
-        env_vars = load_env()
-        acct = env_vars.get("IB_ACCOUNT_ID", "")
-    except Exception:
-        pass
-    if not acct:
-        # Fall back to transaction history
+    if redis:
         try:
-            from ib_trader.data.repositories.transaction_repository import TransactionRepository
-            txn_repo = TransactionRepository(sf)
-            open_orders = txn_repo.get_open_orders()
-            if open_orders:
-                acct = open_orders[0].account_id
-        except Exception:
-            pass
-    if acct:
-        account_mode = "paper" if acct.startswith("DU") else "live"
+            session = await StateStore(redis).get(StateKeys.engine_session())
+            if session:
+                account_mode = session.get("account_mode") or "unknown"
+                acct = session.get("account_id") or ""
+        except Exception as e:
+            logger.debug("engine session read failed", exc_info=e)
+    if account_mode == "unknown":
+        from ib_trader.config.loader import load_env
+        try:
+            env_vars = load_env()
+            acct = env_vars.get("IB_ACCOUNT_ID", "")
+            if acct:
+                account_mode = "paper" if acct.startswith("DU") else "live"
+        except Exception as e:
+            logger.debug("failed to load account env", exc_info=e)
 
-    # Realized P&L from closed trade groups
-    from ib_trader.data.repository import TradeRepository
+    # Open alerts from Redis
+    alert_list = []
+    alert_count = 0
+    if redis:
+        try:
+            raw_alerts = await redis.hgetall(StateKeys.alerts_active())
+            for _aid, val in raw_alerts.items():
+                try:
+                    alert_list.append(_json.loads(val))
+                except (ValueError, TypeError) as e:
+                    logger.debug("failed to decode alert", exc_info=e)
+            alert_count = len(alert_list)
+        except Exception as e:
+            logger.debug("alerts fetch failed", exc_info=e)
+
+    # Realized P&L from bot:stats:* Redis hashes
     realized_pnl = 0.0
-    try:
-        all_trades = TradeRepository(sf).get_all()
-        closed = [t for t in all_trades if t.status.value == "CLOSED" and t.realized_pnl is not None]
-        realized_pnl = sum(float(t.realized_pnl) for t in closed)
-    except Exception:
-        pass
-
-    # Open alerts
-    open_alerts = alerts.get_open()
-    alert_list = [
-        {
-            "id": a.id, "severity": a.severity.value, "trigger": a.trigger,
-            "message": a.message, "created_at": a.created_at.isoformat(),
-            "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
-        }
-        for a in open_alerts
-    ]
+    if redis:
+        try:
+            async for key in redis.scan_iter(match="bot:stats:*"):
+                raw = await redis.get(key)
+                if raw:
+                    try:
+                        stats = _json.loads(raw)
+                        realized_pnl += float(stats.get("pnl_today", 0))
+                    except (ValueError, TypeError) as e:
+                        logger.debug("failed to parse bot stats", exc_info=e)
+        except Exception as e:
+            logger.debug("realized pnl scan failed", exc_info=e)
 
     return {
         "heartbeats": hb_list,
@@ -108,5 +122,5 @@ def get_status(
         "service_health": service_health,
         "realized_pnl": realized_pnl,
         "engine_uptime_seconds": engine_uptime_seconds,
-        "alert_count": len(open_alerts),
+        "alert_count": alert_count,
     }

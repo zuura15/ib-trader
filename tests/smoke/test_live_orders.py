@@ -418,7 +418,7 @@ class TestFordRTHFills:
                     # Didn't fill — cancel and use market
                     await live_ib.cancel_order(close_id)
                     await asyncio.sleep(1)
-                    mkt_id = await asyncio.wait_for(
+                    await asyncio.wait_for(
                         live_ib.place_market_order(
                             con_id=ford_con_id, symbol=SYMBOL, side="SELL",
                             qty=QTY, outside_rth=True,
@@ -598,7 +598,7 @@ class TestFordOvernight:
         )
         await asyncio.sleep(3)
         status = await live_ib.get_order_status(ib_id)
-        error = live_ib.get_order_error(str(ib_id))
+        live_ib.get_order_error(str(ib_id))
         # Market orders on Blue Ocean ATS get rejected or cancelled
         rejected_statuses = {"Cancelled", "ApiCancelled", "Inactive"}
         if status["status"] not in rejected_statuses:

@@ -1,0 +1,12 @@
+id: e5850e61-d386-4776-a1b7-476e02df8562
+name: "Close Trend RSI \u2014 USO"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/close_trend_uso.yaml
+  symbol: USO
+symbols:
+- USO

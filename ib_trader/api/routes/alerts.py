@@ -1,43 +1,48 @@
 """Alert endpoints.
 
-GET /api/alerts — list alerts (open by default)
-POST /api/alerts/{alert_id}/resolve — resolve an alert
+GET /api/alerts — list active alerts from Redis alerts:active hash
+POST /api/alerts/{alert_id}/resolve — resolve: remove from Redis + archive in SQLite
 """
-from fastapi import APIRouter, Depends, HTTPException
+import json
+import logging
 
-from ib_trader.api.deps import get_alerts
-from ib_trader.api.serializers import AlertResponse
+from fastapi import APIRouter, Depends
+
+from ib_trader.api.deps import get_alerts, get_redis
 from ib_trader.data.repository import AlertRepository
+from ib_trader.redis.state import StateKeys
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
 
-def _serialize_alert(a) -> AlertResponse:
-    return AlertResponse(
-        id=a.id,
-        severity=a.severity.value,
-        trigger=a.trigger,
-        message=a.message,
-        created_at=a.created_at,
-        resolved_at=a.resolved_at,
-    )
-
-
-@router.get("", response_model=list[AlertResponse])
-def list_alerts(
-    resolved: bool = False,
-    alerts: AlertRepository = Depends(get_alerts),
-):
-    """List system alerts. By default returns only open (unresolved) alerts."""
-    if resolved:
-        # Return all — no filter method exists, get_open filters for us
-        rows = alerts.get_open()
-    else:
-        rows = alerts.get_open()
-    return [_serialize_alert(a) for a in rows]
+@router.get("")
+async def list_alerts(redis=Depends(get_redis)):
+    """List active (unresolved) alerts from Redis."""
+    if redis is None:
+        return []
+    raw = await redis.hgetall(StateKeys.alerts_active())
+    alerts = []
+    for _aid, val in raw.items():
+        try:
+            alerts.append(json.loads(val))
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.debug("failed to decode alert payload", exc_info=e)
+    return alerts
 
 
 @router.post("/{alert_id}/resolve", status_code=204)
-def resolve_alert(alert_id: str, alerts: AlertRepository = Depends(get_alerts)):
-    """Mark an alert as resolved."""
-    alerts.resolve(alert_id)
+async def resolve_alert(
+    alert_id: str,
+    alerts: AlertRepository = Depends(get_alerts),
+    redis=Depends(get_redis),
+):
+    """Resolve an alert: remove from Redis active hash + archive in SQLite."""
+    if redis:
+        await redis.hdel(StateKeys.alerts_active(), alert_id)
+    # SQLite archival write; alert may not exist if it was created post-migration.
+    try:
+        alerts.resolve(alert_id)
+    except Exception as e:
+        logger.debug("alert resolve skipped (not in SQLite)", exc_info=e)

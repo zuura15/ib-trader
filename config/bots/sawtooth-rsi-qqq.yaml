@@ -1,0 +1,12 @@
+id: 55862660-3b46-4888-bd81-3d5bfbc0be73
+name: "Sawtooth RSI \u2014 QQQ"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/sawtooth_qqq.yaml
+  symbol: QQQ
+symbols:
+- QQQ

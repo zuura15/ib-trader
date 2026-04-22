@@ -98,18 +98,18 @@ def load_pane_configs(settings: dict[str, Any]) -> list[PaneConfig]:
 
         configs.append(PaneConfig(name=pane_name, rank=rank, height=height, enabled=enabled))
 
-    enabled = [c for c in configs if c.enabled]
+    enabled_configs = [c for c in configs if c.enabled]
 
-    if len(enabled) < 2:
+    if len(enabled_configs) < 2:
         raise ValueError(
-            f"TUI requires at least 2 enabled panes, got {len(enabled)}: "
-            f"{[c.name.value for c in enabled]}"
+            f"TUI requires at least 2 enabled panes, got {len(enabled_configs)}: "
+            f"{[c.name.value for c in enabled_configs]}"
         )
 
-    ranks = [c.rank for c in enabled]
+    ranks = [c.rank for c in enabled_configs]
     if len(ranks) != len(set(ranks)):
         seen: set[int] = set()
         dupes = sorted(r for r in ranks if r in seen or seen.add(r))  # type: ignore[func-returns-value]
         raise ValueError(f"Duplicate pane ranks in TUI config: {dupes}")
 
-    return sorted(enabled, key=lambda c: c.rank)
+    return sorted(enabled_configs, key=lambda c: c.rank)

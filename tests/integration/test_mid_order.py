@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import TransactionAction, LegType, TradeGroup, TradeStatus, TransactionEvent
+from ib_trader.data.models import TransactionAction, LegType, TradeGroup, TradeStatus
 from ib_trader.engine.order import execute_order, _handle_fill, _handle_partial, _OrderContext
 from ib_trader.engine.exceptions import IBOrderRejectedError
 
@@ -19,8 +19,9 @@ from ib_trader.engine.exceptions import IBOrderRejectedError
 @pytest.fixture
 def fast_settings(ctx):
     """Make reprice settings very fast for testing."""
-    ctx.settings["reprice_interval_seconds"] = 0.01
-    ctx.settings["reprice_duration_seconds"] = 0.1
+    ctx.settings["reprice_steps"] = 10
+    ctx.settings["reprice_active_duration_seconds"] = 0.1
+    ctx.settings["reprice_passive_wait_seconds"] = 0.1
     return ctx
 
 
@@ -28,9 +29,9 @@ class _ImmediateRejectMock:
     """Mixin: marks every placed order as Cancelled before the poll loop runs."""
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         ib_id = await super().place_limit_order(
-            con_id, symbol, side, qty, price, outside_rth, tif
+            con_id, symbol, side, qty, price, outside_rth, tif, order_ref=order_ref
         )
         # Simulate IB immediately rejecting the order.
         self._order_statuses[ib_id] = {
@@ -46,9 +47,9 @@ class _PreSubmittedMock:
     """Mixin: marks every placed order as PreSubmitted (market closed simulation)."""
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC") -> str:
+                                outside_rth=True, tif="GTC", order_ref=None) -> str:
         ib_id = await super().place_limit_order(
-            con_id, symbol, side, qty, price, outside_rth, tif
+            con_id, symbol, side, qty, price, outside_rth, tif, order_ref=order_ref
         )
         self._order_statuses[ib_id] = {
             "status": "PreSubmitted",
@@ -97,7 +98,6 @@ class TestOrderPlacementPreSubmitted:
         from datetime import datetime
         from zoneinfo import ZoneInfo
         from tests.conftest import MockIBClient
-        from ib_trader.engine.exceptions import IBOrderRejectedError
 
         class PreSubmittedMock(_PreSubmittedMock, MockIBClient):
             pass
@@ -158,7 +158,7 @@ class TestOrderPlacementUnacknowledged:
 
 class TestMidOrderCancelOnTimeout:
     async def test_cancel_on_timeout(self, fast_settings):
-        """Mid order with no fill is canceled after reprice_duration_seconds."""
+        """Mid order with no fill is canceled after the total_order_wait window."""
         ctx = fast_settings
         cmd = BuyCommand(
             symbol="MSFT", qty=Decimal("5"), dollars=None,
@@ -281,6 +281,18 @@ class TestHandlePartial:
             strategy="mid", profit_amount=None,
             take_profit_price=None, stop_loss=None,
         )
+
+        # _handle_partial now waits for IB to confirm the cancel (so a
+        # late-arriving fill can be promoted to FILLED). Pre-register the
+        # mock order so cancel_order() flips it to Cancelled and the wait
+        # loop returns on the first iteration instead of hitting the
+        # settle timeout.
+        ctx.ib._order_statuses["mock-ib-123"] = {
+            "status": "Submitted",
+            "qty_filled": Decimal("6"),
+            "avg_fill_price": Decimal("100.00"),
+            "commission": Decimal("0.60"),
+        }
 
         await _handle_partial(
             order_ctx, trade,

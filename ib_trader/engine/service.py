@@ -1,51 +1,138 @@
-"""Engine service — central command execution loop.
+"""Engine service — command execution helpers for the internal HTTP API.
 
-The engine service is the sole process with broker connections. All other
-processes (REPL, API server, bot runner) submit commands by inserting rows
-into the pending_commands table. The engine polls for PENDING commands,
-executes them via the trading engine, and writes results back.
-
-Commands execute concurrently via asyncio.create_task() with a semaphore
-to limit concurrent broker calls.
+The engine runs the internal HTTP API (see engine/internal_api.py); this
+module provides the execute_single_command coroutine that the API invokes
+to run buy/sell/close commands and the historical-bar warmup helper.
 """
 import asyncio
 import dataclasses
 import json
 import logging
-from datetime import datetime, timezone
 
 from ib_trader.config.context import AppContext
 from ib_trader.data.models import PendingCommandStatus
-from ib_trader.engine.recovery import recover_in_flight_orders
+from ib_trader.redis.streams import StreamNames, StreamWriter
 from ib_trader.repl.commands import (
     BuyCommand, SellCommand, CloseCommand, parse_command,
 )
-from ib_trader.repl.output_router import OutputRouter, OutputSeverity
+from ib_trader.repl.output_router import OutputRouter
+
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_CONCURRENT = 5
-_DEFAULT_POLL_INTERVAL_S = 0.1
+
+def recover_stale_commands(ctx: AppContext) -> int:
+    """Mark any RUNNING command-audit rows from a previous crash as FAILURE.
+
+    execute_single_command writes an audit row in RUNNING state at the start
+    of every HTTP-API command. If the engine crashes mid-command, that row
+    would otherwise stay RUNNING forever and make /api/commands/{id} stuck.
+    Called once on engine startup before the internal API begins serving.
+    """
+    if ctx.pending_commands is None:
+        return 0
+    stale = ctx.pending_commands.get_by_status(PendingCommandStatus.RUNNING)
+    for cmd_row in stale:
+        ctx.pending_commands.complete(
+            cmd_row.id, PendingCommandStatus.FAILURE,
+            error="Engine crashed during execution. Command was interrupted.",
+        )
+        logger.warning(json.dumps({
+            "event": "STALE_COMMAND_RECOVERED",
+            "cmd_id": cmd_row.id,
+            "command": cmd_row.command_text,
+            "source": cmd_row.source,
+        }))
+    return len(stale)
 
 
 class _ListRenderer:
     """OutputRouter renderer that collects messages into a list.
 
     Used by the engine service to capture command output for writing
-    back to the pending_commands table.
+    back to the pending_commands table. Also captures structured metadata
+    (trade serial, order_ref) for the internal HTTP API.
+
+    When ``redis`` and ``cmd_id`` are provided, every captured message is
+    also XADDed to ``cmd:{cmd_id}:output`` so the frontend can render it
+    live via a WebSocket subscription without waiting for the HTTP
+    response to complete.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, redis=None, cmd_id: str | None = None) -> None:
         self.messages: list[str] = []
+        self.metadata: dict = {}  # Structured data: serial, order_ref, etc.
+        self._writer: StreamWriter | None = None
+        if redis is not None and cmd_id:
+            self._writer = StreamWriter(
+                redis, StreamNames.command_output(cmd_id), maxlen=500,
+            )
+
+    def _append(self, message: str, severity=None) -> None:
+        # OutputRouter routes WARNING/ERROR messages to BOTH panes, which
+        # calls write_log and write_command_output back-to-back with the
+        # same text. Collapse that adjacent duplicate so the HTTP response
+        # output doesn't show the same line twice.
+        if self.messages and self.messages[-1] == message:
+            return
+        self.messages.append(message)
+        self._publish(message, severity)
+
+    def _publish(self, message: str, severity) -> None:
+        if self._writer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop — sync test path, skip publish
+        sev = getattr(severity, "value", None) or "info"
+        loop.create_task(self._writer.add({
+            "type": "line",
+            "message": message,
+            "severity": sev,
+        }))
+
+    async def publish_terminal(self, status: str, error: str | None = None) -> None:
+        """Emit a terminal marker so WS subscribers can close the stream."""
+        if self._writer is None:
+            return
+        try:
+            await self._writer.add({
+                "type": "done",
+                "status": status,
+                "error": error or "",
+            })
+        except Exception:
+            # Promote this from a DEBUG-only swallow so the UI surfaces
+            # a failing live-output stream — otherwise the user sees a
+            # command bubble stuck in "running" with no signal why.
+            try:
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=self._writer._redis if self._writer else None,
+                    trigger="CMD_OUTPUT_TERMINAL_PUBLISH_FAILED",
+                    message="Failed to publish terminal marker to cmd:<id>:output stream.",
+                    severity="WARNING",
+                )
+            except Exception:
+                logger.exception('{"event": "CMD_OUTPUT_TERMINAL_PUBLISH_FAILED"}')
 
     def write_log(self, message: str, severity=None) -> None:
-        self.messages.append(message)
+        self._append(message, severity)
 
     def write_command_output(self, message: str, severity=None) -> None:
-        self.messages.append(message)
+        self._append(message, severity)
 
     def update_order_row(self, serial, data) -> None:
-        pass
+        # Capture structured fields the /engine/orders caller relies on.
+        # Bots use ``ib_order_id`` to dispatch PlaceExitOrder to the FSM and
+        # to key stoic-mode release on the terminal order event — losing it
+        # here causes duplicate orders (ib_trader/bots/runtime.py:441,1209).
+        if serial is not None:
+            self.metadata["serial"] = serial
+        ib_order_id = data.get("ib_order_id") if isinstance(data, dict) else None
+        if ib_order_id is not None and ib_order_id != "":
+            self.metadata["ib_order_id"] = str(ib_order_id)
 
     def update_header(self, **kwargs) -> None:
         pass
@@ -112,347 +199,16 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
     if verb == "refresh":
         return "Refresh triggered."
 
-    # subscribe_bars and unsubscribe_bars are handled in _execute_single_command
-    # since they need async context.
-
     return verb
 
 
-async def _execute_single_command(cmd_row, ctx: AppContext,
-                                   sem: asyncio.Semaphore) -> None:
-    """Execute a single command from the pending_commands queue.
-
-    Runs under a semaphore to limit concurrent broker calls.
-    Captures all output via a _ListRenderer and writes it back
-    to the pending_commands row on completion.
-    """
-    async with sem:
-        # Create a per-command OutputRouter with a list-collecting renderer
-        # so output doesn't leak into the main router.
-        # CRITICAL: Use dataclasses.replace() to create an isolated context
-        # copy — NEVER mutate the shared ctx.router, as concurrent tasks
-        # would corrupt each other's output.
-        renderer = _ListRenderer()
-        cmd_router = OutputRouter()
-        cmd_router.set_renderer(renderer)
-
-        # Resolve broker for this command (supports multi-broker)
-        try:
-            broker = ctx.get_broker(cmd_row.broker)
-        except KeyError:
-            msg = f"Broker '{cmd_row.broker}' not configured"
-            print(f"[ENGINE] FAIL  {cmd_row.command_text!r} — {msg}")
-            ctx.pending_commands.complete(
-                cmd_row.id, PendingCommandStatus.FAILURE, error=msg,
-            )
-            return
-
-        # Create isolated context copy with the right broker and router
-        cmd_ctx = dataclasses.replace(ctx, ib=broker, router=cmd_router)
-
-        print(f"[ENGINE] EXEC  {cmd_row.command_text!r} (source={cmd_row.source}, broker={cmd_row.broker})")
-
-        try:
-            # Handle bar subscription commands before normal parsing
-            cmd_text = cmd_row.command_text.strip()
-            if cmd_text.startswith("subscribe_bars "):
-                symbol = cmd_text.split(maxsplit=1)[1].strip()
-                output = await _handle_subscribe_bars(symbol, cmd_ctx)
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
-                )
-                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
-                return
-            if cmd_text.startswith("warmup_bars "):
-                parts = cmd_text.split()
-                symbol = parts[1]
-                duration = int(parts[2]) if len(parts) > 2 else 7200
-                output = await _handle_warmup_bars(symbol, duration, cmd_ctx)
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
-                )
-                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
-                return
-            if cmd_text.startswith("unsubscribe_bars "):
-                symbol = cmd_text.split(maxsplit=1)[1].strip()
-                output = await _handle_unsubscribe_bars(symbol, cmd_ctx)
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.SUCCESS, output=output,
-                )
-                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
-                return
-
-            parsed = parse_command(cmd_row.command_text, router=cmd_router)
-
-            if parsed is None:
-                print(f"[ENGINE] FAIL  {cmd_row.command_text!r} — unknown command")
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.FAILURE,
-                    error=f"Unknown command: {cmd_row.command_text}",
-                )
-                return
-
-            if isinstance(parsed, str):
-                # Built-in read-only commands
-                output = _handle_builtin(parsed, cmd_ctx)
-                print(f"[ENGINE] OK    {cmd_row.command_text!r}")
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.SUCCESS,
-                    output=output,
-                )
-                return
-
-            if isinstance(parsed, (BuyCommand, SellCommand)):
-                from ib_trader.engine.order import execute_order
-                await execute_order(parsed, cmd_ctx)
-            elif isinstance(parsed, CloseCommand):
-                from ib_trader.engine.order import execute_close
-                await execute_close(parsed, cmd_ctx)
-            else:
-                print(f"[ENGINE] FAIL  {cmd_row.command_text!r} — unsupported type")
-                cmd_ctx.pending_commands.complete(
-                    cmd_row.id, PendingCommandStatus.FAILURE,
-                    error=f"Unsupported command type: {type(parsed).__name__}",
-                )
-                return
-
-            output = "\n".join(renderer.messages) if renderer.messages else None
-            print(f"[ENGINE] OK    {cmd_row.command_text!r}")
-            cmd_ctx.pending_commands.complete(
-                cmd_row.id, PendingCommandStatus.SUCCESS,
-                output=output,
-            )
-
-            # Trigger immediate position cache refresh after order execution
-            if isinstance(parsed, (BuyCommand, SellCommand, CloseCommand)):
-                await asyncio.sleep(2)  # Give IB time to update positions
-                from ib_trader.engine.main import position_refresh_event
-                position_refresh_event.set()
-
-        except Exception as e:
-            print(f"[ENGINE] ERROR {cmd_row.command_text!r} — {e}")
-            logger.exception(json.dumps({
-                "event": "COMMAND_FAILED",
-                "cmd_id": cmd_row.id,
-                "error": str(e),
-            }))
-
-            # Clean up any orphaned trade groups created by the failed command.
-            # When execute_order throws mid-way, it may have created TradeGroup
-            # records in SQLite that are stuck OPEN with no confirmed placement.
-            try:
-                from ib_trader.data.models import TradeStatus
-                open_trades = cmd_ctx.trades.get_open()
-                for trade in open_trades:
-                    if cmd_ctx.transactions.has_unconfirmed_placements(trade.id):
-                        cmd_ctx.trades.update_status(trade.id, TradeStatus.CLOSED)
-                        logger.info(json.dumps({
-                            "event": "ORPHAN_TRADE_CLEANED",
-                            "trade_id": trade.id,
-                            "symbol": trade.symbol,
-                        }))
-            except Exception:
-                logger.exception(json.dumps({"event": "ORPHAN_CLEANUP_FAILED"}))
-
-            output = "\n".join(renderer.messages) if renderer.messages else None
-            error_msg = f"{str(e)}\n\n{output}" if output else str(e)
-            cmd_ctx.pending_commands.complete(
-                cmd_row.id, PendingCommandStatus.FAILURE,
-                error=error_msg,
-            )
-
-
-async def recover_stale_commands(ctx: AppContext) -> int:
-    """Mark any RUNNING commands from a previous crash as FAILURE.
-
-    Called on engine startup. Returns the number of stale commands found.
-    """
-    stale = ctx.pending_commands.get_by_status(PendingCommandStatus.RUNNING)
-    for cmd_row in stale:
-        ctx.pending_commands.complete(
-            cmd_row.id, PendingCommandStatus.FAILURE,
-            error="Engine crashed during execution. Command was interrupted.",
-        )
-        print(f"[ENGINE] RECOVERED stale command: {cmd_row.command_text!r} (source={cmd_row.source})")
-        logger.warning(json.dumps({
-            "event": "STALE_COMMAND_RECOVERED",
-            "cmd_id": cmd_row.id,
-            "command": cmd_row.command_text,
-            "source": cmd_row.source,
-        }))
-    return len(stale)
-
-
-# Active bar subscriptions: {symbol: con_id}
-_bar_subscriptions: dict[str, int] = {}
-
-
-async def _handle_subscribe_bars(symbol: str, ctx: AppContext) -> str:
-    """Subscribe to bar data and streaming quotes for a symbol.
-
-    Two background tasks:
-    1. Bar poller: fetches 5-sec bars via reqHistoricalData every 30 seconds
-    2. Quote writer: reads streaming ticker every 2 seconds, writes to market_quotes
-    """
-    from ib_trader.data.models import MarketBar, MarketQuote
-    from datetime import datetime, timezone
-
-    if symbol in _bar_subscriptions:
-        return f"Already subscribed to bars for {symbol}"
-
-    # Ensure tables exist
-    db_engine = ctx.pending_commands._session().get_bind()
-    MarketBar.__table__.create(bind=db_engine, checkfirst=True)
-    MarketQuote.__table__.create(bind=db_engine, checkfirst=True)
-
-    # Qualify the contract
-    contract_info = await ctx.ib.qualify_contract(symbol)
-    con_id = contract_info["con_id"]
-
-    session_factory = ctx.pending_commands._session_factory
-    _bar_subscriptions[symbol] = con_id
-
-    # Start a background polling task
-    async def _poll_bars():
-        """Poll IB for recent 5-sec bars every 30 seconds."""
-        last_bar_time = None
-        while symbol in _bar_subscriptions:
-            try:
-                await ctx.ib._throttle()
-                contract = ctx.ib._contract_cache.get(con_id)
-                if contract is None:
-                    logger.warning('{"event": "BAR_POLL_NO_CONTRACT", "symbol": "%s"}', symbol)
-                    await asyncio.sleep(30)
-                    continue
-
-                bars = await ctx.ib._ib.reqHistoricalDataAsync(
-                    contract,
-                    endDateTime="",
-                    durationStr="120 S",
-                    barSizeSetting="5 secs",
-                    whatToShow="TRADES",
-                    useRTH=False,
-                    formatDate=2,
-                )
-
-                if bars:
-                    session = session_factory()
-                    new_count = 0
-                    for bar in bars:
-                        bar_time = bar.date
-                        if last_bar_time and bar_time <= last_bar_time:
-                            continue
-                        bar_row = MarketBar(
-                            symbol=symbol,
-                            bar_seconds=5,
-                            timestamp_utc=bar_time,
-                            open=bar.open,
-                            high=bar.high,
-                            low=bar.low,
-                            close=bar.close,
-                            volume=int(bar.volume),
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        session.add(bar_row)
-                        new_count += 1
-                    if new_count > 0:
-                        session.commit()
-                        last_bar_time = bars[-1].date
-                        logger.debug(
-                            '{"event": "BARS_POLLED", "symbol": "%s", "new": %d, "total_in_batch": %d}',
-                            symbol, new_count, len(bars),
-                        )
-                    else:
-                        session.rollback()
-
-                    # Purge old bars (keep last 24h)
-                    try:
-                        from datetime import timedelta
-                        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-                        session.execute(
-                            __import__("sqlalchemy").text(
-                                "DELETE FROM market_bars WHERE symbol = :s AND timestamp_utc < :c"
-                            ),
-                            {"s": symbol, "c": cutoff},
-                        )
-                        session.commit()
-                    except Exception:
-                        pass
-
-            except Exception as exc:
-                logger.warning('{"event": "BAR_POLL_ERROR", "symbol": "%s", "error": "%s"}',
-                               symbol, exc)
-                try:
-                    session_factory().rollback()
-                except Exception:
-                    pass
-
-            await asyncio.sleep(30)
-
-    asyncio.create_task(_poll_bars())
-
-    # Also subscribe to streaming market data for real-time quotes
-    await ctx.ib.subscribe_market_data(con_id, symbol)
-
-    async def _poll_quotes():
-        """Write latest streaming ticker to market_quotes every 2 seconds."""
-        while symbol in _bar_subscriptions:
-            try:
-                ticker = ctx.ib.get_ticker(con_id)
-                if ticker:
-                    bid = ticker.get("bid")
-                    ask = ticker.get("ask")
-                    last = ticker.get("last")
-                    vol = ticker.get("volume")
-
-                    # Only write if we have at least one valid price
-                    if bid or ask or last:
-                        session = session_factory()
-                        from ib_trader.data.models import MarketQuote
-                        # Upsert: update if exists, insert if not
-                        existing = session.query(MarketQuote).filter(
-                            MarketQuote.symbol == symbol
-                        ).first()
-                        now = datetime.now(timezone.utc)
-                        if existing:
-                            if bid: existing.bid = bid
-                            if ask: existing.ask = ask
-                            if last: existing.last = last
-                            if vol: existing.volume = int(vol)
-                            existing.updated_at = now
-                        else:
-                            session.add(MarketQuote(
-                                symbol=symbol,
-                                bid=bid, ask=ask, last=last,
-                                volume=int(vol) if vol else None,
-                                updated_at=now,
-                            ))
-                        session.commit()
-            except Exception as exc:
-                logger.debug('{"event": "QUOTE_WRITE_ERROR", "symbol": "%s", "error": "%s"}',
-                             symbol, exc)
-                try:
-                    session_factory().rollback()
-                except Exception:
-                    pass
-            await asyncio.sleep(2)
-
-    asyncio.create_task(_poll_quotes())
-
-    logger.info(json.dumps({
-        "event": "BARS_SUBSCRIBED", "symbol": symbol, "con_id": con_id,
-        "method": "historical_polling + streaming_quotes",
-    }))
-    return f"Subscribed to bars + quotes for {symbol} (con_id={con_id})"
-
-
 async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContext) -> str:
-    """Fetch historical 5-sec bars and write to market_bars for bot warmup."""
-    from ib_trader.data.models import MarketBar
-    from datetime import datetime, timezone
+    """Fetch historical 5-sec bars and publish to the Redis bar stream.
 
-    db_engine = ctx.pending_commands._session().get_bind()
-    MarketBar.__table__.create(bind=db_engine, checkfirst=True)
+    Bots read warmup bars via XREAD on bar:{symbol}:5s (from "0") — same
+    stream the live reqRealTimeBars callback publishes to. No SQLite write.
+    """
+    from ib_trader.redis.streams import StreamWriter, StreamNames
 
     contract_info = await ctx.ib.qualify_contract(symbol)
     con_id = contract_info["con_id"]
@@ -475,101 +231,147 @@ async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContex
     if not bars:
         return f"No historical bars returned for {symbol}"
 
-    session_factory = ctx.pending_commands._session_factory
-    session = session_factory()
+    if ctx.redis is None:
+        logger.warning('{"event": "WARMUP_BARS_NO_REDIS", "symbol": "%s"}', symbol)
+        return f"Redis unavailable — skipped warmup for {symbol}"
+
+    writer = StreamWriter(ctx.redis, StreamNames.bar(symbol, "5s"), maxlen=5000)
     count = 0
     for bar in bars:
-        bar_row = MarketBar(
-            symbol=symbol,
-            bar_seconds=5,
-            timestamp_utc=bar.date,
-            open=bar.open,
-            high=bar.high,
-            low=bar.low,
-            close=bar.close,
-            volume=int(bar.volume),
-            created_at=datetime.now(timezone.utc),
-        )
-        session.add(bar_row)
+        ts = bar.date
+        ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        await writer.add({
+            "ts": ts_str,
+            "o": float(bar.open),
+            "h": float(bar.high),
+            "l": float(bar.low),
+            "c": float(bar.close),
+            "v": int(bar.volume),
+        })
         count += 1
-    session.commit()
 
     logger.info(json.dumps({
-        "event": "WARMUP_BARS_LOADED", "symbol": symbol,
+        "event": "WARMUP_BARS_PUBLISHED", "symbol": symbol,
         "count": count, "duration_s": duration_seconds,
     }))
-    return f"Loaded {count} warmup bars for {symbol} ({duration_seconds}s of history)"
+    return f"Published {count} warmup bars for {symbol} ({duration_seconds}s of history)"
 
 
-async def _handle_unsubscribe_bars(symbol: str, ctx: AppContext) -> str:
-    """Unsubscribe from bars and streaming quotes for a symbol."""
-    con_id = _bar_subscriptions.pop(symbol, None)
-    if con_id is None:
-        return f"No active bar subscription for {symbol}"
+async def execute_single_command(
+    ctx: AppContext,
+    command_text: str,
+    source: str = "api",
+    bot_ref: str | None = None,
+    cmd_id: str | None = None,
+) -> dict:
+    """Execute a buy/sell/close/built-in command for the internal HTTP API.
 
-    await ctx.ib.unsubscribe_realtime_bars(con_id)
-    await ctx.ib.unsubscribe_market_data(con_id)
-    logger.info(json.dumps({
-        "event": "BARS_UNSUBSCRIBED", "symbol": symbol, "con_id": con_id,
-    }))
-    return f"Unsubscribed from bars + quotes for {symbol}"
-
-
-async def engine_loop(ctx: AppContext,
-                       max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
-                       poll_interval: float = _DEFAULT_POLL_INTERVAL_S,
-                       ) -> None:
-    """Main engine service loop.
-
-    Polls pending_commands for PENDING rows, executes them concurrently
-    via asyncio tasks, and writes results back.
+    Bar subscription lifecycle (subscribe/warmup/unsubscribe) is handled by
+    dedicated endpoints in engine/internal_api.py, not via this path.
 
     Args:
-        ctx: AppContext with all repositories and broker connection.
-        max_concurrent: Maximum number of commands executing simultaneously.
-        poll_interval: Seconds between polls of the pending_commands table.
+        ctx: AppContext with broker connection.
+        command_text: Raw command string (e.g., "buy QQQ 20 mid").
+        source: Command source identifier (e.g., "bot:saw-rsi", "api").
+        bot_ref: Optional bot reference ID for orderRef tagging. The engine
+                 encodes the full orderRef after allocating the trade serial.
+
+    Returns:
+        Dict with keys: status, output, serial, order_ref.
     """
-    sem = asyncio.Semaphore(max_concurrent)
+    # The cmd_id (if caller supplied one — the public API forwards the
+    # frontend-generated UUID so the browser can subscribe to live output
+    # before the POST returns) doubles as both the pending-commands audit
+    # id and the Redis output-stream key.
+    import uuid as _uuid
+    resolved_cmd_id = cmd_id or str(_uuid.uuid4())
 
-    # Startup recovery
-    stale_count = await recover_stale_commands(ctx)
-    if stale_count:
-        print(f"[ENGINE] Recovered {stale_count} stale command(s) from previous crash.")
-        logger.warning(json.dumps({
-            "event": "STALE_COMMANDS_FOUND", "count": stale_count,
-        }))
-    else:
-        print("[ENGINE] No stale commands found.")
+    renderer = _ListRenderer(redis=getattr(ctx, "redis", None), cmd_id=resolved_cmd_id)
+    cmd_router = OutputRouter()
+    cmd_router.set_renderer(renderer)
+    cmd_ctx = dataclasses.replace(ctx, router=cmd_router)
 
-    # Recover any abandoned orders from a previous crash
-    abandoned = recover_in_flight_orders(ctx.transactions, ctx.trades)
-    if abandoned:
-        print(f"[ENGINE] Found {len(abandoned)} abandoned order(s) from previous crash.")
-        logger.warning(json.dumps({
-            "event": "ABANDONED_ORDERS_FOUND", "count": len(abandoned),
-        }))
+    async def _notify_commands_changed() -> None:
+        if getattr(ctx, "redis", None) is not None:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(ctx.redis, "commands")
 
-    print(f"[ENGINE] Ready. Polling pending_commands (max_concurrent={max_concurrent})...")
-    logger.info(json.dumps({
-        "event": "ENGINE_LOOP_STARTED", "max_concurrent": max_concurrent,
-    }))
+    # Write audit log to pending_commands (write-only, never read on hot path)
+    audit_id: str | None = None
+    if ctx.pending_commands:
+        from ib_trader.data.models import PendingCommand
+        from datetime import datetime as _dt, timezone as _tz
+        audit_id = resolved_cmd_id
+        cmd = PendingCommand(
+            id=audit_id,
+            source=source,
+            command_text=command_text,
+            status=PendingCommandStatus.RUNNING,
+            submitted_at=_dt.now(_tz.utc),
+        )
+        ctx.pending_commands._session().add(cmd)
+        ctx.pending_commands._session().commit()
+        await _notify_commands_changed()
 
-    while True:
-        try:
-            pending = ctx.pending_commands.get_pending()
-            for cmd_row in pending:
-                ctx.pending_commands.update_status(
-                    cmd_row.id, PendingCommandStatus.RUNNING,
-                )
-                asyncio.create_task(
-                    _execute_single_command(cmd_row, ctx, sem),
-                )
-        except Exception:
-            logger.exception('{"event": "ENGINE_POLL_ERROR"}')
-            # Rollback any poisoned session state so the next poll cycle works
+    try:
+        parsed = parse_command(command_text, router=cmd_router)
+
+        if parsed is None:
+            error = f"Unknown command: {command_text}"
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
+                await _notify_commands_changed()
+            await renderer.publish_terminal("FAILURE", error=error)
+            return {"status": "FAILURE", "output": error, "cmd_id": resolved_cmd_id}
+
+        if isinstance(parsed, str):
+            output = _handle_builtin(parsed, cmd_ctx)
+            if audit_id:
+                ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+                await _notify_commands_changed()
+            await renderer.publish_terminal("SUCCESS")
+            return {"status": "SUCCESS", "output": output, "cmd_id": resolved_cmd_id}
+
+        if isinstance(parsed, (BuyCommand, SellCommand)):
+            from ib_trader.engine.order import execute_order
+            # Inject bot_ref so execute_order can encode orderRef after serial allocation
+            if bot_ref:
+                parsed = dataclasses.replace(parsed, bot_ref=bot_ref)
+            await execute_order(parsed, cmd_ctx)
+        elif isinstance(parsed, CloseCommand):
+            from ib_trader.engine.order import execute_close
+            if bot_ref:
+                parsed = dataclasses.replace(parsed, bot_ref=bot_ref)
+            await execute_close(parsed, cmd_ctx)
+
+        output = "\n".join(renderer.messages) if renderer.messages else ""
+        if audit_id:
+            ctx.pending_commands.complete(audit_id, PendingCommandStatus.SUCCESS, output=output)
+            await _notify_commands_changed()
+
+        # Use structured metadata from the renderer (set by update_order_row
+        # and execute_order) instead of parsing output text
+        result = {"status": "SUCCESS", "output": output, "cmd_id": resolved_cmd_id}
+        result.update(renderer.metadata)
+
+        # Build order_ref from bot_ref + the engine-allocated serial
+        if bot_ref and "serial" in result:
+            from ib_trader.engine.order_ref import encode as encode_ref
+            side_code = "B" if isinstance(parsed, BuyCommand) else "S"
             try:
-                ctx.pending_commands._session().rollback()
-            except Exception:
+                result["order_ref"] = encode_ref(
+                    bot_ref, parsed.symbol, side_code, result["serial"],
+                )
+            except (ValueError, AttributeError):
                 pass
 
-        await asyncio.sleep(poll_interval)
+        await renderer.publish_terminal("SUCCESS")
+        return result
+
+    except Exception as e:
+        error = str(e)
+        if audit_id:
+            ctx.pending_commands.complete(audit_id, PendingCommandStatus.FAILURE, error=error)
+            await _notify_commands_changed()
+        await renderer.publish_terminal("FAILURE", error=error)
+        raise

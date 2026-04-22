@@ -10,7 +10,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 from ib_trader.repl.commands import BuyCommand
-from ib_trader.data.models import TransactionAction, LegType
+from ib_trader.data.models import LegType
 from ib_trader.engine.order import execute_order, place_profit_taker
 from ib_trader.engine.exceptions import SafetyLimitError
 
@@ -206,7 +206,6 @@ class TestRepriceLoop:
         ctx.tracker.register(correlation_id, "IB1000", "MSFT")
 
         # Run reprice loop with very fast settings (2 steps, 0.01s interval).
-        ctx.settings["reprice_interval_seconds"] = 0.01
         task = asyncio.create_task(
             reprice_loop(
                 correlation_id=correlation_id,
@@ -218,6 +217,7 @@ class TestRepriceLoop:
                 total_steps=2,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.05"),
+                target_qty=Decimal("10"),
                 trade_id=trade.id,
                 leg_type=LegType.ENTRY,
                 security_type="STK",
@@ -256,6 +256,7 @@ class TestRepriceLoop:
                 total_steps=100,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.05"),
+                target_qty=Decimal("10"),
                 trade_id=trade.id,
                 leg_type=LegType.ENTRY,
                 security_type="STK",
@@ -298,6 +299,7 @@ class TestRepriceLoop:
                 total_steps=10,
                 interval_seconds=0.01,
                 initial_price=Decimal("100.00"),
+                target_qty=Decimal("10"),
                 trade_id=trade.id,
                 leg_type=LegType.ENTRY,
                 security_type="STK",

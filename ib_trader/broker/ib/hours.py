@@ -12,7 +12,6 @@ from ib_trader.engine.market_hours import (
     is_overnight_session,
     is_session_break,
     is_weekend_closure,
-    presubmitted_reason,
     session_label as ib_session_label,
 )
 

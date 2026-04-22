@@ -108,6 +108,7 @@ export interface Bot {
   tradesToday: number;
   pnlToday: number;
   symbols: string[];
+  refId?: string;
   uptime: number;
 }
 
@@ -121,6 +122,33 @@ export interface TradeGroup {
   totalCommission: string | null;
   openedAt: string;
   closedAt: string | null;
+  // Augmented fill detail (set by /api/trades from the entry/exit legs).
+  entryQty: string | null;
+  entryPrice: string | null;
+  exitQty: string | null;
+  exitPrice: string | null;
+  orderType: string | null;
+}
+
+export interface BotTrade {
+  id: string;
+  botId: string;
+  botName: string | null;
+  symbol: string;
+  direction: string;
+  entryPrice: string;
+  entryQty: string;
+  entryTime: string;
+  exitPrice: string | null;
+  exitQty: string | null;
+  exitTime: string | null;
+  realizedPnl: string | null;
+  commission: string | null;
+  trailResetCount: number;
+  durationSeconds: number | null;
+  entrySerial: number | null;
+  exitSerial: number | null;
+  createdAt: string;
 }
 
 export interface CommandEntry {

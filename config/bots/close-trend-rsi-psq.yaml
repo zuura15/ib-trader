@@ -1,0 +1,12 @@
+id: da438f50-bf49-4143-837f-a9c7e58b50e5
+name: "Close Trend RSI \u2014 PSQ"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: sawtooth_rsi
+  strategy_config: config/strategies/close_trend_psq.yaml
+  symbol: PSQ
+symbols:
+- PSQ

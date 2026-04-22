@@ -35,23 +35,23 @@ except ImportError:
     # readline is unavailable on Windows without pyreadline; degrade silently.
     readline = None  # type: ignore[assignment]
 
-import click  # noqa: E402
+import click
 
-from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions  # noqa: E402
-from ib_trader.config.context import AppContext  # noqa: E402
-from ib_trader.data.repository import (  # noqa: E402
+from ib_trader.config.loader import load_env, load_settings, load_symbols, check_file_permissions
+from ib_trader.config.context import AppContext
+from ib_trader.data.repository import (
     TradeRepository, RepriceEventRepository,
     ContractRepository, HeartbeatRepository, AlertRepository,
     create_db_engine, create_session_factory, init_db,
 )
-from ib_trader.data.repositories.transaction_repository import TransactionRepository  # noqa: E402
-from ib_trader.engine.tracker import OrderTracker  # noqa: E402
-from ib_trader.engine.exceptions import ConfigurationError, SafetyLimitError  # noqa: E402
-from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings, close_orphaned_trade_groups  # noqa: E402
-from ib_trader.engine.order import execute_order, execute_close  # noqa: E402
-from ib_trader.ib.insync_client import InsyncClient  # noqa: E402
-from ib_trader.logging_.logger import setup_logging  # noqa: E402
-from ib_trader.repl.commands import (  # noqa: E402
+from ib_trader.data.repositories.transaction_repository import TransactionRepository
+from ib_trader.engine.tracker import OrderTracker
+from ib_trader.engine.exceptions import ConfigurationError, SafetyLimitError
+from ib_trader.engine.recovery import recover_in_flight_orders, format_recovery_warnings
+from ib_trader.engine.order import execute_order, execute_close
+from ib_trader.ib.insync_client import InsyncClient
+from ib_trader.logging_.logger import setup_logging
+from ib_trader.repl.commands import (
     parse_command, BuyCommand, SellCommand, CloseCommand, ModifyCommand
 )
 
@@ -73,7 +73,7 @@ async def run_repl(ctx: AppContext, symbols: list[str]) -> None:
     except Exception as e:
         print(f"\u2717 IB connection failed: {e}")
         print("Please check that TWS or IB Gateway is running, then press Enter to retry...")
-        input()
+        await asyncio.to_thread(input)
         try:
             await ctx.ib.connect()
         except Exception as e2:
@@ -395,12 +395,22 @@ SESSION
 @click.option("--env", default=".env", help=".env file path")
 @click.option("--settings", "settings_path", default="config/settings.yaml", help="Settings YAML path")
 @click.option("--symbols", "symbols_path", default="config/symbols.yaml", help="Symbols YAML path")
-@click.option("--paper", is_flag=True, default=False, help="Use paper trading account (IB_PORT_PAPER / IB_ACCOUNT_ID_PAPER from .env)")
-def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) -> None:
+@click.option(
+    "--force-mode",
+    type=click.Choice(["paper", "live"]),
+    default=None,
+    help=(
+        "Assert the detected Gateway mode must match this value. Without "
+        "this flag the REPL auto-detects from the Gateway's managedAccounts."
+    ),
+)
+def main(db: str, env: str, settings_path: str, symbols_path: str,
+         force_mode: str | None) -> None:
     """IB Trader — interactive trading session for Interactive Brokers.
 
     Start once and trade from the prompt. Type 'help' for commands.
-    Defaults to live trading. Pass --paper to use the paper trading account.
+    Auto-detects paper vs live from the Gateway's managedAccounts
+    (DU*=paper, else live).
     """
     setup_logging()
 
@@ -412,17 +422,46 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, paper: bool) 
         print(f"\u2717 Configuration error: {e}")
         sys.exit(1)
 
-    # Override settings with .env values, switching to paper keys when --paper is set
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    if paper:
-        settings["ib_port"] = int(env_vars.get("IB_PORT_PAPER", 4002))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE_PAPER", 3))
-        account_id = env_vars.get("IB_ACCOUNT_ID_PAPER") or env_vars["IB_ACCOUNT_ID"]
-    else:
-        settings["ib_port"] = int(env_vars.get("IB_PORT", settings.get("ib_port", 4001)))
-        settings["ib_market_data_type"] = int(env_vars.get("IB_MARKET_DATA_TYPE", settings.get("ib_market_data_type", 1)))
-        account_id = env_vars["IB_ACCOUNT_ID"]
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
+
+    # Probe the Gateway and detect paper/live before constructing the
+    # IB client. See ib_trader.engine.connect for details.
+    import asyncio as _asyncio
+    from ib_trader.engine.connect import (
+        load_candidates, probe_gateway, pick_account, pick_market_data_type,
+    )
+    candidates = load_candidates(settings)
+    probe_timeout = float(settings.get("ib_probe_timeout", 2.0))
+    try:
+        result = _asyncio.run(probe_gateway(
+            settings["ib_host"], candidates, settings["ib_client_id"],
+            timeout=probe_timeout,
+        ))
+    except RuntimeError as e:
+        print(f"\u2717 {e}")
+        sys.exit(1)
+
+    if force_mode and result.mode != force_mode:
+        print(
+            f"\u2717 --force-mode={force_mode!r} but Gateway reports "
+            f"mode={result.mode!r} (accounts={result.accounts})."
+        )
+        sys.exit(1)
+
+    account_id = pick_account(result.mode, env_vars, result.accounts)
+    settings["ib_port"] = result.port
+    settings["ib_market_data_type"] = pick_market_data_type(result.mode, env_vars, settings)
+    settings["account_mode"] = result.mode
+    logger.info(
+        '{"event": "REPL_MODE_DETECTED", "mode": "%s", "port": %d, '
+        '"label": "%s", "account_id": "%s"}',
+        result.mode, result.port, result.label, account_id,
+    )
+    print(
+        f"Detected {result.mode} mode on {result.label} "
+        f"(port {result.port}), account {account_id}."
+    )
 
     # Check DB file permissions if it exists
     if Path(db).exists():

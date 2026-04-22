@@ -4,6 +4,7 @@ The API server is a thin read layer + command submitter.
 It has NO broker connection — all order execution goes through
 the engine service via the pending_commands SQLite table.
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.api.deps import set_session_factory
-from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, templates, positions, logs, watchlist
+from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, bot_trades, templates, positions, logs, watchlist
 from ib_trader.api import ws
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,47 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         set_session_factory(session_factory)
+
+        # Populate the in-memory bot registry from config/bots/*.yaml.
+        # Without this, registry_config.get_by_name() returns None for
+        # every lookup — the WebSocket `subscribe_bot` handler silently
+        # aborts on that, which breaks the Bots-pane SharesCell and
+        # ForceSellButton live updates. The bot runner does its own
+        # load(); the API server had been missing this call.
+        try:
+            from ib_trader.bots import registry_config
+            defns = registry_config.load()
+            logger.info(
+                '{"event": "API_BOT_REGISTRY_LOADED", "count": %d}', len(defns),
+            )
+        except Exception as e:
+            logger.warning(
+                '{"event": "API_BOT_REGISTRY_LOAD_FAILED", "error": "%s"}', str(e),
+            )
+
+        # Connect to Redis for real-time data
+        try:
+            from ib_trader.config.loader import load_settings
+            settings = load_settings("config/settings.yaml")
+            redis_url = settings.get("redis_url", "redis://localhost:6379/0")
+            from ib_trader.redis.client import get_redis
+            redis = await get_redis(redis_url)
+            from ib_trader.api.deps import set_redis
+            set_redis(redis)
+            logger.info('{"event": "API_REDIS_CONNECTED"}')
+        except Exception as e:
+            logger.warning('{"event": "API_REDIS_FAILED", "error": "%s"}', str(e))
+
         logger.info('{"event": "API_SERVER_STARTED"}')
-        yield
+        try:
+            yield
+        except asyncio.CancelledError:
+            pass  # Graceful shutdown via Ctrl+C
+        try:
+            from ib_trader.redis.client import close_redis
+            await close_redis()
+        except Exception as e:
+            logger.debug("redis close failed on shutdown", exc_info=e)
         logger.info('{"event": "API_SERVER_STOPPED"}')
 
     app = FastAPI(
@@ -73,6 +113,7 @@ def create_app(
     app.include_router(system.router)
     app.include_router(positions.router)
     app.include_router(bots.router)
+    app.include_router(bot_trades.router)
     app.include_router(templates.router)
     app.include_router(logs.router)
     app.include_router(watchlist.router)

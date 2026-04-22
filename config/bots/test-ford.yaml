@@ -1,0 +1,23 @@
+# Test-only bot used by frontend/e2e/live-bots-workflow.live.spec.ts.
+#
+# Exercises the FULL production strategy path (trailing stop, hard stop,
+# time stop, exit state machine) against real IB, with one exception:
+#   manual_entry_only: true   -> auto-BUY entries from strategy.on_event
+#                                are blocked by ManualEntryMiddleware.
+# Operators still enter via force-buy; the bot then manages the position
+# exactly like a production bot would.
+#
+# Max risk footprint: 10 shares of F (~$125 notional).
+id: 11111111-1111-1111-1111-111111111111
+name: test-ford
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 5
+manual_entry_only: true
+symbols:
+  - F
+config:
+  strategy_config: config/strategies/test_ford_close_trend.yaml
+  symbol: F
+  qty: 10
+  max_orders: 10

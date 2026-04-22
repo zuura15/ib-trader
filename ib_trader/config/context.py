@@ -19,6 +19,7 @@ from ib_trader.data.repository import (
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.data.repositories.pending_command_repository import PendingCommandRepository
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
+from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 from ib_trader.data.repositories.template_repository import OrderTemplateRepository
 from ib_trader.engine.tracker import OrderTracker
 from ib_trader.repl.output_router import OutputRouter
@@ -51,11 +52,17 @@ class AppContext:
     settings: dict          # Loaded from settings.yaml
     account_id: str         # From .env
     transactions: TransactionRepository
+    redis: object | None = None  # redis.asyncio.Redis — optional, None until Redis is available
     pending_commands: PendingCommandRepository | None = None
     bots: BotRepository | None = None
     bot_events: BotEventRepository | None = None
+    bot_trades: BotTradeRepository | None = None
     templates: OrderTemplateRepository | None = None
     router: OutputRouter = field(default_factory=OutputRouter)
+
+    # In-memory IB positions cache — refreshed by positionEvent callback
+    # + 30s poll. Served via GET /engine/positions. No Redis.
+    positions_cache: list = field(default_factory=list)
 
     # Multi-broker support: dict of broker name → BrokerClientBase
     # When set, get_broker() uses this instead of self.ib

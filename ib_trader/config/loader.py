@@ -20,8 +20,9 @@ REQUIRED_SETTINGS_KEYS = [
     "max_retries",
     "retry_delay_seconds",
     "retry_backoff_multiplier",
-    "reprice_interval_seconds",
-    "reprice_duration_seconds",
+    "reprice_steps",
+    "reprice_active_duration_seconds",
+    "reprice_passive_wait_seconds",
     "ib_host",
     "ib_port",
     "ib_client_id",
@@ -209,8 +210,8 @@ def check_file_permissions(path: str, required_mode: int, label: str) -> None:
     """
     try:
         file_stat = os.stat(path)
-    except FileNotFoundError:
-        raise ConfigurationError(f"{label} file not found: {path}")
+    except FileNotFoundError as err:
+        raise ConfigurationError(f"{label} file not found: {path}") from err
 
     actual_mode = stat.S_IMODE(file_stat.st_mode)
     if actual_mode != required_mode:

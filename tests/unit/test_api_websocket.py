@@ -5,7 +5,6 @@ Covers: connection, subscribe, snapshot delivery, ping/pong, diff detection.
 import json
 import pytest
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -13,7 +12,6 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 from ib_trader.data.models import (
     Base, TradeGroup, TradeStatus,
-    SystemAlert, AlertSeverity,
 )
 from ib_trader.api.app import create_app
 from ib_trader.api import deps as api_deps
@@ -110,14 +108,8 @@ class TestWebSocketData:
             assert trades[0]["symbol"] == "AAPL"
             assert trades[0]["status"] == "OPEN"
 
-    def test_snapshot_includes_alerts(self, ws_client, ws_session_factory):
-        s = ws_session_factory()
-        s.add(SystemAlert(
-            severity=AlertSeverity.WARNING, trigger="test",
-            message="Test warning", created_at=_now(),
-        ))
-        s.commit()
-
+    def test_snapshot_alerts_empty_without_redis(self, ws_client):
+        """Without Redis, alerts snapshot returns [] (alerts now in Redis)."""
         with ws_client.websocket_connect("/ws") as ws:
             ws.send_text(json.dumps({
                 "type": "subscribe",
@@ -125,8 +117,7 @@ class TestWebSocketData:
             }))
             resp = json.loads(ws.receive_text())
             alerts = resp["data"]["alerts"]
-            assert len(alerts) == 1
-            assert alerts[0]["severity"] == "WARNING"
+            assert alerts == []
 
 
 class TestDiffComputation:

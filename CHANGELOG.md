@@ -3,6 +3,161 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-04-20
+
+### Changed
+- **Unified order-wait policy (MID / BID / ASK / MARKET)** — replaced
+  `reprice_duration_seconds: 10`, `reprice_interval_seconds: 1`, and
+  `bid_ask_wait_seconds: 30` with a single triad:
+  `reprice_steps: 10`, `reprice_active_duration_seconds: 30`,
+  `reprice_passive_wait_seconds: 90`. MID now runs its walker for the
+  active phase then holds at the last amended price for the passive
+  phase; BID/ASK/MARKET wait `active+passive=120 s` as a single
+  window. `SMART_MARKET` keeps its own staged knobs. HTTP client
+  timeouts bumped to **260 s** across all callers
+  (`commands.py`, `bots/middleware.py`, `bots/runtime.py`, both
+  `api/routes/bots.py` force-buy/force-sell proxies) to cover the
+  engine's worst-case total_order_wait (120 s) + cancel_settle
+  (120 s) + buffer.
+- **Bot entries default to `smart_market`** — `order_strategy` flipped
+  from `mid` to `smart_market` in all four strategy configs
+  (`sawtooth_rsi.yaml`, `sawtooth_qqq.yaml`, `close_trend_rsi.yaml`,
+  `close_trend_uso.yaml`) and in the code defaults of `sawtooth_rsi.py`
+  / `close_trend_rsi.py`. Exits were already `smart_market`; entries
+  now follow suit because signal timing matters more than 1-2 ¢ of
+  slippage on entry.
+- **Data-rich Trades panel.** `TradeResponse` gained `entry_qty`,
+  `entry_price`, `exit_qty`, `exit_price`, `order_type` (sourced from
+  the entry fill and weighted-avg exit fills via the transaction
+  legs). Frontend columns: `# | Symbol | Dir | Status | Type | Qty |
+  Entry | Exit | P&L ($ + %) | Opened | Closed`. Compact mode hides
+  `Type / Exit / Closed`.
+- **Bot UI font sizes**. `BotsPanel` bumped +25 %
+  (`text-[10px] → text-[13px]`, `text-[11px] → text-[14px]`).
+  `BotActivity` / `BotLogStream` fonts normalized to +25 % of their
+  original sizes (previous bump was 40-60 % — too large).
+
+### Fixed
+- **Bot UI "0 shares" flash during entry-order wait.** `PositionLine`'s
+  early-return guard now includes `ENTRY_ORDER_PLACED` and requires
+  `qty !== 0`. Previously rendered `+0 @ $0.00` for the 3-4 s window
+  between placing an entry order and the first fill — purely a
+  rendering artifact (state was correct), fixed with a guard tighten.
+- **Cancel-settle wedge on IBEOS flip-cycles.** When IBEOS flipped an
+  order through Cancelled → Submitted → Filled in rapid succession,
+  `_cancel_and_await_resolution` could block forever on
+  `ctx.ib.get_open_orders()` — the 10 s resync call had no timeout
+  and `reqAllOpenOrdersAsync` would hang under IBEOS contention. Fix:
+  wrap the resync in `asyncio.wait_for(..., timeout=5.0)`, and add a
+  `track.is_canceled` check so the brief Cancelled window caught by
+  our status callback resolves the wait even if a subsequent
+  `get_order_status` poll lands on a post-flip `Submitted`.
+- **Cancel dispatch shielded against task cancellation.** The first
+  `ctx.ib.cancel_order` call inside `_cancel_and_await_resolution` is
+  now run under `asyncio.shield` — an outer cancellation (HTTP client
+  timeout, handler abort) can't interrupt the cancel packet mid-
+  throttle and leave the order live at IB.
+
+### Added
+- **Per-fill progress emits in all entry/close helpers.** `on_fill`
+  callbacks in `_execute_mid_order`, `_execute_bid_ask_order`,
+  `_execute_market_order`, and `execute_close` now accumulate
+  running-qty and emit `[HH:MM:SS] Filled {q} @ ${avg}
+  ({cumulative}/{target})` to the COMMAND pane. Console / frontend
+  see partials stream in live instead of only the final aggregated
+  FILLED line.
+- **Walker visibility emits.** `reprice_loop` now emits a
+  `Reprice tick N/10 — holding at $X` line on dedup'd steps (where
+  the proportional price rounded to the same value), a
+  `Walker paused at step N/10` line when the walker breaks early on
+  a partial fill, and the existing `Amended → $X | amend N` line.
+  Closes the "30 seconds of silence" window during which the walker
+  was alive but the user saw no output.
+- **Cancel-settle heartbeat.** `_cancel_and_await_resolution` emits
+  `[HH:MM:SS] Cancel pending #N — waiting for IB…
+  (Y/Z filled)` every 5 s during the settle window. Gives live
+  visibility and keeps the frontend's WebSocket `cmd:{cmd_id}:output`
+  consumer from idle-timing-out during long cancel-settle waits.
+- **`_fmt_qty` helper** strips trailing `.0` from whole-number fill
+  displays (IB always reports qty as `Decimal("621.0")`; now shows
+  `621`). Applied uniformly to all amend, fill, walker, and
+  `✓ FILLED` lines.
+- **Playwright coverage of bot lifecycle.** New
+  `frontend/e2e/bots-lifecycle.spec.ts` drives start → force-buy →
+  force-sell against the extended mock and asserts that the
+  `PositionLine` appears with `data-qty=15`, `data-entry=180.25`,
+  `data-position-state=AWAITING_EXIT_TRIGGER` after force-buy and
+  disappears after force-sell. Mock API gained a `subscribe_bot` WS
+  handler and a `broadcastBotState` helper that mirrors the real
+  backend's `bot_state` broadcast. 6 bot-related Playwright tests
+  pass.
+
+### Changed
+- **Collapsed the bot FSM module into methods on the bot runtime** —
+  `ib_trader/bots/fsm.py` (775 lines) deleted. The 6-state `BotState`
+  enum moved to `ib_trader/bots/lifecycle.py` alongside a
+  `force_off_state` helper and an `is_clean_for_start` predicate.
+  Each FSM handler (`_h_start`, `_h_stop`, `_h_entry_filled`, …)
+  became an `on_*` method on `StrategyBotRunner`; the 29 call sites
+  previously invoking `FSM.dispatch` now call the bot method
+  directly. `TransitionResult.side_effects` and the
+  `_execute_side_effects` case-switch are gone — side effects
+  (cancel_order, pager_alert, record_trade_closed, retry_exit_order)
+  are inline method calls. Stoic mode (`_order_submit_in_flight`,
+  `_awaiting_terminal_ib_order_id`, `_recent_terminal_order_ids`,
+  `_check_stoic_mode_timeout`) is gone too — the bot's lifecycle
+  state itself is the gate, achieved by transitioning to
+  `ENTRY_ORDER_PLACED` / `EXIT_ORDER_PLACED` *before* the engine HTTP
+  call instead of after. Net: ~1,000 lines deleted. See ADR 016.
+- **Crashed / errored bots now require an explicit `/reset` before
+  re-START.** `/bots/<id>/start` self-checks the doc and refuses
+  unless `state=OFF` with all position fields zeroed. The new
+  `POST /api/bots/<id>/reset` endpoint calls `force_off_state`
+  (same helper the startup panic path uses). Prior behaviour
+  auto-cleared ERRORED on START, which could silently resume a bot
+  with a stale `entry_price` from an interrupted trade.
+- **`/bots/<id>/start` now uses a reservation pattern.** A
+  synchronous `_RESERVED` sentinel is inserted before the warmup
+  `await` to close the check-then-await-then-insert race where two
+  concurrent START requests could both pass the `in` check and kick
+  off parallel bot instantiations.
+
+### Fixed
+- **SMART_MARKET walker pre-amend status race** — `_walk_limit_aggressive`
+  now re-checks order state (in-memory tracker + `get_order_status`) right
+  before every `amend_order` call, not just at the top of the loop. Closes
+  the race where an order filled during the walker's sleep/quote-fetch
+  window but the amend was still sent, producing IB error 104 and
+  ib_async assertion noise. Residual post-amend race (now microseconds
+  wide) is logged as `SMART_MARKET_AMEND_RACE` at WARNING; only truly
+  unexpected amend failures keep `SMART_MARKET_AMEND_FAILED` at ERROR.
+
+### Added
+- **Force-sell for bots** — new `POST /api/bots/{bot_id}/force-sell` endpoint
+  and "FORCE SELL" / "SELL" UI buttons (large + compact views) that close a
+  bot's open position immediately via the same strategy exit path an organic
+  exit uses. Promoted each strategy's `_trigger_exit` to a public
+  `build_exit_actions` method on the `Strategy` Protocol so both organic and
+  force exits produce bit-identical orders — only the `ExitType` in the
+  LogSignal payload differs (`FORCE_EXIT` vs `TRAILING_STOP` / `HARD_STOP_LOSS`
+  / etc.). Button is gated on bot status == running AND an open position,
+  and the runner state-guards that the FSM is in `AWAITING_EXIT_TRIGGER`.
+
+### Changed
+- **Auto-detect paper/live from the Gateway** — the engine and REPL no longer
+  require a `--paper` / `--live` flag at startup. On launch they probe a
+  configurable list of candidate ports (default `[4001, 4002]` — live first,
+  paper fallback), connect to whichever Gateway is up, and classify the
+  session as paper/live from the `managedAccounts` prefix (`DU*` = paper,
+  else live). `account_id` and `ib_market_data_type` are then selected from
+  `.env` to match.
+- New `--force-mode {paper,live}` option on `ib-engine` and `ib-trader`
+  asserts the detected mode must match, for scripted environments that want
+  the old failfast behavior.
+- `config/settings.yaml` gains `ib_port_candidates` and `ib_probe_timeout`.
+- Dropped `_validate_account_mode` (engine/main.py) — with auto-detect there
+  is no flag/account drift to catch.
+
 ## 2026-03-13
 
 ### Added

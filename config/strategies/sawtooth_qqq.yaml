@@ -2,13 +2,14 @@
 # Buys intraday dips within confirmed sawtooth uptrends on 3-minute bars.
 
 name: sawtooth_rsi_reversal
+ref_id: saw-rsi-qqq
 version: "1.0"
 
 # Symbol and sizing
 symbol: QQQ
 max_position_value: 10000     # $10K max per trade
 max_shares: 20                # hard cap regardless of price
-order_strategy: mid           # limit at midpoint for entry
+order_strategy: smart_market  # aggressive-mid walker → MKT residual; timing beats 1-2¢ on entry
 
 # Bar configuration
 bar_size_seconds: 180         # 3-minute bars

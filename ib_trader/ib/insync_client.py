@@ -21,6 +21,18 @@ _apply_overnight_patch()
 
 logger = logging.getLogger(__name__)
 
+# Retain references to fire-and-forget asyncio tasks so the loop's weakref
+# collection doesn't cancel them mid-flight. See Python docs on create_task.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """Create an asyncio task, track it, and auto-discard on completion."""
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 class InsyncClient(IBClientBase):
     """IB API client implemented via ib_async.
@@ -69,6 +81,28 @@ class InsyncClient(IBClientBase):
         # fire for every order and are never auto-removed.
         self._fill_callbacks: dict[str, list] = {}
         self._status_callbacks: dict[str, list] = {}
+        # Commission callbacks fire when IB delivers a CommissionReport
+        # (typically slightly after the matching execDetails). Same
+        # keying convention as _fill_callbacks: per-ib_order_id scoped
+        # callbacks + a _GLOBAL bucket that fires for all orders.
+        # Non-gating — handlers only update persisted state.
+        self._commission_callbacks: dict[str, list] = {}
+        # Seen exec_ids for commission-dedup: IB occasionally re-delivers
+        # the same CommissionReport on reconnect.
+        self._seen_commission_execs: set[str] = set()
+        # Per-order asyncio locks. Every dispatched callback (fill,
+        # status, commission) for a given ib_order_id acquires this
+        # lock before running, so IB events for the same order are
+        # processed strictly in arrival order even when individual
+        # handlers yield mid-flight. Different orders remain parallel.
+        # asyncio.Lock serves waiters FIFO, so tasks created in IB's
+        # dispatch order acquire in IB's dispatch order. Locks are
+        # retained for the life of the engine — per-order memory
+        # overhead is negligible and late events (e.g. a commission
+        # arriving after terminal) must find the same lock to
+        # maintain ordering against any fills that were still in
+        # flight when the status flipped.
+        self._order_locks: dict[str, asyncio.Lock] = {}
         # Maps ib_order_id -> Trade object for amendment support
         self._active_trades: dict[str, Trade] = {}
         # Maps con_id -> fully-qualified Contract ready for order placement.
@@ -136,6 +170,7 @@ class InsyncClient(IBClientBase):
         self._ib.disconnectedEvent += self._on_disconnected
         self._ib.execDetailsEvent += self._on_exec_details
         self._ib.orderStatusEvent += self._on_order_status
+        self._ib.commissionReportEvent += self._on_commission_report
         self._ib.errorEvent += self._on_error
         self._ib.reqMarketDataType(self._market_data_type)
         logger.info(
@@ -154,6 +189,10 @@ class InsyncClient(IBClientBase):
     def is_connected(self) -> bool:
         """Return True if the underlying IB connection is alive."""
         return self._ib.isConnected()
+
+    def managed_accounts(self) -> list[str]:
+        """Return the IB account IDs attached to this Gateway session."""
+        return list(self._ib.managedAccounts())
 
     async def qualify_contract(
         self,
@@ -331,6 +370,7 @@ class InsyncClient(IBClientBase):
         price: Decimal,
         outside_rth: bool = True,
         tif: str = "GTC",
+        order_ref: str | None = None,
     ) -> str:
         """Place a limit order. Returns IB order ID as string."""
         await self._throttle()
@@ -341,6 +381,8 @@ class InsyncClient(IBClientBase):
         order.account = self._account_id
         order.outsideRth = outside_rth
         order.tif = tif
+        if order_ref:
+            order.orderRef = order_ref
         overnight = is_overnight_session()
         if overnight:
             # During overnight session (8 PM – 3:50 AM ET), set includeOvernight
@@ -377,6 +419,7 @@ class InsyncClient(IBClientBase):
         side: str,
         qty: Decimal,
         outside_rth: bool = True,
+        order_ref: str | None = None,
     ) -> str:
         """Place a market order. Returns IB order ID as string."""
         await self._throttle()
@@ -386,6 +429,8 @@ class InsyncClient(IBClientBase):
         order = MarketOrder(side, float(qty))
         order.account = self._account_id
         order.outsideRth = outside_rth
+        if order_ref:
+            order.orderRef = order_ref
         overnight = is_overnight_session()
         if overnight:
             order.includeOvernight = True
@@ -582,8 +627,8 @@ class InsyncClient(IBClientBase):
             if not entry.get("enriched"):
                 try:
                     self._ib.cancelMktData(entry["contract"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("cancelMktData failed during upgrade", exc_info=e)
                 ticker = self._ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
                 entry["ticker"] = ticker
                 entry["enriched"] = True
@@ -619,8 +664,8 @@ class InsyncClient(IBClientBase):
         if entry["refs"] <= 0:
             try:
                 self._ib.cancelMktData(entry["contract"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelMktData failed on unsubscribe", exc_info=e)
             del self._streaming[con_id]
             logger.info(
                 '{"event": "STREAMING_SUB_CANCELLED", "con_id": %d}', con_id,
@@ -781,7 +826,7 @@ class InsyncClient(IBClientBase):
                         try:
                             import asyncio
                             if asyncio.iscoroutinefunction(cb):
-                                asyncio.ensure_future(cb(bar_data))
+                                _spawn_background(cb(bar_data))
                             else:
                                 cb(bar_data)
                         except Exception as exc:
@@ -805,8 +850,8 @@ class InsyncClient(IBClientBase):
         if entry["refs"] <= 0:
             try:
                 self._ib.cancelRealTimeBars(entry["bars"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cancelRealTimeBars failed", exc_info=e)
             del self._realtime_bars[con_id]
             logger.info(
                 '{"event": "RT_BARS_CANCELLED", "con_id": %d}', con_id,
@@ -828,6 +873,21 @@ class InsyncClient(IBClientBase):
         2107,  # HMDS data farm connection inactive (not an error)
         2108,  # Market data farm connection inactive (not an error)
         2158,  # Sec-def data farm connection OK
+        10340, # ManualOrderIndicator not supported (delayed warning, not an error)
+    })
+
+    # Benign order-race codes — the order already terminalized by the
+    # time our code tried to amend/cancel. The engine's walker and
+    # close paths catch these cleanly (e.g. SMART_MARKET_AMEND_RACE),
+    # so they're noise, not failures. Logged at WARNING; NOT written
+    # to _order_errors so the PendingSubmit wait loop and bid/ask
+    # rejection detector don't surface a spurious rejection.
+    _BENIGN_ORDER_RACE_CODES: frozenset[int] = frozenset({
+        104,    # Cannot modify a filled order
+        105,    # Order does not match any existing order
+        135,    # Can't find order with id
+        201,    # Order rejected - reason: Order is already filled (amend-race)
+        10147,  # OrderId is not an active order
     })
 
     def _on_error(self, reqId: int, errorCode: int, errorString: str, *_) -> None:
@@ -846,13 +906,36 @@ class InsyncClient(IBClientBase):
         newer ib_async versions without breaking older ones.
         """
         ib_order_id = str(reqId)
+        is_info = errorCode in self._INFO_CODES
+        is_benign_race = errorCode in self._BENIGN_ORDER_RACE_CODES
         if ib_order_id in self._active_trades:
-            logger.error(
-                '{"event": "IB_ORDER_ERROR", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
-                ib_order_id, errorCode, errorString,
-            )
-            self._order_errors[ib_order_id] = f"[{errorCode}] {errorString}"
-        elif errorCode in self._INFO_CODES:
+            # INFO-class codes (e.g. 10340 ManualOrderIndicator) still
+            # reference an active order but must NOT be treated as a
+            # rejection — log at INFO and skip the _order_errors write
+            # so downstream code doesn't surface a false failure.
+            if is_info:
+                logger.info(
+                    '{"event": "IB_NOTICE", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+            elif is_benign_race:
+                # Expected race when our walker/close path amends or
+                # cancels an order that IB just terminalized. The engine
+                # side handles these via SMART_MARKET_AMEND_RACE (or the
+                # close-path guard) and returns cleanly — this is a
+                # diagnostic, not an error.
+                logger.warning(
+                    '{"event": "IB_ORDER_RACE", "ib_order_id": "%s", '
+                    '"code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+            else:
+                logger.error(
+                    '{"event": "IB_ORDER_ERROR", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
+                    ib_order_id, errorCode, errorString,
+                )
+                self._order_errors[ib_order_id] = f"[{errorCode}] {errorString}"
+        elif is_info:
             logger.info(
                 '{"event": "IB_NOTICE", "reqId": %d, "code": %d, "msg": "%s"}',
                 reqId, errorCode, errorString,
@@ -895,11 +978,46 @@ class InsyncClient(IBClientBase):
         "Filled", "Cancelled", "Inactive", "ApiCancelled",
     })
 
+    def _get_order_lock(self, ib_order_id: str) -> asyncio.Lock:
+        """Return the per-order asyncio.Lock for ``ib_order_id``, creating
+        it lazily on first use. Lazy creation avoids loop-binding issues
+        during construction and only pays for orders that actually see
+        traffic."""
+        lock = self._order_locks.get(ib_order_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._order_locks[ib_order_id] = lock
+        return lock
+
+    async def _dispatch_ordered(
+        self, ib_order_id: str, cb, *args,
+    ) -> None:
+        """Run ``cb(*args)`` under the per-order lock.
+
+        Every IB-event callback (fill / status / commission) for a given
+        ``ib_order_id`` funnels through this wrapper, so they execute
+        strictly in the order they were scheduled — which is IB's
+        dispatch order, since ib_async invokes our sync event handlers
+        in arrival order and each handler wraps callbacks via
+        ``_spawn_background`` immediately. Without this lock, a handler
+        that yields (e.g. ``await order_writer.add(...)``) can be
+        overtaken by the next event's handler, letting a status=Filled
+        terminalize the ledger before a still-queued fill has
+        accumulated — which left orphan positions in IB in live trading.
+        """
+        async with self._get_order_lock(ib_order_id):
+            await cb(*args)
+
     def _on_exec_details(self, trade: Trade, fill: Fill) -> None:
-        """Handle fill event from IB and dispatch to registered callbacks."""
+        """Handle fill event from IB and dispatch to registered callbacks.
+
+        Uses fill.execution data (this specific fill) rather than
+        trade.orderStatus (cumulative, lags behind on partial fills).
+        """
         ib_order_id = str(trade.order.orderId)
-        qty_filled = Decimal(str(trade.orderStatus.filled))
-        avg_price = Decimal(str(trade.orderStatus.avgFillPrice))
+        # Use fill-level data — orderStatus.filled/avgFillPrice lag behind
+        qty_filled = Decimal(str(fill.execution.shares))
+        avg_price = Decimal(str(fill.execution.price))
         commission = Decimal("0")
         if fill.commissionReport:
             commission = Decimal(str(fill.commissionReport.commission))
@@ -915,12 +1033,84 @@ class InsyncClient(IBClientBase):
             fill.execution.exchange,
         )
 
-        loop = asyncio.get_event_loop()
         # Dispatch to order-specific callbacks, then global callbacks.
+        # Every dispatch for this ib_order_id funnels through the
+        # per-order lock so fills/statuses for the same order run in
+        # IB's arrival order even when individual handlers yield.
         for cb in self._fill_callbacks.get(ib_order_id, []):
-            loop.create_task(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, qty_filled, avg_price, commission,
+            ))
         for cb in self._fill_callbacks.get("_GLOBAL", []):
-            loop.create_task(cb(ib_order_id, qty_filled, avg_price, commission))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, qty_filled, avg_price, commission,
+            ))
+
+    def _on_commission_report(self, trade, fill, report) -> None:
+        """Handle CommissionReport from IB (fires shortly AFTER execDetails).
+
+        IB delivers commission info on a separate event because the
+        number is computed server-side after the fill is booked. If
+        ``execDetailsEvent`` already had ``fill.commissionReport`` set,
+        our ``_on_exec_details`` captured the commission inline and the
+        handlers here are "extra" — dedup via ``exec_id`` to avoid
+        double-posting.
+        """
+        try:
+            ib_order_id = str(trade.order.orderId)
+        except Exception:
+            return
+        exec_id = getattr(fill.execution, "execId", "") or ""
+        commission_raw = getattr(report, "commission", 0) or 0
+        try:
+            commission = Decimal(str(commission_raw))
+        except Exception:
+            return
+        # Dedup. On reconnect IB sometimes redelivers the same report.
+        if exec_id and exec_id in self._seen_commission_execs:
+            logger.debug(
+                '{"event": "IB_COMMISSION_REPORT_DEDUPED", '
+                '"ib_order_id": "%s", "exec_id": "%s"}',
+                ib_order_id, exec_id,
+            )
+            return
+        if exec_id:
+            self._seen_commission_execs.add(exec_id)
+
+        logger.info(
+            '{"event": "IB_COMMISSION_REPORT", "ib_order_id": "%s", '
+            '"exec_id": "%s", "commission": "%s"}',
+            ib_order_id, exec_id, commission,
+        )
+
+        # Fire per-order callbacks then global. Handlers do DB updates
+        # only — never gate anything waiting for commission. Funnel
+        # through the per-order lock so commission writes stay ordered
+        # relative to any still-in-flight fill/status handlers for the
+        # same ib_order_id.
+        for cb in self._commission_callbacks.get(ib_order_id, []):
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, exec_id, commission,
+            ))
+        for cb in self._commission_callbacks.get("_GLOBAL", []):
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, exec_id, commission,
+            ))
+
+    def register_commission_callback(
+        self, callback, ib_order_id: str | None = None,
+    ) -> None:
+        """Register a callback for CommissionReport events.
+
+        Args:
+            callback: async callable taking (ib_order_id, exec_id, commission).
+            ib_order_id: Scope to a single order, or None for the _GLOBAL
+                bucket that fires for every order. Per-order callbacks are
+                NOT auto-removed on terminal — commission can arrive after
+                the order is marked Filled.
+        """
+        key = ib_order_id or "_GLOBAL"
+        self._commission_callbacks.setdefault(key, []).append(callback)
 
     def _on_order_status(self, trade: Trade) -> None:
         """Handle order status change event from IB and dispatch to callbacks.
@@ -933,22 +1123,56 @@ class InsyncClient(IBClientBase):
         status = trade.orderStatus.status
         why_held = getattr(trade.orderStatus, "whyHeld", "") or ""
         remaining = trade.orderStatus.remaining
+        perm_id = trade.order.permId
+        filled = trade.orderStatus.filled
 
         logger.debug(
             '{"event": "IB_STATUS_CHANGE", "ib_order_id": "%s", '
             '"symbol": "%s", "status": "%s", "filled": %s, '
             '"remaining": %s, "why_held": "%s", "perm_id": %s}',
             ib_order_id, trade.contract.symbol, status,
-            trade.orderStatus.filled, remaining, why_held,
-            trade.order.permId,
+            filled, remaining, why_held, perm_id,
         )
 
-        loop = asyncio.get_event_loop()
+        # IB sometimes fires a spurious `Cancelled` status with perm_id=0 when
+        # it rejects some order attribute (e.g. unsupported TIF combined with
+        # a destination) and re-routes the order with a corrected attribute.
+        # The resulting sequence is:
+        #   Cancelled (perm_id=0, filled=0, remaining=0, ValidationError)
+        #   → PreSubmitted → Submitted → Filled (with a real perm_id)
+        # Treating that first Cancelled as terminal removes the per-order
+        # fill callback, which then never fires on the real fill. Skip the
+        # auto-cleanup when perm_id is 0 and nothing filled — the order has
+        # not actually reached the exchange yet.
+        is_prerouting_cancel = (
+            status == "Cancelled"
+            and perm_id == 0
+            and (filled or 0) == 0
+        )
+
+        if is_prerouting_cancel:
+            # Swallow — the order has not reached the exchange yet and will be
+            # reissued momentarily. Propagating a "Cancelled" here would make
+            # status listeners mark the order dead.
+            logger.debug(
+                '{"event": "IB_PREROUTING_CANCEL_IGNORED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            return
+
         # Dispatch to order-specific callbacks, then global callbacks.
+        # Funnel through the per-order lock — critical here, because a
+        # terminal status that overtakes a still-queued fill would
+        # terminalize the ledger with under-counted fills and leave
+        # orphan position in IB (PSQ incident, 2026-04-21).
         for cb in self._status_callbacks.get(ib_order_id, []):
-            loop.create_task(cb(ib_order_id, status))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, status,
+            ))
         for cb in self._status_callbacks.get("_GLOBAL", []):
-            loop.create_task(cb(ib_order_id, status))
+            _spawn_background(self._dispatch_ordered(
+                ib_order_id, cb, ib_order_id, status,
+            ))
 
         # Auto-cleanup after terminal status dispatch.
         if status in self._TERMINAL_STATUSES:
