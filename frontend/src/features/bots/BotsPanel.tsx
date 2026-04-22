@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useStore } from '../../data/store';
-import { formatAge, formatCurrency, formatDuration, pnlClass } from '../../utils/format';
+import { formatAge } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 import type { Bot, BotStatus } from '../../types';
 
@@ -183,6 +183,56 @@ function ForceSellButton({ botId, symbol, botRef, compact = false }: {
   );
 }
 
+/**
+ * Renders the current # of shares held by the bot. Mirrors
+ * ForceSellButton's subscription pattern — initial fetch from
+ * /api/bots/{id}/state, then a WebSocket subscription so the
+ * cell updates on every fill without polling.
+ */
+function SharesCell({ botId, symbol, botRef }: {
+  botId: string; symbol: string; botRef?: string;
+}) {
+  const [qty, setQty] = useState<number>(0);
+
+  useEffect(() => {
+    const apply = (s: BotPositionState) => {
+      const n = s.qty ? parseFloat(s.qty) : 0;
+      const pos = s.position_state || s.state || 'FLAT';
+      setQty(pos === 'FLAT' || pos === 'OFF' ? 0 : n);
+    };
+
+    fetch(`/api/bots/${botId}/state`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then(apply)
+      .catch(() => {});
+
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      if (botRef) ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'bot_state' && msg.symbol === symbol && msg.strategy) {
+          apply(msg.strategy);
+        }
+      } catch {}
+    };
+    return () => ws.close();
+  }, [botId, symbol, botRef]);
+
+  return (
+    <span
+      className="font-mono"
+      data-testid={`bot-shares-${botId}`}
+      data-qty={qty}
+    >
+      {qty > 0 ? qty : '—'}
+    </span>
+  );
+}
+
 function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string; botRef?: string }) {
   const [state, setState] = useState<BotPositionState>({});
   const [livePrice, setLivePrice] = useState<number>(0);
@@ -346,157 +396,99 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
         <div className="h-full overflow-auto p-2 grid grid-cols-1 gap-2">
           {bots.map((bot) => {
             const cfg = statusConfig[bot.status];
+            const symbol = bot.symbols[0] || '—';
             return (
               <div
                 key={bot.id}
-                className="rounded border p-3"
+                className="rounded border p-2 flex items-center gap-3 flex-wrap"
                 style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-default)' }}
                 data-testid={`bot-row-${bot.id}`}
                 data-bot-id={bot.id}
                 data-bot-name={bot.name}
                 data-bot-status={bot.status}
               >
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <span style={{ color: cfg.var }} className="text-sm">{cfg.dot}</span>
-                    <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>{bot.name}</span>
-                    <span
-                      className={`badge ${bot.status === 'running' ? 'badge-green' : bot.status === 'error' ? 'badge-red' : bot.status === 'paused' ? 'badge-yellow' : 'badge-gray'}`}
-                      data-testid={`bot-status-${bot.id}`}
-                      data-status={bot.status}
-                    >
-                      {cfg.label}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[13px]" style={{ color: 'var(--text-muted)' }}>
-                      {bot.strategy}
-                    </span>
-                    <button
-                      onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
-                      className="text-[13px] px-2 py-0.5 rounded font-semibold"
-                      disabled={!!getPending(bot.id)}
-                      style={{
-                        background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
-                        color: getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
-                        border: `1px solid ${getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
-                        cursor: getPending(bot.id) ? 'wait' : 'pointer',
-                        opacity: getPending(bot.id) ? 0.7 : 1,
-                      }}
-                      data-testid={`bot-toggle-${bot.id}`}
-                    >
-                      {getPending(bot.id) || (bot.status === 'running' ? 'STOP' : 'START')}
-                    </button>
-                    {bot.status === 'running' && (
-                      <button
-                        onClick={() => forceBuy(bot.id)}
-                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
-                        style={{
-                          background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
-                          color: 'var(--accent-yellow)',
-                          border: '1px solid var(--accent-yellow)',
-                          cursor: 'pointer',
-                        }}
-                        data-testid={`bot-force-buy-${bot.id}`}
-                      >
-                        FORCE BUY
-                      </button>
-                    )}
-                    {bot.status === 'running' && bot.symbols[0] && (
-                      <ForceSellButton
-                        botId={bot.id}
-                        symbol={bot.symbols[0]}
-                        botRef={bot.refId}
-                      />
-                    )}
-                    {bot.status === 'running' && (
-                      <button
-                        onClick={() => forceStop(bot.id)}
-                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
-                        style={{
-                          background: 'var(--badge-red-bg)',
-                          color: 'var(--accent-red)',
-                          border: '1px solid var(--accent-red)',
-                          cursor: 'pointer',
-                        }}
-                        data-testid={`bot-force-stop-${bot.id}`}
-                        title="Emergency stop — parks the bot in ERRORED"
-                      >
-                        FORCE STOP
-                      </button>
-                    )}
-                    {bot.status === 'error' && (
-                      <button
-                        onClick={() => resetBot(bot.id)}
-                        className="text-[13px] px-2 py-0.5 rounded font-semibold"
-                        style={{
-                          background: 'var(--badge-blue-bg)',
-                          color: 'var(--accent-blue)',
-                          border: '1px solid var(--accent-blue)',
-                          cursor: 'pointer',
-                        }}
-                        data-testid={`bot-reset-${bot.id}`}
-                        title="Clear ERRORED and reset to OFF so the bot can be STARTed again"
-                      >
-                        RESET
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-4 gap-3 text-xs mb-2">
-                  <div>
-                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Heartbeat</div>
-                    <div className="font-mono" style={{ color: bot.status === 'error' ? 'var(--accent-red)' : 'var(--text-primary)' }}>
-                      {formatAge(bot.lastHeartbeat)} ago
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Trades Today</div>
-                    <div className="font-mono" style={{ color: 'var(--text-primary)' }}>{bot.tradesToday}</div>
-                  </div>
-                  <div>
-                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>P&L Today</div>
-                    <div className={`font-mono ${pnlClass(bot.pnlToday)}`}>{formatCurrency(bot.pnlToday)}</div>
-                  </div>
-                  <div>
-                    <div className="text-[13px] uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Uptime</div>
-                    <div className="font-mono" style={{ color: 'var(--text-primary)' }}>{bot.uptime > 0 ? formatDuration(bot.uptime) : '—'}</div>
-                  </div>
-                </div>
-
-                <div className="text-xs">
-                  <div className="flex gap-2">
-                    <span style={{ color: 'var(--text-muted)' }}>Symbols:</span>
-                    <span style={{ color: 'var(--text-secondary)' }}>{bot.symbols.join(', ')}</span>
-                  </div>
-                  {bot.lastSignal && (
-                    <div className="flex gap-2 mt-0.5">
-                      <span style={{ color: 'var(--text-muted)' }}>Signal:</span>
-                      <span style={{ color: 'var(--text-secondary)' }}>{bot.lastSignal}</span>
-                    </div>
-                  )}
-                  {bot.lastAction && (
-                    <div className="flex gap-2 mt-0.5">
-                      <span style={{ color: 'var(--text-muted)' }}>Action:</span>
-                      <span style={{ color: 'var(--accent-blue)' }}>{bot.lastAction}</span>
-                    </div>
-                  )}
-                  {bot.errorMessage && (
-                    <div className="mt-1 p-1.5 rounded text-[14px]"
-                      style={{ background: 'var(--badge-red-bg)', color: 'var(--accent-red)' }}>
-                      {bot.errorMessage}
-                    </div>
-                  )}
-                </div>
-                {/* Render PositionLine whenever the bot has a symbol — the
-                    line renders FLAT state when there's no position, and
-                    keeps showing a live position if the bot is stopped
-                    while holding one. Gating on status hid real positions
-                    during transitions. */}
+                <span style={{ color: cfg.var }} className="text-sm" title={cfg.label}>{cfg.dot}</span>
+                <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>{bot.name}</span>
+                <span className="font-mono text-[13px]" style={{ color: 'var(--text-secondary)' }}>{symbol}</span>
                 {bot.symbols[0] && (
-                  <PositionLine botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                  <SharesCell botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
                 )}
+                <span
+                  className="font-mono text-[13px]"
+                  style={{ color: bot.status === 'error' ? 'var(--accent-red)' : 'var(--text-muted)' }}
+                  title="Heartbeat age"
+                >
+                  {formatAge(bot.lastHeartbeat)} ago
+                </span>
+                <div className="flex items-center gap-2 ml-auto">
+                  <button
+                    onClick={() => !getPending(bot.id) && toggleBot(bot.id, bot.status)}
+                    className="text-[13px] px-2 py-0.5 rounded font-semibold"
+                    disabled={!!getPending(bot.id)}
+                    style={{
+                      background: getPending(bot.id) ? 'var(--badge-yellow-bg, rgba(234,179,8,0.1))' : bot.status === 'running' ? 'var(--badge-red-bg)' : 'var(--badge-green-bg)',
+                      color: getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)',
+                      border: `1px solid ${getPending(bot.id) ? 'var(--accent-yellow)' : bot.status === 'running' ? 'var(--accent-red)' : 'var(--accent-green)'}`,
+                      cursor: getPending(bot.id) ? 'wait' : 'pointer',
+                      opacity: getPending(bot.id) ? 0.7 : 1,
+                    }}
+                    data-testid={`bot-toggle-${bot.id}`}
+                  >
+                    {getPending(bot.id) || (bot.status === 'running' ? 'STOP' : 'START')}
+                  </button>
+                  {bot.status === 'running' && (
+                    <button
+                      onClick={() => forceBuy(bot.id)}
+                      className="text-[13px] px-2 py-0.5 rounded font-semibold"
+                      style={{
+                        background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
+                        color: 'var(--accent-yellow)',
+                        border: '1px solid var(--accent-yellow)',
+                        cursor: 'pointer',
+                      }}
+                      data-testid={`bot-force-buy-${bot.id}`}
+                    >
+                      FORCE BUY
+                    </button>
+                  )}
+                  {bot.status === 'running' && bot.symbols[0] && (
+                    <ForceSellButton
+                      botId={bot.id}
+                      symbol={bot.symbols[0]}
+                      botRef={bot.refId}
+                    />
+                  )}
+                  {bot.status === 'running' && (
+                    <button
+                      onClick={() => forceStop(bot.id)}
+                      className="text-[13px] px-2 py-0.5 rounded font-semibold"
+                      style={{
+                        background: 'var(--badge-red-bg)',
+                        color: 'var(--accent-red)',
+                        border: '1px solid var(--accent-red)',
+                        cursor: 'pointer',
+                      }}
+                      data-testid={`bot-force-stop-${bot.id}`}
+                      title="Emergency stop — parks the bot in ERRORED"
+                    >
+                      FORCE STOP
+                    </button>
+                  )}
+                  <button
+                    onClick={() => resetBot(bot.id)}
+                    className="text-[13px] px-2 py-0.5 rounded font-semibold"
+                    style={{
+                      background: 'var(--badge-blue-bg)',
+                      color: 'var(--accent-blue)',
+                      border: '1px solid var(--accent-blue)',
+                      cursor: 'pointer',
+                    }}
+                    data-testid={`bot-reset-${bot.id}`}
+                    title="Reset bot state to OFF"
+                  >
+                    RESET
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -516,20 +508,19 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
             <tr>
               <th></th>
               <th>Bot</th>
-              <th>Strategy</th>
+              <th>Symbol</th>
+              <th>Shares</th>
               <th>Heartbeat</th>
-              <th>Trades</th>
-              <th>P&L</th>
-              <th>Last Action</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
             {bots.map((bot) => {
               const cfg = statusConfig[bot.status];
+              const symbol = bot.symbols[0] || '—';
               return (
-                <React.Fragment key={bot.id}>
                 <tr
+                  key={bot.id}
                   data-testid={`bot-row-${bot.id}`}
                   data-bot-id={bot.id}
                   data-bot-name={bot.name}
@@ -537,14 +528,16 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                 >
                   <td style={{ color: cfg.var }} title={cfg.label}>{cfg.dot}</td>
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{bot.name}</td>
-                  <td style={{ color: 'var(--text-secondary)' }}>{bot.strategy}</td>
+                  <td className="font-mono" style={{ color: 'var(--text-secondary)' }}>{symbol}</td>
+                  <td>
+                    {bot.symbols[0] ? (
+                      <SharesCell botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                    ) : (
+                      <span className="font-mono">—</span>
+                    )}
+                  </td>
                   <td className="font-mono" style={{ color: bot.status === 'error' ? 'var(--accent-red)' : 'var(--text-secondary)' }}>
                     {formatAge(bot.lastHeartbeat)}
-                  </td>
-                  <td className="font-mono">{bot.tradesToday}</td>
-                  <td className={`font-mono ${pnlClass(bot.pnlToday)}`}>{formatCurrency(bot.pnlToday)}</td>
-                  <td className="max-w-[200px] truncate" style={{ color: 'var(--text-secondary)' }}>
-                    {bot.lastAction || '—'}
                   </td>
                   <td>
                     <button
@@ -601,32 +594,22 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                         ABORT
                       </button>
                     )}
-                    {bot.status === 'error' && (
-                      <button
-                        onClick={() => resetBot(bot.id)}
-                        className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
-                        style={{
-                          background: 'var(--badge-blue-bg)',
-                          color: 'var(--accent-blue)',
-                          border: '1px solid var(--accent-blue)',
-                          cursor: 'pointer',
-                        }}
-                        data-testid={`bot-reset-${bot.id}`}
-                        title="Clear ERRORED and reset to OFF"
-                      >
-                        RESET
-                      </button>
-                    )}
+                    <button
+                      onClick={() => resetBot(bot.id)}
+                      className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
+                      style={{
+                        background: 'var(--badge-blue-bg)',
+                        color: 'var(--accent-blue)',
+                        border: '1px solid var(--accent-blue)',
+                        cursor: 'pointer',
+                      }}
+                      data-testid={`bot-reset-${bot.id}`}
+                      title="Reset bot state to OFF"
+                    >
+                      RESET
+                    </button>
                   </td>
                 </tr>
-                {bot.status === 'running' && (
-                  <tr>
-                    <td colSpan={8} style={{ padding: 0 }}>
-                      <PositionLine botId={bot.id} symbol={bot.symbols[0] || ''} botRef={bot.refId} />
-                    </td>
-                  </tr>
-                )}
-                </React.Fragment>
               );
             })}
           </tbody>
