@@ -3,6 +3,21 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-04-22
+
+### Fixed
+- **Vite dev server: silenced benign WS proxy disconnect noise** (#43).
+  Each browser tab close produced 2–3 ERROR-level stack traces
+  (`[vite] ws proxy error:`, `[vite] ws proxy socket error:`) from
+  Vite's built-in proxy listeners, which fire *after* the user
+  `configure(proxy)` callback and so can't be suppressed there. Fix:
+  wrap the default logger via `customLogger` and drop `.error()` calls
+  whose `opts.error` is a benign socket-close (`EPIPE` /
+  `ECONNRESET` / `ERR_STREAM_WRITE_AFTER_END` / "socket has been
+  ended") and whose message contains "proxy". Genuine proxy errors
+  (ECONNREFUSED, misconfig) still surface. Net effect: 3 stack-trace
+  blocks → 1 line per disconnect.
+
 ## 2026-04-20
 
 ### Changed
