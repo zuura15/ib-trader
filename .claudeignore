@@ -34,3 +34,9 @@ run/
 .vscode/
 .idea/
 .DS_Store
+
+# Legacy ChatGPT prompt snapshots (historical reference, not working code)
+prompts/
+
+# Pre-migration safety backups (.env.*.bak, trader.db.*.bak, etc.)
+*.pre-migrate.bak
