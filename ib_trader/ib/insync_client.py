@@ -499,17 +499,11 @@ class InsyncClient(IBClientBase):
             return
         trade.order.lmtPrice = float(new_price)
         trade.order.outsideRth = True  # ib_async resets this on TWS echo-back (GitHub #141)
-        # Do NOT touch tif on modify. IB rejects any TIF in a modify message
-        # with code 462 ("Order modify failed. Cannot change to the new
-        # Time in Force.<value>") even when the value matches the order's
-        # current TIF — the modify message is treated as a change request
-        # by virtue of the field being present. This bit a force-buy that
-        # placed during overnight (tif=DAY at placement) and got cancelled
-        # by IB on the first reprice walker amend, then drifted into a
-        # half-filled state that the bot couldn't reconcile.
-        # includeOvernight is dropped from the amend for the same reason —
-        # safer to let IB preserve placement-time values for both fields.
+        # Preserve includeOvernight + DAY tif on amendments during overnight.
         overnight = is_overnight_session()
+        if overnight:
+            trade.order.includeOvernight = True
+            trade.order.tif = "DAY"
         self._ib.placeOrder(trade.contract, trade.order)
         logger.info(
             '{"event": "ORDER_AMENDED", "ib_order_id": "%s", "new_price": "%s"}',

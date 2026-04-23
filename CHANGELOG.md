@@ -5,6 +5,24 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-04-22
 
+### Reverted
+- **Undid the `amend_order` "TIF-on-modify" change from `c6ef7bc`.** The
+  claim that removing `trade.order.tif = "DAY"` / `includeOvernight
+  = True` from the amend prevented IB error 462 turned out to be
+  wrong: `ib_async`'s `client.placeOrder` always serialises every
+  `Order` field at fixed wire positions (see `client.py:497`), so
+  the fields were still being sent regardless. Empirical follow-up
+  (bare-`ib_async` test harness vs the engine's InsyncClient) and
+  cross-checking the log archive (9/9 overnight amends that did NOT
+  pre-route got 462; 2/2 that did pre-route avoided it) showed the
+  actual variable is IB's smart-routing venue at placement time, not
+  the presence of TIF in the modify. The correct fix requires either
+  (a) detecting rejection and cancelling-and-replacing, or (b)
+  forcing a venue that accepts price-only modifies — both pending
+  further investigation with Gateway API Detail logging enabled.
+  Restoring the original code keeps the overnight placement /
+  modify behaviour consistent with what was working before.
+
 ### Fixed
 - **PositionLine details pane required browser refresh after a fill.**
   After force-buy fills (FSM transitions to `AWAITING_EXIT_TRIGGER`),
@@ -25,12 +43,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   to the new Time in Force"), spuriously cancelled the order, then
   continued executing on the re-routed venue — leaving the bot's FSM
   stuck in `ENTRY_ORDER_PLACED` with only some of the fills attributed.
-  - `ib_trader/ib/insync_client.py` `amend_order`: stopped re-asserting
-    `tif="DAY"` and `includeOvernight=True` on every modify. IB rejects
-    *any* TIF in a modify message — even a no-op same-value re-assert —
-    with code 462. Modify now sends only the new limit price plus
-    `outsideRth` (which has the known ib_async echo-back issue per
-    GitHub #141). Removes the trigger.
+  - ~~`ib_trader/ib/insync_client.py` `amend_order`: stopped re-asserting
+    `tif="DAY"` and `includeOvernight=True` on every modify.~~ **Reverted
+    — see 2026-04-22 Reverted entry above.** That change was a no-op
+    on the wire; the real 462 trigger is venue-routing, not TIF
+    re-assertion. Root-cause investigation continuing.
   - `ib_trader/engine/order_ledger.py` cancel-held guard extended to the
     partial-fill shape: a Cancelled with non-zero `filled_qty` and
     `prev_status` in (PreSubmitted/Submitted/PendingSubmit) is now held
