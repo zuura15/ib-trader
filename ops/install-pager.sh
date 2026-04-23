@@ -76,33 +76,38 @@ systemctl --user daemon-reload
 systemctl --user enable --now ibtrader-health.timer
 systemctl --user list-timers ibtrader-health.timer --no-pager || true
 
-# Intentionally do NOT enable loginctl linger.
+# loginctl linger is optional.
 #
-# IB Gateway is a GUI process that requires an interactive login
-# before the trading stack can come up. If the timer ran via linger
-# (so it kept ticking on boot before anyone logged in), it would
-# page CATASTROPHIC every tick during the unattended period —
-# bogus, since the operator wasn't expected to have the stack up
-# yet. The intended semantic is:
+# With the wrapper-alive gate in ops/health_check.sh, linger is
+# safe either way:
+#   - linger OFF: timer runs only while you have an active
+#     session. Closing a single terminal (e.g., the one running
+#     `make dev`) doesn't end the session — GUI or another SSH
+#     keeps it alive — so the timer naturally survives the usual
+#     Ctrl+C/restart dev loop. Full logout stops it; next login
+#     auto-restarts it (enabled).
+#   - linger ON: timer runs across full logouts and boots. Between
+#     boot and operator login, it ticks, finds no `make dev`
+#     wrapper, and stays silent — no bogus pages. Slightly more
+#     robust; costs ~nothing. Enable with:
+#         sudo loginctl enable-linger $USER
 #
-#   pager runs ⇔ operator is logged in (and `make dev` may be running)
-#
-# The timer auto-starts when you log in (because it's enabled) and
-# stops when you log out completely. Closing a single terminal
-# window — the Ctrl+C-then-restart dev pattern — keeps the user
-# systemd instance alive so the timer survives.
-#
-# If you ever want the pager to run on a truly headless box with no
-# interactive login (e.g. a VPS deployment), `sudo loginctl
-# enable-linger $USER` is the toggle — but you'd also need to
-# auto-start the stack somehow, which is a different conversation.
+# Either choice works. Leaving the default (OFF) alone unless the
+# operator explicitly wants linger.
 if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
     echo
-    echo "WARNING: loginctl Linger is ON for user '$USER'."
-    echo "         The pager will alarm every tick after a reboot"
-    echo "         until you log in and start 'make dev' — usually"
-    echo "         not what you want on a GUI-login box."
-    echo "         Disable with:  sudo loginctl disable-linger $USER"
+    echo "NOTE: loginctl Linger is ON for '$USER' — timer will run"
+    echo "      across logouts and reboots. Wrapper-alive gate keeps"
+    echo "      it quiet during unattended periods. All good."
+else
+    echo
+    echo "NOTE: loginctl Linger is OFF for '$USER'. The timer runs only"
+    echo "      while you have an active session (closing one terminal"
+    echo "      is fine; full logout stops it, next login restarts it)."
+    echo "      If you'd rather have it run across logouts / reboots:"
+    echo "          sudo loginctl enable-linger $USER"
+    echo "      (safe either way — the wrapper-alive gate keeps the"
+    echo "       pager silent when \`make dev\` isn't running.)"
 fi
 
 echo

@@ -61,20 +61,26 @@ expected to be down and we stay quiet — just heartbeat HC so its
 dead-man's-switch doesn't fire. If the wrapper is alive and
 something beneath it is broken, we page.
 
-This is why we **do not** enable `loginctl enable-linger`:
+Because the wrapper-alive gate keeps the pager silent whenever the
+stack isn't running, `loginctl enable-linger` is **optional** —
+both settings are safe:
 
-- Enabling linger would start the timer at boot, before the
-  operator has logged in and brought the stack up. Every tick
-  during the unattended pre-login window would see "wrapper dead"
-  and — without the presence gate — would page bogusly.
-- With linger *off*, the user systemd instance starts on login
-  and terminates on full logout. The timer naturally tracks
-  operator presence.
-- Closing an individual terminal (e.g., the one running `make
-  dev`) does **not** end the user's session as long as any other
-  session (GUI, another SSH) remains — so the installer can be
-  run from any terminal, the operator can close it, and the
-  timer keeps going.
+- **Linger OFF** (default): the user systemd instance starts on
+  login and terminates on full logout. Timer auto-starts on next
+  login because it's `enable`d. Closing an individual terminal
+  (e.g., the one running `make dev`) does *not* end the session
+  as long as any other session (GUI, another SSH) remains — so
+  the installer can be run from any terminal, the operator can
+  close it, and the timer keeps going.
+- **Linger ON**: timer runs across full logouts and reboots.
+  Between boot and operator login, the timer ticks but finds no
+  `make dev` wrapper, so it stays silent and just heartbeats
+  Healthchecks.io. Slightly more robust; same behaviour for the
+  operator; costs ~nothing. Enable with `sudo loginctl
+  enable-linger $USER` if preferred.
+
+The installer leaves the current setting alone and prints a NOTE
+explaining both options.
 
 Trade-off: if OOM or the kernel kills the `make dev` wrapper while
 the operator is logged in, the pager quietly stops alarming for
