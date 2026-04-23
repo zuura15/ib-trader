@@ -3,6 +3,31 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-04-23
+
+### Fixed
+- **IB Gateway disconnect silently missed in the UI.** The engine's
+  `_raise_ib_disconnect_alert` wrote directly to SQLite via
+  `ctx.alerts.create()`, but `/api/alerts` (and the UI's
+  CatastrophicOverlay) reads from Redis `alerts:active`, not SQLite —
+  so the CATASTROPHIC alert never reached the frontend. A parallel
+  bug made this worse: the SQLite-side dedupe early-returned when it
+  found a stale `IB_GATEWAY_DISCONNECTED` row with `resolved_at IS
+  NULL`, so even if we had been reading SQLite the new event wouldn't
+  have landed.
+  - Rewrote the handler to use the standard `fire_and_forget_alert`
+    helper so the CATASTROPHIC alert lands in Redis
+    `alerts:active` and hits `/api/alerts` / the UI overlay.
+  - Dedupe now consults Redis (not SQLite): a flapping connection
+    results in one active alert, not a pile, and a stale archival
+    SQLite row never blocks a fresh event.
+  - Added `set_connect_callback` to `InsyncClient` and wired a
+    `_resolve_ib_disconnect_alert` handler that auto-clears the
+    alert from Redis the moment the Gateway reconnects, so the
+    UI's CATASTROPHIC banner disappears without operator action.
+  - One-shot: resolved the stale April 19 SQLite row that exposed
+    the dedupe bug.
+
 ## 2026-04-22
 
 ### Reverted

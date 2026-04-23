@@ -209,8 +209,11 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # Wire the IB-disconnect callback so a dead Gateway is surfaced
         # as a CATASTROPHIC alert (visible in the frontend Alerts pane and
         # console pane via the existing WebSocket alerts channel).
+        # The connect callback auto-resolves the alert on reconnect.
         if hasattr(ctx.ib, "set_disconnect_callback"):
             ctx.ib.set_disconnect_callback(lambda: _raise_ib_disconnect_alert(ctx))
+        if hasattr(ctx.ib, "set_connect_callback"):
+            ctx.ib.set_connect_callback(lambda: _resolve_ib_disconnect_alert(ctx))
 
         # Fail fast if the configured account_id isn't one the Gateway
         # can actually trade. IB authenticates at the session level, so
@@ -423,41 +426,103 @@ def _validate_account_id(ctx: AppContext) -> None:
 
 
 def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
-    """Write a CATASTROPHIC alert when the IB Gateway connection drops.
+    """Publish a CATASTROPHIC alert to Redis when the IB Gateway drops.
 
     Called from the ib_async event-loop callback in InsyncClient. Must be
-    fast and non-blocking — we only do a single SQLite insert. Dedupe by
-    checking for an existing open alert with the same trigger so a flapping
-    connection doesn't spam the alerts table.
+    fast and non-blocking. Uses ``fire_and_forget_alert`` so the alert
+    lands in ``alerts:active`` (where ``/api/alerts`` reads from and
+    where the UI CatastrophicOverlay triggers off). The prior version
+    wrote to SQLite via ``ctx.alerts.create()``, which the UI never saw
+    — that's why the Gateway dropping silently on 2026-04-22 never
+    surfaced in the header.
+
+    Dedupe: skip if a live IB_GATEWAY_DISCONNECTED is already present in
+    Redis. A flapping connection → one active alert, not a pile.
     """
-    from datetime import datetime, timezone
-    from ib_trader.data.models import AlertSeverity, SystemAlert
-    try:
-        existing_open = ctx.alerts.get_open()
-        if any(a.trigger == "IB_GATEWAY_DISCONNECTED" for a in existing_open):
-            return
-        alert = SystemAlert(
-            severity=AlertSeverity.CATASTROPHIC,
+    from ib_trader.logging_.alerts import fire_and_forget_alert
+    redis = ctx.redis
+
+    async def _dedupe_and_fire():
+        import json as _json
+        try:
+            from ib_trader.redis.state import StateKeys as _SK
+            active = await redis.hgetall(_SK.alerts_active()) if redis else {}
+        except Exception:
+            logger.exception('{"event": "IB_DISCONNECT_ALERT_DEDUPE_FAILED"}')
+            active = {}
+        for _aid, raw in (active or {}).items():
+            try:
+                if _json.loads(raw).get("trigger") == "IB_GATEWAY_DISCONNECTED":
+                    return
+            except (TypeError, ValueError):
+                continue
+        fire_and_forget_alert(
+            redis=redis,
             trigger="IB_GATEWAY_DISCONNECTED",
+            severity="CATASTROPHIC",
             message=(
                 "IB Gateway connection lost. The engine cannot place or "
-                "track orders. Restart IB Gateway / TWS, then restart the "
-                "engine to reconnect."
+                "track orders. Restart IB Gateway / TWS to reconnect."
             ),
-            created_at=datetime.now(timezone.utc),
         )
-        ctx.alerts.create(alert)
         logger.error(
             '{"event": "SYSTEM_ALERT_RAISED", "severity": "CATASTROPHIC", '
             '"trigger": "IB_GATEWAY_DISCONNECTED"}'
         )
-        # Nudge WS consumers — without this, the CATASTROPHIC alert only
-        # reaches the UI on the 30s fallback refresh.
-        if ctx.redis is not None:
+
+    if redis is None:
+        # Early-boot path (no Redis yet). Log at ERROR only — the engine
+        # hasn't connected to Redis so the UI can't render anything anyway.
+        logger.error(
+            '{"event": "SYSTEM_ALERT_RAISED", "severity": "CATASTROPHIC", '
+            '"trigger": "IB_GATEWAY_DISCONNECTED", '
+            '"note": "redis unavailable; UI signal skipped"}'
+        )
+        return
+    _spawn_background(_dedupe_and_fire())
+
+
+def _resolve_ib_disconnect_alert(ctx: AppContext) -> None:
+    """Auto-resolve any live IB_GATEWAY_DISCONNECTED alerts on reconnect.
+
+    Called from the ib_async connectedEvent via InsyncClient. Removes the
+    alert from ``alerts:active`` and nudges WS consumers so the UI clears
+    the CATASTROPHIC banner immediately. Stale SQLite rows are left as-is
+    (archival only; the UI never reads them)."""
+    redis = ctx.redis
+    if redis is None:
+        return
+
+    async def _resolve():
+        import json as _json
+        from ib_trader.redis.state import StateKeys as _SK
+        try:
+            active = await redis.hgetall(_SK.alerts_active())
+        except Exception:
+            logger.exception('{"event": "IB_CONNECT_ALERT_RESOLVE_FAILED"}')
+            return
+        to_remove: list[str] = []
+        for aid, raw in (active or {}).items():
+            try:
+                if _json.loads(raw).get("trigger") == "IB_GATEWAY_DISCONNECTED":
+                    to_remove.append(aid)
+            except (TypeError, ValueError):
+                continue
+        if not to_remove:
+            return
+        try:
+            await redis.hdel(_SK.alerts_active(), *to_remove)
             from ib_trader.redis.streams import publish_activity
-            _spawn_background(publish_activity(ctx.redis, "alerts"))
-    except Exception:
-        logger.exception('{"event": "IB_DISCONNECT_ALERT_WRITE_FAILED"}')
+            await publish_activity(redis, "alerts")
+            logger.info(
+                '{"event": "SYSTEM_ALERT_RESOLVED", '
+                '"trigger": "IB_GATEWAY_DISCONNECTED", "count": %d}',
+                len(to_remove),
+            )
+        except Exception:
+            logger.exception('{"event": "IB_CONNECT_ALERT_RESOLVE_FAILED"}')
+
+    _spawn_background(_resolve())
 
 
 async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool = False) -> int:

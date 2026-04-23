@@ -149,6 +149,7 @@ class InsyncClient(IBClientBase):
         # InsyncClient stays free of repository imports.
         self._expected_disconnect: bool = False
         self._on_unexpected_disconnect = None  # type: ignore[assignment]
+        self._on_connected_callback = None  # type: ignore[assignment]
 
     def set_disconnect_callback(self, cb) -> None:
         """Register a callback fired on unexpected IB disconnect.
@@ -159,6 +160,15 @@ class InsyncClient(IBClientBase):
         complete quickly.
         """
         self._on_unexpected_disconnect = cb
+
+    def set_connect_callback(self, cb) -> None:
+        """Register a callback fired on every successful IB connect.
+
+        Used by the engine to auto-resolve the IB_GATEWAY_DISCONNECTED
+        alert on reconnect. Same contract as ``set_disconnect_callback``
+        — synchronous, fast, non-blocking.
+        """
+        self._on_connected_callback = cb
 
     async def connect(self) -> None:
         """Connect to TWS or IB Gateway."""
@@ -176,6 +186,7 @@ class InsyncClient(IBClientBase):
             timeout=self._connect_timeout,
         )
         self._ib.disconnectedEvent += self._on_disconnected
+        self._ib.connectedEvent += self._on_connected
         self._ib.execDetailsEvent += self._on_exec_details
         self._ib.orderStatusEvent += self._on_order_status
         self._ib.commissionReportEvent += self._on_commission_report
@@ -984,6 +995,16 @@ class InsyncClient(IBClientBase):
                 '{"event": "IB_ERROR", "reqId": %d, "code": %d, "msg": "%s"}',
                 reqId, errorCode, errorString,
             )
+
+    def _on_connected(self) -> None:
+        """Fire the engine's connect callback (if registered). Used to
+        auto-resolve the IB_GATEWAY_DISCONNECTED alert so the UI clears
+        the CATASTROPHIC banner the moment the Gateway comes back."""
+        if self._on_connected_callback is not None:
+            try:
+                self._on_connected_callback()
+            except Exception:
+                logger.exception('{"event": "IB_CONNECT_CALLBACK_FAILED"}')
 
     def _on_disconnected(self) -> None:
         """Handle IB disconnect event.
