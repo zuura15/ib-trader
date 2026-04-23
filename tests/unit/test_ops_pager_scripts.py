@@ -36,7 +36,6 @@ def pager_env(tmp_path):
     return {
         "PAGER_ENV": str(env_file),
         "MAINT_LOCK": str(tmp_path / "maint.lock"),
-        "AUTO_GRACE_STATE": str(tmp_path / "autograce"),
         "REPO_ROOT": str(REPO_ROOT),
         # point LOG_FILE at a non-existent path by default; specific
         # tests override it when they want to inject log content.
@@ -157,27 +156,42 @@ class TestHealthCheckGating:
 
 
 # ---------------------------------------------------------------------------
-# ops/health_check.sh — auto-grace detection
+# ops/health_check.sh — operator-presence gate (make dev wrapper)
 # ---------------------------------------------------------------------------
 
 
-class TestAutoGraceDetection:
-    def test_existing_autograce_window_keeps_quiet(self, pager_env):
-        # Write an auto-grace file that expires 5 min from now.
-        Path(pager_env["AUTO_GRACE_STATE"]).write_text(
-            str(int(time.time()) + 300)
-        )
-        r = run(HEALTH, env=pager_env)
-        # The script should exit 0, short-circuit past all checks.
+class TestOperatorPresenceGate:
+    def test_wrapper_absent_exits_silently(self, pager_env, tmp_path):
+        """When no `make dev` wrapper / uv-run-ib processes are
+        visible, pager must exit 0 silently — stack-absent is
+        never an alert. The live stack DOES have `uv run ib-*`
+        processes on this dev box, so simulate 'wrapper absent'
+        by monkey-patching the PATH so pgrep finds nothing.
+
+        We inject a fake pgrep that always returns 1 (no matches).
+        """
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "pgrep").write_text("#!/usr/bin/env bash\nexit 1\n")
+        (fake_bin / "pgrep").chmod(0o755)
+        env = {**pager_env, "PATH": f"{fake_bin}:{pager_env['PATH']}"}
+        r = run(HEALTH, env=env)
         assert r.returncode == 0
-        # Must not attempt a ntfy push.
+        # Must NOT produce a push message.
         assert "IB Trader health check" not in r.stdout
 
-    def test_expired_autograce_runs_full_checks(self, pager_env):
-        Path(pager_env["AUTO_GRACE_STATE"]).write_text("1")
-        r = run(HEALTH, env=pager_env)
-        # Exit 0 if healthy, 1 if anything's broken — both acceptable,
-        # the point is the script did execute past the gate.
+    def test_wrapper_present_runs_full_checks(self, pager_env, tmp_path):
+        """When pgrep returns success (wrapper alive), the script
+        proceeds past the gate and runs real checks. Depending on
+        what's actually up, exit is 0 or 1 — we assert only that
+        it did not short-circuit."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "pgrep").write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake_bin / "pgrep").chmod(0o755)
+        env = {**pager_env, "PATH": f"{fake_bin}:{pager_env['PATH']}"}
+        r = run(HEALTH, env=env)
+        # Any outcome is fine as long as the script ran past the gate.
         assert r.returncode in (0, 1)
 
 

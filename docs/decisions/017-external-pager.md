@@ -46,33 +46,55 @@ topic our local script uses. One Android app (ntfy, free on Play
 Store / F-Droid) subscribed to one secret topic; two producers
 feeding it. No extra inbox to watch.
 
-### Maintenance handling
+### Operator-presence model
 
-The host is also the dev box. We will restart processes and reboot
-daily. The monitor must respect intentional downtime without creating
-a global off-switch.
+The host is also the dev box. IB Gateway is a GUI app that requires
+an interactive login, so the trading stack intrinsically cannot run
+until the operator is sitting at the box (physically or via a GUI
+session). The pager follows the same invariant:
 
-Two mechanisms:
+> **Pager alarms ⇔ operator is logged in and `make dev` is running.**
 
-- **Explicit window**: `ops/maint start [duration]` writes a
-  lockfile at `~/.config/ibtrader-maint.lock` with a UNIX timestamp
-  expiry. Monitor checks this first on every tick and exits 0
-  silently if the window is active. Also POSTs Healthchecks.io's
-  `/start` endpoint so HC's own dead-man's-switch pauses for the
-  same window. `ops/maint end` clears it. The lockfile
-  auto-expires (default 30 min, cap 8 h) — "I forgot" degrades to
-  "alerts resume automatically" instead of "silent forever".
-- **Auto-detected Ctrl+C**: if the `make dev` wrapper process is
-  gone **and** a graceful-shutdown log event (`SHUTDOWN_REQUESTED`,
-  `ENGINE_STOPPED`, `API_SERVER_STOPPED`, `BOT_RUNNER_STOPPED`, or
-  `IB_DISCONNECTED expected=true`) appeared in the last 30 s, the
-  monitor enters a 5-minute grace window without operator action.
-  If the user is re-running `make dev` after a Ctrl+C, this covers
-  them. If they Ctrl+C'd and walked away, alerts resume after 5 min.
+Concretely: the monitor's first check is whether the `make dev`
+wrapper process exists. If it doesn't, the entire stack is
+expected to be down and we stay quiet — just heartbeat HC so its
+dead-man's-switch doesn't fire. If the wrapper is alive and
+something beneath it is broken, we page.
 
-Wrapper-dead **without** a graceful-shutdown signal — kernel panic,
-OOM kill, power blip — pages immediately; the local monitor may go
-dark shortly after, and Healthchecks.io takes over.
+This is why we **do not** enable `loginctl enable-linger`:
+
+- Enabling linger would start the timer at boot, before the
+  operator has logged in and brought the stack up. Every tick
+  during the unattended pre-login window would see "wrapper dead"
+  and — without the presence gate — would page bogusly.
+- With linger *off*, the user systemd instance starts on login
+  and terminates on full logout. The timer naturally tracks
+  operator presence.
+- Closing an individual terminal (e.g., the one running `make
+  dev`) does **not** end the user's session as long as any other
+  session (GUI, another SSH) remains — so the installer can be
+  run from any terminal, the operator can close it, and the
+  timer keeps going.
+
+Trade-off: if OOM or the kernel kills the `make dev` wrapper while
+the operator is logged in, the pager quietly stops alarming for
+daemon failures too. This is an accepted loss in exchange for (a)
+avoiding bogus boot-time alerts with zero extra state machinery
+and (b) matching the operator's mental model that "pager runs
+while I'm trading." A future iteration could add a "wrapper died
+unexpectedly" alert by comparing wrapper state across ticks if it
+becomes a real gap.
+
+**Explicit maintenance window**: `ops/maint start [duration]`
+writes a lockfile at `~/.config/ibtrader-maint.lock` with a UNIX
+timestamp expiry. Monitor checks this first on every tick and
+exits 0 silently if the window is active. Also POSTs
+Healthchecks.io's `/start` endpoint so HC's own dead-man's-switch
+pauses for the same window. `ops/maint end` clears it. The
+lockfile auto-expires (default 30 min, cap 8 h) — "I forgot"
+degrades to "alerts resume automatically" instead of "silent
+forever". Primarily useful for longer planned work (VPN blip,
+Gateway reinstall) that takes more than a quick restart.
 
 ## Why not
 

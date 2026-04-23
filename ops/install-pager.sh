@@ -76,15 +76,33 @@ systemctl --user daemon-reload
 systemctl --user enable --now ibtrader-health.timer
 systemctl --user list-timers ibtrader-health.timer --no-pager || true
 
-# Ensure the user's lingering session is set so the timer keeps ticking
-# when you're logged out. This is idempotent.
-if ! loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+# Intentionally do NOT enable loginctl linger.
+#
+# IB Gateway is a GUI process that requires an interactive login
+# before the trading stack can come up. If the timer ran via linger
+# (so it kept ticking on boot before anyone logged in), it would
+# page CATASTROPHIC every tick during the unattended period —
+# bogus, since the operator wasn't expected to have the stack up
+# yet. The intended semantic is:
+#
+#   pager runs ⇔ operator is logged in (and `make dev` may be running)
+#
+# The timer auto-starts when you log in (because it's enabled) and
+# stops when you log out completely. Closing a single terminal
+# window — the Ctrl+C-then-restart dev pattern — keeps the user
+# systemd instance alive so the timer survives.
+#
+# If you ever want the pager to run on a truly headless box with no
+# interactive login (e.g. a VPS deployment), `sudo loginctl
+# enable-linger $USER` is the toggle — but you'd also need to
+# auto-start the stack somehow, which is a different conversation.
+if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
     echo
-    echo "NOTE: loginctl Linger is OFF for user '$USER'. The timer will"
-    echo "      only run while you have an active session. To keep the"
-    echo "      timer running across logouts / reboots with auto-login"
-    echo "      off, run (requires sudo):"
-    echo "        sudo loginctl enable-linger $USER"
+    echo "WARNING: loginctl Linger is ON for user '$USER'."
+    echo "         The pager will alarm every tick after a reboot"
+    echo "         until you log in and start 'make dev' — usually"
+    echo "         not what you want on a GUI-login box."
+    echo "         Disable with:  sudo loginctl disable-linger $USER"
 fi
 
 echo

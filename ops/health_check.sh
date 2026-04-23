@@ -8,12 +8,22 @@
 #     script stops pinging HC (box dead / network dead / monitor
 #     crashed).
 #
+# When to alarm:
+#   Pager only raises CATASTROPHIC for failures of a RUNNING stack.
+#   Stack absence is never an alert. The `make dev` wrapper process
+#   is the gate — if it's dead, operator is not trading and we stay
+#   quiet (HC still heartbeats so its dead-man's-switch doesn't fire
+#   spuriously).
+#
+#   This intentional choice means: OOM-killing `make dev` won't page
+#   you. Trade-off accepted so that (a) closing the operator's
+#   terminal naturally stops alerts, and (b) post-reboot alerts stay
+#   quiet until operator starts the stack — no `loginctl linger`
+#   needed.
+#
 # Maintenance respect:
 #   - If ~/.config/ibtrader-maint.lock holds a future expiry, skip
 #     all checks (lockfile is set by `ops/maint start`).
-#   - If the `make dev` wrapper process is gone AND a graceful-
-#     shutdown log event appeared in the last 30s, auto-grace for
-#     5 min (Ctrl+C + re-run pattern — no manual step required).
 #
 # Env vars (sourced from ~/.config/ibtrader-pager.env, mode 600):
 #   HC_PING_URL     https://hc-ping.com/<uuid>
@@ -27,20 +37,12 @@ MAINT_LOCK="${MAINT_LOCK:-$HOME/.config/ibtrader-maint.lock}"
 REPO_ROOT="${REPO_ROOT:-$HOME/projects/ib-trader}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/ib_trader.log}"
 
-# Auto-grace window when `make dev` wrapper is gone + graceful-shutdown
-# log event is recent. Stored on disk so multiple ticks share it.
-AUTO_GRACE_STATE="${AUTO_GRACE_STATE:-$HOME/.cache/ibtrader-autograce}"
-AUTO_GRACE_SECONDS="${AUTO_GRACE_SECONDS:-300}"          # 5 min
-GRACEFUL_LOG_WINDOW_SECONDS="${GRACEFUL_LOG_WINDOW_SECONDS:-30}"
-
 # Benign IB error codes (see engine/insync_client error callbacks).
 BENIGN_IB_CODES="202 2103 2104 2105 2107 2108 2158 2174"
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-mkdir -p "$(dirname "$AUTO_GRACE_STATE")"
 
 errors=()
 warnings=()
@@ -82,84 +84,27 @@ if _maint_active; then
 fi
 
 # ---------------------------------------------------------------------------
-# auto-grace for intentional Ctrl+C of `make dev`
+# operator-presence gate: `make dev` wrapper alive?
 # ---------------------------------------------------------------------------
+#
+# If the operator hasn't started `make dev` (box just booted / logged
+# out / Ctrl+C'd for maintenance / deliberately stopped), the whole
+# stack will look missing. That's expected, not alert-worthy. Gate
+# on the wrapper: wrapper dead → heartbeat HC (so its dead-man's
+# switch stays green) and exit quietly.
 
 _wrapper_alive() {
     # The top-level `sh -c 'trap … & wait'` that make dev invokes.
-    # Matches either make's invocation directly or the trap shell it
-    # spawns; both vanish on Ctrl+C.
+    # Any of these signals indicates the dev stack is up:
     pgrep -f 'uv run ib-engine' >/dev/null 2>&1 \
         || pgrep -f 'make dev' >/dev/null 2>&1 \
         || pgrep -f '\buv run ib-' >/dev/null 2>&1
 }
 
-_recent_graceful_shutdown() {
-    # Any of these appearing in the last GRACEFUL_LOG_WINDOW_SECONDS
-    # indicates an operator-driven shutdown in progress.
-    [[ -r "$LOG_FILE" ]] || return 1
-    local cutoff_epoch=$(( $(_now_epoch) - GRACEFUL_LOG_WINDOW_SECONDS ))
-    tail -n 500 "$LOG_FILE" 2>/dev/null | python3 -c '
-import sys, re, json
-from datetime import datetime, timezone
-cutoff = int(sys.argv[1])
-flags = ("SHUTDOWN_REQUESTED", "ENGINE_STOPPED",
-         "API_SERVER_STOPPED", "BOT_RUNNER_STOPPED")
-for line in sys.stdin:
-    if not any(f in line for f in flags) and "\"expected\": true" not in line:
-        continue
-    m = re.search(r"\"timestamp\": \"([^\"]+)\"", line)
-    if not m:
-        continue
-    try:
-        dt = datetime.fromisoformat(m.group(1))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if dt.timestamp() >= cutoff:
-            print(line, end="")
-            sys.exit(0)
-    except Exception:
-        pass
-sys.exit(1)
-' "$cutoff_epoch" >/dev/null 2>&1
-}
-
-_in_auto_grace() {
-    [[ -f "$AUTO_GRACE_STATE" ]] || return 1
-    local until
-    until=$(cat "$AUTO_GRACE_STATE" 2>/dev/null | head -1 | tr -d '[:space:]')
-    [[ -n "$until" ]] || return 1
-    [[ "$until" -gt "$(_now_epoch)" ]]
-}
-
-_set_auto_grace() {
-    echo "$(( $(_now_epoch) + AUTO_GRACE_SECONDS ))" > "$AUTO_GRACE_STATE"
-}
-
-_clear_auto_grace() {
-    rm -f "$AUTO_GRACE_STATE"
-}
-
-# If we're already inside an active auto-grace window, keep quiet.
-if _in_auto_grace; then
-    # Exit normally, but still heartbeat HC so its grace window doesn't fire
-    # spuriously — the operator is expected to be bringing things back up
-    # within the 5-min window, and we want HC to know we're alive.
+if ! _wrapper_alive; then
     curl -fsS --max-time 5 "$HC_PING_URL" >/dev/null 2>&1 || true
     exit 0
 fi
-
-# Wrapper dead + graceful shutdown logged → enter auto-grace.
-if ! _wrapper_alive && _recent_graceful_shutdown; then
-    _set_auto_grace
-    curl -fsS --max-time 5 "$HC_PING_URL" >/dev/null 2>&1 || true
-    exit 0
-fi
-
-# Otherwise (wrapper alive, or wrapper dead without graceful signals),
-# run full checks. Wrapper-dead-without-graceful is a CRASH we WANT to
-# page on.
-_clear_auto_grace
 
 # ---------------------------------------------------------------------------
 # A. per-daemon liveness

@@ -26,11 +26,16 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
     "I forgot" degrades to "alerts resume" not "silent forever".
     Also notifies HC's `/start` so its dead-man's-switch pauses for
     the same window.
-  - Ctrl+C of `make dev` is **auto-detected**: wrapper dead +
-    graceful-shutdown log events (`ENGINE_STOPPED` et al.) in the
-    last 30s → 5-min grace window with zero operator action.
-    Wrapper dead **without** graceful signals (kernel panic, OOM)
-    pages immediately.
+  - **Operator-presence gate**: the monitor's first check is whether
+    the `make dev` wrapper process exists. If the stack isn't
+    running, we heartbeat HC and exit quietly — stack-absent is
+    never an alert. This matches the operator model for the dev box
+    (GUI login required for IB Gateway → pager should only alarm
+    when operator is present and trading) and eliminates the need
+    for `loginctl enable-linger`. Closing the install terminal
+    leaves the pager running; full logout stops it; next login
+    restarts it. Trade-off accepted: OOM-killing the wrapper goes
+    unpaged in exchange for zero bogus boot-time alerts.
   - Health probe endpoints added: `GET /api/system/health` on
     `ib-api`, `GET /health` on `ib-bots`. Dependency-free (no
     Redis, no DB) — intentional minimal surface.
