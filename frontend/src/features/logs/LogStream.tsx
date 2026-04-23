@@ -5,12 +5,12 @@ import { PanelShell } from '../../components/PanelShell';
 
 const levelColor: Record<string, string> = {
   debug: 'var(--text-muted)',
-  info: 'var(--text-secondary)',
+  info: 'var(--accent-green)',
   success: 'var(--accent-green)',
   warning: 'var(--accent-yellow)',
   error: 'var(--accent-red)',
   DEBUG: 'var(--text-muted)',
-  INFO: 'var(--text-secondary)',
+  INFO: 'var(--accent-green)',
   WARNING: 'var(--accent-yellow)',
   ERROR: 'var(--accent-red)',
 };
