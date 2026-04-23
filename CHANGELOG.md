@@ -6,6 +6,50 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-04-22
 
 ### Fixed
+- **GLD partial-fill limbo: lost fills + stuck FSM after IB code-462 modify
+  reject.** Three-layered fix for a recurring force-buy failure where IB
+  rejected the reprice walker's first amend with code 462 ("Cannot change
+  to the new Time in Force"), spuriously cancelled the order, then
+  continued executing on the re-routed venue — leaving the bot's FSM
+  stuck in `ENTRY_ORDER_PLACED` with only some of the fills attributed.
+  - `ib_trader/ib/insync_client.py` `amend_order`: stopped re-asserting
+    `tif="DAY"` and `includeOvernight=True` on every modify. IB rejects
+    *any* TIF in a modify message — even a no-op same-value re-assert —
+    with code 462. Modify now sends only the new limit price plus
+    `outsideRth` (which has the known ib_async echo-back issue per
+    GitHub #141). Removes the trigger.
+  - `ib_trader/engine/order_ledger.py` cancel-held guard extended to the
+    partial-fill shape: a Cancelled with non-zero `filled_qty` and
+    `prev_status` in (PreSubmitted/Submitted/PendingSubmit) is now held
+    instead of terminalised, just like the zero-fill re-route case. The
+    eight late re-route fills that the old code dropped as
+    `LATE_FILL_AFTER_TERMINAL` now accumulate cleanly.
+  - **Pre-place position-diff reconcile** (the safety net for any future
+    IB quirk that loses fill events). `OrderLedger` accepts an injected
+    `position_getter`; `insync_client` fires a synchronous
+    `register_order_placed_callback` immediately after `placeOrder()`
+    returns; engine snapshots the broker-side net position for the
+    symbol *before* any fill events can run (asyncio is single-threaded)
+    and calls `ledger.register(..., pre_position=pre_qty)`. At
+    terminal-emit time, if `filled_qty < target_qty`, `_make_terminal`
+    asks the position getter for `current_qty`, computes signed delta
+    (`current - pre` for BUY, `pre - current` for SELL), floors at
+    tracked fills, caps at `target_qty`, and synthesizes a "ghost" fill
+    for the gap so the emitted terminal carries broker-truth qty.
+    Honors the *no self-derive* rule: terminal still only fires when IB
+    sends one — only the *qty* attribution is reconciled. New
+    `ORDER_LEDGER_POSITION_DIFF_RECONCILE` log line on each upgrade.
+
+### Changed
+- **Logger: human-readable stdout format with ANSI colors on the level
+  token.** WARNING+ stream-handler output is now
+  `HH:MM:SS [PREFIX] LEVEL event-or-message k=v k=v` (red ERROR, yellow
+  WARN, green INFO, dim DEBUG) when stderr is a TTY and `NO_COLOR` is
+  unset. JSON file output unchanged. PREFIX is inferred from logger
+  name (`ib_trader.engine.*` → `[E]`, `.bots.*` → `[B]`, `.api.*` →
+  `[API]`, etc.). Frontend Logs panel: `INF` label flipped from muted
+  gray to green to match.
+
 - **Vite dev server: silenced benign WS proxy disconnect noise** (#43).
   Each browser tab close produced 2–3 ERROR-level stack traces
   (`[vite] ws proxy error:`, `[vite] ws proxy socket error:`) from

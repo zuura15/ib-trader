@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,13 @@ class _LedgerEntry:
     # for this entry. Prevents the same stuck entry from re-alerting on
     # every watchdog tick.
     stuck_alerted: bool = False
+    # IB-reported net position for this symbol immediately *before* the
+    # order was placed. ``None`` if not snapshotted (e.g. auto-created
+    # entries for orders we didn't place). Used by ``_apply_position_diff``
+    # at terminal time to detect when IB processed shares that we never
+    # received fill events for (re-route quirks, callback drops, late
+    # fills) — the broker-side position is the ground truth.
+    pre_position: Optional[Decimal] = None
 
     @property
     def filled_qty(self) -> Decimal:
@@ -106,11 +113,19 @@ class OrderLedger:
     XADD.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        position_getter: Optional[Callable[[str, str], Decimal]] = None,
+    ) -> None:
+        """``position_getter(symbol, sec_type) -> qty`` returns the broker's
+        current net position for the symbol. Used at terminal-emit time
+        to reconcile against pre-place snapshots when our tracked fills
+        fall short of the order's target."""
         self._entries: dict[str, _LedgerEntry] = {}
         # Recently evicted order IDs — suppress duplicate terminals from
         # IB firing both exec-details and on_status("Filled") for the same fill.
         self._recently_evicted: set[str] = set()
+        self._position_getter = position_getter
 
     def register(
         self,
@@ -121,11 +136,31 @@ class OrderLedger:
         con_id: int,
         side: str,
         target_qty: Decimal,
+        *,
+        pre_position: Optional[Decimal] = None,
     ) -> list[dict]:
         """Create a ledger entry when an order is placed.
 
+        ``pre_position`` is the broker's net position for ``symbol``
+        immediately *before* this order was placed. Stashed for the
+        position-diff reconcile at terminal-emit time.
+
+        If an entry already exists for this ``ib_order_id`` (a fill or
+        status auto-created it during a race), populate the missing
+        target_qty / pre_position fields rather than overwriting fills.
+
         Returns a progress event with status=Submitted.
         """
+        existing = self._entries.get(ib_order_id)
+        if existing is not None:
+            # Auto-create races: backfill the fields the auto-create
+            # didn't know about. Don't clobber accumulated fills.
+            if existing.target_qty == 0 and target_qty > 0:
+                existing.target_qty = target_qty
+            if existing.pre_position is None and pre_position is not None:
+                existing.pre_position = pre_position
+            return [self._make_event(existing, terminal=False, status="Submitted")]
+
         entry = _LedgerEntry(
             ib_order_id=ib_order_id,
             order_ref=order_ref,
@@ -134,6 +169,7 @@ class OrderLedger:
             con_id=con_id,
             side=side,
             target_qty=target_qty,
+            pre_position=pre_position,
         )
         self._entries[ib_order_id] = entry
         return [self._make_event(entry, terminal=False, status="Submitted")]
@@ -274,20 +310,36 @@ class OrderLedger:
         events: list[dict] = []
 
         if status in _TERMINAL_STATUSES:
-            # Guard against IB's prerouting cancel: Submitted → Cancelled
-            # with zero fills is likely a venue re-route, not a real cancel.
-            # Hold the entry (don't evict); if a fill arrives later the
-            # cancel was spurious. If the entry ages out on the next
-            # record_status call with a REAL terminal, it'll be evicted then.
-            if (
+            # Guard against IB's prerouting cancel: while re-routing an
+            # order between venues, IB sends a spurious "Cancelled" with
+            # the previous-venue stats. The sequence is
+            # Submitted/PreSubmitted → Cancelled → Submitted → Filled.
+            # Two shapes seen in production:
+            #   1. zero fills (re-route before any execution)
+            #   2. partial fill + remaining > 0 (the first venue executed
+            #      N shares before the cancel, the rest re-routed). The
+            #      GLD bug: 34/114 filled, then "Cancelled" with
+            #      remaining=80, then 80 more fills + Filled status.
+            # We hold the entry on either shape; if a fill or non-terminal
+            # status arrives later the cancel was spurious. If no follow-up
+            # arrives the watchdog (`check_stuck`) raises a WARNING per the
+            # "ledger never self-derives terminal" rule.
+            cancel_might_be_preroute = (
                 status in ("Cancelled", "ApiCancelled")
-                and entry.filled_qty == 0
                 and prev_status in _PREROUTE_PREV_STATUSES
-            ):
+                and (
+                    entry.filled_qty == 0
+                    or (entry.target_qty > 0
+                        and entry.filled_qty < entry.target_qty)
+                )
+            )
+            if cancel_might_be_preroute:
                 logger.info(
                     '{"event": "ORDER_LEDGER_CANCEL_HELD", "ib_order_id": "%s", '
-                    '"prev_status": "%s", "reason": "possible_preroute"}',
+                    '"prev_status": "%s", "filled_qty": "%s", "target_qty": "%s", '
+                    '"reason": "possible_preroute"}',
                     entry.ib_order_id, prev_status,
+                    entry.filled_qty, entry.target_qty,
                 )
                 events.append(self._make_event(entry, terminal=False, status="CancelHeld"))
             else:
@@ -361,7 +413,89 @@ class OrderLedger:
             "ts": _now_iso(),
         }
 
+    def _apply_position_diff(self, entry: _LedgerEntry) -> Optional[Decimal]:
+        """Reconcile entry.filled_qty against the broker-side position diff.
+
+        Honors the no-self-derive rule: the ledger never invents a
+        terminal — IB has already given us one (or a Cancelled that the
+        caller of ``_make_terminal`` deemed terminal). What we *do* here
+        is decide *what qty to attribute* on a terminal that arrived with
+        ``filled_qty < target_qty``. IB occasionally drops fill events
+        during venue re-routes; the broker's net position is the
+        ground truth fallback.
+
+        Returns the effective filled qty (≥ ``entry.filled_qty``) when
+        an upgrade applies, or ``None`` to leave ``entry.filled_qty``
+        alone.
+
+        Guards:
+        - No upgrade unless ``pre_position`` was snapshotted at place time
+          AND a ``position_getter`` is wired AND ``target_qty > 0``.
+        - No upgrade if ``filled_qty`` already meets ``target_qty``.
+        - No upgrade if we tracked zero fills — too dangerous to invent
+          a fill price; let the operator reconcile.
+        - The diff is capped at ``target_qty`` so we never over-attribute
+          on concurrent same-symbol activity.
+        """
+        if self._position_getter is None or entry.pre_position is None:
+            return None
+        if entry.target_qty <= 0 or entry.filled_qty >= entry.target_qty:
+            return None
+        if entry.filled_qty == 0:
+            return None
+        try:
+            current_qty = self._position_getter(entry.symbol, entry.sec_type)
+        except Exception as e:  # noqa: BLE001 — broker shape varies
+            logger.warning(
+                '{"event": "ORDER_LEDGER_POSITION_LOOKUP_FAILED", '
+                '"ib_order_id": "%s", "symbol": "%s", "error": "%s"}',
+                entry.ib_order_id, entry.symbol, str(e),
+            )
+            return None
+
+        if entry.side == "BUY":
+            delta = current_qty - entry.pre_position
+        elif entry.side == "SELL":
+            delta = entry.pre_position - current_qty
+        else:
+            return None
+
+        # Floor at tracked fills, cap at the order target — never lose
+        # what we already know, never claim more than we asked for.
+        effective = min(max(delta, entry.filled_qty), entry.target_qty)
+        if effective <= entry.filled_qty:
+            return None
+
+        logger.info(
+            '{"event": "ORDER_LEDGER_POSITION_DIFF_RECONCILE", '
+            '"ib_order_id": "%s", "symbol": "%s", "side": "%s", '
+            '"pre_position": "%s", "current_position": "%s", '
+            '"raw_delta": "%s", "tracked_filled": "%s", '
+            '"target": "%s", "effective": "%s"}',
+            entry.ib_order_id, entry.symbol, entry.side,
+            entry.pre_position, current_qty, delta,
+            entry.filled_qty, entry.target_qty, effective,
+        )
+        return effective
+
     def _make_terminal(self, entry: _LedgerEntry) -> dict:
+        # Position-diff reconcile: if IB's net position confirms shares
+        # moved beyond what our tracked fills reflect (callback drop /
+        # re-route quirk), synthesize a "ghost" fill for the gap so the
+        # emitted terminal carries the broker-truth qty. The ghost uses
+        # the most recent tracked fill price as its best estimate.
+        # Strict guards live in ``_apply_position_diff``.
+        effective_qty = self._apply_position_diff(entry)
+        if effective_qty is not None and effective_qty > entry.filled_qty:
+            gap_qty = effective_qty - entry.filled_qty
+            ghost_price = entry.fills[-1].price if entry.fills else Decimal("0")
+            entry.fills.append(_Fill(
+                qty=gap_qty,
+                price=ghost_price,
+                commission=Decimal("0"),
+                exec_id="POSITION_DIFF_RECONCILE",
+            ))
+
         status = _resolve_terminal_status(entry)
         event = self._make_event(
             entry,

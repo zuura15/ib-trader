@@ -90,6 +90,14 @@ class InsyncClient(IBClientBase):
         # Seen exec_ids for commission-dedup: IB occasionally re-delivers
         # the same CommissionReport on reconnect.
         self._seen_commission_execs: set[str] = set()
+        # Order-placed callbacks: fire synchronously inside place_*_order
+        # right after ib_async returns the Trade. Used by the engine to
+        # snapshot the broker-side position *before* any fill events can
+        # arrive, then register the order with the OrderLedger including
+        # the snapshot. Single-threaded asyncio guarantees no fill
+        # callback runs between placeOrder() and our callback dispatch
+        # below, so the snapshot is genuinely pre-fill.
+        self._order_placed_callbacks: list = []
         # Per-order asyncio locks. Every dispatched callback (fill,
         # status, commission) for a given ib_order_id acquires this
         # lock before running, so IB events for the same order are
@@ -396,6 +404,12 @@ class InsyncClient(IBClientBase):
         trade = self._ib.placeOrder(contract, order)
         ib_order_id = str(trade.order.orderId)
         self._active_trades[ib_order_id] = trade
+        # Fire pre-fill snapshot callback (engine wires this to the
+        # OrderLedger so the position-diff reconcile has a baseline).
+        self._fire_order_placed(
+            ib_order_id, symbol, contract.secType or "STK",
+            int(contract.conId or 0), side, qty, order_ref or "",
+        )
         logger.info(
             '{"event": "ORDER_PLACED", "symbol": "%s", "side": "%s", '
             '"qty": "%s", "price": "%s", "ib_order_id": "%s", "includeOvernight": %s}',
@@ -438,6 +452,10 @@ class InsyncClient(IBClientBase):
         trade = self._ib.placeOrder(contract, order)
         ib_order_id = str(trade.order.orderId)
         self._active_trades[ib_order_id] = trade
+        self._fire_order_placed(
+            ib_order_id, symbol, contract.secType or "STK",
+            int(contract.conId or 0), side, qty, order_ref or "",
+        )
         logger.info(
             '{"event": "ORDER_PLACED", "symbol": "%s", "side": "%s", '
             '"qty": "%s", "type": "MARKET", "ib_order_id": "%s", "includeOvernight": %s}',
@@ -481,11 +499,17 @@ class InsyncClient(IBClientBase):
             return
         trade.order.lmtPrice = float(new_price)
         trade.order.outsideRth = True  # ib_async resets this on TWS echo-back (GitHub #141)
-        # Preserve includeOvernight + DAY tif on amendments during overnight.
+        # Do NOT touch tif on modify. IB rejects any TIF in a modify message
+        # with code 462 ("Order modify failed. Cannot change to the new
+        # Time in Force.<value>") even when the value matches the order's
+        # current TIF — the modify message is treated as a change request
+        # by virtue of the field being present. This bit a force-buy that
+        # placed during overnight (tif=DAY at placement) and got cancelled
+        # by IB on the first reprice walker amend, then drifted into a
+        # half-filled state that the bot couldn't reconcile.
+        # includeOvernight is dropped from the amend for the same reason —
+        # safer to let IB preserve placement-time values for both fields.
         overnight = is_overnight_session()
-        if overnight:
-            trade.order.includeOvernight = True
-            trade.order.tif = "DAY"
         self._ib.placeOrder(trade.contract, trade.order)
         logger.info(
             '{"event": "ORDER_AMENDED", "ib_order_id": "%s", "new_price": "%s"}',
@@ -741,6 +765,27 @@ class InsyncClient(IBClientBase):
         """
         key = ib_order_id or "_GLOBAL"
         self._fill_callbacks.setdefault(key, []).append(callback)
+
+    def register_order_placed_callback(self, callback) -> None:
+        """Register a synchronous callback fired right after every order
+        placement. Receives ``(ib_order_id, symbol, sec_type, con_id,
+        side, qty, order_ref)``. Used by the engine to snapshot
+        broker-side position *before* any fill events can arrive."""
+        self._order_placed_callbacks.append(callback)
+
+    def _fire_order_placed(
+        self, ib_order_id: str, symbol: str, sec_type: str,
+        con_id: int, side: str, qty: Decimal, order_ref: str,
+    ) -> None:
+        for cb in self._order_placed_callbacks:
+            try:
+                cb(ib_order_id, symbol, sec_type, con_id, side, qty, order_ref)
+            except Exception:  # noqa: BLE001 — never let a callback kill the placement path
+                logger.exception(
+                    '{"event": "ORDER_PLACED_CALLBACK_FAILED", '
+                    '"ib_order_id": "%s"}',
+                    ib_order_id,
+                )
 
     def register_status_callback(self, callback, ib_order_id: str | None = None) -> None:
         """Register a callback for order status change events.

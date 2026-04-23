@@ -603,9 +603,56 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     if redis is None:
         return
 
-    ledger = OrderLedger()
+    def _live_position_qty(symbol: str, sec_type: str = "STK") -> Decimal:
+        """Look up the broker's current net position for ``symbol`` from
+        ib_async's in-memory state. Used by the order ledger at terminal
+        time to reconcile against the pre-place snapshot when our tracked
+        fills fall short of the order target."""
+        if not hasattr(ctx.ib, '_ib'):
+            return Decimal("0")
+        for p in ctx.ib._ib.positions():
+            if (
+                getattr(p.contract, 'symbol', None) == symbol
+                and getattr(p.contract, 'secType', 'STK') == sec_type
+            ):
+                return Decimal(str(p.position))
+        return Decimal("0")
+
+    ledger = OrderLedger(position_getter=_live_position_qty)
     # Expose on ctx so the position poll loop can sweep stale entries
     ctx._order_ledger = ledger
+
+    def on_order_placed(
+        ib_order_id: str, symbol: str, sec_type: str, con_id: int,
+        side: str, qty: Decimal, order_ref: str,
+    ) -> None:
+        """Fired synchronously by insync_client right after every place_*
+        returns. Snapshots the broker's net position *before* any fill
+        events can run (asyncio is single-threaded; no fill callback can
+        slip in between placeOrder() and this dispatch), then registers
+        the order with the ledger including the snapshot. The ledger uses
+        the snapshot at terminal-emit time to reconcile any fills IB
+        dropped during venue re-routes against the broker-truth diff."""
+        try:
+            pre_qty = _live_position_qty(symbol, sec_type)
+            ledger.register(
+                ib_order_id=ib_order_id,
+                order_ref=order_ref,
+                symbol=symbol,
+                sec_type=sec_type,
+                con_id=con_id,
+                side=side,
+                target_qty=Decimal(str(qty)),
+                pre_position=pre_qty,
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "LEDGER_REGISTER_FAILED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+
+    if hasattr(ctx.ib, "register_order_placed_callback"):
+        ctx.ib.register_order_placed_callback(on_order_placed)
     order_writer = StreamWriter(redis, StreamNames.order_updates(), maxlen=5000)
     orders_open_key = StateKeys.orders_open()
 

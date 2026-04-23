@@ -116,7 +116,19 @@ def test_cancel_after_inactive_is_terminal(ledger):
     assert ledger.get("100") is None
 
 
-def test_partial_fill_then_cancel(ledger):
+def test_partial_fill_then_cancel_is_held(ledger):
+    """Partial fill followed by Cancelled is HELD, not terminal — IB's
+    re-route across venues looks identical to a real partial cancel at
+    the moment the cancel arrives. The ledger holds; a follow-up status
+    (more fills + Filled, or a second Cancelled) finalizes. If no
+    follow-up arrives the watchdog raises a WARNING after
+    ``order_terminal_timeout_seconds`` per the no-self-derive rule.
+
+    Regression: GLD bot bought 114 shares, IB sent Cancelled at filled=34
+    while re-routing the remaining 80, then continued filling. The old
+    eager-terminate logic dropped the post-cancel fills and the bot
+    state recorded only 34 shares (real position: 114).
+    """
     ledger.register("100", "ref", "F", "STK", 1, "BUY", Decimal("10"))
     ledger.record_fill(
         "100", qty=Decimal("4"), price=Decimal("12.70"),
@@ -124,9 +136,214 @@ def test_partial_fill_then_cancel(ledger):
     )
     events = ledger.record_status("100", "Cancelled")
     assert len(events) == 1
-    assert events[0]["terminal"] is True
-    assert events[0]["status"] == "PartialFillCancelled"
-    assert events[0]["filled_qty"] == "4"
+    assert events[0]["terminal"] is False
+    assert events[0]["status"] == "CancelHeld"
+    # Entry must remain so further fills can still attach.
+    assert ledger.get("100") is not None
+
+
+def test_preroute_cancel_after_partial_then_more_fills(ledger):
+    """The actual GLD-bug shape end-to-end: register 114, partial fill 34,
+    spurious Cancelled, 80 more fills across multiple execDetails, IB
+    closes with Filled. The ledger must accumulate every fill and emit
+    a single terminal Filled with filled_qty=114."""
+    ledger.register("880", "ref", "GLD", "STK", 51529211, "BUY", Decimal("114"))
+    ledger.record_status("880", "Submitted")
+    ledger.record_fill(
+        "880", qty=Decimal("34"), price=Decimal("435.08"),
+        commission=Decimal("0"), remaining=Decimal("80"),
+    )
+    held = ledger.record_status("880", "Cancelled")
+    assert held[0]["terminal"] is False
+    assert held[0]["status"] == "CancelHeld"
+    # Re-route delivers more fills + status flips back to Submitted.
+    for qty in (Decimal("15"), Decimal("15"), Decimal("5"), Decimal("45")):
+        evs = ledger.record_fill(
+            "880", qty=qty, price=Decimal("435.08"),
+            commission=Decimal("0"), remaining=Decimal("0"),
+        )
+        for ev in evs:
+            assert ev["terminal"] is False
+    term = ledger.record_status("880", "Filled")
+    assert len(term) == 1
+    assert term[0]["terminal"] is True
+    assert term[0]["status"] == "Filled"
+    assert term[0]["filled_qty"] == "114"
+    assert ledger.get("880") is None  # evicted on real terminal
+
+
+def test_double_cancel_after_partial_finalizes(ledger):
+    """If IB sends Cancelled twice (the second one is the genuine cancel
+    rather than a re-route), the second one finalizes — prev_status is
+    now ``Cancelled`` so the preroute guard does NOT re-fire."""
+    ledger.register("200", "ref", "F", "STK", 1, "BUY", Decimal("10"))
+    ledger.record_status("200", "Submitted")
+    ledger.record_fill(
+        "200", qty=Decimal("4"), price=Decimal("12.70"),
+        commission=Decimal("0.10"), remaining=Decimal("6"),
+    )
+    held = ledger.record_status("200", "Cancelled")
+    assert held[0]["terminal"] is False
+    final = ledger.record_status("200", "Cancelled")
+    assert final[0]["terminal"] is True
+    assert final[0]["status"] == "PartialFillCancelled"
+    assert final[0]["filled_qty"] == "4"
+
+
+# ---------------------------------------------------------------------------
+# Position-diff reconcile
+# ---------------------------------------------------------------------------
+
+
+def _make_ledger_with_position(qty: Decimal):
+    """Build a ledger whose position_getter returns the given fixed qty."""
+    from ib_trader.engine.order_ledger import OrderLedger
+    holder = {"qty": qty}
+
+    def getter(symbol: str, sec_type: str = "STK") -> Decimal:
+        return holder["qty"]
+
+    return OrderLedger(position_getter=getter), holder
+
+
+def test_position_diff_upgrades_partial_terminal_to_full():
+    """The GLD bug shape end-to-end via the position diff: BUY 114 with
+    pre_position=3, only 84 fills tracked, IB's net position now shows
+    117 (pre 3 + actual 114). At terminal time the ledger upgrades the
+    emitted filled_qty from 84 to 114 because the broker confirms it."""
+    ledger, position = _make_ledger_with_position(Decimal("3"))  # pre-place
+    ledger.register(
+        "886", "ref-gld", "GLD", "STK", 51529211, "BUY", Decimal("114"),
+        pre_position=Decimal("3"),
+    )
+    ledger.record_status("886", "Submitted")
+    ledger.record_fill(
+        "886", qty=Decimal("84"), price=Decimal("435.61"),
+        commission=Decimal("0.34"), remaining=Decimal("30"),
+    )
+    # Broker-side: full 114 actually filled (IB just dropped fill events
+    # for the last 30 during a re-route).
+    position["qty"] = Decimal("117")
+    term = ledger.record_status("886", "Filled")
+    assert len(term) == 1
+    assert term[0]["terminal"] is True
+    assert term[0]["filled_qty"] == "114"
+    assert term[0]["status"] == "Filled"
+
+
+def test_position_diff_caps_at_target_qty():
+    """If the broker's position moved by MORE than target_qty (e.g. a
+    concurrent manual buy on the same symbol), the upgrade is capped at
+    target_qty so we never over-attribute."""
+    ledger, position = _make_ledger_with_position(Decimal("0"))
+    ledger.register(
+        "300", "ref", "F", "STK", 1, "BUY", Decimal("10"),
+        pre_position=Decimal("0"),
+    )
+    ledger.record_status("300", "Submitted")
+    ledger.record_fill(
+        "300", qty=Decimal("4"), price=Decimal("12.70"),
+        commission=Decimal("0"), remaining=Decimal("6"),
+    )
+    # Position shows 25 — way more than our 10-share target. Capped.
+    position["qty"] = Decimal("25")
+    term = ledger.record_status("300", "Filled")
+    assert term[0]["filled_qty"] == "10"
+
+
+def test_position_diff_does_not_downgrade():
+    """If the broker's position moved by LESS than tracked fills (we
+    counted more than IB shows), trust tracked fills — never silently
+    lose qty."""
+    ledger, position = _make_ledger_with_position(Decimal("0"))
+    ledger.register(
+        "301", "ref", "F", "STK", 1, "BUY", Decimal("10"),
+        pre_position=Decimal("0"),
+    )
+    ledger.record_status("301", "Submitted")
+    ledger.record_fill(
+        "301", qty=Decimal("8"), price=Decimal("12.70"),
+        commission=Decimal("0"), remaining=Decimal("2"),
+    )
+    # Broker shows only 5 long despite our 8 tracked. Don't downgrade.
+    position["qty"] = Decimal("5")
+    term = ledger.record_status("301", "Filled")
+    assert term[0]["filled_qty"] == "8"
+
+
+def test_position_diff_no_upgrade_when_zero_tracked_fills():
+    """Refuses to upgrade an entry with zero tracked fills even if the
+    broker shows the position moved — synthesizing a fill price out of
+    thin air is too dangerous. Operator must reconcile manually."""
+    ledger, position = _make_ledger_with_position(Decimal("0"))
+    ledger.register(
+        "302", "ref", "F", "STK", 1, "BUY", Decimal("10"),
+        pre_position=Decimal("0"),
+    )
+    ledger.record_status("302", "Submitted")
+    # No fills tracked at all.
+    position["qty"] = Decimal("10")
+    term = ledger.record_status("302", "Filled")
+    assert term[0]["filled_qty"] == "0"
+
+
+def test_position_diff_sell_side_uses_signed_delta():
+    """For a SELL, the diff is ``pre - current``, not ``current - pre``."""
+    ledger, position = _make_ledger_with_position(Decimal("100"))
+    ledger.register(
+        "303", "ref", "F", "STK", 1, "SELL", Decimal("100"),
+        pre_position=Decimal("100"),
+    )
+    ledger.record_status("303", "Submitted")
+    ledger.record_fill(
+        "303", qty=Decimal("60"), price=Decimal("12.70"),
+        commission=Decimal("0"), remaining=Decimal("40"),
+    )
+    # Broker says position is now 0 — we sold all 100 even though we
+    # only saw 60 fill events.
+    position["qty"] = Decimal("0")
+    term = ledger.record_status("303", "Filled")
+    assert term[0]["filled_qty"] == "100"
+
+
+def test_position_diff_skipped_without_position_getter():
+    """A ledger constructed without a position_getter behaves exactly as
+    before — terminals reflect tracked fills only."""
+    from ib_trader.engine.order_ledger import OrderLedger
+    plain = OrderLedger()
+    plain.register(
+        "304", "ref", "F", "STK", 1, "BUY", Decimal("10"),
+        pre_position=Decimal("0"),
+    )
+    plain.record_status("304", "Submitted")
+    plain.record_fill(
+        "304", qty=Decimal("4"), price=Decimal("12.70"),
+        commission=Decimal("0"), remaining=Decimal("6"),
+    )
+    term = plain.record_status("304", "Filled")
+    assert term[0]["filled_qty"] == "4"
+
+
+def test_register_after_auto_create_backfills_pre_position():
+    """If a fill auto-creates the entry before our explicit register
+    runs, the explicit register backfills target_qty + pre_position
+    rather than overwriting the accumulated fills."""
+    ledger, position = _make_ledger_with_position(Decimal("0"))
+    # A fill arrives first (race) — ledger auto-creates with target=4.
+    ledger.record_fill(
+        "305", qty=Decimal("4"), price=Decimal("12.70"),
+        commission=Decimal("0"), remaining=Decimal("6"),
+        symbol="F", sec_type="STK", con_id=1, side="BUY",
+    )
+    # Then our register call lands with the real target + snapshot.
+    ledger.register(
+        "305", "ref", "F", "STK", 1, "BUY", Decimal("10"),
+        pre_position=Decimal("0"),
+    )
+    # Broker position confirms the full 10 filled.
+    position["qty"] = Decimal("10")
+    term = ledger.record_status("305", "Filled")
+    assert term[0]["filled_qty"] == "10"
 
 
 def test_inactive_maps_to_rejected(ledger):
