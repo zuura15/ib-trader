@@ -5,6 +5,22 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-04-23
 
+### Fixed
+- **Phantom `ORDER_TERMINAL_TIMEOUT` alerts from IB-redelivered
+  foreign orders.** On engine restart, IB re-delivers
+  currently-live open orders the account has on the books —
+  including ones placed by a previous engine session, a different
+  IB client, or TWS directly. For those orders, ib_async reports
+  the status event with `ib_order_id="0"` because there's no
+  matching live `Trade` in this session. `OrderLedger.record_status`
+  was auto-creating a ledger entry keyed on `"0"` with empty
+  symbol / qty / side, and `check_stuck` fired a useless WARNING
+  five minutes later. The new guard drops phantom events at the
+  auto-create boundary (both `record_status` and `record_fill`),
+  logging DEBUG `ORDER_LEDGER_PHANTOM_STATUS_IGNORED` so the
+  pattern is traceable without alerting. 4 new regression tests
+  in `tests/unit/test_order_ledger.py`.
+
 ### Added
 - **External pager: Healthchecks.io dead-man's-switch + ntfy.sh live
   push** (#47). A small bash monitor under a systemd user timer

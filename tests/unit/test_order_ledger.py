@@ -324,6 +324,39 @@ def test_position_diff_skipped_without_position_getter():
     assert term[0]["filled_qty"] == "4"
 
 
+def test_record_status_ignores_phantom_ib_order_id_zero(ledger):
+    """IB re-delivers live open orders on reconnect; foreign ones
+    (placed by a prior session or another IB client) arrive with
+    ib_order_id="0". Auto-creating an entry wires them into
+    check_stuck → useless WARNING 5 min later. Drop at boundary."""
+    events = ledger.record_status("0", "Submitted", symbol="QQQ")
+    assert events == []
+    assert ledger.get("0") is None
+
+
+def test_record_status_ignores_empty_ib_order_id(ledger):
+    events = ledger.record_status("", "Submitted", symbol="QQQ")
+    assert events == []
+    assert ledger.get("") is None
+
+
+def test_record_fill_ignores_phantom_ib_order_id_zero(ledger):
+    """Symmetric: a fill with ib_order_id="0" is also phantom."""
+    events = ledger.record_fill(
+        "0", qty=Decimal("10"), price=Decimal("100"),
+        commission=Decimal("0"), symbol="QQQ",
+    )
+    assert events == []
+    assert ledger.get("0") is None
+
+
+def test_phantom_guard_does_not_affect_real_orders(ledger):
+    """Sanity: a real ib_order_id still auto-creates as before."""
+    events = ledger.record_status("123", "Submitted", symbol="F")
+    assert events and events[0]["status"] == "Submitted"
+    assert ledger.get("123") is not None
+
+
 def test_register_after_auto_create_backfills_pre_position():
     """If a fill auto-creates the entry before our explicit register
     runs, the explicit register backfills target_qty + pre_position

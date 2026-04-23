@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "Inactive", "ApiCancelled"})
 
+# ib_async uses "0" (or empty) for the client-side orderId on status
+# events that have no matching live trade — e.g. foreign orders IB
+# re-delivers on reconnect for orders placed by a prior engine
+# session or a different IB client. These are phantoms from our
+# perspective; creating a ledger entry for them wires them into
+# check_stuck and produces useless WARNING alerts with empty
+# metadata. Filter at the auto-create boundary.
+_PHANTOM_IB_ORDER_IDS: frozenset[str] = frozenset({"", "0"})
+
 # IB fires a spurious "Cancelled" (perm_id=0) when re-routing an order
 # between venues. The sequence is: Submitted → Cancelled → Submitted →
 # Filled. The ledger must NOT emit a terminal event for these.
@@ -224,6 +233,13 @@ class OrderLedger:
 
         entry = self._entries.get(ib_order_id)
         if entry is None:
+            if ib_order_id in _PHANTOM_IB_ORDER_IDS:
+                logger.debug(
+                    '{"event": "ORDER_LEDGER_PHANTOM_FILL_IGNORED", '
+                    '"ib_order_id": "%s", "symbol": "%s", "qty": "%s"}',
+                    ib_order_id, symbol, qty,
+                )
+                return []
             # Prefer the authoritative total_qty (static once placed).
             # Fall back to qty+remaining for callers that don't plumb it.
             if total_qty > 0:
@@ -283,6 +299,19 @@ class OrderLedger:
 
         entry = self._entries.get(ib_order_id)
         if entry is None:
+            # Phantom status events: IB re-delivers live open orders on
+            # reconnect, and ib_async reports them with ib_order_id="0"
+            # when no client-side trade record exists (foreign orders
+            # from a prior session or different client). Creating an
+            # entry for these wires them into check_stuck and fires a
+            # useless WARNING 5 min later. Drop them at the boundary.
+            if ib_order_id in _PHANTOM_IB_ORDER_IDS:
+                logger.debug(
+                    '{"event": "ORDER_LEDGER_PHANTOM_STATUS_IGNORED", '
+                    '"ib_order_id": "%s", "status": "%s", "symbol": "%s"}',
+                    ib_order_id, status, symbol,
+                )
+                return []
             # For Cancelled/ApiCancelled on an untracked order: this is
             # likely IB's preroute cancel (the order was placed by us but
             # register() was never called). Create an entry so the
