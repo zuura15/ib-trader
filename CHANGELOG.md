@@ -6,6 +6,19 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-04-22
 
 ### Fixed
+- **PositionLine details pane required browser refresh after a fill.**
+  After force-buy fills (FSM transitions to `AWAITING_EXIT_TRIGGER`),
+  the details pane stayed hidden until the user manually refreshed.
+  Cause: `_stream_bot_state_to_ws` (`api/ws.py`) subscribed to the
+  ACTIVITY redis stream at cursor `$` and entered its `xread`
+  wake-loop without pushing an initial snapshot. If the FSM
+  transition's activity nudge fired between the frontend's HTTP
+  state-fetch and the WS subscribe being observed by `xread`, the
+  client missed it and sat on stale state until an unrelated activity
+  event woke the handler (often >>10s for a quiet single-bot system).
+  Fix: push the current state snapshot once immediately after
+  subscribing, before entering the wake-loop. Subsequent
+  ACTIVITY-driven pushes layer on top unchanged.
 - **GLD partial-fill limbo: lost fills + stuck FSM after IB code-462 modify
   reject.** Three-layered fix for a recurring force-buy failure where IB
   rejected the reprice walker's first amend with code 462 ("Cannot change

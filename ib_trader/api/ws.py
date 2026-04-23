@@ -451,6 +451,18 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
         except (RuntimeError, WebSocketDisconnect) as e:
             raise asyncio.CancelledError() from e
 
+    # Push current state immediately on subscribe so the client never
+    # waits for the next ACTIVITY entry to see a recently-committed FSM
+    # transition. Without this, a fill that lands between the HTTP
+    # state-fetch and the WS subscribe leaves PositionLine on stale
+    # state until an unrelated activity event nudges it (often >>10s
+    # for a quiet single-bot system). Symptom: details pane only
+    # appears after browser refresh.
+    try:
+        await push_snapshot()
+    except asyncio.CancelledError:
+        return
+
     while True:
         try:
             results = await redis.xread(streams, block=10000)
