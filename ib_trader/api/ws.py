@@ -803,7 +803,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 raw = await asyncio.wait_for(
                     websocket.receive_text(), timeout=_POLL_INTERVAL_S,
                 )
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Benign: browsers occasionally send empty /
+                    # non-JSON frames during reconnect, mobile
+                    # keepalives, or devtools probes. Drop the
+                    # frame, keep the connection. This was raising
+                    # ERROR-level tracebacks that polluted the log
+                    # and tripped the pager's log-pattern scan.
+                    logger.debug(
+                        '{"event": "WEBSOCKET_BAD_FRAME", '
+                        '"len": %d}',
+                        len(raw) if raw else 0,
+                    )
+                    continue
+                if not isinstance(msg, dict):
+                    logger.debug(
+                        '{"event": "WEBSOCKET_BAD_FRAME", '
+                        '"reason": "non-object"}'
+                    )
+                    continue
                 msg_type = msg.get("type")
 
                 if msg_type == "subscribe":
