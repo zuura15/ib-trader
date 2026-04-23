@@ -1,0 +1,17 @@
+[Unit]
+Description=IB Trader external pager — every 60s
+Documentation=https://github.com/zuura15/ib-trader/issues/47
+
+[Timer]
+# Fire 10s after user session boot, then every 60s.
+OnBootSec=10s
+OnUnitActiveSec=60s
+# Persistent=true means missed ticks during sleep/suspend fire
+# immediately on wake — important since the box is also the dev
+# machine and may suspend overnight.
+Persistent=true
+AccuracySec=5s
+Unit=ibtrader-health.service
+
+[Install]
+WantedBy=default.target

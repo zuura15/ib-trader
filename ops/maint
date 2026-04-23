@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# ops/maint start [duration] | end
+#
+# Manage an explicit maintenance window for the external pager.
+# When active, ops/health_check.sh skips all checks and stays quiet.
+# Pairs with Healthchecks.io's /start endpoint so HC's dead-man's-
+# switch also pauses for the same window.
+#
+# Auto-expires after `duration` (default 30m, max 8h). See GH #47.
+set -euo pipefail
+
+PAGER_ENV="${PAGER_ENV:-$HOME/.config/ibtrader-pager.env}"
+MAINT_LOCK="${MAINT_LOCK:-$HOME/.config/ibtrader-maint.lock}"
+MAX_DURATION_SECONDS=$(( 8 * 3600 ))
+
+_usage() {
+    cat >&2 <<EOF
+Usage:
+  ops/maint start [duration]   # e.g. "30m" (default), "2h", "5m", "1h30m"
+  ops/maint end                 # clear the window and resume alerting
+
+The start duration is capped at 8h. Window auto-expires at that
+timestamp regardless of whether 'end' is invoked — if you forget,
+alerts resume automatically at the cap.
+EOF
+    exit 1
+}
+
+_parse_duration_seconds() {
+    # Accepts "30m", "2h", "1h30m", "5m", "3600" (raw seconds).
+    local spec=$1 total=0
+    if [[ "$spec" =~ ^[0-9]+$ ]]; then
+        echo "$spec"; return
+    fi
+    local h m s
+    h=$(echo "$spec" | grep -oE '[0-9]+h' | tr -d h || true)
+    m=$(echo "$spec" | grep -oE '[0-9]+m' | tr -d m || true)
+    s=$(echo "$spec" | grep -oE '[0-9]+s' | tr -d s || true)
+    total=$(( ${h:-0} * 3600 + ${m:-0} * 60 + ${s:-0} ))
+    if (( total <= 0 )); then
+        echo "ops/maint: invalid duration '$spec'" >&2
+        return 1
+    fi
+    echo "$total"
+}
+
+_load_env() {
+    if [[ -r "$PAGER_ENV" ]]; then
+        # shellcheck disable=SC1090
+        source "$PAGER_ENV"
+    fi
+}
+
+_cmd_start() {
+    local spec="${1:-30m}"
+    local secs
+    secs=$(_parse_duration_seconds "$spec")
+    if (( secs > MAX_DURATION_SECONDS )); then
+        echo "ops/maint: duration capped at 8h. Re-run after it expires if longer needed." >&2
+        secs=$MAX_DURATION_SECONDS
+    fi
+    local expiry=$(( $(date -u +%s) + secs ))
+    mkdir -p "$(dirname "$MAINT_LOCK")"
+    echo "$expiry" > "$MAINT_LOCK"
+    chmod 600 "$MAINT_LOCK"
+
+    local human_expiry
+    human_expiry=$(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S %Z')
+    echo "Maintenance window ON until $human_expiry (in ${secs}s)"
+
+    _load_env
+    # HC_PING_URL is a best-effort companion — if HC is unreachable or
+    # the URL is misconfigured, the local lockfile still gates the
+    # monitor. Silent on failure unless MAINT_VERBOSE=1 (noisy during
+    # tests/installers).
+    if [[ -n "${HC_PING_URL:-}" ]]; then
+        if curl -fsS --max-time 5 "${HC_PING_URL%/}/start" -d "maint start ${secs}s" >/dev/null 2>&1; then
+            echo "Healthchecks.io: notified /start"
+        elif [[ "${MAINT_VERBOSE:-0}" == 1 ]]; then
+            echo "Warning: HC /start POST failed (continuing — local lockfile is the real gate)" >&2
+        fi
+    fi
+}
+
+_cmd_end() {
+    if [[ -f "$MAINT_LOCK" ]]; then
+        rm -f "$MAINT_LOCK"
+        echo "Maintenance window OFF (local lockfile cleared)"
+    else
+        echo "Maintenance window OFF (no lockfile was set)"
+    fi
+    _load_env
+    if [[ -n "${HC_PING_URL:-}" ]]; then
+        # Best-effort — timer picks up on next tick if this fails.
+        if curl -fsS --max-time 5 "$HC_PING_URL" >/dev/null 2>&1; then
+            echo "Healthchecks.io: heartbeat sent (will resume normal ticks from the timer)"
+        elif [[ "${MAINT_VERBOSE:-0}" == 1 ]]; then
+            echo "Warning: HC heartbeat POST failed (timer will retry on next tick)" >&2
+        fi
+    fi
+}
+
+_cmd_status() {
+    if [[ -f "$MAINT_LOCK" ]]; then
+        local expiry
+        expiry=$(cat "$MAINT_LOCK" | head -1 | tr -d '[:space:]')
+        local now=$(date -u +%s)
+        if (( expiry > now )); then
+            local remaining=$(( expiry - now ))
+            local human
+            human=$(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S %Z')
+            echo "maintenance ON — expires $human (in ${remaining}s)"
+            return 0
+        fi
+        echo "maintenance expired (lockfile stale at $(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S %Z'))"
+        return 0
+    fi
+    echo "maintenance OFF"
+}
+
+case "${1:-}" in
+    start)  shift; _cmd_start "$@" ;;
+    end)    _cmd_end ;;
+    status) _cmd_status ;;
+    *)      _usage ;;
+esac

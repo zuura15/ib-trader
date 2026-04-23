@@ -18,6 +18,20 @@ router = APIRouter(prefix="/api", tags=["system"])
 _HEARTBEAT_STALE_SECONDS = 60
 
 
+@router.get("/system/health")
+async def get_system_health():
+    """Liveness probe for the API process.
+
+    Lightweight and dependency-free — no Redis call, no DB call. The
+    external pager (see `ops/health_check.sh`, GH #47) polls this
+    every 60s to decide whether the process itself is responsive.
+    Keep this endpoint intentionally boring; for richer signals use
+    ``/api/status``.
+    """
+    import os as _os
+    return {"status": "ok", "pid": _os.getpid()}
+
+
 @router.get("/status")
 async def get_status(redis=Depends(get_redis)):
     """Return full system status from Redis."""

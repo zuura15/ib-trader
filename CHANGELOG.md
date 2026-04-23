@@ -5,6 +5,49 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-04-23
 
+### Added
+- **External pager: Healthchecks.io dead-man's-switch + ntfy.sh live
+  push** (#47). A small bash monitor under a systemd user timer
+  gives us a pager path independent of the app itself. Covers the
+  class of "entire stack silent" failures (engine process dies,
+  host powers off, network out, kernel panic) that the in-app
+  alerts can't surface, and also forwards in-app CATASTROPHIC
+  alerts to the operator's phone within ~60s.
+  - `ops/health_check.sh` runs every 60s. Checks per-daemon
+    liveness (process + HTTP health endpoint + log freshness),
+    scans `logs/ib_trader.log` for fresh ERROR / Traceback /
+    `BOT_CRASH` / non-benign `IB_ORDER_ERROR` / high WARNING rate,
+    pulls `/api/alerts` for CATASTROPHIC entries (forwards them
+    verbatim), checks bot heartbeat staleness, watches disk
+    free / load avg. Pings Healthchecks.io when clean, pushes a
+    detailed message to ntfy.sh when not.
+  - `ops/maint start [duration] | end | status` provides explicit
+    maintenance windows. Auto-expires (default 30m, cap 8h) so
+    "I forgot" degrades to "alerts resume" not "silent forever".
+    Also notifies HC's `/start` so its dead-man's-switch pauses for
+    the same window.
+  - Ctrl+C of `make dev` is **auto-detected**: wrapper dead +
+    graceful-shutdown log events (`ENGINE_STOPPED` et al.) in the
+    last 30s → 5-min grace window with zero operator action.
+    Wrapper dead **without** graceful signals (kernel panic, OOM)
+    pages immediately.
+  - Health probe endpoints added: `GET /api/system/health` on
+    `ib-api`, `GET /health` on `ib-bots`. Dependency-free (no
+    Redis, no DB) — intentional minimal surface.
+  - `ops/install-pager.sh` one-shot installer prompts for HC ping
+    URL + ntfy topic URL, writes `~/.config/ibtrader-pager.env`
+    (mode 600), installs the systemd user unit files, enables the
+    timer. Total setup ~15 min.
+  - ADR `017-external-pager.md` records the rationale and the
+    rejected alternatives.
+  - Tests: `tests/unit/test_ops_pager_scripts.py` (26 cases covering
+    maintenance flows, duration parsing, gating, auto-grace,
+    systemd-unit structure) +
+    `tests/unit/test_bots_internal_api_health.py` (3 cases on the
+    new `/health` endpoint) + new
+    `test_system_health_endpoint` case in
+    `tests/unit/test_api_routes.py`.
+
 ### Fixed
 - **IB Gateway disconnect silently missed in the UI.** The engine's
   `_raise_ib_disconnect_alert` wrote directly to SQLite via

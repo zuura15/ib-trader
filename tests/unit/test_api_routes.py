@@ -131,7 +131,7 @@ class TestAlertRoutes:
 
 
 class TestSystemRoutes:
-    """GET /api/status."""
+    """GET /api/status and /api/system/health."""
 
     def test_status_returns_valid_shape(self, client):
         resp = client.get("/api/status")
@@ -141,3 +141,13 @@ class TestSystemRoutes:
         assert "alerts" in data
         assert "connection_status" in data
         assert "account_mode" in data
+
+    def test_system_health_endpoint(self, client):
+        """External pager (GH #47) polls this every 60s. Must be lightweight
+        (no Redis / DB) and return 200 with pid so the pager can verify the
+        API process is responsive."""
+        import os
+        resp = client.get("/api/system/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data == {"status": "ok", "pid": os.getpid()}

@@ -39,6 +39,22 @@ def _get_state() -> dict:
     return _runner_state
 
 
+@app.get("/health")
+async def health():
+    """Liveness probe for the bot runner process.
+
+    Lightweight — reports PID and active-bot count only. No Redis
+    call, no bot state traversal. Polled every 60s by the external
+    pager (see `ops/health_check.sh`, GH #47).
+    """
+    import os as _os
+    active = 0
+    if _runner_state is not None:
+        running = _runner_state.get("running_tasks") or {}
+        active = sum(1 for t in running.values() if t and not t.done())
+    return {"status": "ok", "pid": _os.getpid(), "bots_active": active}
+
+
 @app.post("/bots/{bot_id}/start")
 async def start_bot(bot_id: str):
     state = _get_state()

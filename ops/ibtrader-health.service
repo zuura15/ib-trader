@@ -1,0 +1,20 @@
+[Unit]
+Description=IB Trader external pager — one-shot health check
+Documentation=https://github.com/zuura15/ib-trader/issues/47
+
+[Service]
+Type=oneshot
+# REPO_ROOT and PAGER_ENV are overridable but default to sensible
+# paths for this user. The script itself sources ~/.config/ibtrader-pager.env
+# for the HC + ntfy URLs.
+Environment=REPO_ROOT=%h/projects/ib-trader
+Environment=PAGER_ENV=%h/.config/ibtrader-pager.env
+Environment=MAINT_LOCK=%h/.config/ibtrader-maint.lock
+Environment=AUTO_GRACE_STATE=%h/.cache/ibtrader-autograce
+ExecStart=/usr/bin/env bash %h/projects/ib-trader/ops/health_check.sh
+# Each tick is budgeted at ≤ 30s. HTTP probes are 3s each; typical
+# run is <2s. Timer period is 60s so there's no risk of pile-up.
+TimeoutStartSec=30s
+# The script exits 1 on CATASTROPHIC but we do NOT want systemd to
+# treat that as a unit failure (each tick is independent).
+SuccessExitStatus=0 1
