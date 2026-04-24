@@ -5,6 +5,20 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-04-23
 
+### Added
+- **One-shot backfill for GH #48 phantom-cancel victims**
+  (`scripts/backfill_gh48_phantom_cancel_fills.py`). Pre-fix, the
+  synthetic Cancelled short-circuited the strategy before fills landed,
+  so the `transactions` table got CANCELLED rows but never the
+  corresponding FILLED rows — leaving CLOSED trade groups with no
+  entry-fill data and `—` across the trades panel. The script scans
+  engine logs for `FILL_RELAYED` lines, sums per-fill quantity, computes
+  weighted-avg price, and appends a single FILLED row per affected trade
+  tagged `correlation_id="backfill-gh48"` (identifiable, reversible,
+  and append-only — the original CANCELLED row stays as historical
+  truth of what the engine thought happened). 19 trades recovered on
+  the live DB; 9 too old to find logs for.
+
 ### Fixed
 - **Phantom cancels after IB error 462 missed real fills** (#48).
   ib_async's wrapper synthesizes a `Cancelled` order status from any
