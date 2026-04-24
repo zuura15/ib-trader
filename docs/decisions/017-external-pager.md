@@ -97,7 +97,7 @@ timestamp expiry. Monitor checks this first on every tick and
 exits 0 silently if the window is active. Also POSTs
 Healthchecks.io's `/start` endpoint so HC's own dead-man's-switch
 pauses for the same window. `ops/maint end` clears it. The
-lockfile auto-expires (default 30 min, cap 8 h) — "I forgot"
+lockfile auto-expires (default 30 min, cap 12 h) — "I forgot"
 degrades to "alerts resume automatically" instead of "silent
 forever". Primarily useful for longer planned work (VPN blip,
 Gateway reinstall) that takes more than a quick restart.

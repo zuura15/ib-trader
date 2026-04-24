@@ -6,12 +6,12 @@
 # Pairs with Healthchecks.io's /start endpoint so HC's dead-man's-
 # switch also pauses for the same window.
 #
-# Auto-expires after `duration` (default 30m, max 8h). See GH #47.
+# Auto-expires after `duration` (default 30m, max 12h). See GH #47.
 set -euo pipefail
 
 PAGER_ENV="${PAGER_ENV:-$HOME/.config/ibtrader-pager.env}"
 MAINT_LOCK="${MAINT_LOCK:-$HOME/.config/ibtrader-maint.lock}"
-MAX_DURATION_SECONDS=$(( 8 * 3600 ))
+MAX_DURATION_SECONDS=$(( 12 * 3600 ))
 
 _usage() {
     cat >&2 <<EOF
@@ -19,7 +19,7 @@ Usage:
   ops/maint start [duration]   # e.g. "30m" (default), "2h", "5m", "1h30m"
   ops/maint end                 # clear the window and resume alerting
 
-The start duration is capped at 8h. Window auto-expires at that
+The start duration is capped at 12h. Window auto-expires at that
 timestamp regardless of whether 'end' is invoked — if you forget,
 alerts resume automatically at the cap.
 EOF
@@ -56,7 +56,7 @@ _cmd_start() {
     local secs
     secs=$(_parse_duration_seconds "$spec")
     if (( secs > MAX_DURATION_SECONDS )); then
-        echo "ops/maint: duration capped at 8h. Re-run after it expires if longer needed." >&2
+        echo "ops/maint: duration capped at 12h. Re-run after it expires if longer needed." >&2
         secs=$MAX_DURATION_SECONDS
     fi
     local expiry=$(( $(date -u +%s) + secs ))

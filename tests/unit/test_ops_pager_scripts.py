@@ -107,12 +107,12 @@ class TestMaint:
         # Allow a 5s tolerance for execution overhead.
         assert abs(delta - expected_secs) < 5
 
-    def test_duration_caps_at_8h(self, pager_env):
+    def test_duration_caps_at_12h(self, pager_env):
         r = run(MAINT, "start", "24h", env=pager_env)
-        assert "capped at 8h" in (r.stdout + r.stderr)
+        assert "capped at 12h" in (r.stdout + r.stderr)
         expiry = int(Path(pager_env["MAINT_LOCK"]).read_text().strip())
         delta = expiry - int(time.time())
-        assert 8 * 3600 - 5 < delta <= 8 * 3600 + 5
+        assert 12 * 3600 - 5 < delta <= 12 * 3600 + 5
 
     def test_no_subcommand_exits_nonzero(self, pager_env):
         r = run(MAINT, env=pager_env)
