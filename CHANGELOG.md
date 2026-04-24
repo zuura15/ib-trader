@@ -6,6 +6,25 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-04-23
 
 ### Fixed
+- **Phantom cancels after IB error 462 missed real fills** (#48).
+  ib_async's wrapper synthesizes a `Cancelled` order status from any
+  non-warning order error on a live trade — including modify-rejection
+  errors where IB itself leaves the underlying order alive
+  (`ib_async/wrapper.py:1657-1668`; `ib_insync` issue #502). On
+  2026-04-23 a `BUY 1000 PSQ @ mid` amend during the overnight session
+  hit error 462 ("Cannot change to the new Time in Force.DAY"); the
+  engine treated the synthetic cancel as terminal and missed the real
+  fill that landed at IBEOS 100s later. `_on_order_status` now defers
+  dispatch on Cancelled events whose just-appended `trade.log[-1]`
+  carries `errorCode == 462` and verifies via `reqOpenOrdersAsync()`:
+  if IB still has the order open, the synthetic cancel is suppressed
+  and callbacks remain registered for the eventual real terminal. On
+  query failure we default to suppress — the asymmetry favors not
+  missing fills (engine's existing 120s timeout cleanly handles a
+  false-suppress; a false-propagate orphans positions). Six regression
+  tests in `tests/unit/test_insync_cancel_verify.py`. Design rationale,
+  upstream-hotspot marker, and broaden-the-guard trigger captured in
+  ADR-018.
 - **REPL parser rejected `$`-prefixed limit prices.** `_parse_decimal`
   fed raw tokens to `Decimal()` so `sell PSQ 1000 limit $28.45` raised
   `InvalidOperation` and surfaced as "limit strategy requires a price".

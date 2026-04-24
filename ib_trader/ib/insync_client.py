@@ -1038,6 +1038,14 @@ class InsyncClient(IBClientBase):
         "Filled", "Cancelled", "Inactive", "ApiCancelled",
     })
 
+    # IB error codes that trigger an open-orders verification round-trip
+    # before propagating a Cancelled status. Currently scoped to 462 — the
+    # only synthetic-cancel code we have observed in the wild (see GH #48,
+    # ADR-018). If other modify-rejection codes start producing the same
+    # false-cancel pattern, broaden by removing the errorCode gate entirely
+    # and verifying every Cancelled — the verifier handles them generically.
+    _VERIFY_CANCEL_ERROR_CODES: frozenset[int] = frozenset({462})
+
     def _get_order_lock(self, ib_order_id: str) -> asyncio.Lock:
         """Return the per-order asyncio.Lock for ``ib_order_id``, creating
         it lazily on first use. Lazy creation avoids loop-binding issues
@@ -1220,11 +1228,41 @@ class InsyncClient(IBClientBase):
             )
             return
 
-        # Dispatch to order-specific callbacks, then global callbacks.
-        # Funnel through the per-order lock — critical here, because a
-        # terminal status that overtakes a still-queued fill would
-        # terminalize the ledger with under-counted fills and leave
-        # orphan position in IB (PSQ incident, 2026-04-21).
+        # ib_async synthesizes a Cancelled status from any non-warning error on
+        # a live trade — including modify-rejection errors where IB's actual
+        # behavior is "modify failed, order still live" (wrapper.py:1657-1668;
+        # ib_insync issue #502; GH #48). Discriminator: trade.log[-1] is
+        # appended at wrapper.py:1663 *before* orderStatusEvent.emit at line
+        # 1666, so the just-appended log entry is synchronously visible here
+        # and carries the originating errorCode. When the code is one we know
+        # produces false cancels, defer dispatch and ask IB whether the order
+        # is actually still open before propagating.
+        if (
+            status == "Cancelled"
+            and trade.log
+            and getattr(trade.log[-1], "errorCode", None) in self._VERIFY_CANCEL_ERROR_CODES
+        ):
+            err_code = trade.log[-1].errorCode
+            logger.info(
+                '{"event": "IB_CANCEL_VERIFY_DEFERRED", '
+                '"ib_order_id": "%s", "code": %d}',
+                ib_order_id, err_code,
+            )
+            _spawn_background(self._verify_cancel(trade, ib_order_id, err_code))
+            return
+
+        self._dispatch_status_to_callbacks(trade, ib_order_id, status)
+
+    def _dispatch_status_to_callbacks(
+        self, trade: Trade, ib_order_id: str, status: str,
+    ) -> None:
+        """Dispatch an order-status update to registered callbacks.
+
+        Funnel through the per-order lock — critical here, because a terminal
+        status that overtakes a still-queued fill would terminalize the
+        ledger with under-counted fills and leave orphan position in IB
+        (PSQ incident, 2026-04-21).
+        """
         for cb in self._status_callbacks.get(ib_order_id, []):
             _spawn_background(self._dispatch_ordered(
                 ib_order_id, cb, ib_order_id, status,
@@ -1237,3 +1275,62 @@ class InsyncClient(IBClientBase):
         # Auto-cleanup after terminal status dispatch.
         if status in self._TERMINAL_STATUSES:
             self.unregister_callbacks(ib_order_id)
+
+    async def _verify_cancel(
+        self, trade: Trade, ib_order_id: str, err_code: int,
+    ) -> None:
+        """Verify a suspect Cancelled status against IB's open-orders list.
+
+        ib_async manufactures Cancelled status events for some modify-rejection
+        errors that leave the underlying order live on the exchange (see
+        ``_on_order_status``). This routine asks IB authoritatively whether
+        the order is still open. If yes, the synthetic Cancelled is suppressed
+        and callbacks remain registered to handle the eventual real terminal.
+        If no, the Cancelled is dispatched normally.
+
+        On query failure we default to suppress: a missed cancel surfaces via
+        the engine's existing 120s active+passive timeout with no orphan
+        position, while a missed fill leaves money exposed (GH #48).
+        """
+        try:
+            await self._throttle()
+            open_trades = await self._ib.reqOpenOrdersAsync()
+            still_open = any(
+                str(t.order.orderId) == ib_order_id for t in open_trades
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "IB_CANCEL_VERIFY_FAILED", '
+                '"ib_order_id": "%s", "code": %d, "default": "suppress"}',
+                ib_order_id, err_code,
+            )
+            still_open = True
+
+        if still_open:
+            logger.warning(
+                '{"event": "IB_CANCEL_SUPPRESSED_OPEN_AT_IB", '
+                '"ib_order_id": "%s", "code": %d}',
+                ib_order_id, err_code,
+            )
+            return
+
+        # Race: the real terminal may have landed via _orderStatus() during the
+        # IB round-trip. Filled goes through this same method and dispatches
+        # synchronously, so trade.orderStatus.status reflects it. Re-check
+        # before propagating a stale Cancelled that would re-fire callbacks
+        # on an already-Filled order.
+        current = trade.orderStatus.status
+        if current == "Filled":
+            logger.info(
+                '{"event": "IB_CANCEL_SUPERSEDED_BY_FILL", '
+                '"ib_order_id": "%s", "code": %d}',
+                ib_order_id, err_code,
+            )
+            return
+
+        logger.info(
+            '{"event": "IB_CANCEL_VERIFIED_TERMINAL", '
+            '"ib_order_id": "%s", "code": %d}',
+            ib_order_id, err_code,
+        )
+        self._dispatch_status_to_callbacks(trade, ib_order_id, "Cancelled")
