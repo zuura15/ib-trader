@@ -38,7 +38,11 @@ REPO_ROOT="${REPO_ROOT:-$HOME/projects/ib-trader}"
 LOG_FILE="${LOG_FILE:-$REPO_ROOT/logs/ib_trader.log}"
 
 # Benign IB error codes (see engine/insync_client error callbacks).
-BENIGN_IB_CODES="202 2103 2104 2105 2107 2108 2158 2174"
+# 462 = "Order modify failed. Cannot change to the new TIF" — handled by
+# the cancel-verification path (ADR-018 / GH #48). The synthetic Cancelled
+# is suppressed when IB confirms the order is still open, so a 462 in the
+# logs is expected noise, not a pageable failure.
+BENIGN_IB_CODES="202 462 2103 2104 2105 2107 2108 2158 2174"
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -205,17 +209,23 @@ for line in sys.stdin:
 ' "$cutoff_epoch" 2>/dev/null)
     [[ -n "$recent" ]] || return
 
-    local err_count
-    err_count=$(echo "$recent" | grep -c '"level": "ERROR"' || true)
-    # Known-benign engine log lines.
+    # Generic ERROR-line scan. Pages only on truly unclassified errors —
+    # CATASTROPHIC alerts come through the dedicated Redis path below, and
+    # IB_ORDER_ERROR has its own benign-codes-aware scan further down.
+    # Goal: alert on "something we haven't seen before", not on every ERROR
+    # log line. Adding to the exclusion list is correct when an error pattern
+    # is handled by the engine and surfaces only as expected log noise.
     local err_signal
     err_signal=$(echo "$recent" \
         | grep '"level": "ERROR"' \
         | grep -v 'alert resolve skipped' \
         | grep -v 'tick heartbeat cancel' \
+        | grep -v '"event": "IB_ORDER_ERROR"' \
         | head -3 || true)
     if [[ -n "$err_signal" ]]; then
-        _add_error "recent ERROR log lines ($err_count in 60s): $(echo "$err_signal" | head -1 | head -c 240)"
+        local err_count
+        err_count=$(echo "$err_signal" | wc -l)
+        _add_error "unclassified ERROR log lines ($err_count in 60s): $(echo "$err_signal" | head -1 | head -c 240)"
     fi
 
     # IB_ORDER_ERROR with non-benign code.
