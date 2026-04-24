@@ -3,6 +3,25 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-04-24
+
+### Added
+- **IB-authoritative realized P&L on closed trades.** `CommissionReport`
+  carries `realizedPNL` on every execution — the engine now captures
+  that value on the global commission callback and accumulates it into
+  a new `trade_groups.ib_realized_pnl` column (additive across
+  multi-execution closes; opening-fill sentinel values filtered).
+  Serializer prefers `ib_realized_pnl` when set, falls back to
+  `realized_pnl` (which bot/close-leg paths still write from the
+  engine's own computation) — keeps the two sources independent so
+  they never collide. New repo method `add_ib_realized_pnl` + migration
+  `3b9c1a04e7d2`. Unblocks round-trip P&L display for one-shot user
+  orders typed in the REPL without requiring the upcoming
+  SELL-against-long classification feature. Companion script
+  `scripts/backfill_ib_realized_pnl.py` pulls historical P&L via
+  `reqExecutionsAsync` within IB's retention window (typically the
+  current trading day).
+
 ## 2026-04-23
 
 ### Added

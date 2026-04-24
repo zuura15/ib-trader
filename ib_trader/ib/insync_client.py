@@ -1134,6 +1134,20 @@ class InsyncClient(IBClientBase):
             commission = Decimal(str(commission_raw))
         except Exception:
             return
+        # CommissionReport.realizedPNL is the position's cumulative realized
+        # P&L at this execution, set by IB. Opening fills carry a sentinel
+        # ~1.7976931348623157e308 ("not applicable" — Python: sys.float_info.max).
+        # Filter that and pass real values through so the engine can record
+        # IB-authoritative P&L on closes (GH #48 follow-up).
+        realized_pnl: Decimal | None = None
+        pnl_raw = getattr(report, "realizedPNL", None)
+        if pnl_raw is not None:
+            try:
+                pnl_f = float(pnl_raw)
+                if abs(pnl_f) < 1e15:
+                    realized_pnl = Decimal(str(pnl_raw))
+            except (ValueError, TypeError):
+                pass
         # Dedup. On reconnect IB sometimes redelivers the same report.
         if exec_id and exec_id in self._seen_commission_execs:
             logger.debug(
@@ -1147,8 +1161,9 @@ class InsyncClient(IBClientBase):
 
         logger.info(
             '{"event": "IB_COMMISSION_REPORT", "ib_order_id": "%s", '
-            '"exec_id": "%s", "commission": "%s"}',
+            '"exec_id": "%s", "commission": "%s", "realized_pnl": "%s"}',
             ib_order_id, exec_id, commission,
+            realized_pnl if realized_pnl is not None else "",
         )
 
         # Fire per-order callbacks then global. Handlers do DB updates
@@ -1158,11 +1173,11 @@ class InsyncClient(IBClientBase):
         # same ib_order_id.
         for cb in self._commission_callbacks.get(ib_order_id, []):
             _spawn_background(self._dispatch_ordered(
-                ib_order_id, cb, ib_order_id, exec_id, commission,
+                ib_order_id, cb, ib_order_id, exec_id, commission, realized_pnl,
             ))
         for cb in self._commission_callbacks.get("_GLOBAL", []):
             _spawn_background(self._dispatch_ordered(
-                ib_order_id, cb, ib_order_id, exec_id, commission,
+                ib_order_id, cb, ib_order_id, exec_id, commission, realized_pnl,
             ))
 
     def register_commission_callback(

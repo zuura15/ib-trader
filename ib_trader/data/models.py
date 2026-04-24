@@ -112,6 +112,13 @@ class TradeGroup(Base):
     direction        = Column(String(5), nullable=False)    # LONG / SHORT
     status           = Column(Enum(TradeStatus), nullable=False, default=TradeStatus.OPEN)
     realized_pnl     = Column(Numeric(18, 8), nullable=True)
+    # Sum of CommissionReport.realizedPNL across executions, written
+    # additively from the engine's commission callback. Independent of
+    # ``realized_pnl`` (which is set by bot/close-leg flows from the
+    # engine's own computation). The API serializer prefers this when
+    # set so user one-shot orders get IB's authoritative round-trip
+    # P&L on close, without colliding with bot-derived values.
+    ib_realized_pnl  = Column(Numeric(18, 8), nullable=True)
     total_commission = Column(Numeric(18, 8), nullable=True)
     opened_at        = Column(DateTime, nullable=False)
     closed_at        = Column(DateTime, nullable=True)

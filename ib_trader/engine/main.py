@@ -849,8 +849,13 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     # Retry with small backoff — the row almost always shows up
     # within a few hundred ms. Non-gating: this runs as its own
     # background task; bot FSM flow never waits for it.
-    async def on_commission(ib_order_id: str, exec_id: str, commission: Decimal) -> None:
-        if commission is None or commission == 0:
+    async def on_commission(
+        ib_order_id: str, exec_id: str, commission: Decimal,
+        realized_pnl: Decimal | None = None,
+    ) -> None:
+        if (commission is None or commission == 0) and (
+            realized_pnl is None or realized_pnl == 0
+        ):
             return
         try:
             order_id_int = int(ib_order_id)
@@ -862,22 +867,26 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             # Covers the normal 10–50 ms race and tolerates a stalled
             # DB write without exhausting the event loop.
             delays = [0.05, 0.1, 0.2, 0.4, 0.8, 1.6]
-            for attempt, delay in enumerate([0.0] + delays):
-                if delay:
-                    await asyncio.sleep(delay)
-                txn_rows = ctx.transactions.add_commission(order_id_int, commission)
-                if txn_rows > 0:
-                    break
-            if txn_rows == 0:
-                logger.warning(
-                    '{"event": "COMMISSION_UNMATCHED", "ib_order_id": "%s", '
-                    '"exec_id": "%s", "commission": "%s", "reason": '
-                    '"no_FILLED_transaction_row_after_retry"}',
-                    ib_order_id, exec_id, commission,
-                )
-                return
-            # Resolve trade_serial via any transaction row for this order.
+            if commission and commission != 0:
+                for attempt, delay in enumerate([0.0] + delays):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    txn_rows = ctx.transactions.add_commission(order_id_int, commission)
+                    if txn_rows > 0:
+                        break
+                if txn_rows == 0:
+                    logger.warning(
+                        '{"event": "COMMISSION_UNMATCHED", "ib_order_id": "%s", '
+                        '"exec_id": "%s", "commission": "%s", "reason": '
+                        '"no_FILLED_transaction_row_after_retry"}',
+                        ib_order_id, exec_id, commission,
+                    )
+                    return
+            # Resolve trade_serial + trade_id via any transaction row for
+            # this order. Used both for bot-trade commission and for
+            # writing IB-authoritative realized P&L on the trade group.
             trade_serial = None
+            trade_id = None
             try:
                 from ib_trader.data.models import (
                     TransactionEvent, TransactionAction,
@@ -896,18 +905,38 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 )
                 if ev is not None:
                     trade_serial = ev.trade_serial
+                    trade_id = ev.trade_id
             except Exception:
                 logger.debug("commission serial lookup failed", exc_info=True)
             bt_rows = 0
-            if trade_serial is not None and ctx.bot_trades is not None:
+            if trade_serial is not None and ctx.bot_trades is not None and commission:
                 bt_rows = ctx.bot_trades.add_commission_by_serial(
                     trade_serial, commission,
                 )
+            # Write IB's authoritative realized P&L (additive across
+            # multi-execution closes; opening fills filtered upstream).
+            ib_pnl_written = False
+            if (
+                realized_pnl is not None and realized_pnl != 0
+                and trade_id is not None
+            ):
+                try:
+                    ctx.trades.add_ib_realized_pnl(trade_id, realized_pnl)
+                    ib_pnl_written = True
+                except Exception:
+                    logger.exception(
+                        '{"event": "IB_REALIZED_PNL_WRITE_FAILED", '
+                        '"ib_order_id": "%s", "trade_id": "%s"}',
+                        ib_order_id, trade_id,
+                    )
             logger.info(
                 '{"event": "COMMISSION_APPLIED", "ib_order_id": "%s", '
                 '"exec_id": "%s", "commission": "%s", '
-                '"txn_rows": %d, "bot_trade_rows": %d}',
+                '"txn_rows": %d, "bot_trade_rows": %d, '
+                '"ib_realized_pnl": "%s", "ib_pnl_written": %s}',
                 ib_order_id, exec_id, commission, txn_rows, bt_rows,
+                realized_pnl if realized_pnl is not None else "",
+                "true" if ib_pnl_written else "false",
             )
         except Exception:
             logger.exception(

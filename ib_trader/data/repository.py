@@ -202,6 +202,20 @@ class TradeRepository(TradeRepositoryBase):
         trade.total_commission = commission
         s.commit()
 
+    def add_ib_realized_pnl(self, trade_id: str, pnl_delta: Decimal) -> None:
+        """Add an IB ``CommissionReport.realizedPNL`` contribution to a trade.
+
+        Sums into ``ib_realized_pnl`` so multi-execution closes accumulate
+        correctly. Lives on a separate column from ``realized_pnl`` so the
+        IB-authoritative value cannot collide with bot-computed P&L. The
+        API serializer prefers ``ib_realized_pnl`` when set.
+        """
+        s = self._session()
+        trade = s.query(TradeGroup).filter(TradeGroup.id == trade_id).one()
+        existing = trade.ib_realized_pnl or Decimal("0")
+        trade.ib_realized_pnl = existing + pnl_delta
+        s.commit()
+
     def next_serial_number(self) -> int:
         """Return the lowest unused integer serial number in range 0–999.
 

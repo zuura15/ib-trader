@@ -52,13 +52,18 @@ def _serialize_trade(t, transactions: TransactionRepository) -> TradeResponse:
         if exit_notional > 0:
             exit_price = str((exit_notional / exit_qty_total).quantize(Decimal("0.0001")))
 
+    # Prefer IB-authoritative realized P&L (set additively from
+    # CommissionReport.realizedPNL) when available; fall back to the
+    # engine/bot-computed value. Lets one-shot user orders show round-
+    # trip P&L on close without colliding with bot-derived values.
+    pnl = t.ib_realized_pnl if t.ib_realized_pnl is not None else t.realized_pnl
     return TradeResponse(
         id=t.id,
         serial_number=t.serial_number,
         symbol=t.symbol,
         direction=t.direction,
         status=t.status.value,
-        realized_pnl=str(t.realized_pnl) if t.realized_pnl is not None else None,
+        realized_pnl=str(pnl) if pnl is not None else None,
         total_commission=str(t.total_commission) if t.total_commission is not None else None,
         opened_at=t.opened_at,
         closed_at=t.closed_at,

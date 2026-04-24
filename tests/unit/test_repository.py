@@ -73,6 +73,36 @@ class TestTradeRepository:
         assert fetched.realized_pnl == Decimal("234.50")
         assert fetched.total_commission == Decimal("4.00")
 
+    def test_add_ib_realized_pnl_sums_across_calls(self, session_factory):
+        """Multi-execution closes call add_ib_realized_pnl once per
+        CommissionReport. The contributions must accumulate."""
+        repo = TradeRepository(session_factory)
+        trade = repo.create(TradeGroup(
+            serial_number=66, symbol="GLD", direction="LONG",
+            status=TradeStatus.OPEN, opened_at=_now(),
+        ))
+        repo.add_ib_realized_pnl(trade.id, Decimal("5.25"))
+        repo.add_ib_realized_pnl(trade.id, Decimal("-1.50"))
+        repo.add_ib_realized_pnl(trade.id, Decimal("0.10"))
+        fetched = repo.get_by_serial(66)
+        assert fetched.ib_realized_pnl == Decimal("3.85")
+        # realized_pnl (the bot/close-leg path) stays untouched.
+        assert fetched.realized_pnl is None
+
+    def test_add_ib_realized_pnl_does_not_clobber_realized_pnl(self, session_factory):
+        """Bot trades write realized_pnl via update_pnl; the IB path
+        writes ib_realized_pnl. They must not interact."""
+        repo = TradeRepository(session_factory)
+        trade = repo.create(TradeGroup(
+            serial_number=67, symbol="GLD", direction="LONG",
+            status=TradeStatus.OPEN, opened_at=_now(),
+        ))
+        repo.update_pnl(trade.id, Decimal("100.00"), Decimal("1.50"))
+        repo.add_ib_realized_pnl(trade.id, Decimal("99.50"))
+        fetched = repo.get_by_serial(67)
+        assert fetched.realized_pnl == Decimal("100.00")
+        assert fetched.ib_realized_pnl == Decimal("99.50")
+
     def test_next_serial_number_starts_at_0(self, session_factory):
         repo = TradeRepository(session_factory)
         assert repo.next_serial_number() == 0
