@@ -90,6 +90,32 @@ class TestParseBuySell:
         assert isinstance(cmd, BuyCommand)
         assert cmd.limit_price is None
 
+    def test_sell_limit_with_dollar_prefix(self):
+        # Repro: user typed `sell psq 1000 limit $28.45`.  The `$` must be
+        # stripped so the price parses as Decimal('28.45').  See GH bug.
+        cmd = parse_buy_sell(["sell", "PSQ", "1000", "limit", "$28.45"])
+        assert isinstance(cmd, SellCommand)
+        assert cmd.strategy == "limit"
+        assert cmd.limit_price == Decimal("28.45")
+        assert cmd.qty == Decimal("1000")
+
+    def test_sell_limit_without_dollar_prefix(self):
+        cmd = parse_buy_sell(["sell", "PSQ", "1000", "limit", "28.45"])
+        assert isinstance(cmd, SellCommand)
+        assert cmd.limit_price == Decimal("28.45")
+
+    def test_buy_limit_with_dollar_prefix(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit", "$400.00"])
+        assert isinstance(cmd, BuyCommand)
+        assert cmd.limit_price == Decimal("400.00")
+
+    def test_dollar_prefix_on_take_profit_price(self):
+        cmd = parse_buy_sell(
+            ["buy", "MSFT", "10", "mid", "--take-profit-price", "$420.00"]
+        )
+        assert isinstance(cmd, BuyCommand)
+        assert cmd.take_profit_price == Decimal("420.00")
+
     def test_invalid_qty_returns_none(self, capsys):
         cmd = parse_buy_sell(["buy", "MSFT", "abc", "mid"])
         assert cmd is None
@@ -149,6 +175,11 @@ class TestParseClose:
     def test_close_non_limit_has_no_limit_price(self):
         cmd = parse_close(["close", "4", "mid"])
         assert cmd.limit_price is None
+
+    def test_close_limit_with_dollar_prefix(self):
+        cmd = parse_close(["close", "4", "limit", "$450.00"])
+        assert isinstance(cmd, CloseCommand)
+        assert cmd.limit_price == Decimal("450.00")
 
     def test_invalid_serial(self, capsys):
         cmd = parse_close(["close", "abc"])

@@ -6,6 +6,12 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-04-23
 
 ### Fixed
+- **REPL parser rejected `$`-prefixed limit prices.** `_parse_decimal`
+  fed raw tokens to `Decimal()` so `sell PSQ 1000 limit $28.45` raised
+  `InvalidOperation` and surfaced as "limit strategy requires a price".
+  Fixed at the chokepoint — covers every monetary field across buy /
+  sell / close / take-profit / stop-loss / dollars. Five new tests in
+  `tests/unit/test_commands.py`.
 - **Phantom `ORDER_TERMINAL_TIMEOUT` alerts from IB-redelivered
   foreign orders.** On engine restart, IB re-delivers
   currently-live open orders the account has on the books —

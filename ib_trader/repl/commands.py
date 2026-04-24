@@ -98,9 +98,17 @@ def _emit_error(message: str, router: "OutputRouter | None") -> None:
 
 
 def _parse_decimal(value: str, name: str) -> Decimal:
-    """Parse a string as Decimal, raising ValueError on failure."""
+    """Parse a user-typed string as Decimal, raising ValueError on failure.
+
+    Accepts an optional leading ``$`` so REPL users can type prices as
+    ``$28.45`` or ``28.45`` interchangeably.  Currency is implicit (USD); we
+    do not infer locale.  Comma thousands-separators are not accepted — IB
+    quotes are dot-decimal and we keep input unambiguous.
+    """
+    raw = value.strip()
+    stripped = raw[1:] if raw.startswith("$") else raw
     try:
-        return Decimal(value)
+        return Decimal(stripped)
     except InvalidOperation as e:
         raise ValueError(f"'{name}' must be a number, got: {value!r}") from e
 
