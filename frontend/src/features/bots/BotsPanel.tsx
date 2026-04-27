@@ -10,6 +10,7 @@ interface BotPositionState {
   entry_price?: string;
   trade_serial?: number;
   qty?: string;
+  filled_qty?: string;
   last_price?: string;
   high_water_mark?: string;
   current_stop?: string;
@@ -209,7 +210,14 @@ function SharesCell({ botId, symbol, botRef, maxShares, maxPositionValue }: {
 
   useEffect(() => {
     const apply = (s: BotPositionState) => {
-      const n = s.qty ? parseFloat(s.qty) : 0;
+      const stratQty = s.qty ? parseFloat(s.qty) : 0;
+      const filled = s.filled_qty ? parseFloat(s.filled_qty) : 0;
+      // Prefer the broker-confirmed fill (``filled_qty``) over the
+      // strategy's tracked ``qty`` — the latter can drift if the
+      // strategy doesn't update on every fill, but ``filled_qty``
+      // mirrors what IB reported. Falls back to ``qty`` when the
+      // bot hasn't yet received a fill in this cycle.
+      const n = filled > 0 ? filled : stratQty;
       const pos = s.position_state || s.state || 'FLAT';
       setQty(pos === 'FLAT' || pos === 'OFF' ? 0 : n);
       const lp = s.last_price ? parseFloat(s.last_price) : 0;
