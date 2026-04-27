@@ -1,0 +1,12 @@
+id: d422efd7-f3b5-422a-bdbe-4443a3c5c6c2
+name: "Close Trend RSI — META"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+config:
+  strategy_name: close_trend_rsi
+  strategy_config: config/strategies/close_trend_meta.yaml
+  symbol: META
+symbols:
+- META
