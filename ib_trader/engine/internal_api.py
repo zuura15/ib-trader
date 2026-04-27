@@ -322,6 +322,29 @@ async def get_positions():
     return _ctx.positions_cache
 
 
+@app.get("/engine/positions/refresh")
+async def refresh_position(symbol: str):
+    """Force-refresh IB positions via reqPositionsAsync, then read the
+    cache for the given symbol.
+
+    Differs from ``/engine/positions`` (which serves the cached push
+    state without forcing a refresh). Used by bots as a tiebreaker when
+    a positionEvent push disagrees with their own state — the pull goes
+    against IB's authoritative position book, so the partial-fill race
+    that drove GH #85 cannot be in flight inside the response.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    try:
+        await asyncio.wait_for(_ctx.ib.reqPositionsAsync(), timeout=10)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(status_code=504, detail="reqPositions timed out") from e
+    for p in _ctx.positions_cache:
+        if p.get("symbol") == symbol:
+            return {"symbol": symbol, "qty": p.get("quantity", "0")}
+    return {"symbol": symbol, "qty": "0"}
+
+
 @app.get("/engine/health", response_model=HealthResponse)
 async def health():
     """Engine health check."""

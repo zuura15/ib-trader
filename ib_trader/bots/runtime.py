@@ -116,6 +116,10 @@ class StrategyBotRunner(BotBase):
         # on the Redis doc so concurrent HTTP handlers + stream handlers
         # never lose updates.
         self._state_lock = asyncio.Lock()
+        # Serializes positionEvent reconciliation so concurrent
+        # positionEvents on the same bot don't issue overlapping pulls.
+        # See ``_apply_position_event`` (GH #85).
+        self._position_event_lock = asyncio.Lock()
         # Sentinel used in ``awaiting_ib_order_id`` between the moment
         # on_place_order flips the state and the moment the engine HTTP
         # call returns with a real id.
@@ -320,66 +324,183 @@ class StrategyBotRunner(BotBase):
             self.bot_id, symbol, new_state, reason,
         )
 
+    async def _verify_position_via_pull(self, symbol: str) -> Decimal | None:
+        """Force-refresh IB positions via reqPositionsAsync and return the
+        current snapshot for ``symbol``.
+
+        Used as the tiebreaker when a positionEvent push disagrees with
+        the bot's tracked state (GH #85). The push stream is eventually
+        consistent — a positionEvent dispatched moments after a multi-
+        venue fill can carry an intermediate snapshot. The pull goes
+        against IB's authoritative position book, so its response is
+        synchronous-on-IB's-side current.
+
+        Returns ``None`` on failure (engine unreachable, IB disconnected,
+        timeout). Callers MUST treat ``None`` as "do not reconcile" — the
+        next positionEvent will retry.
+        """
+        engine_url = self.config.get("_engine_url")
+        if not engine_url:
+            return None
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                resp = await c.get(
+                    f"{engine_url}/engine/positions/refresh",
+                    params={"symbol": symbol},
+                )
+                resp.raise_for_status()
+                return abs(Decimal(str(resp.json().get("qty", "0"))))
+        except Exception:
+            logger.exception(
+                '{"event": "POSITION_VERIFY_FAILED", "bot_id": "%s", '
+                '"symbol": "%s"}',
+                self.bot_id, symbol,
+            )
+            return None
+
     async def _apply_position_event(self, *, bot_ref: str, symbol: str,
                                      ib_qty: Decimal, ib_avg_price: Decimal) -> None:
         """Apply the manual-close reconciliation rule on a positionEvent.
 
         Discipline contract: bot has exclusive control of a symbol while
         active. If IB's aggregate qty drops below what the bot tracks,
-        the user manually closed part/all of the position. Update our
-        state to match IB and log a MANUAL_CLOSE event.
+        EITHER the user manually closed part/all of the position OR the
+        positionEvent feed is delivering a stale snapshot from an
+        in-flight fill (GH #85: order-stream and position-stream race).
+
+        We resolve the ambiguity by issuing a fresh ``reqPositionsAsync``
+        — a *pull* against IB's authoritative position book. If the pull
+        confirms the reduction, it's a real manual close. If the pull
+        agrees with our tracked state, the push was stale and we leave
+        state alone. If the pull reports a higher position than tracked,
+        something genuinely unexpected has happened and we park ERRORED
+        rather than guessing.
+
+        A per-symbol lock prevents two positionEvents from queuing
+        concurrent verifies.
         """
-        redis = self.config.get("_redis")
-        from ib_trader.redis.state import StateStore
-        store = StateStore(redis)
-        key = f"bot:{self.bot_id}"
-        existing = await store.get(key) or {}
-        cur_state = existing.get("state", BotState.OFF.value)
-        if cur_state in (BotState.OFF.value, BotState.ERRORED.value,
-                         BotState.AWAITING_ENTRY_TRIGGER.value):
-            # No tracked position — nothing to reconcile.
-            return
+        async with self._position_event_lock:
+            redis = self.config.get("_redis")
+            from ib_trader.redis.state import StateStore
+            store = StateStore(redis)
+            key = f"bot:{self.bot_id}"
+            existing = await store.get(key) or {}
+            cur_state = existing.get("state", BotState.OFF.value)
+            if cur_state in (BotState.OFF.value, BotState.ERRORED.value,
+                             BotState.AWAITING_ENTRY_TRIGGER.value):
+                # No tracked position — nothing to reconcile.
+                return
 
-        expected = Decimal(existing.get("qty", "0"))
-        actual = abs(ib_qty)   # bot tracks absolute qty; long/short is implicit
+            expected = Decimal(existing.get("qty", "0"))
+            actual = abs(ib_qty)   # bot tracks absolute qty; long/short is implicit
 
-        if actual >= expected:
-            # IB has at least as much as we expect — no manual reduction.
-            # (actual > expected means manual add; bot doesn't claim those.)
-            return
+            if actual >= expected:
+                # IB has at least as much as we expect — no apparent
+                # reduction. (actual > expected means manual add; bot
+                # doesn't claim those.)
+                return
 
-        reduction = expected - actual
-        now_iso = datetime.now(timezone.utc).isoformat()
-        existing["qty"] = str(actual)
-        existing["updated_at"] = now_iso
-        await store.set(key, existing)
+            # Push says position dropped. Don't trust the push — verify
+            # against IB's authoritative book via reqPositions.
+            verified = await self._verify_position_via_pull(symbol)
+            if verified is None:
+                # Pull failed (engine unreachable, IB disconnected,
+                # timeout). Fail closed: leave state unchanged. The next
+                # positionEvent will re-trigger this code path.
+                logger.warning(
+                    '{"event": "BOT_POSITION_VERIFY_UNAVAILABLE", '
+                    '"bot_id": "%s", "symbol": "%s", "push_qty": "%s", '
+                    '"expected": "%s"}',
+                    self.bot_id, symbol, actual, expected,
+                )
+                return
 
-        # If actual==0, the user closed the position manually at TWS.
-        # Transition back to AWAITING_ENTRY_TRIGGER via the bot's own
-        # on_manual_close method.
-        if actual == 0:
+            if verified == expected:
+                # Push was stale. State is correct. Log it for
+                # observability — frequency of this event tells us how
+                # often the push/pull race fires in production.
+                logger.info(
+                    '{"event": "BOT_POSITION_PUSH_STALE_DETECTED", '
+                    '"bot_id": "%s", "symbol": "%s", "push_qty": "%s", '
+                    '"verified_qty": "%s"}',
+                    self.bot_id, symbol, actual, verified,
+                )
+                return
+
+            if verified < expected:
+                # Pull confirms the reduction. Real manual close.
+                reduction = expected - verified
+                now_iso = datetime.now(timezone.utc).isoformat()
+                existing["qty"] = str(verified)
+                existing["updated_at"] = now_iso
+                await store.set(key, existing)
+
+                if verified == 0:
+                    try:
+                        await self.on_manual_close(
+                            message=f"IB qty dropped to 0 (bot had {expected})",
+                            payload={"reduction": str(reduction)},
+                        )
+                    except Exception:
+                        logger.exception(
+                            '{"event": "MANUAL_CLOSE_HANDLER_FAILED", '
+                            '"bot_id": "%s"}',
+                            self.bot_id,
+                        )
+
+                self.log_event(
+                    "MANUAL_CLOSE",
+                    message=f"User manually reduced {symbol} by {reduction} "
+                            f"(bot had {expected}, IB has {verified})",
+                    payload={
+                        "expected_qty": str(expected),
+                        "actual_qty": str(verified),
+                        "reduction": str(reduction),
+                        "full_close": verified == 0,
+                    },
+                )
+                return
+
+            # verified > expected — IB has *more* than we tracked, in
+            # the opposite direction of a manual close. Either someone
+            # manually bought outside the bot, or our state is missing
+            # a fill we should have seen. Don't guess — escalate to
+            # ERRORED for human review.
             try:
-                await self.on_manual_close(
-                    message=f"IB qty dropped to 0 (bot had {expected})",
-                    payload={"reduction": str(reduction)},
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=redis,
+                    trigger="BOT_POSITION_UNEXPECTED_INCREASE",
+                    severity="CATASTROPHIC",
+                    bot_id=self.bot_id,
+                    symbol=symbol,
+                    message=(
+                        f"Bot {self.bot_id} {symbol}: tracked={expected} "
+                        f"but IB has {verified}. Parking in ERRORED for "
+                        f"manual review."
+                    ),
+                    extra={"expected": str(expected),
+                           "verified": str(verified)},
+                    exc_info=False,
                 )
             except Exception:
                 logger.exception(
-                    '{"event": "MANUAL_CLOSE_HANDLER_FAILED", "bot_id": "%s"}',
-                    self.bot_id,
+                    '{"event": "BOT_POSITION_UNEXPECTED_INCREASE_ALERT_FAILED", '
+                    '"bot_id": "%s"}', self.bot_id,
                 )
-
-        self.log_event(
-            "MANUAL_CLOSE",
-            message=f"User manually reduced {symbol} by {reduction} "
-                    f"(bot had {expected}, IB has {actual})",
-            payload={
-                "expected_qty": str(expected),
-                "actual_qty": str(actual),
-                "reduction": str(reduction),
-                "full_close": actual == 0,
-            },
-        )
+            try:
+                await self.on_ib_position_mismatch(
+                    message=(
+                        f"IB qty {verified} > tracked {expected} for "
+                        f"{symbol}; manual review required"
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    '{"event": "BOT_POSITION_MISMATCH_HANDLER_FAILED", '
+                    '"bot_id": "%s"}', self.bot_id,
+                )
 
     async def _load_state_from_redis(self, redis, bot_ref: str, symbol: str) -> dict | None:
         """Load strategy state from Redis key.
@@ -932,8 +1053,22 @@ class StrategyBotRunner(BotBase):
             new_position_qty = max(position_qty - qty, Decimal("0"))
             residual_on_order = max(order_qty - qty, Decimal("0"))
 
-            # Fully flat — record the closed trade and return to awaiting
-            # entry.
+            # Fully flat — record the closed trade and stop the bot.
+            #
+            # Stop-on-exit policy (GH #85): after a successful round-
+            # trip we transition to OFF and signal the loop to exit. The
+            # operator manually restarts the bot via the UI before the
+            # next entry. This avoids the "bot fires another 140
+            # immediately after a 100-share stop-out" pattern observed
+            # when a positionEvent race corrupts qty mid-cycle, and
+            # gives an unattended operator a safe pause to review.
+            #
+            # FUTURE — see GH #86: replace the stop with a 2-minute
+            # cooldown timer. The bot will transition to a new
+            # COOLDOWN state on exit, set a wakeup timestamp, and auto-
+            # re-arm to AWAITING_ENTRY_TRIGGER after ``cooldown_seconds``
+            # (default 120). That removes the manual-restart friction
+            # once we have confidence in the drift fix.
             if new_position_qty == 0:
                 entry_price = Decimal(str(doc.get("entry_price") or "0"))
                 realized_pnl = (
@@ -966,8 +1101,12 @@ class StrategyBotRunner(BotBase):
                     "trail_reset_count": 0,  # Reset for next trade
                 }
                 await self._apply_transition(
-                    doc, BotState.AWAITING_ENTRY_TRIGGER, patch, "on_exit_filled",
+                    doc, BotState.OFF, patch, "on_exit_filled_stop_on_exit",
                 )
+                # Signal run_event_loop to exit on its next iteration so
+                # the runner task supervisor clears bot_instances; the
+                # operator's next /start spawns a fresh task cleanly.
+                self.request_stop()
                 notify_kind = "filled"
                 retry_args = None
                 escalated = False
@@ -1707,6 +1846,26 @@ class StrategyBotRunner(BotBase):
         )
 
         while True:
+            if self._stop_requested:
+                # Self-stop signalled (e.g., by stop-on-exit policy in
+                # ``on_exit_filled`` per GH #85). Run teardown
+                # (strategy.on_stop + unsubscribe bars) so we don't leak
+                # bar subscriptions, then exit. The runner's task
+                # supervisor (runner.py) clears bot_instances on done()
+                # so a subsequent user-initiated /start spawns a fresh
+                # task without an "already running" false positive.
+                logger.info(
+                    '{"event": "BOT_LOOP_EXIT_SELF_REQUEST", '
+                    '"bot_id": "%s"}', self.bot_id,
+                )
+                try:
+                    await self.on_teardown()
+                except Exception:
+                    logger.exception(
+                        '{"event": "BOT_TEARDOWN_FAILED", "bot_id": "%s"}',
+                        self.bot_id,
+                    )
+                break
             try:
                 # 5s timeout = liveness floor. If Redis returns nothing for 5s,
                 # we still loop (no work to do, just wait for next event).
