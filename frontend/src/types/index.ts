@@ -110,6 +110,8 @@ export interface Bot {
   symbols: string[];
   refId?: string;
   uptime: number;
+  maxShares?: number;
+  maxPositionValue?: number;
 }
 
 export interface TradeGroup {

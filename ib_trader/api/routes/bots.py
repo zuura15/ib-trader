@@ -46,6 +46,8 @@ def _serialize_bot(b, fsm_doc: dict | None = None,
     live state.
     """
     ref_id = None
+    max_shares = None
+    max_position_value = None
     try:
         cfg = json.loads(b.config_json) if b.config_json else {}
         strategy_config_path = cfg.get("strategy_config")
@@ -54,8 +56,10 @@ def _serialize_bot(b, fsm_doc: dict | None = None,
             with open(strategy_config_path) as f:
                 strat = yaml.safe_load(f)
                 ref_id = strat.get("ref_id")
+                max_shares = strat.get("max_shares")
+                max_position_value = strat.get("max_position_value")
     except Exception as e:
-        logger.debug("failed to load strategy ref_id", exc_info=e)
+        logger.debug("failed to load strategy config", exc_info=e)
 
     fsm_doc = fsm_doc or {"state": BotState.OFF.value}
     state = fsm_doc.get("state", BotState.OFF.value)
@@ -87,6 +91,8 @@ def _serialize_bot(b, fsm_doc: dict | None = None,
         "pnl_today": str(pnl_today),
         "symbols_json": b.symbols_json,
         "ref_id": ref_id,
+        "max_shares": max_shares,
+        "max_position_value": str(max_position_value) if max_position_value is not None else None,
         # Position snapshot for the UI's PositionLine — only populated
         # when the bot actually has a position.
         "position": {
@@ -117,6 +123,22 @@ def _serialize_bot_from_defn(
     last_heartbeat = (heartbeat or {}).get("ts")
 
     ref_id = defn.config.get("ref_id") or defn.name
+    max_shares = None
+    max_position_value = None
+    strategy_config_path = defn.config.get("strategy_config")
+    if strategy_config_path:
+        try:
+            import yaml
+            with open(strategy_config_path) as f:
+                strat = yaml.safe_load(f) or {}
+                # Defn's ref_id falls back to the strategy yaml's ref_id when
+                # the bot yaml didn't set one explicitly.
+                if not defn.config.get("ref_id"):
+                    ref_id = strat.get("ref_id") or ref_id
+                max_shares = strat.get("max_shares")
+                max_position_value = strat.get("max_position_value")
+        except Exception as e:
+            logger.debug("failed to load strategy config", exc_info=e)
 
     return {
         "id": defn.id,
@@ -137,6 +159,8 @@ def _serialize_bot_from_defn(
         "pnl_today": "0",
         "symbols_json": json.dumps(list(defn.symbols)) if defn.symbols else "[]",
         "ref_id": ref_id,
+        "max_shares": max_shares,
+        "max_position_value": str(max_position_value) if max_position_value is not None else None,
         "position": {
             "qty": fsm_doc.get("qty") or "0",
             "entry_price": fsm_doc.get("entry_price"),

@@ -46,6 +46,8 @@ function mapApiBot(b: any): Bot {
     symbols: b.symbols_json ? JSON.parse(b.symbols_json) : [],
     refId: b.ref_id,
     uptime: 0,
+    maxShares: b.max_shares != null ? Number(b.max_shares) : undefined,
+    maxPositionValue: b.max_position_value != null ? Number(b.max_position_value) : undefined,
   };
 }
 
@@ -183,22 +185,35 @@ function ForceSellButton({ botId, symbol, botRef, compact = false }: {
   );
 }
 
+function formatDollars(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 10_000) return `$${Math.round(n / 1_000)}K`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(0)}`;
+}
+
 /**
- * Renders the current # of shares held by the bot. Mirrors
- * ForceSellButton's subscription pattern — initial fetch from
- * /api/bots/{id}/state, then a WebSocket subscription so the
- * cell updates on every fill without polling.
+ * Renders shares held + dollar value for the bot. When the bot has a
+ * live position the cell shows actual qty × last_price; when flat (or
+ * stopped) it shows the configured ``max_shares`` and
+ * ``max_position_value`` from the strategy yaml so the operator can see
+ * the bot's intent at a glance without starting it.
  */
-function SharesCell({ botId, symbol, botRef }: {
+function SharesCell({ botId, symbol, botRef, maxShares, maxPositionValue }: {
   botId: string; symbol: string; botRef?: string;
+  maxShares?: number; maxPositionValue?: number;
 }) {
   const [qty, setQty] = useState<number>(0);
+  const [lastPrice, setLastPrice] = useState<number>(0);
 
   useEffect(() => {
     const apply = (s: BotPositionState) => {
       const n = s.qty ? parseFloat(s.qty) : 0;
       const pos = s.position_state || s.state || 'FLAT';
       setQty(pos === 'FLAT' || pos === 'OFF' ? 0 : n);
+      const lp = s.last_price ? parseFloat(s.last_price) : 0;
+      if (lp > 0) setLastPrice(lp);
     };
 
     fetch(`/api/bots/${botId}/state`)
@@ -222,13 +237,32 @@ function SharesCell({ botId, symbol, botRef }: {
     return () => ws.close();
   }, [botId, symbol, botRef]);
 
+  const live = qty > 0;
+  const shownShares = live ? qty : (maxShares ?? 0);
+  const shownValue = live
+    ? (lastPrice > 0 ? qty * lastPrice : 0)
+    : (maxPositionValue ?? 0);
+
+  if (shownShares <= 0 && shownValue <= 0) {
+    return <span className="font-mono" data-testid={`bot-shares-${botId}`} data-qty={qty}>—</span>;
+  }
+
   return (
     <span
       className="font-mono"
       data-testid={`bot-shares-${botId}`}
       data-qty={qty}
+      data-live={live ? '1' : '0'}
+      title={live
+        ? `Live: ${qty} sh @ $${lastPrice.toFixed(2)}`
+        : `Configured cap: max ${maxShares ?? '—'} sh, ${maxPositionValue != null ? `$${maxPositionValue.toLocaleString()}` : '—'}`
+      }
+      style={{ color: live ? 'var(--text-primary)' : 'var(--text-muted)' }}
     >
-      {qty > 0 ? qty : '—'}
+      {live ? '' : 'max '}
+      {shownShares > 0 ? shownShares : '—'}
+      {' · '}
+      {formatDollars(shownValue)}
     </span>
   );
 }
@@ -396,7 +430,6 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
         <div className="h-full overflow-auto p-2 grid grid-cols-1 gap-2">
           {bots.map((bot) => {
             const cfg = statusConfig[bot.status];
-            const symbol = bot.symbols[0] || '—';
             return (
               <div
                 key={bot.id}
@@ -410,9 +443,14 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                 <div className="flex items-center gap-3 flex-wrap">
                 <span style={{ color: cfg.var }} className="text-sm" title={cfg.label}>{cfg.dot}</span>
                 <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>{bot.name}</span>
-                <span className="font-mono text-[13px]" style={{ color: 'var(--text-secondary)' }}>{symbol}</span>
                 {bot.symbols[0] && (
-                  <SharesCell botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                  <SharesCell
+                    botId={bot.id}
+                    symbol={bot.symbols[0]}
+                    botRef={bot.refId}
+                    maxShares={bot.maxShares}
+                    maxPositionValue={bot.maxPositionValue}
+                  />
                 )}
                 <span
                   className="font-mono text-[13px]"
@@ -517,7 +555,6 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
             <tr>
               <th></th>
               <th>Bot</th>
-              <th>Symbol</th>
               <th>Shares</th>
               <th>Heartbeat</th>
               <th></th>
@@ -526,7 +563,6 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
           <tbody>
             {bots.map((bot) => {
               const cfg = statusConfig[bot.status];
-              const symbol = bot.symbols[0] || '—';
               return (
                 <React.Fragment key={bot.id}>
                 <tr
@@ -537,10 +573,15 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                 >
                   <td style={{ color: cfg.var }} title={cfg.label}>{cfg.dot}</td>
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{bot.name}</td>
-                  <td className="font-mono" style={{ color: 'var(--text-secondary)' }}>{symbol}</td>
                   <td>
                     {bot.symbols[0] ? (
-                      <SharesCell botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
+                      <SharesCell
+                        botId={bot.id}
+                        symbol={bot.symbols[0]}
+                        botRef={bot.refId}
+                        maxShares={bot.maxShares}
+                        maxPositionValue={bot.maxPositionValue}
+                      />
                     ) : (
                       <span className="font-mono">—</span>
                     )}
@@ -621,7 +662,7 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                 </tr>
                 {bot.symbols[0] && (
                   <tr>
-                    <td colSpan={6} style={{ padding: 0 }}>
+                    <td colSpan={5} style={{ padding: 0 }}>
                       <PositionLine botId={bot.id} symbol={bot.symbols[0]} botRef={bot.refId} />
                     </td>
                   </tr>
