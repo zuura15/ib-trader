@@ -38,9 +38,23 @@ typecheck: lint-types
 # API and bots processes connect via engine's internal API and inherit mode.
 IB_MODE_FLAG := $(if $(FORCE_MODE),--force-mode $(FORCE_MODE),)
 
+# Ports owned by `make dev`. Stale binders (orphaned processes after a hard
+# kill) get reaped before we restart so 8081 doesn't EADDRINUSE on relaunch.
+DEV_PORTS := 8000 8081 8082 5173
+
 dev:
 	@echo "Starting all services (auto-detect $(if $(FORCE_MODE),forced=$(FORCE_MODE),mode))... (Ctrl+C to stop all)"
 	@mkdir -p run/redis-data logs
+	@for port in $(DEV_PORTS); do \
+		pids=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "[DEV] Port $$port in use by PID(s) $$pids — killing."; \
+			kill $$pids 2>/dev/null || true; \
+			sleep 0.3; \
+			pids=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null); \
+			if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
+		fi; \
+	done
 	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
 		echo "[DEV] Redis already running."; \
 	else \
