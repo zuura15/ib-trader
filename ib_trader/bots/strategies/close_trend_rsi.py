@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
@@ -465,7 +465,39 @@ class CloseTrendRsiStrategy:
             ])
 
         elif pos == BotState.EXIT_ORDER_PLACED and event.side == "SELL":
-            entry_price = Decimal(str(ctx.state.get("entry_price", "0")))
+            # GH #87: distinguish full close from partial-with-residual.
+            # The runtime's on_exit_filled has already adjusted state for
+            # both cases — full close sets qty="0", partial sets qty to
+            # the residual (e.g. "44"). We MUST NOT clear position fields
+            # on a partial: doing so wipes the residual the runtime just
+            # set up for retry, which leaves the bot believing it's flat
+            # while IB still holds the unsold shares.
+            cur_qty_raw = ctx.state.get("qty")
+            try:
+                cur_qty = Decimal(str(cur_qty_raw)) if cur_qty_raw not in (None, "") else Decimal("0")
+            except (ValueError, TypeError, InvalidOperation):
+                cur_qty = Decimal("0")
+            is_full_close = cur_qty == 0
+
+            if not is_full_close:
+                # Partial fill — residual remains. Runtime has already
+                # patched state.qty to the residual and queued a retry.
+                # Do NOT touch position fields.
+                actions.append(LogSignal(
+                    event_type=LogEventType.EXIT_CHECK,
+                    message=f"{event.symbol} partial sell {event.qty} @ "
+                            f"{event.fill_price}; residual {cur_qty} held",
+                    payload={"sold_qty": str(event.qty),
+                             "fill_price": str(event.fill_price),
+                             "residual_qty": str(cur_qty)},
+                    trade_serial=ctx.state.get("trade_serial"),
+                ))
+                return actions
+
+            # Full close — runtime cleared position fields. Just emit the
+            # CLOSED audit and clear strategy-scoped fields the runtime
+            # doesn't touch.
+            entry_price = Decimal(str(ctx.state.get("entry_price", "0") or "0"))
             pnl = (event.fill_price - entry_price) * event.qty if entry_price > 0 else Decimal("0")
 
             actions.extend([
@@ -475,10 +507,7 @@ class CloseTrendRsiStrategy:
                     trade_serial=ctx.state.get("trade_serial"),
                 ),
                 UpdateState({
-                    "trade_serial": None, "entry_price": None,
-                    "entry_time": None, "high_water_mark": None,
-                    "current_stop": None, "trail_activated": False,
-                    "qty": None,
+                    "trade_serial": None,
                 }),
             ])
 

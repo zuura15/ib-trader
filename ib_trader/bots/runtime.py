@@ -205,7 +205,12 @@ class StrategyBotRunner(BotBase):
         — fills always apply to the current position.
         """
         await self._refresh_state()
-        existing_qty = Decimal(str(self.ctx.state.get("qty", "0")))
+        # GH #87: a previous version computed ``existing_qty`` here
+        # eagerly. The value was unused (the SELL branch reads from
+        # ``fresh_doc`` and the BUY branch ignores prior qty) AND
+        # crashed with ``decimal.InvalidOperation`` when ``state["qty"]``
+        # was the literal string ``"None"`` after a strategy bug
+        # cleared qty to Python ``None``. Removed.
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if side == "B":

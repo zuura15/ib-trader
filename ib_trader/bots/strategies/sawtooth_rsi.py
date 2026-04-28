@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
@@ -510,9 +510,40 @@ class SawtoothRsiStrategy:
             }))
 
         elif pos == BotState.EXIT_ORDER_PLACED and event.side == "SELL":
-            # Exit filled — the FSM will transition to AWAITING_ENTRY_TRIGGER
-            # on EXIT_FILLED; strategy clears trade-scoped state.
-            entry_price = Decimal(str(state.get("entry_price", "0")))
+            # GH #87: distinguish full close from partial-with-residual.
+            # The runtime's on_exit_filled has already adjusted state for
+            # both cases — full close sets qty="0", partial sets qty to
+            # the residual (e.g. "44"). We MUST NOT clear position fields
+            # on a partial: doing so wipes the residual the runtime just
+            # set up for retry, which leaves the bot believing it's flat
+            # while IB still holds the unsold shares.
+            cur_qty_raw = state.get("qty")
+            try:
+                cur_qty = Decimal(str(cur_qty_raw)) if cur_qty_raw not in (None, "") else Decimal("0")
+            except (ValueError, TypeError, InvalidOperation):
+                cur_qty = Decimal("0")
+            is_full_close = cur_qty == 0
+
+            if not is_full_close:
+                # Partial fill — residual remains. Runtime has already
+                # patched state.qty to the residual and queued a retry.
+                # Do NOT touch position fields here; the next exit fill
+                # (whether the retry's terminal or a manual close) will
+                # land here again with cur_qty == 0.
+                actions.append(LogSignal(
+                    event_type=LogEventType.EXIT_CHECK,
+                    message=f"{event.symbol} partial sell {event.qty} @ "
+                            f"{event.fill_price}; residual {cur_qty} held",
+                    payload={"sold_qty": str(event.qty),
+                             "fill_price": str(event.fill_price),
+                             "residual_qty": str(cur_qty)},
+                    trade_serial=state.get("trade_serial"),
+                ))
+                return actions
+
+            # Full close — emit the CLOSED audit. Position fields were
+            # already cleared by the runtime via clear_position_fields().
+            entry_price = Decimal(str(state.get("entry_price", "0") or "0"))
             pnl = (event.fill_price - entry_price) * event.qty
             entry_time_str = state.get("entry_time")
             held_seconds: float = 0.0
@@ -532,16 +563,14 @@ class SawtoothRsiStrategy:
                 trade_serial=state.get("trade_serial"),
             ))
 
+            # Clear strategy-scoped fields that aren't already wiped by
+            # the runtime's clear_position_fields (trade_serial,
+            # *_command_id). Position fields (qty, entry_price, etc.)
+            # are NOT touched — runtime owns those.
             actions.append(UpdateState({
                 "trade_serial": None,
-                "entry_price": None,
-                "entry_time": None,
-                "high_water_mark": None,
-                "current_stop": None,
-                "trail_activated": False,
                 "entry_command_id": None,
                 "exit_command_id": None,
-                "qty": None,
             }))
 
         return actions
