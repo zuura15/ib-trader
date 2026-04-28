@@ -30,7 +30,7 @@ exit:
   trail_activation_pct: 0.0005    # +0.05% gain before trail activates
   trail_width_pct: 0.0015         # 0.15% below high-water mark
   time_stop_minutes: 108          # keyed from fill timestamp
-  entry_timeout_seconds: 30       # cancel unfilled entry after this
+  entry_timeout_seconds: 120       # cancel unfilled entry after 2 minutes (covers after-hours fill latency on smart_market walker)
   exit_price: bid                 # which quote field triggers stops
 
 # Session filters

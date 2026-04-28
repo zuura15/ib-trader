@@ -112,6 +112,10 @@ export interface Bot {
   uptime: number;
   maxShares?: number;
   maxPositionValue?: number;
+  // Raw FSM state (OFF / AWAITING_ENTRY_TRIGGER / ENTRY_ORDER_PLACED /
+  // AWAITING_EXIT_TRIGGER / EXIT_ORDER_PLACED / ERRORED). ``status``
+  // above is the legacy 4-value UI alias derived from this.
+  state?: string;
 }
 
 export interface TradeGroup {

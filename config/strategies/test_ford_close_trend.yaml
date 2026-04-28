@@ -34,7 +34,7 @@ exit:
   trail_activation_pct: 0.00005  # arm trail on any uptick
   trail_width_pct: 0.0005        # stop at 0.05 % below high-water mark
   time_stop_minutes: 60
-  entry_timeout_seconds: 30
+  entry_timeout_seconds: 120
   exit_price: bid
 
 # Session filter — disabled so the bot runs during pre-market / after-hours.

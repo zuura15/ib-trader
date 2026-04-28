@@ -108,6 +108,51 @@ const statusConfig: Record<BotStatus, { var: string; label: string; dot: string 
   paused: { var: 'var(--accent-yellow)', label: 'PAUSED', dot: '◑' },
 };
 
+/**
+ * Renders an amber "⏳ filling Ns" chip while the bot is in
+ * ENTRY_ORDER_PLACED. Reads ``entry_time`` from the bot's Redis state
+ * doc via the existing _useBotWS subscription and ticks elapsed
+ * seconds every second. Hides itself outside ENTRY_ORDER_PLACED.
+ */
+function FillingChip({ symbol, botRef, botState }: {
+  symbol: string; botRef?: string; botState?: string;
+}) {
+  const [entryTime, setEntryTime] = useState<string | null>(null);
+  const [tick, setTick] = useState<number>(Date.now());
+
+  _useBotWS(symbol, botRef, {
+    onBotState: (s) => {
+      const t = s.entry_time;
+      setEntryTime(typeof t === 'string' && t ? t : null);
+    },
+    subscribeBot: true,
+  });
+
+  useEffect(() => {
+    if (botState !== 'ENTRY_ORDER_PLACED') return;
+    const id = setInterval(() => setTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [botState]);
+
+  if (botState !== 'ENTRY_ORDER_PLACED' || !entryTime) return null;
+  const elapsedMs = tick - new Date(entryTime).getTime();
+  const elapsed = Math.max(0, Math.floor(elapsedMs / 1000));
+  return (
+    <span
+      className="text-[12px] px-2 py-0.5 rounded font-semibold ml-1"
+      style={{
+        background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
+        color: 'var(--accent-yellow)',
+        border: '1px solid var(--accent-yellow)',
+      }}
+      title="Order in flight — waiting for fill or timeout"
+      data-testid={`bot-filling-${botRef ?? ''}`}
+    >
+      ⏳ filling {elapsed}s
+    </span>
+  );
+}
+
 function mapApiBot(b: any): Bot {
   return {
     id: b.id,
@@ -127,6 +172,7 @@ function mapApiBot(b: any): Bot {
     uptime: 0,
     maxShares: b.max_shares != null ? Number(b.max_shares) : undefined,
     maxPositionValue: b.max_position_value != null ? Number(b.max_position_value) : undefined,
+    state: b.state,
   };
 }
 
@@ -503,6 +549,13 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     maxPositionValue={bot.maxPositionValue}
                   />
                 )}
+                {bot.symbols[0] && (
+                  <FillingChip
+                    symbol={bot.symbols[0]}
+                    botRef={bot.refId}
+                    botState={bot.state}
+                  />
+                )}
                 <span
                   className="font-mono text-[13px]"
                   style={{ color: bot.status === 'error' ? 'var(--accent-red)' : 'var(--text-muted)' }}
@@ -528,13 +581,18 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   </button>
                   {bot.status === 'running' && (
                     <button
-                      onClick={() => forceBuy(bot.id)}
+                      onClick={() => bot.state !== 'ENTRY_ORDER_PLACED' && forceBuy(bot.id)}
+                      disabled={bot.state === 'ENTRY_ORDER_PLACED'}
+                      title={bot.state === 'ENTRY_ORDER_PLACED'
+                        ? 'Order in flight — wait for fill or timeout'
+                        : 'Force a BUY at the configured size, bypassing entry conditions'}
                       className="text-[13px] px-2 py-0.5 rounded font-semibold"
                       style={{
                         background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
                         color: 'var(--accent-yellow)',
                         border: '1px solid var(--accent-yellow)',
-                        cursor: 'pointer',
+                        cursor: bot.state === 'ENTRY_ORDER_PLACED' ? 'not-allowed' : 'pointer',
+                        opacity: bot.state === 'ENTRY_ORDER_PLACED' ? 0.5 : 1,
                       }}
                       data-testid={`bot-force-buy-${bot.id}`}
                     >
@@ -623,7 +681,16 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                   data-bot-status={bot.status}
                 >
                   <td style={{ color: cfg.var }} title={cfg.label}>{cfg.dot}</td>
-                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{bot.name}</td>
+                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                    {bot.name}
+                    {bot.symbols[0] && (
+                      <FillingChip
+                        symbol={bot.symbols[0]}
+                        botRef={bot.refId}
+                        botState={bot.state}
+                      />
+                    )}
+                  </td>
                   <td>
                     {bot.symbols[0] ? (
                       <SharesCell
@@ -658,13 +725,18 @@ export function BotsPanel({ large = false }: { large?: boolean }) {
                     </button>
                     {bot.status === 'running' && (
                       <button
-                        onClick={() => forceBuy(bot.id)}
+                        onClick={() => bot.state !== 'ENTRY_ORDER_PLACED' && forceBuy(bot.id)}
+                        disabled={bot.state === 'ENTRY_ORDER_PLACED'}
+                        title={bot.state === 'ENTRY_ORDER_PLACED'
+                          ? 'Order in flight — wait for fill or timeout'
+                          : 'Force a BUY at the configured size'}
                         className="text-[13px] px-2 py-0.5 rounded font-semibold ml-1"
                         style={{
                           background: 'var(--badge-yellow-bg, rgba(234,179,8,0.1))',
                           color: 'var(--accent-yellow)',
                           border: '1px solid var(--accent-yellow)',
-                          cursor: 'pointer',
+                          cursor: bot.state === 'ENTRY_ORDER_PLACED' ? 'not-allowed' : 'pointer',
+                          opacity: bot.state === 'ENTRY_ORDER_PLACED' ? 0.5 : 1,
                         }}
                         data-testid={`bot-force-buy-${bot.id}`}
                       >
