@@ -343,8 +343,11 @@ class SawtoothRsiStrategy:
             return []
 
         exit_cfg = self.config.get("exit", {})
-        price_field = exit_cfg.get("exit_price", QuoteField.BID.value)
-        current_price = getattr(event, price_field, event.bid)
+        # Default to MID for stop/trail comparisons. BID alone trips on
+        # spread widening even when the market hasn't moved — see
+        # close_trend_rsi.py for full reasoning.
+        price_field = exit_cfg.get("exit_price", QuoteField.MID.value)
+        current_price = getattr(event, price_field, event.mid)
 
         if current_price <= 0:
             return []
@@ -362,7 +365,8 @@ class SawtoothRsiStrategy:
         if current_price <= hard_sl_price:
             return actions + self.build_exit_actions(
                 ctx, ExitType.HARD_STOP_LOSS,
-                f"bid={current_price} <= hard_sl={hard_sl_price} (pnl={float(pnl_pct):.4%})",
+                f"{price_field}={current_price} <= hard_sl={hard_sl_price} "
+                f"(bid={event.bid} ask={event.ask} pnl={float(pnl_pct):.4%})",
             )
 
         # Time stop — opt-in per strategy config. If time_stop_minutes is

@@ -31,10 +31,16 @@ class QuoteField(str, enum.Enum):
     """Which price field on a QuoteUpdate to use for stop/trail decisions.
 
     Config key ``exit_price`` in strategies/*.yaml selects one of these.
+    ``MID`` is computed as ``(bid + ask) / 2`` and is the recommended
+    default for stop/trail evaluation — bid alone trips on spread
+    widening even when the market hasn't actually moved against you
+    (entry pays ask, instant bid-based stop check fires immediately
+    on a typical 0.1% threshold for any equity with a > 0.1% spread).
     """
     BID = "bid"
     ASK = "ask"
     LAST = "last"
+    MID = "mid"
 
 
 class ExitType(str, enum.Enum):
@@ -151,6 +157,20 @@ class QuoteUpdate:
     ask: Decimal
     last: Decimal
     timestamp: datetime
+
+    @property
+    def mid(self) -> Decimal:
+        """Midpoint of bid/ask. Falls back to last (then bid, then ask)
+        if either side of the book is missing — keeps the field non-None
+        for stop/trail comparisons even on illiquid quotes.
+        """
+        if self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / Decimal(2)
+        if self.last > 0:
+            return self.last
+        if self.bid > 0:
+            return self.bid
+        return self.ask
 
 
 @dataclass(frozen=True)

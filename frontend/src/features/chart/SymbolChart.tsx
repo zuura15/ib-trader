@@ -75,9 +75,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     const el = containerRef.current;
     if (!el) return;
     const colors = themeColors();
+    // autoSize=true makes lightweight-charts auto-track its container's
+    // size — important when the chart mounts inside a flex layout that
+    // hasn't measured yet (otherwise the chart inits at 0x0 and never
+    // recovers, even after the container resizes).
     const chart = createChart(el, {
-      width: el.clientWidth,
-      height: el.clientHeight,
+      autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: colors.background },
         textColor: colors.text,
@@ -148,17 +151,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (tgt) saveRange(targetKey(tgt), r);
     });
 
-    const ro = new ResizeObserver(() => {
-      if (!containerRef.current || !chartRef.current) return;
-      chartRef.current.applyOptions({
-        width: containerRef.current.clientWidth,
-        height: containerRef.current.clientHeight,
-      });
-    });
-    ro.observe(el);
-
     return () => {
-      ro.disconnect();
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -250,28 +243,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
         if (firstLoad) {
           firstLoad = false;
-          if (prevRange) {
-            chart.timeScale().setVisibleRange({
-              from: prevRange.from as UTCTimestamp,
-              to: prevRange.to as UTCTimestamp,
-            });
-          } else {
-            const total = points.length;
-            if (total > 0) {
-              // Anchor `to` at "now" (wall-clock), not the last historical
-              // bar's timestamp. IB bars often lag by a couple of minutes,
-              // and live WS ticks append at the current wall clock — so
-              // anchoring on the last bar leaves the live tail off-screen
-              // until the user pans right. `from` is "now − visibleMinutes"
-              // so the window width is honored regardless of where the
-              // bar tail lands.
-              const nowSec = localUtcSeconds(new Date());
-              chart.timeScale().setVisibleRange({
-                from: (nowSec - visibleMinutes * 60) as UTCTimestamp,
-                to: nowSec,
-              });
-            }
-          }
+          // First load anchors `to` to wall-clock "now" regardless of
+          // what's persisted. We retain the *width* of the saved zoom
+          // (so users keep their preferred lookback) but always show
+          // the live tail. Subsequent loads in the same session
+          // respect the user's panning/zooming via prevRange below.
+          const nowSec = localUtcSeconds(new Date());
+          const widthSec = prevRange
+            ? Math.max(60, prevRange.to - prevRange.from)
+            : visibleMinutes * 60;
+          chart.timeScale().setVisibleRange({
+            from: (nowSec - widthSec) as UTCTimestamp,
+            to: nowSec,
+          });
         } else if (prevRange) {
           chart.timeScale().setVisibleRange({
             from: prevRange.from as UTCTimestamp,
@@ -317,11 +301,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!chart) return;
     const saved = loadSavedRange(targetKey(target));
     const nowSec = localUtcSeconds(new Date());
-    const range = saved ?? { from: nowSec - visibleMinutes * 60, to: nowSec };
-    chart.timeScale().setVisibleRange({
-      from: range.from as UTCTimestamp,
-      to: range.to as UTCTimestamp,
-    });
+    // Always anchor the right edge to "now" on initial load. We retain
+    // the *width* of the saved zoom — i.e. how far back the user was
+    // looking — but slide the window forward so the live tail is in
+    // view. This matches user expectation: "remember zoom level,
+    // don't strand me where I left off."
+    const widthSec = saved
+      ? Math.max(60, saved.to - saved.from)
+      : visibleMinutes * 60;
+    const range = { from: nowSec - widthSec, to: nowSec };
+    try {
+      chart.timeScale().setVisibleRange({
+        from: range.from as UTCTimestamp,
+        to: range.to as UTCTimestamp,
+      });
+    } catch {
+      // setVisibleRange can throw on a chart that has no data yet in
+      // some lightweight-charts builds. The data-fetch effect re-applies
+      // the same range after series.setData() which always succeeds.
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes]);
 
