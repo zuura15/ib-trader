@@ -92,7 +92,7 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
     # the engine enters its main loop. This sets settings["ib_port"],
     # settings["ib_market_data_type"], settings["account_mode"], and
     # returns the account_id to trade under.
-    from ib_trader.engine.connect import (
+    from ib_trader.ib.gateway_probe import (
         load_candidates, probe_gateway, pick_account, pick_market_data_type,
     )
     candidates = load_candidates(settings)

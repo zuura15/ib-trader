@@ -426,9 +426,9 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
     settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
 
     # Probe the Gateway and detect paper/live before constructing the
-    # IB client. See ib_trader.engine.connect for details.
+    # IB client. See ib_trader.ib.gateway_probe for details.
     import asyncio as _asyncio
-    from ib_trader.engine.connect import (
+    from ib_trader.ib.gateway_probe import (
         load_candidates, probe_gateway, pick_account, pick_market_data_type,
     )
     candidates = load_candidates(settings)

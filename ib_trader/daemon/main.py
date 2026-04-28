@@ -313,9 +313,9 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool,
     settings["ib_client_id"] = daemon_client_id
 
     # Auto-detect mode from the Gateway before building the IB client. See
-    # ib_trader/engine/connect.py and ADR 015.
+    # ib_trader/ib/gateway_probe.py and ADR 015.
     import asyncio as _asyncio
-    from ib_trader.engine.connect import (
+    from ib_trader.ib.gateway_probe import (
         load_candidates, probe_gateway, pick_account, pick_market_data_type,
     )
     candidates = load_candidates(settings)

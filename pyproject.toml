@@ -151,7 +151,6 @@ source_modules = [
     "ib_trader.bots.runtime",
     "ib_trader.bots.middleware",
     "ib_trader.bots.base",
-    "ib_trader.bots.fsm",
     "ib_trader.bots.runner",
     "ib_trader.bots.strategies",
 ]
@@ -170,10 +169,6 @@ ignore_imports = [
     # state or IB directly.
     "ib_trader.bots.base -> ib_trader.data.repository",
     "ib_trader.bots.middleware -> ib_trader.data.repository",
-    # TODO(ib-recovery): runner crash-recovery path reads TradeRepository
-    # at startup to rehydrate open positions. Startup-only, not hot-path.
-    # Migrate to query IB positions directly per CLAUDE.md.
-    "ib_trader.bots.runner -> ib_trader.data.repository",
 ]
 
 [[tool.importlinter.contracts]]
@@ -215,6 +210,38 @@ forbidden_modules = [
     "ib_trader.ib",
     "ib_trader.logging_",
     "ib_trader.redis",
+]
+
+[[tool.importlinter.contracts]]
+name = "ib_async direct imports forbidden outside the wrapper (use ib_trader.ib.* APIs)"
+type = "forbidden"
+# The wrapper at ib_trader.ib.insync_client is the SOLE owner of ib_async.
+# All other modules must route IB calls through wrapper APIs so the
+# wrapper's defenses (verify-cancel, rate-limit, retry, etc.) are
+# universally applied. This contract catches static `import ib_async`
+# / `from ib_async import X` from anywhere else. Attribute-access
+# leaks (e.g. ctx.ib._ib.<x>) are not import statements and need a
+# separate audit.
+source_modules = [
+    "ib_trader.api",
+    "ib_trader.bots",
+    "ib_trader.broker",
+    "ib_trader.config",
+    "ib_trader.daemon",
+    "ib_trader.data",
+    "ib_trader.engine",
+    "ib_trader.logging_",
+    "ib_trader.redis",
+    "ib_trader.repl",
+]
+forbidden_modules = ["ib_async"]
+ignore_imports = [
+    # Wrapper-internal modules legitimately import ib_async — exempt
+    # these edges so transitive walks stop at the wrapper boundary
+    # instead of cascading blame to every module that uses the wrapper.
+    "ib_trader.ib.insync_client -> ib_async",
+    "ib_trader.ib.overnight_patch -> ib_async",
+    "ib_trader.ib.gateway_probe -> ib_async",
 ]
 
 [[tool.importlinter.contracts]]

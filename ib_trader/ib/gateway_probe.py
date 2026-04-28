@@ -6,10 +6,11 @@ the winning port plus the discovered account list. Callers use the account-id
 prefix (``DU*`` = paper, everything else = live) to pick the right account_id
 and market-data type from .env.
 
-This module is the ONLY place in the engine/repl entry points that performs
-IB connect attempts outside of :class:`InsyncClient`. It uses ib_async
-directly because the probe is short-lived and must not leave event handlers
-registered on the surviving client.
+Lives inside ``ib_trader.ib.*`` because it imports ib_async directly: the
+import-linter contract for ``ib_async`` access whitelists this package.
+The probe is short-lived and must not leave event handlers registered on
+the surviving client — that's why this is a sibling of ``insync_client``
+rather than a method on it.
 """
 from __future__ import annotations
 

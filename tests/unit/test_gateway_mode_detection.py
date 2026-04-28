@@ -1,6 +1,6 @@
 """Unit tests for Gateway paper/live auto-detection (ADR 015).
 
-Covers the helpers in ib_trader/engine/connect.py:
+Covers the helpers in ib_trader/ib/gateway_probe.py:
 - probe_gateway: iterates candidates, classifies from managedAccounts prefix
 - pick_account: resolves account_id from .env per detected mode
 - pick_market_data_type: resolves market data type per detected mode
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from ib_trader.engine import connect as C
+from ib_trader.ib import gateway_probe as C
 
 
 class _FakeIB:
