@@ -534,18 +534,14 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
     from decimal import Decimal
     from datetime import datetime, timezone
 
-    if not hasattr(ctx.ib, '_ib'):
-        return 0
-
-    ib_obj = ctx.ib._ib
     try:
-        await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
+        await ctx.ib.req_positions_async(timeout=10)
     except Exception:
         logger.exception('{"event": "POSITION_REFRESH_FAILED"}')
         return len(ctx.positions_cache)
 
     positions = []
-    for p in ib_obj.positions():
+    for p in ctx.ib.get_raw_positions():
         sym = p.contract.symbol
         qty = Decimal(str(p.position))
         if qty == 0:
@@ -673,9 +669,7 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         ib_async's in-memory state. Used by the order ledger at terminal
         time to reconcile against the pre-place snapshot when our tracked
         fills fall short of the order target."""
-        if not hasattr(ctx.ib, '_ib'):
-            return Decimal("0")
-        for p in ctx.ib._ib.positions():
+        for p in ctx.ib.get_raw_positions():
             if (
                 getattr(p.contract, 'symbol', None) == symbol
                 and getattr(p.contract, 'secType', 'STK') == sec_type
@@ -738,22 +732,16 @@ async def _event_relay_loop(ctx: AppContext) -> None:
 
     def _get_trade_meta(ib_order_id: str) -> tuple[str, str, str, int, str]:
         """Extract (orderRef, symbol, sec_type, con_id, side) from the active trade."""
-        order_ref = ""
-        symbol = ""
-        sec_type = "STK"
-        con_id = 0
-        side = ""
-        if hasattr(ctx.ib, '_active_trades'):
-            trade = ctx.ib._active_trades.get(ib_order_id)
-            if trade:
-                if hasattr(trade, 'order'):
-                    order_ref = getattr(trade.order, 'orderRef', "") or ""
-                    side = getattr(trade.order, 'action', "") or ""
-                if hasattr(trade, 'contract'):
-                    symbol = getattr(trade.contract, 'symbol', "") or ""
-                    sec_type = getattr(trade.contract, 'secType', "STK") or "STK"
-                    con_id = getattr(trade.contract, 'conId', 0) or 0
-        return order_ref, symbol, sec_type, con_id, side
+        meta = ctx.ib.get_trade_meta(ib_order_id)
+        if meta is None:
+            return "", "", "STK", 0, ""
+        return (
+            meta["order_ref"],
+            meta["symbol"],
+            meta["sec_type"],
+            meta["con_id"],
+            meta["side"],
+        )
 
     # --- Global fill callback ---
     async def on_fill(ib_order_id: str, qty_filled: Decimal,
@@ -772,19 +760,9 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             # mid-order and emit a second terminal event with only the
             # second fill's per-fill qty. totalQuantity is static once
             # the order is placed, so it's always correct.
-            total_qty = Decimal("-1")
-            remaining = Decimal("-1")
-            if hasattr(ctx.ib, '_active_trades'):
-                trade = ctx.ib._active_trades.get(ib_order_id)
-                if trade:
-                    if hasattr(trade, 'order'):
-                        tq = getattr(trade.order, 'totalQuantity', None)
-                        if tq is not None:
-                            total_qty = Decimal(str(tq))
-                    if hasattr(trade, 'orderStatus'):
-                        rem = getattr(trade.orderStatus, 'remaining', -1)
-                        if rem >= 0:
-                            remaining = Decimal(str(rem))
+            meta = ctx.ib.get_trade_meta(ib_order_id)
+            total_qty = meta["total_qty"] if meta else Decimal("-1")
+            remaining = meta["remaining"] if meta else Decimal("-1")
 
             events = ledger.record_fill(
                 ib_order_id,
@@ -956,20 +934,17 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     # positionEvent for all positions simultaneously on startup.
     _position_sem = asyncio.Semaphore(5)
 
-    if hasattr(ctx.ib, '_ib'):
-        ib_obj = ctx.ib._ib
+    def on_position_event(position) -> None:
+        """Handle position change from IB (any source, including manual TWS closes)."""
+        _spawn_background(_handle_position_event(ctx, position, _position_sem))
 
-        def on_position_event(position) -> None:
-            """Handle position change from IB (any source, including manual TWS closes)."""
-            _spawn_background(_handle_position_event(ctx, position, _position_sem))
-
-        ib_obj.positionEvent += on_position_event
-        # Subscribe to position updates
-        try:
-            await ib_obj.reqPositionsAsync()
-        except Exception as e:
-            logger.debug("reqPositionsAsync failed during wire-up", exc_info=e)
-        logger.info('{"event": "POSITION_EVENT_WIRED"}')
+    ctx.ib.register_position_event_callback(on_position_event)
+    # Subscribe to position updates
+    try:
+        await ctx.ib.req_positions_async()
+    except Exception as e:
+        logger.debug("reqPositionsAsync failed during wire-up", exc_info=e)
+    logger.info('{"event": "POSITION_EVENT_WIRED"}')
 
     # Keep the task alive — this is a daemonic loop, cancelled at shutdown.
     while True:  # noqa: ASYNC110 — not waiting on an event; it's a sleep-forever keepalive
@@ -1209,7 +1184,7 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                 last_pending_event_ts[sym] = now_mono
             _spawn_background(_publish_one(t))
 
-    ctx.ib._ib.pendingTickersEvent += on_pending_tickers
+    ctx.ib.register_pending_tickers_callback(on_pending_tickers)
     logger.info('{"event": "TICK_PUBLISHER_WIRED"}')
 
     async def _heartbeat() -> None:
@@ -1288,10 +1263,7 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
             await hb_task
         except (asyncio.CancelledError, Exception) as e:
             logger.debug("tick heartbeat cancel", exc_info=e)
-        try:
-            ctx.ib._ib.pendingTickersEvent -= on_pending_tickers
-        except Exception as e:
-            logger.debug("pendingTickersEvent unwire failed", exc_info=e)
+        ctx.ib.unregister_pending_tickers_callback(on_pending_tickers)
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:

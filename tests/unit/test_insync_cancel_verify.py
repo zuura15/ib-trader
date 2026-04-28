@@ -64,8 +64,8 @@ async def test_cancel_with_462_and_open_at_ib_is_suppressed():
     ])
 
     # IB authoritatively reports the order as still open.
-    client._ib = AsyncMock()
-    client._ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -80,7 +80,7 @@ async def test_cancel_with_462_and_open_at_ib_is_suppressed():
     assert callback_invocations == []
     # Callbacks must remain registered for the eventual real terminal.
     assert client._status_callbacks.get("1029")
-    client._ib.reqOpenOrdersAsync.assert_awaited_once()
+    client._InsyncClient__ib.reqOpenOrdersAsync.assert_awaited_once()
 
 
 async def test_cancel_with_462_and_not_open_at_ib_is_dispatched():
@@ -93,10 +93,10 @@ async def test_cancel_with_462_and_not_open_at_ib_is_dispatched():
         _log("Cancelled", "Order modify failed", 462),
     ])
 
-    client._ib = AsyncMock()
+    client._InsyncClient__ib = AsyncMock()
     # Different order id in the open list — ours is gone.
     other = _make_trade("9999", "Submitted", [_log("Submitted")])
-    client._ib.reqOpenOrdersAsync = AsyncMock(return_value=[other])
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[other])
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -130,8 +130,8 @@ async def test_cancel_with_462_superseded_by_fill_during_query():
         trade.orderStatus.status = "Filled"
         return []  # IB no longer has it open
 
-    client._ib = AsyncMock()
-    client._ib.reqOpenOrdersAsync = fake_req_open_orders
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = fake_req_open_orders
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -160,8 +160,8 @@ async def test_cancel_with_462_default_suppress_on_query_failure():
         _log("Cancelled", "Order modify failed", 462),
     ])
 
-    client._ib = AsyncMock()
-    client._ib.reqOpenOrdersAsync = AsyncMock(side_effect=ConnectionError("transient"))
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(side_effect=ConnectionError("transient"))
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -177,21 +177,21 @@ async def test_cancel_with_462_default_suppress_on_query_failure():
     assert client._status_callbacks.get("4020")
 
 
-async def test_real_cancel_without_errorcode_dispatches_synchronously():
-    """A genuine cancel via ib_async's _orderStatus() path appends a log entry
-    with errorCode=0 (the dataclass default — _orderStatus() doesn't set
-    errorCode). It must NOT trigger the verification round-trip."""
+async def test_real_cancel_without_errorcode_now_verifies_too():
+    """Updated for the universal verify gate: every Cancelled the wrapper
+    sees triggers a reqOpenOrdersAsync verification, even ones with no
+    errorCode in trade.log (the original dataclass-default-zero shape).
+    Real cancels (verified not-open at IB) still dispatch as terminal —
+    just with one extra round-trip's latency."""
     client = _make_client()
     trade = _make_trade("5030", "Cancelled", [
         _log("Submitted"),
         _log("Cancelled"),  # errorCode defaults to 0
     ])
 
-    client._ib = AsyncMock()
-    # Wire reqOpenOrdersAsync to fail loudly — it must NOT be called.
-    client._ib.reqOpenOrdersAsync = AsyncMock(
-        side_effect=AssertionError("verification path must not run for real cancels"),
-    )
+    # Verify confirms the order is gone — dispatch should fire as terminal.
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[])
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -205,23 +205,27 @@ async def test_real_cancel_without_errorcode_dispatches_synchronously():
 
     assert callback_invocations == [("5030", "Cancelled")]
     assert "5030" not in client._status_callbacks
-    client._ib.reqOpenOrdersAsync.assert_not_called()
+    client._InsyncClient__ib.reqOpenOrdersAsync.assert_awaited_once()
+    # Restored to "Cancelled" after verify confirmed.
+    assert trade.orderStatus.status == "Cancelled"
 
 
-async def test_cancel_with_other_errorcode_dispatches_synchronously():
-    """Errors outside the verify whitelist (e.g. 110 minimum-tick on a brand-new
-    order rejection) follow today's path: dispatch immediately. Verification
-    is currently scoped to 462; broadening is a deliberate future change."""
+async def test_cancel_with_other_errorcode_now_verifies():
+    """Updated for the universal verify gate: any Cancelled (regardless of
+    error code in trade.log) goes through the verify round-trip. Was
+    previously gated on a {462} allowlist — now generalised so unknown
+    synthetic-cancel patterns can't bypass the gate."""
     client = _make_client()
     trade = _make_trade("6040", "Cancelled", [
         _log("PendingSubmit"),
         _log("Cancelled", "Price does not conform to the minimum price variation", 110),
     ])
 
-    client._ib = AsyncMock()
-    client._ib.reqOpenOrdersAsync = AsyncMock(
-        side_effect=AssertionError("verification must not run for non-whitelisted codes"),
-    )
+    # Verify confirms still open — suppression path. trade.orderStatus.status
+    # gets patched back to the previous clean value ("Submitted" — the
+    # last non-Cancelled status before the synthetic cancel).
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
 
     callback_invocations: list[tuple[str, str]] = []
 
@@ -229,13 +233,204 @@ async def test_cancel_with_other_errorcode_dispatches_synchronously():
         callback_invocations.append((ib_order_id, status))
 
     client.register_status_callback(status_cb, ib_order_id="6040")
+    # Seed previous clean status to "Submitted" — under the universal gate
+    # we patch the field back to this value while verify is in flight.
+    client._previous_clean_status_map["6040"] = "Submitted"
 
     client._on_order_status(trade)
     await _settle()
 
-    assert callback_invocations == [("6040", "Cancelled")]
-    assert "6040" not in client._status_callbacks
-    client._ib.reqOpenOrdersAsync.assert_not_called()
+    # Verify ran, found order open at IB → no callback dispatch.
+    assert callback_invocations == []
+    # Status patched back to the previous clean value.
+    assert trade.orderStatus.status == "Submitted"
+    # Callbacks still registered for the next event.
+    assert client._status_callbacks.get("6040")
+    client._InsyncClient__ib.reqOpenOrdersAsync.assert_awaited_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Universal-verify-gate tests (added when the verify scope was generalised
+# beyond the {462} allowlist). Each scenario pins one corner of the new
+# behaviour: tracking the previous clean status, patching the Trade field
+# during verify-pending, restoring on verify-failure, and surviving common
+# edge cases (PreSubmitted, default fallback, unregister cleanup).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_unknown_error_code_now_verified():
+    """Synthetic Cancelled with an unknown error code (was outside the old
+    {462} allowlist) now triggers verify and gets suppressed when IB
+    confirms still-open. Trade field is patched back to the previous
+    clean status."""
+    client = _make_client()
+    trade = _make_trade("7100", "Cancelled", [
+        _log("Submitted"),
+        _log("Cancelled", "made-up rejection", 99999),
+    ])
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
+
+    callback_invocations: list[tuple[str, str]] = []
+
+    async def status_cb(ib_order_id: str, status: str) -> None:
+        callback_invocations.append((ib_order_id, status))
+
+    client.register_status_callback(status_cb, ib_order_id="7100")
+    client._previous_clean_status_map["7100"] = "Submitted"
+
+    client._on_order_status(trade)
+    await _settle()
+
+    assert callback_invocations == []
+    assert trade.orderStatus.status == "Submitted"
+
+
+async def test_cancel_with_no_error_log_also_verified():
+    """Synthetic Cancelled with empty trade.log (the case the old
+    discriminator skipped entirely) now verifies."""
+    client = _make_client()
+    trade = _make_trade("7200", "Cancelled", [])  # empty log
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
+
+    client.register_status_callback(
+        lambda *a: None, ib_order_id="7200"
+    )
+
+    client._on_order_status(trade)
+    await _settle()
+
+    client._InsyncClient__ib.reqOpenOrdersAsync.assert_awaited_once()
+
+
+async def test_get_order_status_returns_patched_value():
+    """During the verify window, get_order_status reads
+    trade.orderStatus.status which has been patched back to the previous
+    clean value. Walker polls see a non-misleading state."""
+    from ib_async import Contract
+
+    client = _make_client()
+    trade = _make_trade("7300", "Cancelled", [
+        _log("Submitted"),
+        _log("Cancelled", "modify failed", 462),
+    ])
+    # Make trade visible via __active_trades so get_order_status finds it.
+    client._InsyncClient__active_trades["7300"] = trade
+    client._InsyncClient__ib = AsyncMock()
+    # Block the verify so we read the patched state mid-flight.
+    verify_started = asyncio.Event()
+    verify_unblock = asyncio.Event()
+
+    async def slow_verify():
+        verify_started.set()
+        await verify_unblock.wait()
+        return [trade]
+
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(side_effect=slow_verify)
+
+    client.register_status_callback(lambda *a: None, ib_order_id="7300")
+    client._previous_clean_status_map["7300"] = "Submitted"
+
+    client._on_order_status(trade)
+    # Wait for verify to be in flight.
+    await asyncio.wait_for(verify_started.wait(), timeout=1.0)
+
+    # Mid-flight: get_order_status reads the patched value, not "Cancelled".
+    status = await client.get_order_status("7300")
+    assert status["status"] == "Submitted"
+
+    # Let verify finish.
+    verify_unblock.set()
+    await _settle()
+
+
+async def test_verify_failure_restores_cancelled_and_dispatches():
+    """When verify confirms the cancel was real (order not in open list),
+    the wrapper restores trade.orderStatus.status to 'Cancelled' and
+    dispatches callbacks as terminal."""
+    client = _make_client()
+    trade = _make_trade("7400", "Cancelled", [
+        _log("Submitted"),
+        _log("Cancelled", "modify failed", 462),
+    ])
+    # Verify says order is GONE (not in open list).
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[])
+
+    callback_invocations: list[tuple[str, str]] = []
+
+    async def status_cb(ib_order_id: str, status: str) -> None:
+        callback_invocations.append((ib_order_id, status))
+
+    client.register_status_callback(status_cb, ib_order_id="7400")
+    client._previous_clean_status_map["7400"] = "Submitted"
+
+    client._on_order_status(trade)
+    await _settle()
+
+    # Trade field restored to "Cancelled".
+    assert trade.orderStatus.status == "Cancelled"
+    # Callback fired with the terminal status.
+    assert callback_invocations == [("7400", "Cancelled")]
+    # Callbacks unregistered after terminal dispatch.
+    assert "7400" not in client._status_callbacks
+
+
+async def test_previous_clean_status_tracks_presubmitted():
+    """If the order's last clean status was PreSubmitted (not yet at a
+    venue), the patch should preserve PreSubmitted, not regress to
+    'Submitted'."""
+    client = _make_client()
+    # First: PreSubmitted lands, recorded.
+    pre_trade = _make_trade("7500", "PreSubmitted", [_log("PreSubmitted")])
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[pre_trade])
+    client.register_status_callback(lambda *a: None, ib_order_id="7500")
+    client._on_order_status(pre_trade)
+    await _settle()
+    assert client._previous_clean_status_map.get("7500") == "PreSubmitted"
+
+    # Now: synthetic Cancelled on the SAME order. Patch should be
+    # "PreSubmitted", not "Submitted".
+    cancel_trade = _make_trade("7500", "Cancelled", [
+        _log("PreSubmitted"),
+        _log("Cancelled", "modify failed", 462),
+    ])
+    client._on_order_status(cancel_trade)
+    await _settle()
+    assert cancel_trade.orderStatus.status == "PreSubmitted"
+
+
+async def test_previous_clean_status_default_is_submitted():
+    """If no clean status has ever been seen for an order, the patch
+    falls back to 'Submitted' (safe lower bound for an order ib_async
+    tracks as alive)."""
+    client = _make_client()
+    trade = _make_trade("7600", "Cancelled", [
+        _log("Cancelled", "modify failed", 462),
+    ])
+    client._InsyncClient__ib = AsyncMock()
+    client._InsyncClient__ib.reqOpenOrdersAsync = AsyncMock(return_value=[trade])
+    client.register_status_callback(lambda *a: None, ib_order_id="7600")
+    # Note: NO seed of _previous_clean_status_map.
+
+    client._on_order_status(trade)
+    await _settle()
+
+    assert trade.orderStatus.status == "Submitted"
+
+
+async def test_unregister_clears_previous_clean_status_entry():
+    """Map doesn't leak entries across orders — cleared on
+    unregister_callbacks (which fires after terminal dispatch)."""
+    client = _make_client()
+    client._previous_clean_status_map["7700"] = "Submitted"
+    client._fill_callbacks["7700"] = [lambda *a: None]
+
+    client.unregister_callbacks("7700")
+
+    assert "7700" not in client._previous_clean_status_map
 
 
 # Use asyncio mode for all tests in this module.

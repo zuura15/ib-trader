@@ -75,12 +75,19 @@ class InsyncClient(IBClientBase):
         self._account_id = account_id
         self._connect_timeout = connect_timeout
         self._market_data_type = market_data_type
-        self._ib = IB()
+        self.__ib = IB()
         # Callbacks keyed by ib_order_id.  Each value is a list (usually one
         # entry) of async callables.  A special key _GLOBAL holds callbacks that
         # fire for every order and are never auto-removed.
         self._fill_callbacks: dict[str, list] = {}
         self._status_callbacks: dict[str, list] = {}
+        # Tracks the last NON-CANCELLED status we saw for each ib_order_id.
+        # When ib_async synthesizes a fake Cancelled (see _on_order_status),
+        # we patch trade.orderStatus.status back to this previous clean
+        # value while reqOpenOrdersAsync verifies. Defaults to "Submitted"
+        # on lookup miss — every order ib_async tracks as alive must be
+        # at least Submitted by the time a synthesized cancel could fire.
+        self._previous_clean_status_map: dict[str, str] = {}
         # Commission callbacks fire when IB delivers a CommissionReport
         # (typically slightly after the matching execDetails). Same
         # keying convention as _fill_callbacks: per-ib_order_id scoped
@@ -112,7 +119,7 @@ class InsyncClient(IBClientBase):
         # flight when the status flipped.
         self._order_locks: dict[str, asyncio.Lock] = {}
         # Maps ib_order_id -> Trade object for amendment support
-        self._active_trades: dict[str, Trade] = {}
+        self.__active_trades: dict[str, Trade] = {}
         # Maps con_id -> fully-qualified Contract ready for order placement.
         # Populated by qualify_contract(); reused by place_* methods so that
         # symbol, secType, exchange, and currency are all present in the IB
@@ -179,19 +186,19 @@ class InsyncClient(IBClientBase):
         _logging.getLogger("ib_async").setLevel(_logging.CRITICAL)
 
         await self._throttle()
-        await self._ib.connectAsync(
+        await self.__ib.connectAsync(
             self._host,
             self._port,
             clientId=self._client_id,
             timeout=self._connect_timeout,
         )
-        self._ib.disconnectedEvent += self._on_disconnected
-        self._ib.connectedEvent += self._on_connected
-        self._ib.execDetailsEvent += self._on_exec_details
-        self._ib.orderStatusEvent += self._on_order_status
-        self._ib.commissionReportEvent += self._on_commission_report
-        self._ib.errorEvent += self._on_error
-        self._ib.reqMarketDataType(self._market_data_type)
+        self.__ib.disconnectedEvent += self._on_disconnected
+        self.__ib.connectedEvent += self._on_connected
+        self.__ib.execDetailsEvent += self._on_exec_details
+        self.__ib.orderStatusEvent += self._on_order_status
+        self.__ib.commissionReportEvent += self._on_commission_report
+        self.__ib.errorEvent += self._on_error
+        self.__ib.reqMarketDataType(self._market_data_type)
         logger.info(
             '{"event": "IB_CONNECTED", "host": "%s", "port": %d, "client_id": %d}',
             self._host, self._port, self._client_id,
@@ -202,16 +209,16 @@ class InsyncClient(IBClientBase):
         # Mark this as an intentional disconnect so _on_disconnected does
         # not raise a CATASTROPHIC alert during normal shutdown.
         self._expected_disconnect = True
-        self._ib.disconnect()
+        self.__ib.disconnect()
         logger.info('{"event": "IB_DISCONNECTED"}')
 
     def is_connected(self) -> bool:
         """Return True if the underlying IB connection is alive."""
-        return self._ib.isConnected()
+        return self.__ib.isConnected()
 
     def managed_accounts(self) -> list[str]:
         """Return the IB account IDs attached to this Gateway session."""
-        return list(self._ib.managedAccounts())
+        return list(self.__ib.managedAccounts())
 
     async def qualify_contract(
         self,
@@ -223,7 +230,7 @@ class InsyncClient(IBClientBase):
         """Qualify an IB contract and return its details."""
         await self._throttle()
         contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
-        [qualified] = await self._ib.qualifyContractsAsync(contract)
+        [qualified] = await self.__ib.qualifyContractsAsync(contract)
         raw = json.dumps({
             "conId": qualified.conId,
             "symbol": qualified.symbol,
@@ -291,7 +298,7 @@ class InsyncClient(IBClientBase):
         # available quote even if nothing is cached right now.  Snapshot
         # mode returns zeros immediately during overnight when the data
         # farm has no warm quote for the symbol.
-        ticker = self._ib.reqMktData(contract, "", False, False)
+        ticker = self.__ib.reqMktData(contract, "", False, False)
         for _ in range(50):  # up to 5 s in 100 ms steps
             await asyncio.sleep(0.1)
             if ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0:
@@ -299,7 +306,7 @@ class InsyncClient(IBClientBase):
             if ticker.last and ticker.last > 0:
                 break
         # Cancel the streaming subscription — we only needed one quote.
-        self._ib.cancelMktData(contract)
+        self.__ib.cancelMktData(contract)
         bid = Decimal(str(ticker.bid)) if ticker.bid and ticker.bid == ticker.bid and ticker.bid > 0 else Decimal("0")
         ask = Decimal(str(ticker.ask)) if ticker.ask and ticker.ask == ticker.ask and ticker.ask > 0 else Decimal("0")
         last = Decimal(str(ticker.last)) if ticker.last and ticker.last == ticker.last and ticker.last > 0 else Decimal("0")
@@ -363,7 +370,7 @@ class InsyncClient(IBClientBase):
         """
         await self._throttle()
         try:
-            bars = await self._ib.reqHistoricalDataAsync(
+            bars = await self.__ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
                 durationStr="3600 S",
@@ -412,9 +419,9 @@ class InsyncClient(IBClientBase):
             # spans the overnight session and the following trading day.
             order.includeOvernight = True
             order.tif = "DAY"
-        trade = self._ib.placeOrder(contract, order)
+        trade = self.__ib.placeOrder(contract, order)
         ib_order_id = str(trade.order.orderId)
-        self._active_trades[ib_order_id] = trade
+        self.__active_trades[ib_order_id] = trade
         # Fire pre-fill snapshot callback (engine wires this to the
         # OrderLedger so the position-diff reconcile has a baseline).
         self._fire_order_placed(
@@ -460,9 +467,9 @@ class InsyncClient(IBClientBase):
         if overnight:
             order.includeOvernight = True
             order.tif = "DAY"
-        trade = self._ib.placeOrder(contract, order)
+        trade = self.__ib.placeOrder(contract, order)
         ib_order_id = str(trade.order.orderId)
-        self._active_trades[ib_order_id] = trade
+        self.__active_trades[ib_order_id] = trade
         self._fire_order_placed(
             ib_order_id, symbol, contract.secType or "STK",
             int(contract.conId or 0), side, qty, order_ref or "",
@@ -486,7 +493,7 @@ class InsyncClient(IBClientBase):
     async def amend_order(self, ib_order_id: str, new_price: Decimal) -> None:
         """Amend an existing limit order to a new price in place."""
         await self._throttle()
-        trade = self._active_trades.get(ib_order_id)
+        trade = self.__active_trades.get(ib_order_id)
         if trade is None:
             logger.warning(
                 '{"event": "ORDER_AMENDED", "warning": "trade not in active cache", '
@@ -515,7 +522,7 @@ class InsyncClient(IBClientBase):
         if overnight:
             trade.order.includeOvernight = True
             trade.order.tif = "DAY"
-        self._ib.placeOrder(trade.contract, trade.order)
+        self.__ib.placeOrder(trade.contract, trade.order)
         logger.info(
             '{"event": "ORDER_AMENDED", "ib_order_id": "%s", "new_price": "%s"}',
             ib_order_id, new_price,
@@ -533,7 +540,7 @@ class InsyncClient(IBClientBase):
     async def cancel_order(self, ib_order_id: str) -> None:
         """Cancel an open order."""
         await self._throttle()
-        trade = self._active_trades.get(ib_order_id)
+        trade = self.__active_trades.get(ib_order_id)
         if trade is None:
             logger.warning(
                 '{"event": "ORDER_CANCELED", "warning": "trade not in active cache", '
@@ -550,13 +557,13 @@ class InsyncClient(IBClientBase):
                 trade.orderStatus.status, ib_order_id,
             )
             return
-        self._ib.cancelOrder(trade.order)
+        self.__ib.cancelOrder(trade.order)
         logger.info('{"event": "ORDER_CANCELED", "ib_order_id": "%s"}', ib_order_id)
 
     async def get_order_status(self, ib_order_id: str) -> dict:
         """Get current status of an order from IB."""
         await self._throttle()
-        trade = self._active_trades.get(ib_order_id)
+        trade = self.__active_trades.get(ib_order_id)
         if trade is None:
             return {
                 "status": "UNKNOWN",
@@ -596,7 +603,7 @@ class InsyncClient(IBClientBase):
         IB keeps them in the open orders list until session reset.
         """
         await self._throttle()
-        open_trades = await self._ib.reqAllOpenOrdersAsync()
+        open_trades = await self.__ib.reqAllOpenOrdersAsync()
         logger.debug(
             '{"event": "OPEN_ORDERS_RAW", "count": %d, "orders": [%s]}',
             len(open_trades),
@@ -637,7 +644,7 @@ class InsyncClient(IBClientBase):
 
     def get_live_order_status(self, ib_order_id: str) -> str | None:
         """Return the live IB status string for an order, or None if unknown."""
-        trade = self._active_trades.get(ib_order_id)
+        trade = self.__active_trades.get(ib_order_id)
         if trade is None:
             return None
         return trade.orderStatus.status or None
@@ -655,10 +662,10 @@ class InsyncClient(IBClientBase):
             # cancelling and re-subscribing with generic ticks.
             if not entry.get("enriched"):
                 try:
-                    self._ib.cancelMktData(entry["contract"])
+                    self.__ib.cancelMktData(entry["contract"])
                 except Exception as e:
                     logger.debug("cancelMktData failed during upgrade", exc_info=e)
-                ticker = self._ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
+                ticker = self.__ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
                 entry["ticker"] = ticker
                 entry["enriched"] = True
                 logger.info(
@@ -677,7 +684,7 @@ class InsyncClient(IBClientBase):
             conId=con_id, symbol=symbol, secType="STK",
             exchange="SMART", currency="USD",
         )
-        ticker = self._ib.reqMktData(contract, _GENERIC_TICKS, False, False)
+        ticker = self.__ib.reqMktData(contract, _GENERIC_TICKS, False, False)
         self._streaming[con_id] = {"ticker": ticker, "refs": 1, "contract": contract, "enriched": True}
         logger.info(
             '{"event": "STREAMING_SUB_ADDED", "con_id": %d, "symbol": "%s"}',
@@ -692,7 +699,7 @@ class InsyncClient(IBClientBase):
         entry["refs"] -= 1
         if entry["refs"] <= 0:
             try:
-                self._ib.cancelMktData(entry["contract"])
+                self.__ib.cancelMktData(entry["contract"])
             except Exception as e:
                 logger.debug("cancelMktData failed on unsubscribe", exc_info=e)
             del self._streaming[con_id]
@@ -760,6 +767,152 @@ class InsyncClient(IBClientBase):
         Contract for this con_id."""
         return con_id in self._contract_cache
 
+    # ------------------------------------------------------------------
+    # Wrapper public APIs that absorb direct ib-async access from outside
+    # the wrapper. Added so external modules don't reach into ``self.__ib``
+    # (class-level name-mangled to ``_InsyncClient__ib`` and not
+    # accessible by convention) or ``self.__active_trades``.
+    #
+    # Import-linter contract "ib_async direct imports forbidden outside
+    # the wrapper" catches static drift on the import path; these methods
+    # absorb the attribute-access drift on the runtime path.
+    # ------------------------------------------------------------------
+
+    async def req_positions_async(self, timeout: float = 10.0) -> None:
+        """Request positions from IB. Returns when IB acknowledges. The
+        position event stream pushes individual positions to whatever
+        callback is registered via ``register_position_event_callback``.
+        """
+        await asyncio.wait_for(self.__ib.reqPositionsAsync(), timeout=timeout)
+
+    def get_raw_positions(self) -> list:
+        """Return ib-async Position objects currently held at the broker.
+
+        The returned list contains ib-async Position instances; callers
+        should treat them as opaque except for documented attributes
+        (``contract``, ``position``, ``avgCost``, ``account``).
+        """
+        return list(self.__ib.positions())
+
+    def register_position_event_callback(self, callback) -> None:
+        """Subscribe to ib-async ``positionEvent``. Callback receives a
+        single ``Position`` object on every position change pushed by IB.
+        """
+        self.__ib.positionEvent += callback
+
+    def unregister_position_event_callback(self, callback) -> None:
+        """Reverse of ``register_position_event_callback``."""
+        try:
+            self.__ib.positionEvent -= callback
+        except Exception as e:
+            logger.debug(
+                '{"event": "POSITION_EVENT_UNWIRE_FAILED", "error": "%s"}',
+                str(e),
+            )
+
+    def register_pending_tickers_callback(self, callback) -> None:
+        """Subscribe to ib-async ``pendingTickersEvent``. Callback fires
+        synchronously whenever ib-async has new tick data on one or more
+        of our subscribed tickers; receives a set of Ticker objects.
+        """
+        self.__ib.pendingTickersEvent += callback
+
+    def unregister_pending_tickers_callback(self, callback) -> None:
+        """Reverse of ``register_pending_tickers_callback``."""
+        try:
+            self.__ib.pendingTickersEvent -= callback
+        except Exception as e:
+            logger.debug(
+                '{"event": "PENDING_TICKERS_UNWIRE_FAILED", "error": "%s"}',
+                str(e),
+            )
+
+    async def req_historical_data_async(
+        self,
+        contract,
+        *,
+        end_date_time: str = "",
+        duration_str: str,
+        bar_size: str,
+        what_to_show: str = "TRADES",
+        use_rth: bool = False,
+        format_date: int = 2,
+    ) -> list:
+        """Fetch historical bars for a contract via ib-async.
+
+        Wraps ib-async's ``reqHistoricalDataAsync`` with the rate-limit
+        throttle applied. ``contract`` should be a fully-qualified ib-
+        async Contract (use ``qualify_contract`` first if you only have
+        a symbol).
+        """
+        await self._throttle()
+        return await self.__ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime=end_date_time,
+            durationStr=duration_str,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=format_date,
+        )
+
+    def get_trade_meta(self, ib_order_id: str) -> dict | None:
+        """Return a snapshot of a tracked Trade's metadata, or None if
+        we don't have the order in our active-trades cache.
+
+        Returned shape:
+            {
+                "order_ref": str,
+                "symbol": str,
+                "sec_type": str,
+                "con_id": int,
+                "side": str,           # "BUY" or "SELL"
+                "total_qty": Decimal,  # original totalQuantity (static)
+                "remaining": Decimal,  # IB's current remaining (volatile)
+                "contract": Contract,  # ib-async Contract object
+            }
+
+        ``contract`` is the ib-async Contract object — exposed because
+        consumers need ``lastTradeDateOrContractMonth`` /
+        ``tradingClass`` / ``multiplier`` for futures display. Treat it
+        as opaque-with-documented-attributes.
+        """
+        trade = self.__active_trades.get(str(ib_order_id))
+        if trade is None:
+            return None
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        order_status = getattr(trade, "orderStatus", None)
+
+        order_ref = getattr(order, "orderRef", "") or "" if order else ""
+        side = getattr(order, "action", "") or "" if order else ""
+        symbol = getattr(contract, "symbol", "") or "" if contract else ""
+        sec_type = getattr(contract, "secType", "STK") or "STK" if contract else "STK"
+        con_id = getattr(contract, "conId", 0) or 0 if contract else 0
+
+        total_qty = Decimal("-1")
+        if order is not None:
+            tq = getattr(order, "totalQuantity", None)
+            if tq is not None:
+                total_qty = Decimal(str(tq))
+
+        remaining = Decimal("-1")
+        if order_status is not None:
+            rem = getattr(order_status, "remaining", -1)
+            if rem >= 0:
+                remaining = Decimal(str(rem))
+
+        return {
+            "order_ref": order_ref,
+            "symbol": symbol,
+            "sec_type": sec_type,
+            "con_id": con_id,
+            "side": side,
+            "total_qty": total_qty,
+            "remaining": remaining,
+            "contract": contract,
+        }
+
     def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:
         """Register a callback for fill events.
 
@@ -817,6 +970,7 @@ class InsyncClient(IBClientBase):
             del self._status_callbacks[ib_order_id]
             removed = True
         self._order_errors.pop(ib_order_id, None)
+        self._previous_clean_status_map.pop(ib_order_id, None)
         if removed:
             logger.debug(
                 '{"event": "CALLBACKS_UNREGISTERED", "ib_order_id": "%s"}',
@@ -849,7 +1003,7 @@ class InsyncClient(IBClientBase):
             conId=con_id, symbol=symbol, secType="STK",
             exchange="SMART", currency="USD",
         )
-        bars = self._ib.reqRealTimeBars(
+        bars = self.__ib.reqRealTimeBars(
             contract, barSize=5, whatToShow=what_to_show, useRTH=False,
         )
         callbacks = [callback] if callback else []
@@ -899,7 +1053,7 @@ class InsyncClient(IBClientBase):
         entry["refs"] -= 1
         if entry["refs"] <= 0:
             try:
-                self._ib.cancelRealTimeBars(entry["bars"])
+                self.__ib.cancelRealTimeBars(entry["bars"])
             except Exception as e:
                 logger.debug("cancelRealTimeBars failed", exc_info=e)
             del self._realtime_bars[con_id]
@@ -958,7 +1112,7 @@ class InsyncClient(IBClientBase):
         ib_order_id = str(reqId)
         is_info = errorCode in self._INFO_CODES
         is_benign_race = errorCode in self._BENIGN_ORDER_RACE_CODES
-        if ib_order_id in self._active_trades:
+        if ib_order_id in self.__active_trades:
             # INFO-class codes (e.g. 10340 ManualOrderIndicator) still
             # reference an active order but must NOT be treated as a
             # rejection — log at INFO and skip the _order_errors write
@@ -1038,13 +1192,14 @@ class InsyncClient(IBClientBase):
         "Filled", "Cancelled", "Inactive", "ApiCancelled",
     })
 
-    # IB error codes that trigger an open-orders verification round-trip
-    # before propagating a Cancelled status. Currently scoped to 462 — the
-    # only synthetic-cancel code we have observed in the wild (see GH #48,
-    # ADR-018). If other modify-rejection codes start producing the same
-    # false-cancel pattern, broaden by removing the errorCode gate entirely
-    # and verifying every Cancelled — the verifier handles them generically.
-    _VERIFY_CANCEL_ERROR_CODES: frozenset[int] = frozenset({462})
+    # Verify-cancel scope used to be gated on a known-error-code allowlist
+    # (originally just 462). Now generalised: every Cancelled / ApiCancelled
+    # the wrapper sees is verified against IB's open-orders list before
+    # propagating to callbacks (see ``_on_order_status``). The allowlist
+    # was a reactive trust model — only suppress when we'd already
+    # observed the false-cancel pattern. The wrapper-as-gate architecture
+    # (no allowlist, always verify) closes the door on unknown error
+    # codes that produce the same false-cancel shape.
 
     def _get_order_lock(self, ib_order_id: str) -> asyncio.Lock:
         """Return the per-order asyncio.Lock for ``ib_order_id``, creating
@@ -1195,6 +1350,18 @@ class InsyncClient(IBClientBase):
         key = ib_order_id or "_GLOBAL"
         self._commission_callbacks.setdefault(key, []).append(callback)
 
+    def _previous_clean_status(self, ib_order_id: str) -> str:
+        """Return the last non-Cancelled status this wrapper saw for the
+        order. Used to patch trade.orderStatus.status during verify-pending
+        so direct readers (get_order_status, walker polls) don't see
+        ib_async's mutated 'Cancelled' field.
+
+        Default of 'Submitted' is the safe lower bound: ib_async only
+        synthesizes Cancelled events for orders it tracks as live, and
+        such orders are by definition past PendingSubmit / PreSubmitted.
+        """
+        return self._previous_clean_status_map.get(ib_order_id, "Submitted")
+
     def _on_order_status(self, trade: Trade) -> None:
         """Handle order status change event from IB and dispatch to callbacks.
 
@@ -1243,28 +1410,38 @@ class InsyncClient(IBClientBase):
             )
             return
 
-        # ib_async synthesizes a Cancelled status from any non-warning error on
-        # a live trade — including modify-rejection errors where IB's actual
-        # behavior is "modify failed, order still live" (wrapper.py:1657-1668;
-        # ib_insync issue #502; GH #48). Discriminator: trade.log[-1] is
-        # appended at wrapper.py:1663 *before* orderStatusEvent.emit at line
-        # 1666, so the just-appended log entry is synchronously visible here
-        # and carries the originating errorCode. When the code is one we know
-        # produces false cancels, defer dispatch and ask IB whether the order
-        # is actually still open before propagating.
-        if (
-            status == "Cancelled"
-            and trade.log
-            and getattr(trade.log[-1], "errorCode", None) in self._VERIFY_CANCEL_ERROR_CODES
-        ):
-            err_code = trade.log[-1].errorCode
+        # Universal verify-cancel gate. ib_async synthesizes a Cancelled
+        # status (and mutates trade.orderStatus.status="Cancelled") from
+        # any non-warning error on a live trade — including modify-
+        # rejection errors where IB's actual behavior is "modify failed,
+        # order still live" (wrapper.py:1657-1668; ib_insync issue #502;
+        # GH #48). The wrapper acts as the gate: every Cancelled goes to
+        # IB authoritatively via reqOpenOrdersAsync. If still open at IB,
+        # we suppress callback dispatch AND patch trade.orderStatus.status
+        # back to the last clean value so direct readers (get_order_status,
+        # walker polls) don't see ib_async's mutated field. ib_async will
+        # overwrite the patched value on the next real wire status; if
+        # verify confirms the cancel was real, we restore "Cancelled" and
+        # dispatch.
+        if status in ("Cancelled", "ApiCancelled"):
+            err_code = (
+                getattr(trade.log[-1], "errorCode", None)
+                if trade.log else None
+            )
+            patched_to = self._previous_clean_status(ib_order_id)
+            trade.orderStatus.status = patched_to
             logger.info(
                 '{"event": "IB_CANCEL_VERIFY_DEFERRED", '
-                '"ib_order_id": "%s", "code": %d}',
-                ib_order_id, err_code,
+                '"ib_order_id": "%s", "code": %s, "patched_to": "%s"}',
+                ib_order_id, err_code, patched_to,
             )
             _spawn_background(self._verify_cancel(trade, ib_order_id, err_code))
             return
+
+        # Non-Cancelled status: record it as the last clean value for
+        # this order, so a future synthesized Cancelled can patch back
+        # to the right "alive" state (PreSubmitted vs Submitted vs ...).
+        self._previous_clean_status_map[ib_order_id] = status
 
         self._dispatch_status_to_callbacks(trade, ib_order_id, status)
 
@@ -1292,7 +1469,7 @@ class InsyncClient(IBClientBase):
             self.unregister_callbacks(ib_order_id)
 
     async def _verify_cancel(
-        self, trade: Trade, ib_order_id: str, err_code: int,
+        self, trade: Trade, ib_order_id: str, err_code: int | None,
     ) -> None:
         """Verify a suspect Cancelled status against IB's open-orders list.
 
@@ -1300,8 +1477,10 @@ class InsyncClient(IBClientBase):
         errors that leave the underlying order live on the exchange (see
         ``_on_order_status``). This routine asks IB authoritatively whether
         the order is still open. If yes, the synthetic Cancelled is suppressed
-        and callbacks remain registered to handle the eventual real terminal.
-        If no, the Cancelled is dispatched normally.
+        — the trade.orderStatus.status was already patched back to the
+        previous clean value in _on_order_status before this verify was
+        scheduled. If no, we restore "Cancelled" on the Trade field and
+        dispatch as terminal.
 
         On query failure we default to suppress: a missed cancel surfaces via
         the engine's existing 120s active+passive timeout with no orphan
@@ -1309,14 +1488,14 @@ class InsyncClient(IBClientBase):
         """
         try:
             await self._throttle()
-            open_trades = await self._ib.reqOpenOrdersAsync()
+            open_trades = await self.__ib.reqOpenOrdersAsync()
             still_open = any(
                 str(t.order.orderId) == ib_order_id for t in open_trades
             )
         except Exception:
             logger.exception(
                 '{"event": "IB_CANCEL_VERIFY_FAILED", '
-                '"ib_order_id": "%s", "code": %d, "default": "suppress"}',
+                '"ib_order_id": "%s", "code": %s, "default": "suppress"}',
                 ib_order_id, err_code,
             )
             still_open = True
@@ -1324,10 +1503,10 @@ class InsyncClient(IBClientBase):
         if still_open:
             logger.warning(
                 '{"event": "IB_CANCEL_SUPPRESSED_OPEN_AT_IB", '
-                '"ib_order_id": "%s", "code": %d}',
+                '"ib_order_id": "%s", "code": %s}',
                 ib_order_id, err_code,
             )
-            return
+            return  # patch stays — ib_async overwrites on next real status
 
         # Race: the real terminal may have landed via _orderStatus() during the
         # IB round-trip. Filled goes through this same method and dispatches
@@ -1338,14 +1517,18 @@ class InsyncClient(IBClientBase):
         if current == "Filled":
             logger.info(
                 '{"event": "IB_CANCEL_SUPERSEDED_BY_FILL", '
-                '"ib_order_id": "%s", "code": %d}',
+                '"ib_order_id": "%s", "code": %s}',
                 ib_order_id, err_code,
             )
             return
 
+        # Verified: cancel was real. Restore "Cancelled" on the Trade
+        # field (we patched it to the previous clean status earlier) so
+        # direct readers see the truth, then dispatch as terminal.
+        trade.orderStatus.status = "Cancelled"
         logger.info(
             '{"event": "IB_CANCEL_VERIFIED_TERMINAL", '
-            '"ib_order_id": "%s", "code": %d}',
+            '"ib_order_id": "%s", "code": %s}',
             ib_order_id, err_code,
         )
         self._dispatch_status_to_callbacks(trade, ib_order_id, "Cancelled")

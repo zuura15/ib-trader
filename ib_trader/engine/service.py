@@ -217,15 +217,14 @@ async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContex
     if contract is None:
         return f"No cached contract for {symbol}"
 
-    await ctx.ib._throttle()
-    bars = await ctx.ib._ib.reqHistoricalDataAsync(
+    bars = await ctx.ib.req_historical_data_async(
         contract,
-        endDateTime="",
-        durationStr=f"{duration_seconds} S",
-        barSizeSetting="5 secs",
-        whatToShow="TRADES",
-        useRTH=False,
-        formatDate=2,
+        end_date_time="",
+        duration_str=f"{duration_seconds} S",
+        bar_size="5 secs",
+        what_to_show="TRADES",
+        use_rth=False,
+        format_date=2,
     )
 
     if not bars:
