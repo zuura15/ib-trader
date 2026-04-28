@@ -1,8 +1,86 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useStore } from '../../data/store';
 import { formatAge } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 import type { Bot, BotStatus } from '../../types';
+
+/**
+ * Shared WS lifecycle for the bots-pane components. Opens a per-bot
+ * connection, sends subscribe messages, dispatches messages to the
+ * caller's refs, and reconnects with exponential backoff when the
+ * socket drops. Without this, a single network blip leaves the UI
+ * permanently stale until the user does a hard refresh — which is
+ * exactly the "trail showed INACTIVE despite being armed" symptom from
+ * the GLD session on 2026-04-27.
+ *
+ * Callbacks are passed via refs so callers don't have to memoize them.
+ */
+function _useBotWS(
+  symbol: string,
+  botRef: string | undefined,
+  opts: {
+    onBotState?: (s: BotPositionState) => void;
+    onQuote?: (data: { bid?: string; ask?: string; last?: string }) => void;
+    subscribeQuote?: boolean;
+    subscribeBot?: boolean;
+  },
+) {
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
+
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) return;
+      const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => {
+        attempt = 0;
+        const sub = optsRef.current;
+        if (sub.subscribeBot && botRef) {
+          ws!.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
+        }
+        if (sub.subscribeQuote) {
+          ws!.send(JSON.stringify({ type: 'subscribe_quote', symbol }));
+        }
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          const cb = optsRef.current;
+          if (msg.type === 'bot_state' && msg.symbol === symbol && msg.strategy) {
+            cb.onBotState?.(msg.strategy);
+          } else if (msg.type === 'quote' && msg.symbol === symbol) {
+            cb.onQuote?.(msg.data);
+          }
+        } catch { /* malformed frame, ignore */ }
+      };
+      ws.onclose = () => {
+        ws = null;
+        if (cancelled) return;
+        // Exponential backoff capped at 30s. First retry at 1s.
+        const delay = Math.min(30_000, 1000 * Math.pow(2, attempt));
+        attempt++;
+        timer = setTimeout(connect, delay);
+      };
+      ws.onerror = () => {
+        // Forces onclose, which schedules the reconnect.
+        ws?.close();
+      };
+    };
+
+    connect();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      if (ws) ws.close();
+    };
+  }, [symbol, botRef]);
+}
 
 interface BotPositionState {
   position_state?: string;
@@ -132,35 +210,25 @@ function ForceSellButton({ botId, symbol, botRef, compact = false }: {
 }) {
   const [hasPosition, setHasPosition] = useState(false);
 
-  useEffect(() => {
-    const applyState = (s: BotPositionState) => {
-      const qty = s.qty ? parseFloat(s.qty) : 0;
-      const pos = s.position_state || s.state || 'FLAT';
-      setHasPosition(
-        qty > 0 && pos !== 'FLAT' && pos !== 'OFF' && pos !== 'AWAITING_ENTRY_TRIGGER',
-      );
-    };
+  const applyState = (s: BotPositionState) => {
+    const qty = s.qty ? parseFloat(s.qty) : 0;
+    const pos = s.position_state || s.state || 'FLAT';
+    setHasPosition(
+      qty > 0 && pos !== 'FLAT' && pos !== 'OFF' && pos !== 'AWAITING_ENTRY_TRIGGER',
+    );
+  };
 
+  useEffect(() => {
     fetch(`/api/bots/${botId}/state`)
       .then((r) => (r.ok ? r.json() : {}))
       .then(applyState)
       .catch(() => {});
+  }, [botId]);
 
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
-    const ws = new WebSocket(wsUrl);
-    ws.onopen = () => {
-      if (botRef) ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
-    };
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'bot_state' && msg.symbol === symbol && msg.strategy) {
-          applyState(msg.strategy);
-        }
-      } catch {}
-    };
-    return () => ws.close();
-  }, [botId, symbol, botRef]);
+  _useBotWS(symbol, botRef, {
+    onBotState: applyState,
+    subscribeBot: true,
+  });
 
   if (!hasPosition) return null;
 
@@ -208,42 +276,32 @@ function SharesCell({ botId, symbol, botRef, maxShares, maxPositionValue }: {
   const [qty, setQty] = useState<number>(0);
   const [lastPrice, setLastPrice] = useState<number>(0);
 
-  useEffect(() => {
-    const apply = (s: BotPositionState) => {
-      const stratQty = s.qty ? parseFloat(s.qty) : 0;
-      const filled = s.filled_qty ? parseFloat(s.filled_qty) : 0;
-      // Prefer the broker-confirmed fill (``filled_qty``) over the
-      // strategy's tracked ``qty`` — the latter can drift if the
-      // strategy doesn't update on every fill, but ``filled_qty``
-      // mirrors what IB reported. Falls back to ``qty`` when the
-      // bot hasn't yet received a fill in this cycle.
-      const n = filled > 0 ? filled : stratQty;
-      const pos = s.position_state || s.state || 'FLAT';
-      setQty(pos === 'FLAT' || pos === 'OFF' ? 0 : n);
-      const lp = s.last_price ? parseFloat(s.last_price) : 0;
-      if (lp > 0) setLastPrice(lp);
-    };
+  const apply = (s: BotPositionState) => {
+    const stratQty = s.qty ? parseFloat(s.qty) : 0;
+    const filled = s.filled_qty ? parseFloat(s.filled_qty) : 0;
+    // Prefer the broker-confirmed fill (``filled_qty``) over the
+    // strategy's tracked ``qty`` — the latter can drift if the
+    // strategy doesn't update on every fill, but ``filled_qty``
+    // mirrors what IB reported. Falls back to ``qty`` when the
+    // bot hasn't yet received a fill in this cycle.
+    const n = filled > 0 ? filled : stratQty;
+    const pos = s.position_state || s.state || 'FLAT';
+    setQty(pos === 'FLAT' || pos === 'OFF' ? 0 : n);
+    const lp = s.last_price ? parseFloat(s.last_price) : 0;
+    if (lp > 0) setLastPrice(lp);
+  };
 
+  useEffect(() => {
     fetch(`/api/bots/${botId}/state`)
       .then((r) => (r.ok ? r.json() : {}))
       .then(apply)
       .catch(() => {});
+  }, [botId]);
 
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
-    const ws = new WebSocket(wsUrl);
-    ws.onopen = () => {
-      if (botRef) ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
-    };
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'bot_state' && msg.symbol === symbol && msg.strategy) {
-          apply(msg.strategy);
-        }
-      } catch {}
-    };
-    return () => ws.close();
-  }, [botId, symbol, botRef]);
+  _useBotWS(symbol, botRef, {
+    onBotState: apply,
+    subscribeBot: true,
+  });
 
   const live = qty > 0;
   const shownShares = live ? qty : (maxShares ?? 0);
@@ -280,41 +338,26 @@ function PositionLine({ botId, symbol, botRef }: { botId: string; symbol: string
   const [livePrice, setLivePrice] = useState<number>(0);
 
   useEffect(() => {
-    // Initial fetch for snapshot
+    // Initial fetch for snapshot — covers the gap between mount and the
+    // first WS push. Subsequent updates flow through _useBotWS below.
     fetch(`/api/bots/${botId}/state`)
       .then((r) => r.ok ? r.json() : {})
       .then(setState)
       .catch(() => {});
+  }, [botId]);
 
-    // WebSocket for live updates — quote pushes on every IB tick,
-    // bot_state pushes on every fill. No polling.
-    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
-    const ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'subscribe_quote', symbol }));
-      if (botRef) {
-        ws.send(JSON.stringify({ type: 'subscribe_bot', bot_ref: botRef, symbol }));
-      }
-    };
-
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'quote' && msg.symbol === symbol) {
-          // Use mid price (bid+ask)/2 — consistent with positions panel
-          const bid = parseFloat(msg.data.bid) || 0;
-          const ask = parseFloat(msg.data.ask) || 0;
-          const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : (parseFloat(msg.data.last) || 0);
-          if (mid > 0) setLivePrice(mid);
-        } else if (msg.type === 'bot_state' && msg.symbol === symbol) {
-          if (msg.strategy) setState(msg.strategy);
-        }
-      } catch {}
-    };
-
-    return () => ws.close();
-  }, [botId, symbol, botRef]);
+  _useBotWS(symbol, botRef, {
+    onBotState: (s) => setState(s),
+    onQuote: (data) => {
+      // Use mid price (bid+ask)/2 — consistent with positions panel
+      const bid = parseFloat(data.bid || '0') || 0;
+      const ask = parseFloat(data.ask || '0') || 0;
+      const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : (parseFloat(data.last || '0') || 0);
+      if (mid > 0) setLivePrice(mid);
+    },
+    subscribeBot: true,
+    subscribeQuote: true,
+  });
 
   const posState = state.position_state || state.state || 'FLAT';
   const qty = state.qty ? parseFloat(state.qty) : 0;
