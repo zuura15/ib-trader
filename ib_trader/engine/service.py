@@ -63,6 +63,9 @@ class _ListRenderer:
         self.messages: list[str] = []
         self.metadata: dict = {}  # Structured data: serial, order_ref, etc.
         self._writer: StreamWriter | None = None
+        # Holds in-flight publish tasks so the GC doesn't collect them
+        # mid-flight; each task discards itself on completion.
+        self._inflight: set[asyncio.Task] = set()
         if redis is not None and cmd_id:
             self._writer = StreamWriter(
                 redis, StreamNames.command_output(cmd_id), maxlen=500,
@@ -86,11 +89,16 @@ class _ListRenderer:
         except RuntimeError:
             return  # no event loop — sync test path, skip publish
         sev = getattr(severity, "value", None) or "info"
-        loop.create_task(self._writer.add({
+        # Fire-and-forget: hold a reference on `self` so the GC doesn't
+        # collect mid-flight (RUF006). Tasks self-clean via the discard
+        # callback below.
+        task = loop.create_task(self._writer.add({
             "type": "line",
             "message": message,
             "severity": sev,
         }))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
     async def publish_terminal(self, status: str, error: str | None = None) -> None:
         """Emit a terminal marker so WS subscribers can close the stream."""

@@ -308,7 +308,6 @@ async def test_get_order_status_returns_patched_value():
     """During the verify window, get_order_status reads
     trade.orderStatus.status which has been patched back to the previous
     clean value. Walker polls see a non-misleading state."""
-    from ib_async import Contract
 
     client = _make_client()
     trade = _make_trade("7300", "Cancelled", [

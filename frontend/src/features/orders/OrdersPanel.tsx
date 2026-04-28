@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useStore } from '../../data/store';
-import { formatPrice, formatAge, parseUTC } from '../../utils/format';
+import { formatPrice, formatAge, parseUTC, formatInstrument } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
 const statusBadge: Record<string, { cls: string; label: string }> = {
@@ -44,6 +44,12 @@ export function OrdersPanel({ compact = false }: { compact?: boolean }) {
           lastUpdate: parseUTC(o.placed_at),
           limitPrice: o.price_placed ? Number(o.price_placed) : undefined,
           avgFillPrice: o.avg_fill_price ? Number(o.avg_fill_price) : undefined,
+          sec_type: o.sec_type,
+          expiry: o.expiry,
+          trading_class: o.trading_class,
+          multiplier: o.multiplier,
+          display_symbol: o.display_symbol,
+          con_id: o.con_id,
         })));
       })
       .catch(() => {});
@@ -88,7 +94,7 @@ export function OrdersPanel({ compact = false }: { compact?: boolean }) {
                 : new Date(order.submittedAt || Date.now());
               return (
                 <tr key={order.id}>
-                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{order.symbol}</td>
+                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{formatInstrument(order)}</td>
                   <td>
                     <span style={{ color: order.side === 'BUY' ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                       {order.side}

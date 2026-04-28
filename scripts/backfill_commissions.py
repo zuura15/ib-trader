@@ -33,8 +33,8 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ib_trader.config.loader import load_settings  # noqa: E402
-from ib_trader.data.models import (  # noqa: E402
+from ib_trader.config.loader import load_settings
+from ib_trader.data.models import (
     Base, BotTrade, TransactionAction, TransactionEvent,
 )
 
@@ -83,7 +83,7 @@ def _apply(session_factory, fills, dry_run: bool) -> tuple[int, int]:
     txn_updates = 0
     bot_trade_updates = 0
 
-    for ib_order_id, exec_id, commission in fills:
+    for ib_order_id, _exec_id, commission in fills:
         # transactions — add commission to every FILLED/PARTIAL_FILL
         # row for this ib_order_id whose commission is currently 0.
         txn_rows = (

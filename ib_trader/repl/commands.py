@@ -17,9 +17,45 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from ib_trader.repl.output_router import OutputPane, OutputSeverity
+from ib_trader.utils.symbol import parse_month_code
 
 if TYPE_CHECKING:
     from ib_trader.repl.output_router import OutputRouter
+
+
+# Known futures roots recognised by the REPL shorthand. If the first
+# positional token matches one of these AND the second token is a
+# month-code (``Z26``, ``H27``...), we parse as FUT and emit explicit
+# security_type/expiry/trading_class fields on the command. No downstream
+# code infers sec-type from token shape — the parser is the only place
+# that converts shorthand into the explicit wire format (Epic 1 D2).
+_FUTURES_ROOTS: frozenset[str] = frozenset({
+    "ES", "MES", "NQ", "MNQ", "YM", "MYM", "RTY", "M2K",
+    "CL", "MCL", "GC", "MGC", "SI", "SIL", "HG", "MHG",
+    "ZN", "ZB", "ZF", "ZT",
+    "6E", "6J", "6B", "6A", "6C",
+})
+
+
+def _maybe_parse_futures_head(positional: list[str]) -> tuple[str | None, str | None]:
+    """If ``positional[0]`` is a known futures root and ``positional[1]`` is
+    a month-code token, return ``(root, expiry_yyyymm)``.
+
+    Otherwise return ``(None, None)``. The caller uses this to decide
+    whether to route to the FUT branch and where to pick up the rest
+    of the positional args (QTY, STRATEGY...).
+    """
+    if len(positional) < 2:
+        return None, None
+    root = positional[0].upper()
+    if root not in _FUTURES_ROOTS:
+        return None, None
+    try:
+        month, yy = parse_month_code(positional[1])
+    except ValueError:
+        return None, None
+    year_full = 2000 + yy
+    return root, f"{year_full}{month:02d}"
 
 
 class Strategy(StrEnum):
@@ -56,6 +92,12 @@ class BuyCommand:
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
+    # Epic 1 additions — explicit sec-type fields produced by the parser.
+    # Never inferred downstream; CLI shorthand writes them here.
+    security_type: str = "STK"
+    expiry: str | None = None          # YYYYMM (CLI) or YYYYMMDD (IB-normalized)
+    trading_class: str | None = None
+    exchange: str | None = None
 
 
 @dataclass
@@ -70,6 +112,10 @@ class SellCommand:
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
+    security_type: str = "STK"
+    expiry: str | None = None
+    trading_class: str | None = None
+    exchange: str | None = None
 
 
 @dataclass
@@ -140,6 +186,10 @@ def parse_buy_sell(
     stop_loss = None
 
     positional = []
+    explicit_sec_type: str | None = None
+    explicit_expiry: str | None = None
+    explicit_trading_class: str | None = None
+    explicit_exchange: str | None = None
     i = 0
     while i < len(args):
         tok = args[i]
@@ -173,6 +223,30 @@ def parse_buy_sell(
             except ValueError as e:
                 _emit_error(f"\u2717 Error: {e}", router)
                 return None
+        elif tok in ("--sec-type", "--security-type"):
+            i += 1
+            if i >= len(args):
+                _emit_error(f"\u2717 Error: {tok} requires a value", router)
+                return None
+            explicit_sec_type = args[i].upper()
+        elif tok == "--expiry":
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --expiry requires a value", router)
+                return None
+            explicit_expiry = args[i]
+        elif tok == "--trading-class":
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --trading-class requires a value", router)
+                return None
+            explicit_trading_class = args[i]
+        elif tok == "--exchange":
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --exchange requires a value", router)
+                return None
+            explicit_exchange = args[i]
         elif tok.startswith("--"):
             _emit_error(f"\u2717 Error: unknown option {tok!r}", router)
             return None
@@ -180,9 +254,30 @@ def parse_buy_sell(
             positional.append(tok)
         i += 1
 
-    # Positional: SYMBOL QTY STRATEGY [PROFIT]
+    # Futures shorthand: ``buy ES Z26 2 mid``. If the first two tokens
+    # match, consume them and shift the remaining positionals forward.
+    security_type = "STK"
+    expiry_yyyymm: str | None = None
+    fut_root, fut_expiry = _maybe_parse_futures_head(positional)
+    if fut_root is not None and fut_expiry is not None:
+        security_type = "FUT"
+        expiry_yyyymm = fut_expiry
+        positional = [fut_root, *positional[2:]]
+    # Explicit --sec-type etc. override the shorthand. This is the path
+    # the internal HTTP API uses when composing a command from an
+    # OrderRequest that already carries explicit fields.
+    if explicit_sec_type is not None:
+        security_type = explicit_sec_type
+    if explicit_expiry is not None:
+        expiry_yyyymm = explicit_expiry
+
+    # Positional (STK): SYMBOL QTY STRATEGY [PROFIT]
+    # Positional (FUT): ROOT QTY STRATEGY [PROFIT] (after the shorthand
+    # shift above has already consumed the month-code token).
     if len(positional) < 3:
-        _emit_error(f"\u2717 Error: usage: {verb} SYMBOL QTY STRATEGY [PROFIT]", router)
+        usage = f"{verb} SYMBOL QTY STRATEGY [PROFIT]" if security_type == "STK" \
+                else f"{verb} ROOT MONTHCODE QTY STRATEGY [PROFIT]"
+        _emit_error(f"\u2717 Error: usage: {usage}", router)
         return None
 
     symbol = positional[0].upper()
@@ -235,6 +330,8 @@ def parse_buy_sell(
             _emit_error(f"\u2717 Error: {e}", router)
             return None
 
+    exchange = explicit_exchange or ("CME" if security_type == "FUT" else None)
+    trading_class = explicit_trading_class
     if verb == "buy":
         return BuyCommand(
             symbol=symbol,
@@ -245,6 +342,10 @@ def parse_buy_sell(
             take_profit_price=take_profit_price,
             stop_loss=stop_loss,
             limit_price=limit_price,
+            security_type=security_type,
+            expiry=expiry_yyyymm,
+            trading_class=trading_class,
+            exchange=exchange,
         )
     else:
         return SellCommand(
@@ -256,6 +357,10 @@ def parse_buy_sell(
             take_profit_price=take_profit_price,
             stop_loss=stop_loss,
             limit_price=limit_price,
+            security_type=security_type,
+            expiry=expiry_yyyymm,
+            trading_class=trading_class,
+            exchange=exchange,
         )
 
 

@@ -169,6 +169,10 @@ ignore_imports = [
     # state or IB directly.
     "ib_trader.bots.base -> ib_trader.data.repository",
     "ib_trader.bots.middleware -> ib_trader.data.repository",
+    # Bot exit path writes realized P&L back to trade_groups via the
+    # repository (archival write, not a live-decision read). CLAUDE.md
+    # explicitly permits archival SQLite writes from the bot path.
+    "ib_trader.bots.runtime -> ib_trader.data.repository",
 ]
 
 [[tool.importlinter.contracts]]

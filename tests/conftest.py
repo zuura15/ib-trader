@@ -48,6 +48,32 @@ class MockIBClient(IBClientBase):
             "multiplier": None,
             "raw": '{"conId": 12345}',
         }
+        # Futures fixtures — tests can extend/replace via attribute.
+        # Each root maps to a list of (trading_class, multiplier, tick_size)
+        # with a shared set of upcoming expiries. Tests that need a specific
+        # layout override ``self.future_fixtures``.
+        self.future_fixtures: dict[str, list[dict]] = {
+            "ES": [
+                {"trading_class": "ES", "multiplier": "50", "tick_size": "0.25", "exchange": "CME", "con_id_base": 400000},
+                {"trading_class": "MES", "multiplier": "5", "tick_size": "0.25", "exchange": "CME", "con_id_base": 500000},
+            ],
+            "MES": [
+                {"trading_class": "MES", "multiplier": "5", "tick_size": "0.25", "exchange": "CME", "con_id_base": 500000},
+            ],
+            "NQ": [
+                {"trading_class": "NQ", "multiplier": "20", "tick_size": "0.25", "exchange": "CME", "con_id_base": 600000},
+            ],
+        }
+        # Default upcoming expiries (1 yr out). Tests override when they
+        # need a specific month or an expired contract.
+        from datetime import date as _date
+        today = _date.today()
+        self.future_expiries: list[str] = [
+            f"{today.year}{m:02d}19" for m in (3, 6, 9, 12)
+            if _date(today.year, m, 19) >= today
+        ]
+        if not self.future_expiries:
+            self.future_expiries = [f"{today.year + 1}0319"]
 
     async def connect(self) -> None:
         self.connected = True
@@ -61,9 +87,90 @@ class MockIBClient(IBClientBase):
         exercise mismatch detection."""
         return getattr(self, "mock_managed_accounts", ["DU0000000"])
 
-    async def qualify_contract(self, symbol, sec_type="STK", exchange="SMART", currency="USD") -> dict:
+    async def qualify_contract(
+        self,
+        symbol,
+        sec_type="STK",
+        exchange="SMART",
+        currency="USD",
+        *,
+        expiry=None,
+        trading_class=None,
+    ) -> dict:
         await self._throttle()
-        return self._qualify_result
+        if sec_type.upper() != "FUT":
+            return self._qualify_result
+        return self._qualify_future_fixture(symbol, exchange, expiry, trading_class)
+
+    def _qualify_future_fixture(self, root, exchange, expiry, trading_class):
+        from datetime import date as _date
+        from ib_trader.broker.exceptions import AmbiguousInstrument, ExpiredContractError
+
+        if not expiry:
+            raise ValueError("FUT qualify requires expiry (YYYYMM or YYYYMMDD)")
+        # Normalise expiry shape
+        if len(str(expiry)) == 6:
+            # YYYYMM → pretend the contract trades on the 19th of that month
+            expiry_full = f"{expiry}19"
+        else:
+            expiry_full = str(expiry)
+        # Past-expiry check
+        y, m, d = int(expiry_full[:4]), int(expiry_full[4:6]), int(expiry_full[6:8])
+        if _date(y, m, d) < _date.today():
+            raise ExpiredContractError(root, expiry_full)
+
+        fams = self.future_fixtures.get(root.upper(), [])
+        if not fams:
+            raise ValueError(f"no IB contract matched {root} {expiry} on {exchange}")
+        if trading_class:
+            fams = [f for f in fams if f["trading_class"].upper() == trading_class.upper()]
+            if not fams:
+                raise ValueError(f"no IB contract matched trading_class={trading_class}")
+        if len(fams) > 1:
+            from ib_trader.broker.types import FutureExpiryCandidate
+            candidates = [
+                FutureExpiryCandidate(
+                    con_id=f["con_id_base"] + int(expiry_full),
+                    root=root, expiry=expiry_full,
+                    trading_class=f["trading_class"], exchange=f["exchange"],
+                    multiplier=Decimal(f["multiplier"]), tick_size=Decimal(f["tick_size"]),
+                )
+                for f in fams
+            ]
+            raise AmbiguousInstrument(root=root, candidates=candidates)
+
+        f = fams[0]
+        con_id = f["con_id_base"] + int(expiry_full)
+        return {
+            "con_id": con_id,
+            "exchange": f["exchange"],
+            "currency": "USD",
+            "multiplier": f["multiplier"],
+            "trading_class": f["trading_class"],
+            "expiry": expiry_full,
+            "tick_size": f["tick_size"],
+            "raw": f'{{"conId": {con_id}}}',
+        }
+
+    async def list_future_expiries(self, root, exchange="CME", trading_class=None, currency="USD"):
+        from ib_trader.broker.types import FutureExpiryCandidate
+
+        fams = self.future_fixtures.get(root.upper(), [])
+        if trading_class:
+            fams = [f for f in fams if f["trading_class"].upper() == trading_class.upper()]
+        out: list[FutureExpiryCandidate] = []
+        for f in fams:
+            if f["exchange"].upper() != exchange.upper():
+                continue
+            for expiry_full in self.future_expiries:
+                out.append(FutureExpiryCandidate(
+                    con_id=f["con_id_base"] + int(expiry_full),
+                    root=root, expiry=expiry_full,
+                    trading_class=f["trading_class"], exchange=f["exchange"],
+                    multiplier=Decimal(f["multiplier"]), tick_size=Decimal(f["tick_size"]),
+                ))
+        out.sort(key=lambda c: c.expiry)
+        return out
 
     async def get_market_snapshot(self, con_id: int) -> dict:
         await self._throttle()

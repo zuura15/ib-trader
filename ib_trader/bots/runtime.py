@@ -33,8 +33,7 @@ from sqlalchemy.orm import scoped_session
 
 from ib_trader.bots.base import BotBase
 from ib_trader.bots.lifecycle import (
-    ACTIVE_STATES, BotState, ERROR_REASONS,
-    MAX_EXIT_RETRIES as _MAX_EXIT_RETRIES,
+    BotState, MAX_EXIT_RETRIES as _MAX_EXIT_RETRIES,
     bot_doc_key, clear_position_fields, now_iso,
 )
 from ib_trader.bots.strategy import (
@@ -1680,6 +1679,18 @@ class StrategyBotRunner(BotBase):
         if self.strategy is None:
             raise ValueError(f"Unknown strategy: {strategy_name}")
 
+        # Epic 1 D8 — validate the configured sec_type is declared on the
+        # strategy's manifest. Legacy strategies (manifest leaves
+        # ``supported_sec_types`` unset) accept STK/ETF silently; new
+        # strategies that want FUT must opt in explicitly.
+        cfg_sec_type = str(self.strategy_config.get("sec_type", "STK")).upper()
+        if not self.strategy.manifest.permits_sec_type(cfg_sec_type):
+            raise ValueError(
+                f"bot {self.bot_id}: strategy {strategy_name!r} does not support "
+                f"sec_type={cfg_sec_type}; declare it in the manifest's "
+                f"supported_sec_types to enable."
+            )
+
         # Restore or initialize state from Redis
         symbol = self.strategy_config["symbol"]
         redis = self.config.get("_redis")
@@ -2121,8 +2132,6 @@ class StrategyBotRunner(BotBase):
             side = data.get("side", "")
             filled_qty_str = data.get("filled_qty", "0")
             avg_price_str = data.get("avg_price")
-            last_fill_qty_str = data.get("last_fill_qty")
-            last_fill_price_str = data.get("last_fill_price")
             event_ib_order_id = str(data.get("ib_order_id") or "")
 
             # Dispatch via the bot's own lifecycle methods (no more FSM).
@@ -2228,10 +2237,21 @@ class StrategyBotRunner(BotBase):
                 return
             if data.get("symbol") != symbol:
                 return
-            # Only react to STK position events — option contracts share
-            # the same symbol and would cause false MANUAL_CLOSE triggers.
-            # Once we re-key by con_id this filter goes away.
+            # Epic 1 D8 — drop events whose sec_type isn't supported by
+            # the strategy's manifest, and log a WARNING (previously the
+            # post-filter silently dropped the event, making misconfigured
+            # bots invisible).
             evt_sec_type = str(data.get("sec_type", "STK")).upper()
+            if not self.strategy.manifest.permits_sec_type(evt_sec_type):
+                logger.warning(
+                    '{"event": "BOT_EVENT_SECTYPE_DROPPED", "bot_id": "%s", '
+                    '"symbol": "%s", "event_sec_type": "%s", "strategy": "%s"}',
+                    self.bot_id, symbol, evt_sec_type, self.strategy.manifest.name,
+                )
+                return
+            # Strategy-config sec_type gate — legacy behaviour for strategies
+            # that still use strategy_config["sec_type"] to target a single
+            # type within a manifest's supported set.
             bot_sec_type = self.strategy_config.get("sec_type", "STK").upper()
             if evt_sec_type != bot_sec_type:
                 return

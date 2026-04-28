@@ -474,7 +474,7 @@ class OrderLedger:
             return None
         try:
             current_qty = self._position_getter(entry.symbol, entry.sec_type)
-        except Exception as e:  # noqa: BLE001 — broker shape varies
+        except Exception as e:
             logger.warning(
                 '{"event": "ORDER_LEDGER_POSITION_LOOKUP_FAILED", '
                 '"ib_order_id": "%s", "symbol": "%s", "error": "%s"}',

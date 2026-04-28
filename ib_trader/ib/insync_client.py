@@ -8,12 +8,86 @@ import asyncio
 import json
 import logging
 import time
+from datetime import date
 from decimal import Decimal
-from ib_async import IB, Contract, LimitOrder, MarketOrder, Trade, Fill
+from zoneinfo import ZoneInfo
 
+from ib_async import IB, Contract, Future, LimitOrder, MarketOrder, Trade, Fill
+
+from ib_trader.broker.exceptions import AmbiguousInstrument, ExpiredContractError
+from ib_trader.broker.types import FutureExpiryCandidate
 from ib_trader.engine.market_hours import is_overnight_session
 from ib_trader.ib.base import IBClientBase
 from ib_trader.ib.overnight_patch import apply as _apply_overnight_patch
+
+
+# Exchange → product-session timezone mapping. CME-family products settle in
+# America/Chicago; unmapped exchanges fall back to UTC (with a warning at
+# the call site). See Epic 1 D9.
+_EXCHANGE_TZ: dict[str, ZoneInfo] = {
+    "CME": ZoneInfo("America/Chicago"),
+    "CBOT": ZoneInfo("America/Chicago"),
+    "NYMEX": ZoneInfo("America/Chicago"),
+    "COMEX": ZoneInfo("America/Chicago"),
+    "GLOBEX": ZoneInfo("America/Chicago"),
+}
+
+
+def _product_today(exchange: str) -> date:
+    """Return today's date in the exchange's session timezone.
+
+    Falls back to UTC for unmapped exchanges; callers log a WARNING via
+    the structured logger when this path is hit.
+    """
+    tz = _EXCHANGE_TZ.get(exchange.upper(), ZoneInfo("UTC"))
+    import datetime as _dt
+    return _dt.datetime.now(tz).date()
+
+
+def _normalize_expiry(expiry: str | None) -> str | None:
+    """Return a YYYYMMDD expiry string from a YYYYMM or YYYYMMDD input.
+
+    YYYYMM alone is ambiguous pre-qualification — we pass it through to
+    IB's qualifier, which resolves it to the contract's last-trade date.
+    This helper validates shape only; the authoritative value is the
+    string IB returns in ``lastTradeDateOrContractMonth`` post-qualify.
+    """
+    if expiry is None:
+        return None
+    if not expiry.isdigit() or len(expiry) not in (6, 8):
+        raise ValueError(f"expiry must be YYYYMM or YYYYMMDD: {expiry!r}")
+    return expiry
+
+
+def _expiry_as_date(expiry: str) -> date:
+    """Parse a YYYYMMDD (or YYYYMM) expiry into a date.
+
+    YYYYMM expiries are treated as the last day of that month, which is
+    always >= the actual last-trade date. This is conservative for the
+    expired-check in ``_qualify_future`` (we never reject a contract
+    that might still be tradable).
+    """
+    if len(expiry) == 8:
+        return date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:8]))
+    if len(expiry) == 6:
+        import calendar
+        y, m = int(expiry[:4]), int(expiry[4:6])
+        return date(y, m, calendar.monthrange(y, m)[1])
+    raise ValueError(f"expiry must be YYYYMM or YYYYMMDD: {expiry!r}")
+
+
+def _candidate_from_details(d, root: str) -> FutureExpiryCandidate:
+    """Build a ``FutureExpiryCandidate`` from an ib_async ContractDetails."""
+    c = d.contract
+    return FutureExpiryCandidate(
+        con_id=c.conId,
+        root=root,
+        expiry=c.lastTradeDateOrContractMonth,
+        trading_class=c.tradingClass or root,
+        exchange=c.exchange,
+        multiplier=Decimal(str(c.multiplier)) if c.multiplier else Decimal("1"),
+        tick_size=Decimal(str(d.minTick)) if d.minTick else Decimal("0.01"),
+    )
 
 # Patch ib_async to support includeOvernight (server version 189).
 # Must run before any IB connection is established.
@@ -226,9 +300,28 @@ class InsyncClient(IBClientBase):
         sec_type: str = "STK",
         exchange: str = "SMART",
         currency: str = "USD",
+        *,
+        expiry: str | None = None,
+        trading_class: str | None = None,
     ) -> dict:
-        """Qualify an IB contract and return its details."""
+        """Qualify an IB contract and return its details.
+
+        For STK the original single-step behaviour is preserved. For
+        FUT the caller must supply ``expiry`` (YYYYMM or YYYYMMDD); the
+        method builds an ``ib_async.Future`` with optional
+        ``trading_class``. When IB returns >1 candidate we raise
+        ``AmbiguousInstrument`` (ES vs MES etc). Past-expiry contracts
+        raise ``ExpiredContractError``. The returned dict grows
+        ``trading_class`` and ``tick_size`` fields for FUT.
+        """
         await self._throttle()
+        sec_type_u = sec_type.upper()
+        if sec_type_u == "FUT":
+            return await self._qualify_future(
+                root=symbol, exchange=exchange, currency=currency,
+                expiry=_normalize_expiry(expiry), trading_class=trading_class,
+            )
+
         contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
         [qualified] = await self.__ib.qualifyContractsAsync(contract)
         raw = json.dumps({
@@ -262,6 +355,126 @@ class InsyncClient(IBClientBase):
             "multiplier": qualified.multiplier or None,
             "raw": raw,
         }
+
+    async def _qualify_future(
+        self,
+        root: str,
+        exchange: str,
+        currency: str,
+        expiry: str | None,
+        trading_class: str | None,
+    ) -> dict:
+        """Qualify a single futures contract via ``reqContractDetailsAsync``.
+
+        ``reqContractDetails`` gives us both the con_id and the
+        tick_size (minTick) in a single round-trip; ``qualifyContracts``
+        would require a second call for tick metadata.
+        """
+        if not expiry:
+            raise ValueError("FUT qualify requires expiry (YYYYMM or YYYYMMDD)")
+
+        future = Future(
+            symbol=root,
+            lastTradeDateOrContractMonth=expiry,
+            exchange=exchange,
+            currency=currency,
+            tradingClass=trading_class or "",
+        )
+        details = await self.__ib.reqContractDetailsAsync(future)
+        if not details:
+            raise ValueError(f"no IB contract matched {root} {expiry} on {exchange}")
+
+        # Filter to non-expired candidates in the exchange's tz.
+        today = _product_today(exchange)
+        if exchange.upper() not in _EXCHANGE_TZ:
+            logger.warning(
+                '{"event": "UNKNOWN_EXCHANGE_TZ", "exchange": "%s", "fallback": "UTC"}',
+                exchange,
+            )
+        fresh = [d for d in details if _expiry_as_date(d.contract.lastTradeDateOrContractMonth) >= today]
+        if not fresh:
+            # Every candidate is expired — flag with the first one's date.
+            raise ExpiredContractError(root, details[0].contract.lastTradeDateOrContractMonth)
+
+        if len(fresh) > 1:
+            candidates = [_candidate_from_details(d, root) for d in fresh]
+            raise AmbiguousInstrument(root=root, candidates=candidates)
+
+        d = fresh[0]
+        qualified = d.contract
+        tick = Decimal(str(d.minTick)) if d.minTick else Decimal("0.01")
+        multiplier = qualified.multiplier or None
+        raw = json.dumps({
+            "conId": qualified.conId,
+            "symbol": qualified.symbol,
+            "secType": qualified.secType,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "tradingClass": qualified.tradingClass,
+            "lastTradeDateOrContractMonth": qualified.lastTradeDateOrContractMonth,
+            "minTick": str(tick),
+        })
+        # Order-placement cache: futures route to their primary exchange
+        # (not SMART) since futures use a single exchange per product.
+        self._contract_cache[qualified.conId] = Contract(
+            conId=qualified.conId,
+            symbol=qualified.symbol,
+            secType=qualified.secType,
+            exchange=qualified.exchange,
+            currency=qualified.currency,
+            lastTradeDateOrContractMonth=qualified.lastTradeDateOrContractMonth,
+            tradingClass=qualified.tradingClass,
+            multiplier=qualified.multiplier,
+        )
+        logger.info(
+            '{"event": "CONTRACT_FETCHED", "symbol": "%s", "con_id": %d, "sec_type": "FUT",'
+            ' "expiry": "%s", "trading_class": "%s", "tick": "%s"}',
+            root, qualified.conId, qualified.lastTradeDateOrContractMonth,
+            qualified.tradingClass, tick,
+        )
+        return {
+            "con_id": qualified.conId,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "trading_class": qualified.tradingClass or None,
+            "expiry": qualified.lastTradeDateOrContractMonth,
+            "tick_size": str(tick),
+            "raw": raw,
+        }
+
+    async def list_future_expiries(
+        self,
+        root: str,
+        exchange: str,
+        trading_class: str | None = None,
+        currency: str = "USD",
+    ) -> list[FutureExpiryCandidate]:
+        """Return upcoming futures expiries for ``root``.
+
+        One round-trip to ``reqContractDetails`` with no expiry supplied
+        returns every listed contract. Expired entries are filtered,
+        and results are sorted ascending by last-trade date.
+        """
+        await self._throttle()
+        if exchange.upper() not in _EXCHANGE_TZ:
+            logger.warning(
+                '{"event": "UNKNOWN_EXCHANGE_TZ", "exchange": "%s", "fallback": "UTC"}',
+                exchange,
+            )
+        future = Future(
+            symbol=root,
+            exchange=exchange,
+            currency=currency,
+            tradingClass=trading_class or "",
+        )
+        details = await self.__ib.reqContractDetailsAsync(future)
+        today = _product_today(exchange)
+        fresh = [d for d in details if _expiry_as_date(d.contract.lastTradeDateOrContractMonth) >= today]
+        candidates = [_candidate_from_details(d, root) for d in fresh]
+        candidates.sort(key=lambda c: c.expiry)
+        return candidates
 
     async def get_market_snapshot(self, con_id: int) -> dict:
         """Fetch a bid/ask/last snapshot for a contract.
@@ -770,12 +983,13 @@ class InsyncClient(IBClientBase):
     # ------------------------------------------------------------------
     # Wrapper public APIs that absorb direct ib-async access from outside
     # the wrapper. Added so external modules don't reach into ``self.__ib``
-    # (class-level name-mangled to ``_InsyncClient__ib`` and not
+    # (which is class-level name-mangled to ``_InsyncClient__ib`` and not
     # accessible by convention) or ``self.__active_trades``.
     #
-    # Import-linter contract "ib_async direct imports forbidden outside
-    # the wrapper" catches static drift on the import path; these methods
-    # absorb the attribute-access drift on the runtime path.
+    # See ib_trader/ib/__init__.py architectural note. Import-linter
+    # contract "ib_async direct imports forbidden outside the wrapper"
+    # catches static drift on the import path; these methods absorb the
+    # attribute-access drift on the runtime path.
     # ------------------------------------------------------------------
 
     async def req_positions_async(self, timeout: float = 10.0) -> None:
@@ -783,7 +997,10 @@ class InsyncClient(IBClientBase):
         position event stream pushes individual positions to whatever
         callback is registered via ``register_position_event_callback``.
         """
-        await asyncio.wait_for(self.__ib.reqPositionsAsync(), timeout=timeout)
+        try:
+            await asyncio.wait_for(self.__ib.reqPositionsAsync(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise
 
     def get_raw_positions(self) -> list:
         """Return ib-async Position objects currently held at the broker.
@@ -793,6 +1010,15 @@ class InsyncClient(IBClientBase):
         (``contract``, ``position``, ``avgCost``, ``account``).
         """
         return list(self.__ib.positions())
+
+    def get_tickers(self) -> list:
+        """Return ib-async Ticker objects for currently subscribed contracts.
+
+        Snapshot of whatever ``ib.tickers()`` reports. Callers should
+        treat each Ticker as opaque except for documented attributes
+        (``contract``, ``bid``, ``ask``, ``last``, ``time``).
+        """
+        return list(self.__ib.tickers())
 
     def register_position_event_callback(self, callback) -> None:
         """Subscribe to ib-async ``positionEvent``. Callback receives a
@@ -872,10 +1098,11 @@ class InsyncClient(IBClientBase):
                 "contract": Contract,  # ib-async Contract object
             }
 
-        ``contract`` is the ib-async Contract object — exposed because
-        consumers need ``lastTradeDateOrContractMonth`` /
-        ``tradingClass`` / ``multiplier`` for futures display. Treat it
-        as opaque-with-documented-attributes.
+        Callers that only need a subset can pick fields off the dict.
+        ``contract`` is the ib-async Contract — exposed because
+        consumers (orders-open enrichment in engine/main.py) need
+        ``expiry`` / ``trading_class`` / ``multiplier`` for futures
+        display. Treat it as opaque-with-documented-attributes.
         """
         trade = self.__active_trades.get(str(ib_order_id))
         if trade is None:
@@ -938,7 +1165,7 @@ class InsyncClient(IBClientBase):
         for cb in self._order_placed_callbacks:
             try:
                 cb(ib_order_id, symbol, sec_type, con_id, side, qty, order_ref)
-            except Exception:  # noqa: BLE001 — never let a callback kill the placement path
+            except Exception:
                 logger.exception(
                     '{"event": "ORDER_PLACED_CALLBACK_FAILED", '
                     '"ib_order_id": "%s"}',
@@ -1506,13 +1733,13 @@ class InsyncClient(IBClientBase):
                 '"ib_order_id": "%s", "code": %s}',
                 ib_order_id, err_code,
             )
-            return  # patch stays — ib_async overwrites on next real status
+            return  # patch stays — ib_async will overwrite on next real status
 
-        # Race: the real terminal may have landed via _orderStatus() during the
-        # IB round-trip. Filled goes through this same method and dispatches
-        # synchronously, so trade.orderStatus.status reflects it. Re-check
-        # before propagating a stale Cancelled that would re-fire callbacks
-        # on an already-Filled order.
+        # Race: the real terminal may have landed via _on_order_status during
+        # the IB round-trip. Filled goes through this same method and
+        # dispatches synchronously, so trade.orderStatus.status reflects it.
+        # Re-check before propagating a stale Cancelled that would re-fire
+        # callbacks on an already-Filled order.
         current = trade.orderStatus.status
         if current == "Filled":
             logger.info(

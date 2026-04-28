@@ -159,6 +159,12 @@ async def run_reconciliation(ctx: AppContext) -> dict:
                         requested_at=now,
                         ib_responded_at=now,
                         is_terminal=True,
+                        # Epic 1 D14: archival rows self-describing.
+                        security_type=getattr(txn, "security_type", None),
+                        expiry=getattr(txn, "expiry", None),
+                        trading_class=getattr(txn, "trading_class", None),
+                        multiplier=getattr(txn, "multiplier", None),
+                        con_id=getattr(txn, "con_id", None),
                     )
                     ctx.transactions.insert(reconciled_event)
                     logger.info(
@@ -189,6 +195,11 @@ async def run_reconciliation(ctx: AppContext) -> dict:
                         requested_at=now,
                         ib_responded_at=now,
                         is_terminal=True,
+                        security_type=getattr(txn, "security_type", None),
+                        expiry=getattr(txn, "expiry", None),
+                        trading_class=getattr(txn, "trading_class", None),
+                        multiplier=getattr(txn, "multiplier", None),
+                        con_id=getattr(txn, "con_id", None),
                     )
                     ctx.transactions.insert(reconciled_event)
                     logger.info(

@@ -38,7 +38,7 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ib_trader.data.models import (  # noqa: E402
+from ib_trader.data.models import (
     Base, TradeGroup, TransactionAction, TransactionEvent,
 )
 

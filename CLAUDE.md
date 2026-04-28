@@ -1,5 +1,12 @@
 # Engineering Standards — IB Trader
 
+## Collaboration
+- Keep answers to 6–8 lines unless more depth is explicitly required.
+- When iterating on a plan, show only the diff from the previous version — do
+  not re-print the whole plan each turn.
+- When we align on a new feature, open a GitHub issue in this repo and record
+  the relevant discussion points there.
+
 ## Data & State
 - Monetary values: `Decimal` or integer cents, never `float`.
 - **IB is the source of truth for broker-held state** (orders, fills, positions,

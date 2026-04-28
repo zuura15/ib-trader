@@ -44,6 +44,14 @@ class _OrderContext:
     right: str | None = None
     ib_order_id: str | None = None
     order_ref: str | None = None  # IB orderRef tag (IBT:{bot_ref}:{symbol}:{side}:{serial})
+    # Epic 1 additions — populated after qualify for FUT so pricing can
+    # use the contract's real tick_size and multiplier instead of the STK
+    # defaults.
+    trading_class: str | None = None
+    exchange: str | None = None
+    tick_size: Decimal = dataclasses.field(default_factory=lambda: STK_TICK)
+    multiplier: Decimal = dataclasses.field(default_factory=lambda: Decimal("1"))
+    con_id: int | None = None
 
 
 def _session_tif() -> str:
@@ -59,6 +67,7 @@ from ib_trader.engine.pricing import (
     calc_mid, calc_profit_taker_price, calc_profit_taker_price_short, calc_step_price,
     calc_shares_from_dollars,
 )
+from ib_trader.engine.ticks import STK_TICK
 from ib_trader.repl.commands import BuyCommand, SellCommand, CloseCommand, Strategy
 
 logger = logging.getLogger(__name__)
@@ -141,6 +150,9 @@ def _write_txn(
     strike: Decimal | None = None,
     right: str | None = None,
     raw_response: str | None = None,
+    trading_class: str | None = None,
+    multiplier: str | None = None,
+    con_id: int | None = None,
 ) -> None:
     """Write a single TransactionEvent row to the audit log.
 
@@ -175,6 +187,9 @@ def _write_txn(
         strike=strike,
         right=right,
         raw_response=raw_response,
+        trading_class=trading_class,
+        multiplier=multiplier,
+        con_id=con_id,
     )
     try:
         ctx.transactions.insert(event)
@@ -212,14 +227,51 @@ async def execute_order(
     settings = ctx.settings
     side = "BUY" if isinstance(cmd, BuyCommand) else "SELL"
 
-    # 1. Resolve quantity
+    # 1. Resolve quantity. For FUT we pass sec-type kwargs through so the
+    # IB qualifier picks the right contract (ES vs MES) and returns the
+    # real tick_size + multiplier for multiplier-aware pricing.
+    sec_type_u = (getattr(cmd, "security_type", None) or "STK").upper()
     qty = cmd.qty
-    contract_info = await _get_contract(cmd.symbol, ctx)
+    contract_info = await _get_contract(
+        cmd.symbol, ctx,
+        sec_type=sec_type_u,
+        expiry=getattr(cmd, "expiry", None),
+        trading_class=getattr(cmd, "trading_class", None),
+        exchange=getattr(cmd, "exchange", None),
+    )
     con_id = contract_info["con_id"]
+    tick_size = Decimal(contract_info["tick_size"]) if contract_info.get("tick_size") else STK_TICK
+    multiplier = (
+        Decimal(contract_info["multiplier"])
+        if contract_info.get("multiplier")
+        else Decimal("1")
+    )
+
+    # CME settlement-break advisory (Epic 1 D7) \u2014 for FUT only. Never
+    # blocks the order; IB's own rejection remains authoritative.
+    if sec_type_u == "FUT":
+        from ib_trader.engine.market_hours_futures import is_cme_equity_break
+        if is_cme_equity_break():
+            ctx.router.emit(
+                f"\u26a0 {cmd.symbol} order entered during expected CME daily-settle "
+                f"window (4\u20135 PM CT Mon-Thu) \u2014 IB may reject.",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+            )
+
+    # Reject off-tick user-supplied limit price post-qualify (Epic 1 D5).
+    limit_price = getattr(cmd, "limit_price", None)
+    if limit_price is not None and tick_size > 0:
+        from ib_trader.engine.ticks import is_on_tick
+        if not is_on_tick(limit_price, tick_size):
+            ctx.router.emit(
+                f"\u2717 Error: price {limit_price} not on tick ({tick_size}) for {cmd.symbol}",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
+            )
+            return
 
     if cmd.dollars is not None:
         snapshot = await ctx.ib.get_market_snapshot(con_id)
-        mid = calc_mid(snapshot["bid"], snapshot["ask"])
+        mid = calc_mid(snapshot["bid"], snapshot["ask"], tick_size=tick_size)
         qty = calc_shares_from_dollars(
             cmd.dollars, mid, settings["max_order_size_shares"]
         )
@@ -290,7 +342,13 @@ async def execute_order(
         qty_requested=qty,
         leg_type=LegType.ENTRY,
         correlation_id=correlation_id,
-        security_type="STK",
+        security_type=sec_type_u,
+        expiry=contract_info.get("expiry") or getattr(cmd, "expiry", None),
+        trading_class=contract_info.get("trading_class") or getattr(cmd, "trading_class", None),
+        exchange=contract_info.get("exchange") or getattr(cmd, "exchange", None),
+        tick_size=tick_size,
+        multiplier=multiplier,
+        con_id=int(con_id) if str(con_id).lstrip("-").isdigit() else None,
         order_ref=order_ref,
     )
 
@@ -325,8 +383,37 @@ async def execute_order(
         raise
 
 
-async def _get_contract(symbol: str, ctx: AppContext) -> dict:
-    """Get contract details, using cache if fresh."""
+async def _get_contract(
+    symbol: str,
+    ctx: AppContext,
+    *,
+    sec_type: str = "STK",
+    expiry: str | None = None,
+    trading_class: str | None = None,
+    exchange: str | None = None,
+) -> dict:
+    """Get contract details, using cache if fresh.
+
+    For STK the on-disk ``Contract`` cache is keyed by symbol; the legacy
+    STK path is preserved byte-for-byte. For FUT the archival cache is
+    not keyed on (expiry, trading_class), so we bypass it and rely on
+    the IB client's in-memory con_id cache — qualify_contract is cheap
+    once populated. The returned dict always includes ``sec_type``; FUT
+    entries also include ``expiry``, ``trading_class``, ``tick_size``.
+    """
+    sec_type_u = sec_type.upper()
+
+    if sec_type_u == "FUT":
+        info = await ctx.ib.qualify_contract(
+            symbol,
+            sec_type="FUT",
+            exchange=exchange or "CME",
+            expiry=expiry,
+            trading_class=trading_class,
+        )
+        info.setdefault("sec_type", "FUT")
+        return info
+
     ttl = ctx.settings["cache_ttl_seconds"]
     if ctx.contracts.is_fresh(symbol, ttl):
         cached = ctx.contracts.get(symbol)
@@ -345,6 +432,7 @@ async def _get_contract(symbol: str, ctx: AppContext) -> dict:
             "exchange": cached.exchange,
             "currency": cached.currency,
             "multiplier": cached.multiplier,
+            "sec_type": "STK",
         }
 
     logger.debug('{"event": "CONTRACT_CACHE_MISS", "symbol": "%s"}', symbol)
@@ -361,6 +449,7 @@ async def _get_contract(symbol: str, ctx: AppContext) -> dict:
         fetched_at=_now_utc(),
     )
     ctx.contracts.upsert(contract)
+    info.setdefault("sec_type", "STK")
     return info
 
 
@@ -531,7 +620,7 @@ async def _execute_mid_order(
         )
         bid = ask = last
 
-    mid = calc_mid(bid, ask)
+    mid = calc_mid(bid, ask, tick_size=order_ctx.tick_size)
 
     ctx.router.emit(
         f"Order #{trade_group.serial_number} \u2014 {side} {qty} {cmd.symbol} @ mid\n"
@@ -744,6 +833,7 @@ async def _execute_mid_order(
             leg_type=order_ctx.leg_type,
             security_type=order_ctx.security_type,
             trade_serial=trade_group.serial_number,
+            tick_size=order_ctx.tick_size,
         )
     )
 
@@ -1434,7 +1524,7 @@ async def _execute_smart_market_order(
                 "available (bid=0, ask=0, last=0)."
             )
         bid = ask = last
-    trigger_price = calc_mid(bid, ask)
+    trigger_price = calc_mid(bid, ask, tick_size=order_ctx.tick_size)
     floor_price = _slippage_floor(trigger_price, side, max_slip)
     rth = not is_outside_rth()
 
@@ -1532,7 +1622,7 @@ async def _execute_smart_market_order(
             event="SMART_MARKET_CROSS_TO_MARKET",
         )
         settle_timeout = float(settings.get("cancel_settle_timeout_seconds", 120))
-        resolution, final_qty, final_avg, final_comm, _ = \
+        _resolution, final_qty, final_avg, final_comm, _ = \
             await _cancel_and_await_resolution(
                 ctx, ib_order_id, qty, track=track, timeout=settle_timeout,
                 heartbeat_label=f"Cancel pending #{trade_group.serial_number} \u2014",
@@ -1814,6 +1904,18 @@ async def _handle_fill(
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="ORDER_FILLED_DISPLAY",
     )
+    # Epic 1 D10 \u2014 post-fill notional disclosure for FUT (not a margin
+    # figure; the scope tenet directs users to TWS for real margin). STK
+    # keeps its existing terse display unchanged.
+    if order_ctx.security_type == "FUT":
+        from ib_trader.engine.pricing import notional_value
+        notional = notional_value(qty_filled, avg_price, order_ctx.multiplier)
+        ctx.router.emit(
+            f"  fill notional=${notional} (qty {qty_filled} \u00d7 mult {order_ctx.multiplier} \u00d7 "
+            f"price ${avg_price}), commission=${commission}",
+            pane=OutputPane.LOG, severity=OutputSeverity.INFO,
+            event="FUT_FILL_NOTIONAL",
+        )
     logger.info(
         '{"event": "ORDER_FILLED", "correlation_id": "%s", "serial": %d, "symbol": "%s", '
         '"qty_filled": "%s", "avg_price": "%s", "commission": "%s"}',
@@ -1835,6 +1937,8 @@ async def _handle_fill(
             symbol=order_ctx.symbol,
             ctx=ctx,
             trade_serial=trade_group.serial_number,
+            tick_size=order_ctx.tick_size,
+            multiplier=order_ctx.multiplier,
         )
 
 
@@ -2133,6 +2237,8 @@ async def _handle_partial(
             symbol=order_ctx.symbol,
             ctx=ctx,
             trade_serial=trade_group.serial_number,
+            tick_size=order_ctx.tick_size,
+            multiplier=order_ctx.multiplier,
         )
 
 
@@ -2151,6 +2257,7 @@ async def reprice_loop(
     leg_type: LegType | None = None,
     security_type: str | None = None,
     trade_serial: int | None = None,
+    tick_size: Decimal | None = None,
 ) -> None:
     """Reprice loop: amend the order toward the ask over total_steps iterations.
 
@@ -2245,7 +2352,10 @@ async def reprice_loop(
                 continue
             bid = ask = ref
 
-        new_price = calc_step_price(bid, ask, step, total_steps, side)
+        new_price = calc_step_price(
+            bid, ask, step, total_steps, side,
+            tick_size=tick_size or STK_TICK,
+        )
 
         if new_price == last_sent_price:
             logger.debug(
@@ -2344,6 +2454,8 @@ async def place_profit_taker(
     symbol: str,
     ctx: AppContext,
     trade_serial: int | None = None,
+    tick_size: Decimal | None = None,
+    multiplier: Decimal | None = None,
 ) -> None:
     """Place a GTC profit taker order after an entry fill.
 
@@ -2371,13 +2483,21 @@ async def place_profit_taker(
     pt_side = "SELL" if entry_side == "BUY" else "BUY"
     pt_correlation_id = str(uuid.uuid4())
 
+    tick = tick_size or STK_TICK
+    mult = multiplier or Decimal("1")
     if take_profit_price is not None:
         pt_price = take_profit_price
     elif profit_amount is not None:
         if entry_side == "BUY":
-            pt_price = calc_profit_taker_price(avg_fill_price, qty_filled, profit_amount)
+            pt_price = calc_profit_taker_price(
+                avg_fill_price, qty_filled, profit_amount,
+                tick_size=tick, multiplier=mult,
+            )
         else:
-            pt_price = calc_profit_taker_price_short(avg_fill_price, qty_filled, profit_amount)
+            pt_price = calc_profit_taker_price_short(
+                avg_fill_price, qty_filled, profit_amount,
+                tick_size=tick, multiplier=mult,
+            )
     else:
         return
 
@@ -2591,9 +2711,27 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     # Determine close side (inverse of entry)
     close_side = "SELL" if entry_side == "BUY" else "BUY"
 
-    # Get contract
-    contract_info = await _get_contract(entry_symbol, ctx)
+    # Get contract. Carry entry-leg sec-type info (if present) so FUT
+    # closes qualify via the same expiry/trading_class and pricing uses
+    # the correct tick_size/multiplier.
+    entry_sec_type = (getattr(entry_txn, "security_type", None) or "STK").upper()
+    entry_expiry = getattr(entry_txn, "expiry", None)
+    entry_trading_class = getattr(entry_txn, "trading_class", None)
+    contract_info = await _get_contract(
+        entry_symbol, ctx,
+        sec_type=entry_sec_type,
+        expiry=entry_expiry,
+        trading_class=entry_trading_class,
+    )
     con_id = contract_info["con_id"]
+    close_tick_size = (
+        Decimal(contract_info["tick_size"]) if contract_info.get("tick_size") else STK_TICK
+    )
+    close_multiplier = (
+        Decimal(contract_info["multiplier"])
+        if contract_info.get("multiplier")
+        else Decimal("1")
+    )
 
     # Create close _OrderContext
     close_correlation_id = str(uuid.uuid4())
@@ -2613,7 +2751,13 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         qty_requested=qty_to_close,
         leg_type=LegType.CLOSE,
         correlation_id=close_correlation_id,
-        security_type="STK",
+        security_type=entry_sec_type,
+        expiry=contract_info.get("expiry") or entry_expiry,
+        trading_class=contract_info.get("trading_class") or entry_trading_class,
+        exchange=contract_info.get("exchange"),
+        tick_size=close_tick_size,
+        multiplier=close_multiplier,
+        con_id=int(con_id) if str(con_id).lstrip("-").isdigit() else None,
         order_ref=close_order_ref,
     )
 
@@ -2629,6 +2773,9 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
     _txn_common = dict(
         trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
         correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
+        expiry=close_ctx.expiry, trading_class=close_ctx.trading_class,
+        multiplier=str(close_ctx.multiplier) if close_ctx.multiplier else None,
+        con_id=close_ctx.con_id,
     )
     if cmd.strategy == Strategy.LIMIT:
         initial_price = cmd.limit_price
@@ -2660,7 +2807,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                     "(bid=0, ask=0, last=0). Check market data subscription."
                 )
             bid = ask = last
-        initial_price = calc_mid(bid, ask)
+        initial_price = calc_mid(bid, ask, tick_size=close_ctx.tick_size)
         _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, entry_symbol, close_side,
                    "LIMIT", qty_to_close, limit_price=initial_price,
                    trade_serial=cmd.serial, **_txn_common)
@@ -2880,6 +3027,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                 trade_id=close_ctx.trade_id,
                 leg_type=close_ctx.leg_type,
                 security_type=close_ctx.security_type,
+                tick_size=close_ctx.tick_size,
                 trade_serial=cmd.serial,
             )
         )

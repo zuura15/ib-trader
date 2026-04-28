@@ -69,3 +69,71 @@ export function pnlClass(value: number): string {
   if (value < 0) return 'value-negative';
   return 'value-neutral';
 }
+
+// ------------------------------------------------------------
+// Instrument display (Epic 1 Phase 4)
+// ------------------------------------------------------------
+
+const MONTH_CODES: Record<number, string> = {
+  1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+  7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z',
+};
+
+export interface Displayable {
+  symbol?: string;
+  sec_type?: string | null;
+  expiry?: string | null;
+  display_symbol?: string | null;
+}
+
+/**
+ * Normalized instrument display string for every pane (positions, orders,
+ * watchlist, trades). FUT rows with an expiry render as ``ES Z26``; STK
+ * rows pass through. The backend already supplies ``display_symbol`` for
+ * most row shapes — this helper is the fallback when it is absent.
+ */
+export function formatInstrument(row: Displayable): string {
+  if (row.display_symbol) return row.display_symbol;
+  const sym = row.symbol || '';
+  const sec = (row.sec_type || 'STK').toUpperCase();
+  if (sec !== 'FUT' || !row.expiry) return sym;
+  const e = String(row.expiry);
+  if (!/^\d{6,8}$/.test(e)) return sym;
+  const year = Number(e.slice(0, 4));
+  const month = Number(e.slice(4, 6));
+  const code = MONTH_CODES[month];
+  if (!code) return sym;
+  return `${sym} ${code}${String(year % 100).padStart(2, '0')}`;
+}
+
+/**
+ * Clipboard-friendly, IB TWS-compatible symbol shorthand for a futures
+ * contract. ``ESZ6``-style. STK passes through.
+ */
+export function formatIbPasteSymbol(row: Displayable): string {
+  const sym = row.symbol || '';
+  const sec = (row.sec_type || 'STK').toUpperCase();
+  if (sec !== 'FUT' || !row.expiry) return sym;
+  const e = String(row.expiry);
+  if (!/^\d{6,8}$/.test(e)) return sym;
+  const year = Number(e.slice(0, 4));
+  const month = Number(e.slice(4, 6));
+  const code = MONTH_CODES[month];
+  if (!code) return sym;
+  return `${sym}${code}${year % 10}`;
+}
+
+export type SecType = 'STK' | 'ETF' | 'FUT' | 'OPT';
+
+export function allSecTypes(): SecType[] {
+  return ['STK', 'ETF', 'FUT', 'OPT'];
+}
+
+/** Filter a list of rows by a set of sec-types (client-side per Epic 1 D11). */
+export function filterBySecType<T extends { sec_type?: string | null }>(
+  rows: T[],
+  allowed: Set<SecType>,
+): T[] {
+  if (allowed.size === 0 || allowed.size === allSecTypes().length) return rows;
+  return rows.filter((r) => allowed.has(((r.sec_type || 'STK').toUpperCase() as SecType)));
+}

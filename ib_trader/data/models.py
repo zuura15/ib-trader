@@ -255,6 +255,13 @@ class TransactionEvent(Base):
     strike            = Column(Numeric(18, 4), nullable=True)
     right             = Column(String(4), nullable=True)
     raw_response      = Column(Text, nullable=True)
+    # Epic 1 additions (Phase 0 widening, Phase 2 reconciler fallback).
+    # Archival rows need full (con_id, trading_class, multiplier) so a
+    # cold-restart reconciler can rebuild the Instrument without a live
+    # IB call. Nullable for back-compat with pre-Epic-1 rows.
+    trading_class     = Column(String(20), nullable=True)
+    multiplier        = Column(String(10), nullable=True)
+    con_id            = Column(Integer, nullable=True)
 
 
 class PendingCommand(Base):

@@ -240,3 +240,53 @@ export function createTemplate(data: {
 export function deleteTemplate(templateId: string) {
   return request<void>(`/templates/${templateId}`, { method: 'DELETE' });
 }
+
+// --- Instruments (futures discovery, Epic 1 Phase 1) ---
+
+export interface FutureExpiryCandidate {
+  con_id: number;
+  root: string;
+  expiry: string;          // YYYYMMDD
+  trading_class: string;
+  exchange: string;
+  multiplier: string;      // Decimal-encoded
+  tick_size: string;       // Decimal-encoded
+  display_symbol: string;  // e.g. "ES Z26"
+}
+
+export function listFutureExpiries(
+  root: string,
+  exchange: string = 'CME',
+  tradingClass?: string,
+) {
+  const qs = new URLSearchParams({ root, exchange });
+  if (tradingClass) qs.set('trading_class', tradingClass);
+  return request<FutureExpiryCandidate[]>(`/instruments/expiries?${qs.toString()}`);
+}
+
+// --- History (chart pane) ---
+
+export interface HistoryBar {
+  ts: string;     // ISO timestamp
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export function getHistory(opts: {
+  conId?: number | null;
+  symbol?: string;
+  secType?: string;
+  hours?: number;
+  barSize?: string;
+}) {
+  const qs = new URLSearchParams();
+  if (opts.conId != null) qs.set('con_id', String(opts.conId));
+  if (opts.symbol) qs.set('symbol', opts.symbol);
+  if (opts.secType) qs.set('sec_type', opts.secType);
+  if (opts.hours != null) qs.set('hours', String(opts.hours));
+  if (opts.barSize) qs.set('bar_size', opts.barSize);
+  return request<HistoryBar[]>(`/history?${qs.toString()}`);
+}

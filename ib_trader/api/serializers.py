@@ -55,6 +55,12 @@ class TradeResponse(BaseModel):
     exit_qty: str | None = None          # ib_filled_qty summed across CLOSE legs
     exit_price: str | None = None        # weighted avg across CLOSE fills
     order_type: str | None = None        # order_type on the entry leg (mid/market/...)
+    # Epic 1 additions — pulled from the entry fill's transaction row.
+    sec_type: str = "STK"
+    expiry: str | None = None
+    trading_class: str | None = None
+    multiplier: str | None = None
+    display_symbol: str | None = None
 
 
 class BotTradeResponse(BaseModel):

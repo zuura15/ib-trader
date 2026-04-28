@@ -102,12 +102,32 @@ class StrategyManifest:
         capabilities: Runtime services used (execution, state_store).
         state_schema: Description of strategy-defined state shape.
         version: Strategy version for compatibility tracking.
+        supported_sec_types: Epic 1 D8. Tuple of security types this
+            strategy is tested against (``"STK"``, ``"ETF"``, ``"FUT"``,
+            ``"OPT"``). ``None`` means "legacy default (STK/ETF)" — used
+            by strategies that predate Epic 1 and have no futures math.
+            The runtime validates the configured symbol's sec_type at
+            ``on_start`` and drops quote/position events whose sec_type
+            isn't in this tuple with a WARNING, replacing today's silent
+            post-filter. New strategies MUST set this explicitly.
     """
     name: str
     subscriptions: list[Subscription]
     capabilities: list[str] = field(default_factory=list)
     state_schema: dict = field(default_factory=dict)
     version: str = "1.0"
+    supported_sec_types: tuple[str, ...] | None = None
+
+    def permits_sec_type(self, sec_type: str) -> bool:
+        """Return True when the manifest declares ``sec_type`` supported.
+
+        ``supported_sec_types=None`` preserves legacy behaviour (STK/ETF).
+        Case-insensitive.
+        """
+        allowed = self.supported_sec_types
+        if allowed is None:
+            allowed = ("STK", "ETF")
+        return sec_type.upper() in (s.upper() for s in allowed)
 
 
 # ---------------------------------------------------------------------------

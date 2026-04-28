@@ -10,10 +10,10 @@ const globalConfig = {
   borderBarSize: 24,
 };
 
-// Variant A — Classic Trading Workstation
-// Left: Positions (top) + Bots (bottom)
-// Center: Console (top) + Orders/Alerts tabbed (bottom)
-// Right: Alerts/Errors (top) + Logs (bottom)
+// Variant A — Classic Trading Workstation (default)
+// Left:   Positions/Watchlist tabbed (top) + Chart (bottom)
+// Center: Console (top) + Orders/Trades/Bots tabbed (bottom)
+// Right:  Bot Log/Bot Activity tabbed (top) + Quick Orders/Alerts/Logs/Errors/Bot Trades tabbed (bottom)
 export const variantA: IJsonModel = {
   global: globalConfig,
   borders: [
@@ -30,14 +30,14 @@ export const variantA: IJsonModel = {
     type: 'row',
     weight: 100,
     children: [
-      // Left column — Positions + Bots
+      // Left column — Positions/Watchlist (top) + Chart (bottom)
       {
         type: 'row',
         weight: 25,
         children: [
           {
             type: 'tabset',
-            weight: 55,
+            weight: 60,
             children: [
               { type: 'tab', name: 'Positions', component: 'positions' },
               { type: 'tab', name: 'Watchlist', component: 'watchlist' },
@@ -45,14 +45,14 @@ export const variantA: IJsonModel = {
           },
           {
             type: 'tabset',
-            weight: 45,
+            weight: 40,
             children: [
-              { type: 'tab', name: 'Bots', component: 'bots' },
+              { type: 'tab', name: 'Chart', component: 'chart' },
             ],
           },
         ],
       },
-      // Center column — Console + Orders/Trades tabbed
+      // Center column — Console (top) + Orders/Trades/Bots tabbed (bottom)
       {
         type: 'row',
         weight: 45,
@@ -71,37 +71,33 @@ export const variantA: IJsonModel = {
               { type: 'tab', name: 'Orders', component: 'orders' },
               { type: 'tab', name: 'Trades', component: 'trades' },
               { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
+              { type: 'tab', name: 'Bots', component: 'bots' },
             ],
           },
         ],
       },
-      // Right column — Quick Orders (top) + Alerts (mid) + Logs (bottom)
+      // Right column — Bot Log/Bot Activity (top) + everything-else tabbed (bottom)
       {
         type: 'row',
         weight: 30,
         children: [
           {
             type: 'tabset',
-            weight: 30,
+            weight: 40,
             children: [
-              { type: 'tab', name: 'Quick Orders', component: 'templates' },
-            ],
-          },
-          {
-            type: 'tabset',
-            weight: 25,
-            children: [
-              { type: 'tab', name: 'Alerts', component: 'alerts' },
-            ],
-          },
-          {
-            type: 'tabset',
-            weight: 45,
-            children: [
-              { type: 'tab', name: 'Logs', component: 'logs' },
-              { type: 'tab', name: 'Errors', component: 'errors' },
+              { type: 'tab', name: 'Stacked Charts', component: 'stacked-charts' },
               { type: 'tab', name: 'Bot Log', component: 'bot-log' },
               { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 60,
+            children: [
+              { type: 'tab', name: 'Quick Orders', component: 'templates' },
+              { type: 'tab', name: 'Alerts', component: 'alerts' },
+              { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
             ],
           },
         ],

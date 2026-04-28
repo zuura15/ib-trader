@@ -3,7 +3,6 @@
 GET /api/bot-trades — list synthesized bot entry-to-exit round-trips
 (optionally filtered by bot_id).
 """
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
 

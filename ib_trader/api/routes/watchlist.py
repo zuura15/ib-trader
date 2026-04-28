@@ -53,7 +53,6 @@ async def _watchlist_from_redis(redis) -> dict | None:
     """Read watchlist quotes from Redis keys."""
     from datetime import datetime, timezone
     from ib_trader.redis.state import StateStore
-    from ib_trader.config.loader import load_watchlist
 
     symbols = load_watchlist(_WATCHLIST_YAML)
     if not symbols:
@@ -100,9 +99,17 @@ async def _watchlist_from_redis(redis) -> dict | None:
 
 @router.get("/symbols")
 def get_symbols():
-    """Return the current watchlist symbol list."""
-    symbols = load_watchlist(_WATCHLIST_YAML)
-    return {"symbols": symbols, "max": _MAX_SYMBOLS}
+    """Return the current watchlist symbol list.
+
+    For back-compat the ``symbols`` field stays a plain list of roots.
+    The ``entries`` field (Epic 1) carries sec-type-aware dicts for new
+    clients — frontend consumes this when rendering futures in the
+    watchlist panel.
+    """
+    from ib_trader.config.loader import load_watchlist_entries
+    entries = load_watchlist_entries(_WATCHLIST_YAML)
+    symbols = [e["root"] for e in entries]
+    return {"symbols": symbols, "entries": entries, "max": _MAX_SYMBOLS}
 
 
 class SymbolsUpdate(BaseModel):

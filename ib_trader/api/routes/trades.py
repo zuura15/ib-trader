@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ib_trader.api.deps import get_trades, get_transactions
 from ib_trader.api.serializers import TradeResponse
-from ib_trader.data.models import LegType, TransactionAction
+from ib_trader.data.models import LegType
 from ib_trader.data.repository import TradeRepository
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
 
@@ -57,6 +57,28 @@ def _serialize_trade(t, transactions: TransactionRepository) -> TradeResponse:
     # engine/bot-computed value. Lets one-shot user orders show round-
     # trip P&L on close without colliding with bot-derived values.
     pnl = t.ib_realized_pnl if t.ib_realized_pnl is not None else t.realized_pnl
+
+    # Epic 1 — pull sec-type metadata from the entry fill's transaction
+    # row. The Transaction table stores ``security_type`` already; FUT
+    # rows carry expiry on the column of the same name.
+    sec_type = "STK"
+    expiry: str | None = None
+    trading_class: str | None = None
+    multiplier: str | None = None
+    if entry_fill is not None:
+        sec_type = (getattr(entry_fill, "security_type", None) or "STK").upper()
+        expiry = getattr(entry_fill, "expiry", None)
+        trading_class = getattr(entry_fill, "trading_class", None)
+        mult_raw = getattr(entry_fill, "multiplier", None)
+        multiplier = str(mult_raw) if mult_raw is not None else None
+    display_symbol = t.symbol
+    if sec_type == "FUT" and expiry:
+        try:
+            from ib_trader.utils.symbol import format_display_symbol
+            display_symbol = format_display_symbol(t.symbol, "FUT", expiry)
+        except Exception:
+            display_symbol = f"{t.symbol} {expiry}"
+
     return TradeResponse(
         id=t.id,
         serial_number=t.serial_number,
@@ -72,6 +94,11 @@ def _serialize_trade(t, transactions: TransactionRepository) -> TradeResponse:
         exit_qty=exit_qty,
         exit_price=exit_price,
         order_type=entry_order_type,
+        sec_type=sec_type,
+        expiry=expiry,
+        trading_class=trading_class,
+        multiplier=multiplier,
+        display_symbol=display_symbol,
     )
 
 

@@ -143,16 +143,27 @@ def load_symbols(symbols_path: str = "config/symbols.yaml") -> list[str]:
 
 
 def load_watchlist(watchlist_path: str = "config/watchlist.yaml") -> list[str]:
-    """Load the watchlist symbol list from YAML.
+    """Load the watchlist symbol (root) list from YAML.
 
     Returns an empty list if the file is missing or invalid (non-fatal).
-    Same flat-list format as symbols.yaml.
+    Legacy string items ``- META`` pass through; Epic 1 dict items
+    ``- {root: ES, sec_type: FUT, expiry: 202612}`` have their ``root``
+    extracted for the string-only API. Callers that need the full
+    sec-type bundle should use :func:`load_watchlist_entries`.
+    """
+    entries = load_watchlist_entries(watchlist_path)
+    return [e["root"].upper() for e in entries]
 
-    Args:
-        watchlist_path: Path to watchlist.yaml.
 
-    Returns:
-        List of uppercase symbol strings.
+def load_watchlist_entries(
+    watchlist_path: str = "config/watchlist.yaml",
+) -> list[dict]:
+    """Load the watchlist as a list of sec-type-aware entries.
+
+    Each returned dict contains ``root``, ``sec_type``, optional
+    ``expiry``, ``trading_class``, ``exchange``. Legacy string items are
+    auto-upgraded to ``{root: X, sec_type: "STK"}`` (never mutating the
+    file on disk).
     """
     path = Path(watchlist_path)
     if not path.exists():
@@ -170,7 +181,29 @@ def load_watchlist(watchlist_path: str = "config/watchlist.yaml") -> list[str]:
     if not data or not isinstance(data, list):
         return []
 
-    return [str(s).upper() for s in data if s]
+    out: list[dict] = []
+    for item in data:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            out.append({"root": item.upper(), "sec_type": "STK"})
+        elif isinstance(item, dict) and item.get("root"):
+            entry = {
+                "root": str(item["root"]).upper(),
+                "sec_type": str(item.get("sec_type", "STK")).upper(),
+            }
+            if item.get("expiry"):
+                entry["expiry"] = str(item["expiry"])
+            if item.get("trading_class"):
+                entry["trading_class"] = str(item["trading_class"])
+            if item.get("exchange"):
+                entry["exchange"] = str(item["exchange"])
+            out.append(entry)
+        else:
+            logger.warning(
+                '{"event": "WATCHLIST_ITEM_SKIPPED", "item": "%s"}', str(item),
+            )
+    return out
 
 
 def save_watchlist(watchlist_path: str, symbols: list[str]) -> None:

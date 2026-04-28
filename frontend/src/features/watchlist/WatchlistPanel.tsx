@@ -51,6 +51,8 @@ function RefreshCountdown({ interval }: { interval: number }) {
 
 export function WatchlistPanel({ compact = false }: { compact?: boolean }) {
   const watchlist = useStore((s) => s.watchlist);
+  const selectedChartTarget = useStore((s) => s.selectedChartTarget);
+  const setSelectedChartTarget = useStore((s) => s.setSelectedChartTarget);
   const [configOpen, setConfigOpen] = useState(false);
 
   return (
@@ -97,8 +99,22 @@ export function WatchlistPanel({ compact = false }: { compact?: boolean }) {
               </tr>
             </thead>
             <tbody>
-              {watchlist.map((item) => (
-                <tr key={item.symbol}>
+              {watchlist.map((item) => {
+                const isSelected =
+                  selectedChartTarget != null &&
+                  selectedChartTarget.conId == null &&
+                  selectedChartTarget.symbol === item.symbol;
+                return (
+                <tr
+                  key={item.symbol}
+                  onClick={() => setSelectedChartTarget({
+                    symbol: item.symbol, secType: 'STK', conId: null,
+                  })}
+                  style={{
+                    cursor: 'pointer',
+                    background: isSelected ? 'var(--row-selected-bg, var(--badge-blue-bg))' : undefined,
+                  }}
+                >
                   <td className="font-semibold" style={{
                     color: item.error ? 'var(--accent-yellow)' : 'var(--text-primary)',
                   }}>
@@ -135,7 +151,8 @@ export function WatchlistPanel({ compact = false }: { compact?: boolean }) {
                     </td>
                   </>}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         )}

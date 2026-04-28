@@ -12,8 +12,6 @@ import time
 import pytest
 
 from ib_trader.bots.runtime import StrategyBotRunner
-from ib_trader.bots.strategy import PlaceOrder
-from decimal import Decimal
 
 
 def _make_runner(**config) -> StrategyBotRunner:

@@ -78,8 +78,13 @@ async def start_bot(bot_id: str):
                 from ib_trader.redis.state import StateStore
                 doc = await StateStore(redis).get(f"bot:{bot_id}") or {}
                 cur = BotState(doc.get("state", BotState.OFF.value))
-            except Exception:
-                pass
+            except Exception as e:
+                # Best-effort enrichment; if Redis is unreachable we
+                # report OFF rather than failing the start request.
+                logger.debug(
+                    '{"event": "BOT_START_REDIS_LOOKUP_FAILED", "bot_id": "%s", "error": "%s"}',
+                    bot_id, str(e),
+                )
         return {"bot_id": bot_id, "state": cur.value, "message": "already running"}
 
     defn = registry.get(bot_id)

@@ -23,10 +23,20 @@ type DataMode = 'mock' | 'live';
 // Detect mode from env or default to mock
 const DATA_MODE: DataMode = (import.meta.env.VITE_DATA_MODE === 'live') ? 'live' : 'mock';
 
+export type ChartTarget = {
+  symbol: string;        // display label + underlying for OPT
+  secType: 'STK' | 'FUT' | 'OPT';
+  conId: number | null;  // preferred identifier; null for watchlist
+};
+
 interface AppStore {
   // Mode
   dataMode: DataMode;
   wsConnected: boolean;
+
+  // Chart selection (cross-pane)
+  selectedChartTarget: ChartTarget | null;
+  setSelectedChartTarget: (t: ChartTarget | null) => void;
 
   // Layout
   activeVariant: LayoutVariant;
@@ -109,13 +119,44 @@ export const useStore = create<AppStore>((set, get) => ({
   dataMode: DATA_MODE,
   wsConnected: false,
 
+  selectedChartTarget: (() => {
+    // Restore the last chart selection across browser reloads. Saved
+    // by setSelectedChartTarget below.
+    try {
+      const raw = localStorage.getItem('ib-chart-target-v1');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.symbol === 'string'
+          && (parsed.secType === 'STK' || parsed.secType === 'FUT' || parsed.secType === 'OPT')) {
+        return parsed as ChartTarget;
+      }
+    } catch { /* corrupt entry — ignore */ }
+    return null;
+  })(),
+  setSelectedChartTarget: (t) => {
+    let next: ChartTarget | null;
+    if (t && t.secType === 'OPT') {
+      // Chart the underlying stock — option premium over 24h is dominated
+      // by theta/gamma and not useful for eyeballing. Header still says
+      // "STK" so the user isn't misled about what's being shown.
+      next = { symbol: t.symbol, secType: 'STK', conId: null };
+    } else {
+      next = t;
+    }
+    try {
+      if (next) localStorage.setItem('ib-chart-target-v1', JSON.stringify(next));
+      else localStorage.removeItem('ib-chart-target-v1');
+    } catch { /* quota — ignore */ }
+    set({ selectedChartTarget: next });
+  },
+
   activeVariant: (localStorage.getItem('ib-layout-variant') as LayoutVariant) || 'A',
   setVariant: (v) => {
     localStorage.setItem('ib-layout-variant', v);
     set({ activeVariant: v });
   },
 
-  theme: (localStorage.getItem('ib-theme') as ThemeMode) || 'dark',
+  theme: (localStorage.getItem('ib-theme') as ThemeMode) || 'light',
   setTheme: (next: ThemeMode) => {
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('ib-theme', next);

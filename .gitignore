@@ -6,6 +6,12 @@
 *.db
 *.db-wal
 *.db-shm
+# Migration / pre-upgrade backups (e.g. trader.db.pre-migrate.bak)
+*.db.*.bak
+*.db.bak*
+*.db.backup-*
+*.db.bak-*
+.env*.bak
 
 # Logs
 /logs/

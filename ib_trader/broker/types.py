@@ -25,15 +25,63 @@ class BrokerCapabilities:
 
 @dataclass
 class Instrument:
-    """Resolved instrument from a broker. Replaces the IB-specific con_id pattern."""
+    """Resolved instrument from a broker.
 
-    asset_id: str           # IB: str(con_id), Alpaca: UUID string
-    symbol: str
+    Identity for STK: (symbol, exchange, currency). Identity for FUT:
+    (root, sec_type, expiry, trading_class, exchange). ``asset_id`` is
+    the broker-stable key (IB con_id string, Alpaca UUID).
+
+    New fields (root, sec_type, expiry, trading_class, tick_size,
+    con_id) were introduced in Epic 1 Phase 1. Legacy callers that pass
+    only the original fields continue to work because every new field
+    is optional or defaults sensibly. ``multiplier`` is kept as ``str |
+    None`` in the dataclass for schema back-compat, but is always a
+    string-encoded Decimal (``"50"``, ``"5"``, ``"1"``); prefer
+    ``multiplier_decimal`` at read time.
+    """
+
+    asset_id: str              # IB: str(con_id), Alpaca: UUID string
+    symbol: str                # Display symbol for STK, or root for FUT (kept for back-compat)
     exchange: str
     currency: str
-    multiplier: str | None  # For futures
-    broker: str             # "ib" or "alpaca"
-    raw: str                # JSON of broker-specific response
+    multiplier: str | None     # String-encoded Decimal; "50" for ES, "1" or None for STK
+    broker: str                # "ib" or "alpaca"
+    raw: str                   # JSON of broker-specific response
+    # Epic 1 additions — all optional for back-compat:
+    root: str | None = None            # "ES", "MES"; None for STK (use ``symbol``)
+    sec_type: str = "STK"              # STK / ETF / FUT / OPT
+    expiry: str | None = None          # YYYYMMDD (IB-normalized last-trade date) for FUT/OPT
+    trading_class: str | None = None   # IB trading-class disambiguator (e.g. "ES" vs "MES")
+    tick_size: Decimal | None = None   # Minimum price increment
+    con_id: int | None = None          # Broker-stable numeric ID (IB). Same value as asset_id when asset_id is a digit string.
+
+    @property
+    def multiplier_decimal(self) -> Decimal:
+        """Return multiplier as Decimal; defaults to 1 when unset/None."""
+        if self.multiplier is None or self.multiplier == "":
+            return Decimal("1")
+        return Decimal(self.multiplier)
+
+    @property
+    def display_root(self) -> str:
+        """Return the root symbol (``root`` if set, else ``symbol``)."""
+        return self.root or self.symbol
+
+
+@dataclass(frozen=True)
+class FutureExpiryCandidate:
+    """A single contract-month entry returned by ``list_future_expiries``.
+
+    Used by the discovery API route and the ExpiryPicker UI component.
+    """
+
+    con_id: int
+    root: str
+    expiry: str                # YYYYMMDD
+    trading_class: str
+    exchange: str
+    multiplier: Decimal
+    tick_size: Decimal
 
 
 @dataclass

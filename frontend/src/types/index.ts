@@ -21,6 +21,12 @@ export interface WatchlistItem {
   high_52w: string | null;
   low_52w: string | null;
   error: string | null;
+  // Epic 1 additions — populated for FUT rows from /api/watchlist/symbols entries.
+  sec_type?: string;
+  expiry?: string | null;
+  trading_class?: string | null;
+  display_symbol?: string | null;
+  multiplier?: string | null;
 }
 
 export interface OrderTemplate {
@@ -70,6 +76,13 @@ export interface Order {
   avgFillPrice?: number;
   commission?: number;
   rejectReason?: string;
+  // Epic 1 additions
+  sec_type?: string;
+  expiry?: string | null;
+  trading_class?: string | null;
+  multiplier?: string | null;
+  display_symbol?: string | null;
+  con_id?: number | null;
 }
 
 export interface Position {
@@ -81,6 +94,13 @@ export interface Position {
   realizedPnl: number;
   dailyPnl: number;
   lastUpdate: Date;
+  // Epic 1 additions
+  sec_type?: string;
+  expiry?: string | null;
+  trading_class?: string | null;
+  multiplier?: string | null;
+  display_symbol?: string | null;
+  con_id?: number | null;
 }
 
 export interface Alert {
@@ -134,6 +154,12 @@ export interface TradeGroup {
   exitQty: string | null;
   exitPrice: string | null;
   orderType: string | null;
+  // Epic 1 additions
+  sec_type?: string;
+  expiry?: string | null;
+  trading_class?: string | null;
+  multiplier?: string | null;
+  display_symbol?: string | null;
 }
 
 export interface BotTrade {

@@ -76,6 +76,12 @@ const MIGRATED_TABS: Array<{ component: string; name: string; anchor: string }> 
   // which only appears in variant A. This way users on any variant get
   // the new tab injected next to their Orders tabset.
   { component: 'bot-trades', name: 'Bot Trades', anchor: 'orders' },
+  // Chart pane added to default layout — anchor next to Watchlist so a
+  // persisted layout still surfaces it near the symbol-context panes.
+  { component: 'chart', name: 'Chart', anchor: 'watchlist' },
+  // Stacked-charts panel — anchor next to Bot Log so persisted layouts
+  // still pick it up in the right column.
+  { component: 'stacked-charts', name: 'Stacked Charts', anchor: 'bot-log' },
 ];
 
 function migrateLayoutJson(raw: any): any {

@@ -286,16 +286,17 @@ class Reconciler:
         return current_state
 
     async def _get_ib_positions(self) -> list[dict]:
-        """Get current IB positions via the raw ib_async API.
+        """Get current IB positions via the wrapper.
 
         Returns list of dicts with keys: symbol, qty, avg_price, con_id.
         """
-        if not hasattr(self._ib, '_ib'):
+        if not hasattr(self._ib, "req_positions_async") or not hasattr(
+            self._ib, "get_raw_positions"
+        ):
             return []
 
-        ib_obj = self._ib._ib
         try:
-            await asyncio.wait_for(ib_obj.reqPositionsAsync(), timeout=10)
+            await self._ib.req_positions_async(timeout=10)
         except asyncio.TimeoutError:
             logger.debug('{"event": "RECONCILER_POSITIONS_TIMEOUT"}')
             return []
@@ -304,7 +305,7 @@ class Reconciler:
             return []
 
         positions = []
-        for p in ib_obj.positions():
+        for p in self._ib.get_raw_positions():
             positions.append({
                 "symbol": p.contract.symbol,
                 "qty": Decimal(str(p.position)),

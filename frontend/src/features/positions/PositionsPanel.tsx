@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../../data/store';
-import { formatPrice, formatCurrency, pnlClass } from '../../utils/format';
+import { formatPrice, formatCurrency, pnlClass, formatInstrument, formatIbPasteSymbol } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
 function LiveIndicator({ connected }: { connected: boolean }) {
@@ -20,6 +20,12 @@ interface BrokerPosition {
   avg_cost: string;
   market_price: string | null;
   broker: string;
+  // Epic 1 additions
+  expiry?: string | null;
+  trading_class?: string | null;
+  multiplier?: string | null;
+  display_symbol?: string | null;
+  con_id?: number | null;
 }
 
 type SortKey = 'symbol' | 'quantity' | 'price' | 'avg_cost' | 'pnl';
@@ -136,8 +142,11 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   // --------------- Live mode ---------------
   const [positions, setPositions] = useState<BrokerPosition[]>([]);
   const [wsLive, setWsLive] = useState(false);
+  const selectedChartTarget = useStore((s) => s.selectedChartTarget);
+  const setSelectedChartTarget = useStore((s) => s.setSelectedChartTarget);
   const [showStocks, setShowStocks] = useState(true);
   const [showOptions, setShowOptions] = useState(false);
+  const [showFutures, setShowFutures] = useState(true);
   const [showOther, setShowOther] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('symbol');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
@@ -209,6 +218,7 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
     const st = (p.sec_type || 'STK').toUpperCase();
     if (st === 'STK' || st === 'ETF' || st === '') return showStocks;
     if (st === 'OPT') return showOptions;
+    if (st === 'FUT') return showFutures;
     return showOther;
   });
 
@@ -229,6 +239,7 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
         <div className="flex gap-1">
           {([
             { key: 'stocks', label: 'STK', active: showStocks, toggle: () => setShowStocks(!showStocks) },
+            { key: 'futures', label: 'FUT', active: showFutures, toggle: () => setShowFutures(!showFutures) },
             { key: 'options', label: 'OPT', active: showOptions, toggle: () => setShowOptions(!showOptions) },
             { key: 'other', label: 'Other', active: showOther, toggle: () => setShowOther(!showOther) },
           ] as const).map(f => (
@@ -279,14 +290,44 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
               const avg = parseNum(pos.avg_cost);
               const mkt = pos.market_price ? parseNum(pos.market_price) : null;
               const pnl = computePnl(pos);
+              const isSelected =
+                selectedChartTarget != null &&
+                ((pos.con_id != null && selectedChartTarget.conId === pos.con_id) ||
+                 (selectedChartTarget.conId == null && selectedChartTarget.symbol === pos.symbol));
               return (
                 <tr
                   key={pos.id}
                   data-testid={`position-row-${pos.symbol}`}
                   data-symbol={pos.symbol}
                   data-qty={qty}
+                  onClick={() => {
+                    const st = (pos.sec_type || 'STK').toUpperCase();
+                    const secType = (st === 'STK' || st === 'FUT' || st === 'OPT') ? st : 'STK';
+                    setSelectedChartTarget({
+                      symbol: pos.symbol,
+                      secType: secType as 'STK' | 'FUT' | 'OPT',
+                      conId: pos.con_id ?? null,
+                    });
+                  }}
+                  style={{
+                    cursor: 'pointer',
+                    background: isSelected ? 'var(--row-selected-bg, var(--badge-blue-bg))' : undefined,
+                  }}
                 >
-                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{pos.symbol}</td>
+                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                    <span
+                      title={pos.sec_type === 'FUT' ? 'Click to copy IB paste shorthand (ESZ6)' : undefined}
+                      style={{ cursor: pos.sec_type === 'FUT' ? 'copy' : 'default' }}
+                      onClick={() => {
+                        if (pos.sec_type === 'FUT') {
+                          const paste = formatIbPasteSymbol(pos);
+                          navigator.clipboard?.writeText(paste).catch(() => {});
+                        }
+                      }}
+                    >
+                      {formatInstrument(pos)}
+                    </span>
+                  </td>
                   <td
                     className="text-right font-mono"
                     style={{ color: qty >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}

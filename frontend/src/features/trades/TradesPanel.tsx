@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../../data/store';
-import { formatDateTime } from '../../utils/format';
+import { formatDateTime, formatInstrument } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 import { getTrades } from '../../api/client';
 
@@ -38,6 +38,11 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
         exitQty: t.exit_qty,
         exitPrice: t.exit_price,
         orderType: t.order_type,
+        sec_type: (t as any).sec_type,
+        expiry: (t as any).expiry,
+        trading_class: (t as any).trading_class,
+        multiplier: (t as any).multiplier,
+        display_symbol: (t as any).display_symbol,
       })));
     }).catch(() => {});
   }, [dataMode, refreshTick, setTradeGroups]);
@@ -155,7 +160,7 @@ export function TradesPanel({ compact = false }: { compact?: boolean }) {
                   data-status={t.status}
                 >
                   <td className="font-mono" style={{ color: 'var(--text-muted)' }} data-testid={`trade-serial-${t.serialNumber}`}>#{t.serialNumber}</td>
-                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{t.symbol}</td>
+                  <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>{formatInstrument(t)}</td>
                   <td style={{ color: t.direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                     {t.direction === 'LONG' ? 'L' : 'S'}
                   </td>

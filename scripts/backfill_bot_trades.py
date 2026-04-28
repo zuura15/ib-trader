@@ -53,7 +53,7 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 # Repo root on path so we can import ib_trader.*
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ib_trader.data.models import Base, BotEvent, BotTrade  # noqa: E402
+from ib_trader.data.models import Base, BotEvent, BotTrade
 
 logger = logging.getLogger("backfill")
 
@@ -196,7 +196,7 @@ def backfill(db_path: str, repo_root: Path, dry_run: bool = False) -> int:
 
     for (bot_id, symbol), rows in buckets.items():
         pending: Optional[dict] = None
-        for ev, fill in rows:
+        for _ev, fill in rows:
             if fill["side"] == "BUY":
                 pending = fill
                 continue

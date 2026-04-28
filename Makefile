@@ -66,7 +66,18 @@ dev:
 	uv run ib-engine $(IB_MODE_FLAG) & \
 	uv run ib-api & \
 	uv run ib-bots & \
-	(cd frontend && VITE_DATA_MODE=live npm run dev) & \
+	( \
+		echo "[DEV] Waiting for ib-api on :8000 before starting Vite..."; \
+		for i in $$(seq 1 60); do \
+			if curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8000/api/status; then \
+				echo "[DEV] ib-api ready (after $${i}s) — launching Vite."; \
+				cd frontend && VITE_DATA_MODE=live exec npm run dev; \
+			fi; \
+			sleep 1; \
+		done; \
+		echo "[DEV] ib-api did not come up within 60s. Starting Vite anyway; proxy errors will appear until the API binds."; \
+		cd frontend && VITE_DATA_MODE=live exec npm run dev \
+	) & \
 	wait
 
 e2e-live:

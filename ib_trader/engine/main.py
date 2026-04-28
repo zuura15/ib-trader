@@ -550,6 +550,18 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         con_id = p.contract.conId
         sec_type = p.contract.secType
 
+        # Seed the wrapper's contract cache so downstream callers (chart
+        # history endpoint, future ad-hoc queries) can look up by con_id
+        # without paying a re-qualify round-trip. positionEvent contracts
+        # arrive fully resolved from IB, so they're safe to cache as-is.
+        try:
+            ctx.ib._contract_cache.setdefault(con_id, p.contract)
+        except Exception as e:
+            logger.debug("seed contract cache failed", exc_info=e)
+        expiry = getattr(p.contract, "lastTradeDateOrContractMonth", None) or None
+        trading_class = getattr(p.contract, "tradingClass", None) or None
+        multiplier = getattr(p.contract, "multiplier", None) or None
+
         # Enrich with live market price from the in-memory ticker
         market_price = None
         try:
@@ -565,6 +577,14 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
 
+        display_symbol = sym
+        if sec_type == "FUT" and expiry:
+            try:
+                from ib_trader.utils.symbol import format_display_symbol
+                display_symbol = format_display_symbol(sym, "FUT", expiry)
+            except Exception:
+                display_symbol = f"{sym} {expiry}"
+
         positions.append({
             "id": f"{sym}_{sec_type}_{con_id}",
             "account_id": p.account,
@@ -576,6 +596,11 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
             "con_id": con_id,
             "broker": "ib",
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            # Epic 1 additions
+            "expiry": expiry,
+            "trading_class": trading_class,
+            "multiplier": multiplier,
+            "display_symbol": display_symbol,
         })
 
         if subscribe_mktdata and sec_type == "STK":
@@ -718,7 +743,10 @@ async def _event_relay_loop(ctx: AppContext) -> None:
     async def _update_orders_open(events: list[dict]) -> None:
         """Maintain the orders:open Redis hash from emitted events.
 
-        Non-terminal events upsert; terminal events remove.
+        Non-terminal events upsert; terminal events remove. Epic 1:
+        non-terminal events are enriched with expiry/trading_class/
+        multiplier/display_symbol pulled from the active IB Trade so the
+        Orders panel can render futures natively.
         """
         for evt in events:
             oid = evt.get("ib_order_id")
@@ -728,7 +756,27 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 await redis.hdel(orders_open_key, oid)
             else:
                 import json as _json
-                await redis.hset(orders_open_key, oid, _json.dumps(evt))
+                enriched = dict(evt)
+                meta = ctx.ib.get_trade_meta(str(oid))
+                if meta is not None and meta.get("contract") is not None:
+                    c = meta["contract"]
+                    expiry = getattr(c, "lastTradeDateOrContractMonth", None) or None
+                    trading_class = getattr(c, "tradingClass", None) or None
+                    multiplier = getattr(c, "multiplier", None) or None
+                    sym = meta["symbol"]
+                    sec_type_c = meta["sec_type"]
+                    enriched.setdefault("expiry", expiry)
+                    enriched.setdefault("trading_class", trading_class)
+                    enriched.setdefault("multiplier", multiplier)
+                    display = sym
+                    if sec_type_c == "FUT" and expiry:
+                        try:
+                            from ib_trader.utils.symbol import format_display_symbol
+                            display = format_display_symbol(sym, "FUT", expiry)
+                        except Exception:
+                            display = f"{sym} {expiry}"
+                    enriched.setdefault("display_symbol", display)
+                await redis.hset(orders_open_key, oid, _json.dumps(enriched))
 
     def _get_trade_meta(ib_order_id: str) -> tuple[str, str, str, int, str]:
         """Extract (orderRef, symbol, sec_type, con_id, side) from the active trade."""
@@ -846,7 +894,7 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             # DB write without exhausting the event loop.
             delays = [0.05, 0.1, 0.2, 0.4, 0.8, 1.6]
             if commission and commission != 0:
-                for attempt, delay in enumerate([0.0] + delays):
+                for delay in [0.0, *delays]:
                     if delay:
                         await asyncio.sleep(delay)
                     txn_rows = ctx.transactions.add_commission(order_id_int, commission)
@@ -974,6 +1022,14 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
         con_id = position.contract.conId
         sec_type = position.contract.secType
 
+        # Seed the wrapper's contract cache so chart-history et al. can
+        # look up by con_id without re-qualifying. See the matching
+        # call in _refresh_positions_cache.
+        try:
+            ctx.ib._contract_cache.setdefault(con_id, position.contract)
+        except Exception as e:
+            logger.debug("seed contract cache (positionEvent) failed", exc_info=e)
+
         # Update in-memory cache (atomic list rebuild)
         now = datetime.now(timezone.utc).isoformat()
         market_price = None
@@ -1076,8 +1132,12 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
     if redis is None:
         return
 
-    if not hasattr(ctx.ib, '_ib'):
-        logger.warning('{"event": "TICK_PUBLISHER_NO_IB"}')
+    # Wrapper exposes register_pending_tickers_callback as the public
+    # surface for ib-async's pendingTickersEvent. The old guard checked
+    # for the private ``_ib`` attribute, which was name-mangled when the
+    # wrapper was sealed — silently disabling the entire quote pipeline.
+    if not hasattr(ctx.ib, 'register_pending_tickers_callback'):
+        logger.warning('{"event": "TICK_PUBLISHER_NO_REGISTER_API"}')
         return
 
     state = StateStore(redis)
@@ -1203,13 +1263,12 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
         while True:
             try:
                 await asyncio.sleep(interval)
-                ib = getattr(ctx.ib, "_ib", None)
-                if ib is None:
+                if not hasattr(ctx.ib, "get_tickers"):
                     continue
                 try:
-                    tickers = list(ib.tickers())
+                    tickers = ctx.ib.get_tickers()
                 except Exception as e:
-                    logger.debug("ib.tickers() failed", exc_info=e)
+                    logger.debug("get_tickers() failed", exc_info=e)
                     continue
                 now_mono = _t.monotonic()
                 rows: list[dict] = []
@@ -1222,8 +1281,9 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
                         continue
                     last_seen = last_pending_event_ts.get(sym)
                     silent_s = round(now_mono - last_seen, 1) if last_seen else None
-                    def _f(attr):
-                        v = getattr(t, attr, None)
+
+                    def _f(attr, _t=t):
+                        v = getattr(_t, attr, None)
                         if v is None:
                             return None
                         try:

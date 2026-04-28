@@ -133,12 +133,21 @@ class IBClient(BrokerClientBase):
         await self._insync.disconnect()
 
     async def resolve_instrument(self, symbol: str, **kwargs) -> Instrument:
+        sec_type = kwargs.get("sec_type", "STK")
+        exchange = kwargs.get("exchange", "SMART")
+        currency = kwargs.get("currency", "USD")
+        expiry = kwargs.get("expiry")
+        trading_class = kwargs.get("trading_class")
+
         result = await self._insync.qualify_contract(
             symbol,
-            sec_type=kwargs.get("sec_type", "STK"),
-            exchange=kwargs.get("exchange", "SMART"),
-            currency=kwargs.get("currency", "USD"),
+            sec_type=sec_type,
+            exchange=exchange,
+            currency=currency,
+            expiry=expiry,
+            trading_class=trading_class,
         )
+        tick = result.get("tick_size")
         return Instrument(
             asset_id=str(result["con_id"]),
             symbol=symbol,
@@ -147,6 +156,32 @@ class IBClient(BrokerClientBase):
             multiplier=result.get("multiplier"),
             broker="ib",
             raw=result.get("raw", "{}"),
+            root=symbol if sec_type.upper() == "FUT" else None,
+            sec_type=sec_type.upper(),
+            expiry=result.get("expiry"),
+            trading_class=result.get("trading_class"),
+            tick_size=Decimal(tick) if tick else None,
+            con_id=int(result["con_id"]) if str(result["con_id"]).lstrip("-").isdigit() else None,
+        )
+
+    async def list_future_expiries(
+        self,
+        root: str,
+        exchange: str = "CME",
+        trading_class: str | None = None,
+        currency: str = "USD",
+    ):
+        """Return the upcoming futures expiries for ``root``.
+
+        Thin bridge to ``InsyncClient.list_future_expiries`` — exposed
+        on the broker client so that engine / API / CLI layers depend
+        only on the broker abstraction.
+        """
+        return await self._insync.list_future_expiries(
+            root=root,
+            exchange=exchange,
+            trading_class=trading_class,
+            currency=currency,
         )
 
     def has_instrument_cached(self, asset_id: str) -> bool:

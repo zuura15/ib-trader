@@ -13,6 +13,8 @@ import { OrderTemplatesPanel } from '../features/templates/OrderTemplatesPanel';
 import { ScenarioPanel } from '../features/scenarios/ScenarioPanel';
 import { HelpPanel } from '../features/help/HelpPanel';
 import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
+import { ChartPane } from '../features/chart/ChartPane';
+import { StackedChartsPane } from '../features/chart/StackedChartsPane';
 
 export function componentFactory(node: TabNode) {
   const component = node.getComponent();
@@ -49,6 +51,10 @@ export function componentFactory(node: TabNode) {
       return <HelpPanel />;
     case 'watchlist':
       return <WatchlistPanel compact={config.compact} />;
+    case 'chart':
+      return <ChartPane />;
+    case 'stacked-charts':
+      return <StackedChartsPane />;
     default:
       return <div className="p-4 text-xs" style={{ color: 'var(--text-muted)' }}>Unknown component: {component}</div>;
   }
