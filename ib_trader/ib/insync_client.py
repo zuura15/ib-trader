@@ -317,9 +317,18 @@ class InsyncClient(IBClientBase):
         await self._throttle()
         sec_type_u = sec_type.upper()
         if sec_type_u == "FUT":
-            return await self._qualify_future(
-                root=symbol, exchange=exchange, currency=currency,
-                expiry=_normalize_expiry(expiry), trading_class=trading_class,
+            # When `expiry` is supplied, caller has explicit (root,
+            # YYYYMM) — use the standard symbol+expiry path. Otherwise
+            # treat `symbol` as the IB-paste localSymbol (``MESM6``)
+            # and qualify by that. Both paths land on the same dict
+            # response and seed the contract cache identically.
+            if expiry:
+                return await self._qualify_future(
+                    root=symbol, exchange=exchange, currency=currency,
+                    expiry=_normalize_expiry(expiry), trading_class=trading_class,
+                )
+            return await self._qualify_future_by_local_symbol(
+                local_symbol=symbol, exchange=exchange, currency=currency,
             )
 
         contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
@@ -432,6 +441,101 @@ class InsyncClient(IBClientBase):
             ' "expiry": "%s", "trading_class": "%s", "tick": "%s"}',
             root, qualified.conId, qualified.lastTradeDateOrContractMonth,
             qualified.tradingClass, tick,
+        )
+        return {
+            "con_id": qualified.conId,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "trading_class": qualified.tradingClass or None,
+            "expiry": qualified.lastTradeDateOrContractMonth,
+            "tick_size": str(tick),
+            "raw": raw,
+        }
+
+    async def _qualify_future_by_local_symbol(
+        self,
+        local_symbol: str,
+        exchange: str,
+        currency: str,
+    ) -> dict:
+        """Qualify a futures contract by its IB-paste localSymbol.
+
+        ``local_symbol`` is the form IB displays in TWS / order tickets:
+        root + month-letter + 1-2 digit year (e.g. ``ESM6``, ``MESM6``,
+        ``GCM26``). IB resolves the contract uniquely from this string
+        — no need for the caller to pre-split into (root, expiry).
+
+        ``exchange`` may be empty; ib-async accepts ``""`` and IB picks
+        the primary listing automatically.
+        """
+        # localSymbol qualifies uniquely across all exchanges, so we
+        # let IB pick the listing rather than guessing per-product
+        # (COMEX gold, NYMEX oil, CBOT treasuries, GLOBEX equities all
+        # coexist). Caller-supplied exchange is intentionally ignored
+        # here — the localSymbol form is its own answer to "where".
+        contract = Future(
+            localSymbol=local_symbol,
+            exchange="",
+            currency=currency,
+        )
+        details = await self.__ib.reqContractDetailsAsync(contract)
+        if not details:
+            raise ValueError(f"no IB contract matched localSymbol {local_symbol!r}")
+
+        # Filter expired (in product-local tz, falling back to UTC).
+        # We don't know the exchange yet — IB's response carries it on
+        # each candidate. Pick the freshest non-expired candidate.
+        candidates: list = []
+        for d in details:
+            ex = (d.contract.exchange or "").upper()
+            today = _product_today(ex)
+            if _expiry_as_date(d.contract.lastTradeDateOrContractMonth) >= today:
+                candidates.append(d)
+
+        if not candidates:
+            raise ExpiredContractError(
+                local_symbol, details[0].contract.lastTradeDateOrContractMonth,
+            )
+        if len(candidates) > 1:
+            cands = [_candidate_from_details(d, d.contract.symbol) for d in candidates]
+            raise AmbiguousInstrument(root=local_symbol, candidates=cands)
+
+        d = candidates[0]
+        qualified = d.contract
+        tick = Decimal(str(d.minTick)) if d.minTick else Decimal("0.01")
+        multiplier = qualified.multiplier or None
+        raw = json.dumps({
+            "conId": qualified.conId,
+            "symbol": qualified.symbol,
+            "secType": qualified.secType,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "tradingClass": qualified.tradingClass,
+            "lastTradeDateOrContractMonth": qualified.lastTradeDateOrContractMonth,
+            "localSymbol": qualified.localSymbol,
+            "minTick": str(tick),
+        })
+        # Cache a fully-qualified contract for downstream placement.
+        # Futures route to their primary exchange (not SMART).
+        self._contract_cache[qualified.conId] = Contract(
+            conId=qualified.conId,
+            symbol=qualified.symbol,
+            secType=qualified.secType,
+            exchange=qualified.exchange,
+            currency=qualified.currency,
+            lastTradeDateOrContractMonth=qualified.lastTradeDateOrContractMonth,
+            tradingClass=qualified.tradingClass,
+            multiplier=qualified.multiplier,
+            localSymbol=qualified.localSymbol,
+        )
+        logger.info(
+            '{"event": "CONTRACT_FETCHED", "local_symbol": "%s", "con_id": %d,'
+            ' "sec_type": "FUT", "root": "%s", "expiry": "%s",'
+            ' "trading_class": "%s", "tick": "%s"}',
+            local_symbol, qualified.conId, qualified.symbol,
+            qualified.lastTradeDateOrContractMonth, qualified.tradingClass, tick,
         )
         return {
             "con_id": qualified.conId,

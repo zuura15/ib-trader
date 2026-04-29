@@ -37,25 +37,32 @@ _FUTURES_ROOTS: frozenset[str] = frozenset({
 })
 
 
-def _maybe_parse_futures_head(positional: list[str]) -> tuple[str | None, str | None]:
-    """If ``positional[0]`` is a known futures root and ``positional[1]`` is
-    a month-code token, return ``(root, expiry_yyyymm)``.
+def _is_futures_local_symbol(symbol: str) -> bool:
+    """True if ``symbol`` is an IB-paste futures localSymbol (e.g.
+    ``ESZ6`` / ``MESM6`` / ``GCM26``). Detection is "starts with a
+    known futures root, followed by a parseable month-code". Returns
+    False for stocks even if a stock ticker happens to share a prefix
+    with a futures root, because the trailing characters won't parse
+    as a month code.
 
-    Otherwise return ``(None, None)``. The caller uses this to decide
-    whether to route to the FUT branch and where to pick up the rest
-    of the positional args (QTY, STRATEGY...).
+    Why only known roots? It's the IB-paste form the system already
+    emits (see ``utils.symbol.format_ib_paste_symbol``). Restricting
+    to ``_FUTURES_ROOTS`` keeps ``GLD`` (an ETF that starts with ``G``)
+    out of the futures path.
     """
-    if len(positional) < 2:
-        return None, None
-    root = positional[0].upper()
-    if root not in _FUTURES_ROOTS:
-        return None, None
-    try:
-        month, yy = parse_month_code(positional[1])
-    except ValueError:
-        return None, None
-    year_full = 2000 + yy
-    return root, f"{year_full}{month:02d}"
+    if not symbol:
+        return False
+    s = symbol.upper()
+    # Iterate longest roots first so MES is preferred over MES-prefixed
+    # ETFs (none today, but future-proofs the check).
+    for root in sorted(_FUTURES_ROOTS, key=len, reverse=True):
+        if s.startswith(root) and len(s) > len(root):
+            try:
+                parse_month_code(s[len(root):])
+                return True
+            except ValueError:
+                continue
+    return False
 
 
 class Strategy(StrEnum):
@@ -213,6 +220,19 @@ def parse_buy_sell(
             except ValueError as e:
                 _emit_error(f"\u2717 Error: {e}", router)
                 return None
+        elif tok == "--profit":
+            # Same semantic as the trailing positional PROFIT (dollars
+            # of P&L to take). Flag form keeps parity with --stop-loss
+            # and matches the cmd_text the engine internal API emits.
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --profit requires a value", router)
+                return None
+            try:
+                profit_amount = _parse_decimal(args[i], "--profit")
+            except ValueError as e:
+                _emit_error(f"\u2717 Error: {e}", router)
+                return None
         elif tok == "--stop-loss":
             i += 1
             if i >= len(args):
@@ -254,33 +274,31 @@ def parse_buy_sell(
             positional.append(tok)
         i += 1
 
-    # Futures shorthand: ``buy ES Z26 2 mid``. If the first two tokens
-    # match, consume them and shift the remaining positionals forward.
+    # Symbol is always a SINGLE token. For futures the user types the
+    # IB-paste localSymbol form (``ESZ6``, ``MESM6``, ``GCM6``); we
+    # don't split it. The engine qualifies futures by localSymbol so
+    # the symbol stays identical across IB, our UI, and the CLI.
     security_type = "STK"
     expiry_yyyymm: str | None = None
-    fut_root, fut_expiry = _maybe_parse_futures_head(positional)
-    if fut_root is not None and fut_expiry is not None:
+
+    if len(positional) < 3:
+        _emit_error(
+            f"\u2717 Error: usage: {verb} SYMBOL QTY STRATEGY [PROFIT]",
+            router,
+        )
+        return None
+
+    symbol = positional[0].upper()
+    if _is_futures_local_symbol(symbol):
         security_type = "FUT"
-        expiry_yyyymm = fut_expiry
-        positional = [fut_root, *positional[2:]]
-    # Explicit --sec-type etc. override the shorthand. This is the path
-    # the internal HTTP API uses when composing a command from an
-    # OrderRequest that already carries explicit fields.
+
+    # Explicit --sec-type etc. override the auto-detection above. This
+    # is the path the internal HTTP API uses when composing a command
+    # from an OrderRequest that already carries explicit fields.
     if explicit_sec_type is not None:
         security_type = explicit_sec_type
     if explicit_expiry is not None:
         expiry_yyyymm = explicit_expiry
-
-    # Positional (STK): SYMBOL QTY STRATEGY [PROFIT]
-    # Positional (FUT): ROOT QTY STRATEGY [PROFIT] (after the shorthand
-    # shift above has already consumed the month-code token).
-    if len(positional) < 3:
-        usage = f"{verb} SYMBOL QTY STRATEGY [PROFIT]" if security_type == "STK" \
-                else f"{verb} ROOT MONTHCODE QTY STRATEGY [PROFIT]"
-        _emit_error(f"\u2717 Error: usage: {usage}", router)
-        return None
-
-    symbol = positional[0].upper()
 
     if dollars is None:
         try:
