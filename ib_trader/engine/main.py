@@ -546,7 +546,7 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         qty = Decimal(str(p.position))
         if qty == 0:
             continue
-        avg_cost = Decimal(str(p.avgCost))
+        avg_cost_raw = Decimal(str(p.avgCost))
         con_id = p.contract.conId
         sec_type = p.contract.secType
 
@@ -561,6 +561,20 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         expiry = getattr(p.contract, "lastTradeDateOrContractMonth", None) or None
         trading_class = getattr(p.contract, "tradingClass", None) or None
         multiplier = getattr(p.contract, "multiplier", None) or None
+
+        # IB's `Position.avgCost` for FUT is the total cost including
+        # the contract multiplier (e.g. MES filled at 6000 reports
+        # avgCost=30000 because multiplier=5). Normalize to the per-unit
+        # price so the UI value lines up directly with chart prices and
+        # IB's order-ticket display. STK keeps avgCost as-is (multiplier
+        # = 1 there).
+        if sec_type == "FUT" and multiplier:
+            try:
+                avg_cost = avg_cost_raw / Decimal(str(multiplier))
+            except Exception:
+                avg_cost = avg_cost_raw
+        else:
+            avg_cost = avg_cost_raw
 
         # Enrich with live market price from the in-memory ticker
         market_price = None
@@ -603,7 +617,7 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
             "display_symbol": display_symbol,
         })
 
-        if subscribe_mktdata and sec_type == "STK":
+        if subscribe_mktdata and sec_type in ("STK", "FUT"):
             try:
                 await ctx.ib.subscribe_market_data(con_id, sym)
             except Exception as e:
@@ -1018,9 +1032,24 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
     try:
         symbol = position.contract.symbol
         qty = Decimal(str(position.position))
-        avg_price = Decimal(str(position.avgCost))
+        avg_price_raw = Decimal(str(position.avgCost))
         con_id = position.contract.conId
         sec_type = position.contract.secType
+        expiry = getattr(position.contract, "lastTradeDateOrContractMonth", None) or None
+        trading_class = getattr(position.contract, "tradingClass", None) or None
+        multiplier = getattr(position.contract, "multiplier", None) or None
+
+        # Same avgCost normalization as _refresh_positions_cache: IB
+        # reports total cost (price × multiplier) for FUT; we want the
+        # per-unit price so the UI matches chart prices. STK is a
+        # multiplier-of-1 no-op.
+        if sec_type == "FUT" and multiplier:
+            try:
+                avg_price = avg_price_raw / Decimal(str(multiplier))
+            except Exception:
+                avg_price = avg_price_raw
+        else:
+            avg_price = avg_price_raw
 
         # Seed the wrapper's contract cache so chart-history et al. can
         # look up by con_id without re-qualifying. See the matching
@@ -1029,6 +1058,18 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             ctx.ib._contract_cache.setdefault(con_id, position.contract)
         except Exception as e:
             logger.debug("seed contract cache (positionEvent) failed", exc_info=e)
+
+        # Subscribe to live ticks for STK and FUT so subsequent ticker
+        # reads here and chart updates have a price to show. Idempotent
+        # — wrapper deduplicates by con_id.
+        if qty != 0 and sec_type in ("STK", "FUT"):
+            try:
+                await ctx.ib.subscribe_market_data(con_id, symbol)
+            except Exception as e:
+                logger.debug(
+                    "market data subscribe (positionEvent) failed for %s",
+                    symbol, exc_info=e,
+                )
 
         # Update in-memory cache (atomic list rebuild)
         now = datetime.now(timezone.utc).isoformat()
@@ -1045,6 +1086,15 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
                     market_price = str(last)
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
+
+        display_symbol = symbol
+        if sec_type == "FUT" and expiry:
+            try:
+                from ib_trader.utils.symbol import format_display_symbol
+                display_symbol = format_display_symbol(symbol, "FUT", expiry)
+            except Exception:
+                display_symbol = f"{symbol} {expiry}"
+
         entry = {
             "id": f"{symbol}_{sec_type}_{con_id}",
             "account_id": position.account,
@@ -1056,6 +1106,10 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             "con_id": con_id,
             "broker": "ib",
             "updated_at": now,
+            "expiry": expiry,
+            "trading_class": trading_class,
+            "multiplier": multiplier,
+            "display_symbol": display_symbol,
         }
         new_cache = [p for p in ctx.positions_cache
                      if not (p.get("symbol") == symbol

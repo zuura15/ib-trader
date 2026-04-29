@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../../data/store';
-import { formatPrice, formatCurrency, pnlClass, formatInstrument, formatIbPasteSymbol } from '../../utils/format';
+import { formatPrice, formatCurrency, pnlClass, formatIbPasteSymbol } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 
 function LiveIndicator({ connected }: { connected: boolean }) {
@@ -39,7 +39,16 @@ function parseNum(v: string | null | undefined): number {
 
 function computePnl(pos: BrokerPosition): number | null {
   if (!pos.market_price) return null;
-  return (parseNum(pos.market_price) - parseNum(pos.avg_cost)) * parseNum(pos.quantity);
+  // Per-unit price diff × qty × multiplier = dollar P&L. Backend now
+  // sends per-unit avg_cost for futures (after dividing IB's total-cost
+  // figure by the multiplier), so the multiplier has to come back in
+  // here to land in dollars. STK has multiplier=1/null which makes
+  // this a no-op for equities.
+  const multStr = pos.multiplier;
+  const mult = multStr ? parseFloat(multStr) : 1;
+  const validMult = Number.isFinite(mult) && mult > 0 ? mult : 1;
+  return (parseNum(pos.market_price) - parseNum(pos.avg_cost))
+       * parseNum(pos.quantity) * validMult;
 }
 
 function sortPositions(positions: BrokerPosition[], key: SortKey, dir: SortDir): BrokerPosition[] {
@@ -316,16 +325,25 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
                 >
                   <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>
                     <span
-                      title={pos.sec_type === 'FUT' ? 'Click to copy IB paste shorthand (ESZ6)' : undefined}
+                      title={pos.sec_type === 'FUT'
+                        ? 'Click to copy IB-paste symbol' : undefined}
                       style={{ cursor: pos.sec_type === 'FUT' ? 'copy' : 'default' }}
-                      onClick={() => {
+                      onClick={(e) => {
                         if (pos.sec_type === 'FUT') {
+                          // The cell already shows the IB-paste form; the
+                          // click-to-copy is now a literal copy of the visible
+                          // text. Stop the row's onClick from also firing
+                          // (which would update the chart target).
+                          e.stopPropagation();
                           const paste = formatIbPasteSymbol(pos);
                           navigator.clipboard?.writeText(paste).catch(() => {});
                         }
                       }}
                     >
-                      {formatInstrument(pos)}
+                      {/* IB-paste form (e.g. MESM6) for FUT — matches what
+                          the user types in the CLI and what IB shows in
+                          TWS / order tickets. STK falls through to symbol. */}
+                      {formatIbPasteSymbol(pos)}
                     </span>
                   </td>
                   <td
