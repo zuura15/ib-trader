@@ -470,18 +470,22 @@ async def get_history(
     # IB's durationStr only accepts S/D/W/M/Y — no H. Convert to seconds
     # (works for the 1–24 h range we care about; ~86400 S for 24 h).
     duration_str = f"{int(hours) * 3600} S"
-    # MIDPOINT (not TRADES) so the chart line is continuous through
-    # quiet after-hours windows. TRADES only emits a bar when an actual
-    # trade printed in that interval — for ETFs and equities in extended
-    # hours that produces multi-hour gaps in the line. MIDPOINT is the
-    # bid/ask mid at each bar interval and is always present while IB
-    # is taping. Charts care about price shape, not volume.
+    # BID_ASK (not TRADES/MIDPOINT) maximizes overnight coverage. IB
+    # tapes book updates whenever any market maker is quoting, even
+    # during quiet AH hours where TRADES (no print) and MIDPOINT (no
+    # quote change) both return nothing. Per IB docs, BID_ASK bar
+    # fields are repurposed:
+    #   open  = average bid in the interval
+    #   high  = max ask in the interval
+    #   low   = min bid in the interval
+    #   close = average ask in the interval
+    # We remap to a single mid for the chart line below.
     try:
         bars = await _ctx.ib.req_historical_data_async(
             contract,
             duration_str=duration_str,
             bar_size=bar_size,
-            what_to_show="MIDPOINT",
+            what_to_show="BID_ASK",
             use_rth=False,
             format_date=2,
         )
@@ -493,13 +497,26 @@ async def get_history(
     for bar in bars or []:
         ts = getattr(bar, "date", None)
         ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        avg_bid = float(bar.open)
+        max_ask = float(bar.high)
+        min_bid = float(bar.low)
+        avg_ask = float(bar.close)
+        # mid = (avg_bid + avg_ask) / 2 if both sides quoted, else
+        # whichever side is non-zero (illiquid hours can have one-sided
+        # quotes).
+        if avg_bid > 0 and avg_ask > 0:
+            mid = (avg_bid + avg_ask) / 2
+        elif avg_ask > 0:
+            mid = avg_ask
+        else:
+            mid = avg_bid
         out.append({
             "ts": ts_str,
-            "open": float(bar.open),
-            "high": float(bar.high),
-            "low": float(bar.low),
-            "close": float(bar.close),
-            "volume": int(getattr(bar, "volume", 0) or 0),
+            "open": avg_bid,
+            "high": max_ask,
+            "low": min_bid,
+            "close": mid,
+            "volume": 0,
         })
 
     _HISTORY_CACHE[cache_key] = (now, out)

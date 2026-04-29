@@ -69,18 +69,42 @@ async def submit_command(body: CommandRequest):
         # 260s = 240s + 20s buffer.
         async with httpx.AsyncClient(timeout=260) as client:
             if verb in ("buy", "sell"):
-                symbol = parts[1] if len(parts) > 1 else ""
-                qty = parts[2] if len(parts) > 2 else "1"
-                order_type = parts[3] if len(parts) > 3 else "mid"
-                side = "BUY" if verb == "buy" else "SELL"
-
-                resp = await client.post(f"{engine_url}/engine/orders", json={
-                    "symbol": symbol,
+                # Use the REPL's parse_buy_sell so the futures shorthand
+                # (``buy MES M6 1 mid``) and the explicit flag form
+                # (``--sec-type FUT --expiry YYYYMM``) are both honored.
+                # A naive split() would misalign positionals when the
+                # shorthand is present.
+                from ib_trader.repl.commands import parse_buy_sell, BuyCommand
+                cmd = parse_buy_sell(parts)
+                if cmd is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to parse command: {cmd_text!r}",
+                    )
+                side = "BUY" if isinstance(cmd, BuyCommand) else "SELL"
+                payload: dict = {
+                    "symbol": cmd.symbol,
                     "side": side,
-                    "qty": qty,
-                    "order_type": order_type,
+                    "qty": str(cmd.qty) if cmd.qty is not None else "1",
+                    "order_type": cmd.strategy.value,
                     "cmd_id": body.command_id,
-                })
+                    "security_type": cmd.security_type,
+                    "schema_version": 2,
+                }
+                if cmd.expiry:
+                    payload["expiry"] = cmd.expiry
+                if cmd.trading_class:
+                    payload["trading_class"] = cmd.trading_class
+                if cmd.exchange:
+                    payload["exchange"] = cmd.exchange
+                if cmd.profit_amount is not None:
+                    payload["profit"] = str(cmd.profit_amount)
+                if cmd.stop_loss is not None:
+                    payload["stop_loss"] = str(cmd.stop_loss)
+                if cmd.limit_price is not None:
+                    payload["price"] = str(cmd.limit_price)
+
+                resp = await client.post(f"{engine_url}/engine/orders", json=payload)
             elif verb == "close":
                 serial = int(parts[1]) if len(parts) > 1 else 0
                 strategy = parts[2] if len(parts) > 2 else "market"
