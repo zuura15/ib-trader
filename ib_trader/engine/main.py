@@ -550,12 +550,27 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         con_id = p.contract.conId
         sec_type = p.contract.secType
 
-        # Seed the wrapper's contract cache so downstream callers (chart
-        # history endpoint, future ad-hoc queries) can look up by con_id
-        # without paying a re-qualify round-trip. positionEvent contracts
-        # arrive fully resolved from IB, so they're safe to cache as-is.
+        # Seed the wrapper's contract cache. For FUT, re-qualify via
+        # localSymbol so the cached contract has a populated exchange
+        # field — IB's reqPositions hands back FUT contracts with empty
+        # exchange (positions are account-wide, not exchange-specific),
+        # which then makes reqMktData reject with code 321 ("Please
+        # enter exchange"). STK position contracts arrive with
+        # exchange=SMART already, so they go straight into the cache.
         try:
-            ctx.ib._contract_cache.setdefault(con_id, p.contract)
+            if con_id not in ctx.ib._contract_cache:
+                if sec_type == "FUT":
+                    local_sym = getattr(p.contract, "localSymbol", "") or ""
+                    if local_sym:
+                        try:
+                            await ctx.ib.qualify_contract(local_sym, sec_type="FUT")
+                        except Exception as e:
+                            logger.debug(
+                                "FUT requalify-by-localSymbol failed for %s",
+                                local_sym, exc_info=e,
+                            )
+                if con_id not in ctx.ib._contract_cache:
+                    ctx.ib._contract_cache[con_id] = p.contract
         except Exception as e:
             logger.debug("seed contract cache failed", exc_info=e)
         expiry = getattr(p.contract, "lastTradeDateOrContractMonth", None) or None
@@ -1051,11 +1066,24 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
         else:
             avg_price = avg_price_raw
 
-        # Seed the wrapper's contract cache so chart-history et al. can
-        # look up by con_id without re-qualifying. See the matching
-        # call in _refresh_positions_cache.
+        # Seed the wrapper's contract cache. For FUT, re-qualify via
+        # localSymbol so the cached contract has a populated exchange
+        # field (see _refresh_positions_cache for the same dance and
+        # the IB-321 reasoning).
         try:
-            ctx.ib._contract_cache.setdefault(con_id, position.contract)
+            if con_id not in ctx.ib._contract_cache:
+                if sec_type == "FUT":
+                    local_sym = getattr(position.contract, "localSymbol", "") or ""
+                    if local_sym:
+                        try:
+                            await ctx.ib.qualify_contract(local_sym, sec_type="FUT")
+                        except Exception as e:
+                            logger.debug(
+                                "FUT requalify-by-localSymbol failed (positionEvent) for %s",
+                                local_sym, exc_info=e,
+                            )
+                if con_id not in ctx.ib._contract_cache:
+                    ctx.ib._contract_cache[con_id] = position.contract
         except Exception as e:
             logger.debug("seed contract cache (positionEvent) failed", exc_info=e)
 
