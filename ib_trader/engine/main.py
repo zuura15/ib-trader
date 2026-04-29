@@ -533,9 +533,25 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
     """
     from decimal import Decimal
     from datetime import datetime, timezone
+    import asyncio as _asyncio
 
     try:
-        await ctx.ib.req_positions_async(timeout=10)
+        # Bumped to 30s — after FUT requalifies and FUT market-data
+        # subscribes started piling up on startup, IB sometimes takes
+        # longer than 10s to send the reqPositions END marker. The
+        # cache stays fresh from positionEvent in the meantime, so a
+        # late END is cosmetic.
+        await ctx.ib.req_positions_async(timeout=30)
+    except _asyncio.TimeoutError:
+        # positionEvent keeps the cache live; the next 30s refresh
+        # tick will retry. Demote to a warning so the operator sees
+        # it without the full stack trace from the raised exception.
+        logger.warning(
+            '{"event": "POSITION_REFRESH_TIMEOUT", "note": '
+            '"reqPositions END not received in 30s; positionEvent stream '
+            'continues to keep the cache live"}',
+        )
+        return len(ctx.positions_cache)
     except Exception:
         logger.exception('{"event": "POSITION_REFRESH_FAILED"}')
         return len(ctx.positions_cache)
