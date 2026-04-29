@@ -1230,12 +1230,22 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
             contract = getattr(ticker, "contract", None)
             if contract is None:
                 return
-            # Only publish equities — option/futures tickers share the
-            # underlying's symbol and would overwrite the equity quote.
-            if getattr(contract, "secType", None) != "STK":
+            sec_type = getattr(contract, "secType", None)
+            # Skip OPT — option tickers share the underlying's `symbol`
+            # (e.g. AAPL puts/calls all set ``contract.symbol = "AAPL"``)
+            # and would overwrite the equity quote on `quote:AAPL`. STK
+            # publishes by symbol; FUT publishes by localSymbol (e.g.
+            # `quote:MESM6`) so chart subscribers get live updates.
+            if sec_type not in ("STK", "FUT"):
                 return
-            symbol = getattr(contract, "symbol", None)
             con_id = getattr(contract, "conId", None)
+            # FUT keys on localSymbol so the chart's `quote:MESM6`
+            # subscription matches what we publish. STK keeps `symbol`
+            # (= ticker, e.g. "AAPL") which is what the watchlist uses.
+            if sec_type == "FUT":
+                symbol = getattr(contract, "localSymbol", None)
+            else:
+                symbol = getattr(contract, "symbol", None)
             if not symbol or con_id is None:
                 return
 

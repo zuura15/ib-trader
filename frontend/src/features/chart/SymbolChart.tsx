@@ -94,6 +94,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         timeVisible: true,
         secondsVisible: false,
         borderColor: colors.grid,
+        // When live ticks land past the current visible range, slide
+        // the window forward (preserving its width) so the price tail
+        // stays in view. Default is true in v5; set explicitly so it
+        // can't regress to false on a future lib update.
+        shiftVisibleRangeOnNewBar: true,
       },
       rightPriceScale: { borderColor: colors.grid },
       crosshair: { mode: 1 },
@@ -323,9 +328,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes]);
 
-  // Live tick subscription — engine publishes only STK quotes.
+  // Live tick subscription. Engine publishes STK ticks keyed on
+  // ``symbol`` and FUT ticks keyed on ``localSymbol`` (= the IB-paste
+  // form like MESM6 — same string we hold as ``target.symbol`` for
+  // futures rows). OPT is skipped server-side because option tickers
+  // share the underlying's symbol; clients route to the underlying STK
+  // anyway via the OPT→STK substitution in the store.
   useEffect(() => {
-    if (!target || target.secType !== 'STK' || !target.symbol) return;
+    if (!target || !target.symbol) return;
+    if (target.secType !== 'STK' && target.secType !== 'FUT') return;
     if (!seriesRef.current) return;
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
