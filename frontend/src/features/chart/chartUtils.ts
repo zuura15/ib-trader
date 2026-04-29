@@ -6,7 +6,11 @@ export const PRELOAD_HOURS = 24;
 export const REFRESH_INTERVAL_MS = 30_000;
 export const BAR_SIZE = '1 min';
 
-const ZOOM_STORAGE_KEY = 'ib-chart-zoom-v1';
+// v2: bumped to discard ranges saved by an earlier build where transient
+// auto-fit states could persist as ~2-min "zooms". Old `v1` entries are
+// orphaned (small handful of bytes per target — left for the browser to
+// evict on its own).
+const ZOOM_STORAGE_KEY = 'ib-chart-zoom-v2';
 export type SavedRange = { from: number; to: number };
 export type Point = { time: UTCTimestamp; value: number };
 
