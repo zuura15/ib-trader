@@ -470,12 +470,18 @@ async def get_history(
     # IB's durationStr only accepts S/D/W/M/Y — no H. Convert to seconds
     # (works for the 1–24 h range we care about; ~86400 S for 24 h).
     duration_str = f"{int(hours) * 3600} S"
+    # MIDPOINT (not TRADES) so the chart line is continuous through
+    # quiet after-hours windows. TRADES only emits a bar when an actual
+    # trade printed in that interval — for ETFs and equities in extended
+    # hours that produces multi-hour gaps in the line. MIDPOINT is the
+    # bid/ask mid at each bar interval and is always present while IB
+    # is taping. Charts care about price shape, not volume.
     try:
         bars = await _ctx.ib.req_historical_data_async(
             contract,
             duration_str=duration_str,
             bar_size=bar_size,
-            what_to_show="TRADES",
+            what_to_show="MIDPOINT",
             use_rth=False,
             format_date=2,
         )
