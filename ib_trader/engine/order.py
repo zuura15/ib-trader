@@ -1922,10 +1922,19 @@ async def _handle_fill(
         order_ctx.correlation_id, trade_group.serial_number, order_ctx.symbol, qty_filled, avg_price, commission,
     )
 
-    # Place profit taker if configured
-    if cmd.take_profit_price or cmd.profit_amount:
-        from ib_trader.repl.commands import BuyCommand as BC
-        entry_side = "BUY" if isinstance(cmd, BC) else "SELL"
+    # Place profit taker and/or trailing stop if configured. When both
+    # are present they share an OCA group so IB cancels one when the
+    # other fills.
+    from ib_trader.repl.commands import BuyCommand as BC
+    entry_side = "BUY" if isinstance(cmd, BC) else "SELL"
+    has_profit = bool(cmd.take_profit_price or cmd.profit_amount)
+    has_trail = bool(getattr(cmd, "trail_percent", None) or getattr(cmd, "trail_amount", None))
+    oca_group = (
+        f"trade_{trade_group.serial_number}_exit"
+        if has_profit and has_trail else None
+    )
+
+    if has_profit:
         await place_profit_taker(
             trade_id=trade_group.id,
             entry_side=entry_side,
@@ -1939,7 +1948,28 @@ async def _handle_fill(
             trade_serial=trade_group.serial_number,
             tick_size=order_ctx.tick_size,
             multiplier=order_ctx.multiplier,
+            oca_group=oca_group,
         )
+
+    if has_trail:
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        try:
+            await ctx.ib.place_trailing_stop_order(
+                con_id=con_id,
+                symbol=order_ctx.symbol,
+                side=exit_side,
+                qty=qty_filled,
+                trailing_percent=cmd.trail_percent,
+                aux_price=cmd.trail_amount,
+                oca_group=oca_group,
+                order_ref=f"trail_{trade_group.serial_number}",
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "TRAIL_STOP_PLACE_FAILED", "trade_id": "%s", '
+                '"serial": %d, "symbol": "%s"}',
+                trade_group.id, trade_group.serial_number, order_ctx.symbol,
+            )
 
 
 async def _await_full_fill_or_timeout(
@@ -2456,6 +2486,7 @@ async def place_profit_taker(
     trade_serial: int | None = None,
     tick_size: Decimal | None = None,
     multiplier: Decimal | None = None,
+    oca_group: str | None = None,
 ) -> None:
     """Place a GTC profit taker order after an entry fill.
 
@@ -2510,6 +2541,7 @@ async def place_profit_taker(
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, symbol, pt_side, qty_filled, pt_price,
         outside_rth=True, tif=_session_tif(),
+        oca_group=oca_group,
     )
 
     _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, symbol, pt_side, "LIMIT",

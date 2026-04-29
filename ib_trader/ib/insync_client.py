@@ -12,7 +12,7 @@ from datetime import date
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, Contract, Future, LimitOrder, MarketOrder, Trade, Fill
+from ib_async import IB, Contract, Future, LimitOrder, MarketOrder, Order, Trade, Fill
 
 from ib_trader.broker.exceptions import AmbiguousInstrument, ExpiredContractError
 from ib_trader.broker.types import FutureExpiryCandidate
@@ -714,8 +714,15 @@ class InsyncClient(IBClientBase):
         outside_rth: bool = True,
         tif: str = "GTC",
         order_ref: str | None = None,
+        oca_group: str | None = None,
     ) -> str:
-        """Place a limit order. Returns IB order ID as string."""
+        """Place a limit order. Returns IB order ID as string.
+
+        ``oca_group`` (One-Cancels-All): when supplied, IB cancels every
+        other order with the same OCA tag once any of them fills.
+        Caller pairs this LMT with a TRAIL/STP that shares the tag so
+        the broker handles the exit-leg cancellation atomically.
+        """
         await self._throttle()
         contract = self._contract_cache.get(con_id) or Contract(
             conId=con_id, exchange="SMART", currency="USD"
@@ -726,6 +733,9 @@ class InsyncClient(IBClientBase):
         order.tif = tif
         if order_ref:
             order.orderRef = order_ref
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # CANCEL_WITH_BLOCK
         overnight = is_overnight_session()
         if overnight:
             # During overnight session (8 PM – 3:50 AM ET), set includeOvernight
@@ -804,6 +814,80 @@ class InsyncClient(IBClientBase):
             ib_order_id, contract.exchange, order.tif,
             "true" if order.outsideRth else "false",
             order.orderType, order.account, contract.conId,
+        )
+        return ib_order_id
+
+    async def place_trailing_stop_order(
+        self,
+        con_id: int,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        *,
+        trailing_percent: Decimal | None = None,
+        aux_price: Decimal | None = None,
+        oca_group: str | None = None,
+        order_ref: str | None = None,
+        tif: str = "GTC",
+    ) -> str:
+        """Place an IB-server-managed TRAIL stop. Returns the IB order id.
+
+        Exactly one of ``trailing_percent`` or ``aux_price`` should be
+        set. ``trailing_percent=Decimal("0.5")`` produces a 0.5%
+        trailing stop; ``aux_price=Decimal("2.0")`` produces a $2 (or
+        2-point) fixed-offset trail.
+
+        ``oca_group`` links this order with a profit-target LMT under
+        the same OCA tag so IB cancels one when the other fills.
+        Caller should reuse the same OCA string across the linked
+        orders for a single trade group. ``ocaType=1`` = cancel all
+        remaining orders with block.
+
+        TRAIL on FUT runs 24h on Globex. Caller should not place this
+        on STK — IB-simulated STK trails are RTH-only.
+        """
+        if (trailing_percent is None) == (aux_price is None):
+            raise ValueError(
+                "place_trailing_stop_order: pass exactly one of "
+                "trailing_percent or aux_price",
+            )
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, exchange="SMART", currency="USD",
+        )
+        order = Order()
+        order.action = side.upper()
+        order.totalQuantity = float(qty)
+        order.orderType = "TRAIL"
+        order.tif = tif
+        order.outsideRth = True
+        if trailing_percent is not None:
+            order.trailingPercent = float(trailing_percent)
+        if aux_price is not None:
+            order.auxPrice = float(aux_price)
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # CANCEL_WITH_BLOCK
+        if order_ref:
+            order.orderRef = order_ref
+        if self._account_id:
+            order.account = self._account_id
+
+        trade = self.__ib.placeOrder(contract, order)
+        ib_order_id = str(trade.order.orderId)
+        self.__active_trades[ib_order_id] = trade
+        self._fire_order_placed(
+            ib_order_id, symbol, contract.secType or "FUT",
+            int(contract.conId or 0), side, qty, order_ref or "",
+        )
+        logger.info(
+            '{"event": "TRAIL_STOP_PLACED", "symbol": "%s", "side": "%s", '
+            '"qty": "%s", "trailing_percent": %s, "aux_price": %s, '
+            '"oca_group": "%s", "ib_order_id": "%s"}',
+            symbol, side, qty,
+            float(trailing_percent) if trailing_percent is not None else "null",
+            float(aux_price) if aux_price is not None else "null",
+            oca_group or "", ib_order_id,
         )
         return ib_order_id
 

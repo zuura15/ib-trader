@@ -105,6 +105,13 @@ class BuyCommand:
     expiry: str | None = None          # YYYYMM (CLI) or YYYYMMDD (IB-normalized)
     trading_class: str | None = None
     exchange: str | None = None
+    # Trailing stop (FUT only). Exactly one of ``trail_percent`` or
+    # ``trail_amount`` is set when ``--trail`` is supplied. Both None
+    # means the user didn't ask for a trail; the order flow leaves it
+    # alone. STK is rejected at parse time because IB-simulated STK
+    # trails are RTH-only and unreliable overnight.
+    trail_percent: Decimal | None = None
+    trail_amount: Decimal | None = None
 
 
 @dataclass
@@ -123,6 +130,8 @@ class SellCommand:
     expiry: str | None = None
     trading_class: str | None = None
     exchange: str | None = None
+    trail_percent: Decimal | None = None
+    trail_amount: Decimal | None = None
 
 
 @dataclass
@@ -191,6 +200,8 @@ def parse_buy_sell(
     profit_amount = None
     take_profit_price = None
     stop_loss = None
+    trail_percent: Decimal | None = None
+    trail_amount: Decimal | None = None
 
     positional = []
     explicit_sec_type: str | None = None
@@ -230,6 +241,37 @@ def parse_buy_sell(
                 return None
             try:
                 profit_amount = _parse_decimal(args[i], "--profit")
+            except ValueError as e:
+                _emit_error(f"\u2717 Error: {e}", router)
+                return None
+        elif tok == "--trail":
+            # IB-server-managed trailing stop placed after entry fills.
+            # Accepts either a percent (``0.5%``) or a fixed offset in
+            # instrument points (``2.0``). Percent \u2192 trailingPercent on
+            # the IB Order; fixed \u2192 auxPrice. Mutually exclusive (one
+            # is None on the command).
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --trail requires a value (e.g. 0.5% or 2.0)", router)
+                return None
+            raw = args[i].strip()
+            try:
+                if raw.endswith("%"):
+                    pct = _parse_decimal(raw[:-1], "--trail")
+                    if pct <= 0 or pct >= 50:
+                        _emit_error(
+                            "\u2717 Error: --trail percent must be in (0, 50)", router,
+                        )
+                        return None
+                    trail_percent = pct
+                else:
+                    amt = _parse_decimal(raw, "--trail")
+                    if amt <= 0:
+                        _emit_error(
+                            "\u2717 Error: --trail amount must be positive", router,
+                        )
+                        return None
+                    trail_amount = amt
             except ValueError as e:
                 _emit_error(f"\u2717 Error: {e}", router)
                 return None
@@ -350,6 +392,19 @@ def parse_buy_sell(
 
     exchange = explicit_exchange or ("CME" if security_type == "FUT" else None)
     trading_class = explicit_trading_class
+
+    # Gate --trail to FUT only. IB-simulated trailing stops on STK run
+    # RTH-only and stall overnight, which makes them a foot-gun on a
+    # 24h-trading mindset. Reject loudly so the user doesn't think the
+    # protection is in place when it isn't.
+    if (trail_percent is not None or trail_amount is not None) and security_type != "FUT":
+        _emit_error(
+            "✗ Error: --trail is FUT-only (IB-simulated STK trailing stops "
+            "only run during RTH and aren't reliable overnight)",
+            router,
+        )
+        return None
+
     if verb == "buy":
         return BuyCommand(
             symbol=symbol,
@@ -364,6 +419,8 @@ def parse_buy_sell(
             expiry=expiry_yyyymm,
             trading_class=trading_class,
             exchange=exchange,
+            trail_percent=trail_percent,
+            trail_amount=trail_amount,
         )
     else:
         return SellCommand(
@@ -379,6 +436,8 @@ def parse_buy_sell(
             expiry=expiry_yyyymm,
             trading_class=trading_class,
             exchange=exchange,
+            trail_percent=trail_percent,
+            trail_amount=trail_amount,
         )
 
 

@@ -103,6 +103,13 @@ async def submit_command(body: CommandRequest):
                     payload["stop_loss"] = str(cmd.stop_loss)
                 if cmd.limit_price is not None:
                     payload["price"] = str(cmd.limit_price)
+                # FUT-only trailing stop (parser already gates STK at
+                # parse time). Exactly one of trail_percent / trail_amount
+                # is set when --trail was supplied.
+                if getattr(cmd, "trail_percent", None) is not None:
+                    payload["trail_percent"] = str(cmd.trail_percent)
+                elif getattr(cmd, "trail_amount", None) is not None:
+                    payload["trail_amount"] = str(cmd.trail_amount)
 
                 resp = await client.post(f"{engine_url}/engine/orders", json=payload)
             elif verb == "close":

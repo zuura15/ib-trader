@@ -63,6 +63,12 @@ class OrderRequest(BaseModel):
     trading_class: Optional[str] = Field(default=None, description="IB trading-class disambiguator (ES vs MES)")
     exchange: Optional[str] = Field(default=None, description="Primary exchange; defaults per sec_type")
     schema_version: int = Field(default=1, description="1 = legacy STK-only; 2 = sec-type aware")
+    # Trailing stop (FUT only). Caller sends one of these — `trail_percent`
+    # for ``trailingPercent`` semantics, `trail_amount` for fixed
+    # ``auxPrice``. Both None means no trailing stop. Mirrors the
+    # ``--trail 0.5%`` / ``--trail 2.0`` CLI flag.
+    trail_percent: Optional[str] = Field(default=None, description="Trailing stop percent (e.g. '0.5' for 0.5%)")
+    trail_amount: Optional[str] = Field(default=None, description="Trailing stop fixed offset (instrument points)")
 
 
 class OrderResponse(BaseModel):
@@ -166,6 +172,10 @@ async def place_order(req: OrderRequest):
         cmd_text += f" --trading-class {req.trading_class}"
     if req.exchange:
         cmd_text += f" --exchange {req.exchange}"
+    if req.trail_percent:
+        cmd_text += f" --trail {req.trail_percent}%"
+    elif req.trail_amount:
+        cmd_text += f" --trail {req.trail_amount}"
 
     # Pass bot_ref through to execute_single_command — the engine encodes
     # orderRef AFTER allocating the real trade serial (not the bot's stale one).
