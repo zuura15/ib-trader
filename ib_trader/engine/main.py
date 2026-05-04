@@ -275,11 +275,16 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
         # --- Subscribe to watchlist symbols for tick publishing ---
         from ib_trader.config.loader import load_watchlist
+        from ib_trader.repl.commands import _is_futures_local_symbol
         watchlist_symbols = load_watchlist("config/watchlist.yaml")
         watchlist_subscribed = 0
         for sym in watchlist_symbols:
             try:
-                info = await ctx.ib.qualify_contract(sym)
+                # Detect IB-paste FUT form (e.g. ``MESM6``) so MES futures
+                # in the watchlist qualify as FUT instead of failing the
+                # default STK qualify path.
+                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
+                info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
                 await ctx.ib.subscribe_market_data(info["con_id"], sym)
                 watchlist_subscribed += 1
             except Exception:

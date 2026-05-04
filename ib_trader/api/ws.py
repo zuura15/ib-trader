@@ -405,6 +405,18 @@ async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
             return
         except (ConnectionError, OSError, _RedisConnectionError):
             return  # Redis shut down — exit cleanly
+        except RuntimeError as e:
+            # Starlette raises ``RuntimeError("Cannot call 'send' once a
+            # close message has been sent.")`` when the client
+            # disconnected mid-stream and we tried to push. It's the
+            # WebSocketDisconnect equivalent for a one-sided close —
+            # just stop the loop cleanly. Re-raise anything else.
+            if "close message has been sent" in str(e):
+                return
+            logger.exception(
+                '{"event": "WS_QUOTE_STREAM_ERROR", "symbol": "%s"}', symbol,
+            )
+            await asyncio.sleep(1)
         except Exception:
             logger.exception('{"event": "WS_QUOTE_STREAM_ERROR", "symbol": "%s"}', symbol)
             await asyncio.sleep(1)

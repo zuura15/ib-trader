@@ -330,13 +330,18 @@ async def reload_watchlist():
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
     from ib_trader.config.loader import load_watchlist
+    from ib_trader.repl.commands import _is_futures_local_symbol
 
     try:
         symbols = load_watchlist("config/watchlist.yaml")
         subscribed = []
         for sym in symbols:
             try:
-                info = await _ctx.ib.qualify_contract(sym)
+                # Same FUT-detection as the startup subscribe loop —
+                # IB-paste localSymbol form (``MESM6``) routes through
+                # the FUT qualify path; everything else stays STK.
+                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
+                info = await _ctx.ib.qualify_contract(sym, sec_type=sec_type)
                 await _ctx.ib.subscribe_market_data(info["con_id"], sym)
                 subscribed.append(sym)
             except Exception:
