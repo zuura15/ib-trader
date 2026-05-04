@@ -457,12 +457,21 @@ async def get_history(
         raise HTTPException(status_code=400, detail="con_id or symbol is required")
 
     if con_id is None:
+        # Auto-route IB-paste FUT localSymbols (``MESM6``, ``GCM6``,
+        # ``ESZ6``…) to the FUT qualify path. The frontend's
+        # WatchlistPanel click sends ``sec_type=STK`` for everything,
+        # so without this fallback every futures symbol in the
+        # watchlist would 502 here.
+        from ib_trader.repl.commands import _is_futures_local_symbol
+        effective_sec_type = sec_type
+        if (sec_type or "STK").upper() == "STK" and _is_futures_local_symbol(symbol or ""):
+            effective_sec_type = "FUT"
         try:
-            qualified = await _ctx.ib.qualify_contract(symbol, sec_type=sec_type)
+            qualified = await _ctx.ib.qualify_contract(symbol, sec_type=effective_sec_type)
         except Exception as e:
             logger.exception(
                 '{"event": "HISTORY_QUALIFY_FAILED", "symbol": "%s", "sec_type": "%s"}',
-                symbol, sec_type,
+                symbol, effective_sec_type,
             )
             raise HTTPException(status_code=502, detail=f"qualify_contract failed: {e}") from e
         con_id = int(qualified.get("con_id") or 0)

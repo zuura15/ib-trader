@@ -332,7 +332,18 @@ class InsyncClient(IBClientBase):
             )
 
         contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
-        [qualified] = await self.__ib.qualifyContractsAsync(contract)
+        results = await self.__ib.qualifyContractsAsync(contract)
+        # ib-async returns ``[None]`` (not an empty list) when IB can't
+        # match the contract — destructuring would silently bind None
+        # and we'd crash on the next ``.conId`` access. Raise a clear
+        # error so callers can decide to retry with a different
+        # sec_type / fall back to a FUT-localSymbol path.
+        qualified = results[0] if results else None
+        if qualified is None or not getattr(qualified, "conId", 0):
+            raise ValueError(
+                f"qualify_contract: IB returned no match for "
+                f"{symbol!r} (sec_type={sec_type})",
+            )
         raw = json.dumps({
             "conId": qualified.conId,
             "symbol": qualified.symbol,
