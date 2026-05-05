@@ -55,6 +55,39 @@ dev:
 			if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
 		fi; \
 	done
+	@# Reap orphan ib-engine / ib-api / ib-bots processes that aren't
+	@# currently bound to a port. This catches the case where an SSH
+	@# session was closed mid-`make dev` and the children got reparented
+	@# to PID 1 — the orphan's internal API may have died silently
+	@# (freeing :8081) but the engine process itself is still alive,
+	@# holding the IB Gateway client-ID slot, which would prevent the
+	@# fresh engine from connecting. We use ``ps + awk`` so we don't
+	@# depend on whichever pgrep regex flavor (BRE vs ERE) the host
+	@# system ships. The awk pattern matches a venv-launched binary
+	@# name terminated by space or end-of-line (no false positives on
+	@# things like ``ib-engine-foo``). Self-exclude by PID so the awk
+	@# pipeline doesn't kill its own shell.
+	@self_pid=$$$$; \
+	for proc in ib-engine ib-api ib-bots; do \
+		pids=$$(ps -eo pid,args | awk -v me=$$self_pid -v p=$$proc '$$1!=me && $$0 ~ "/\\.venv/bin/" p "( |$$)" { print $$1 }'); \
+		if [ -n "$$pids" ]; then \
+			echo "[DEV] Orphan $$proc PID(s) $$pids — killing."; \
+			kill $$pids 2>/dev/null || true; \
+			sleep 0.3; \
+			pids=$$(ps -eo pid,args | awk -v me=$$self_pid -v p=$$proc '$$1!=me && $$0 ~ "/\\.venv/bin/" p "( |$$)" { print $$1 }'); \
+			if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
+		fi; \
+	done
+	@# Also reap ``uv run ib-X`` parent wrappers whose child died but
+	@# the wrapper is still alive (rare but happens after a SIGKILL on
+	@# the inner python). Matches the literal command line ``uv run
+	@# ib-engine``/``-api``/``-bots`` at start.
+	@self_pid=$$$$; \
+	pids=$$(ps -eo pid,args | awk -v me=$$self_pid '$$1!=me && $$2=="uv" && $$3=="run" && $$4 ~ /^ib-(engine|api|bots)$$/ { print $$1 }'); \
+	if [ -n "$$pids" ]; then \
+		echo "[DEV] Orphan uv-run wrapper PID(s) $$pids — killing."; \
+		kill -9 $$pids 2>/dev/null || true; \
+	fi
 	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
 		echo "[DEV] Redis already running."; \
 	else \
