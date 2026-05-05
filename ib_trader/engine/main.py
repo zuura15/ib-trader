@@ -802,6 +802,16 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             oid = evt.get("ib_order_id")
             if not oid:
                 continue
+            # Defensive zombie guard: phantom ib_order_id="0" and empty-
+            # symbol events have leaked into orders:open historically (a
+            # status arrives before contract resolution / from a rejected
+            # validation). They never get a terminal so they linger
+            # forever as "Submitted" rows with NaN qty in the UI. The
+            # ledger upstream guards against most of these, but defending
+            # at the hash boundary too is cheap.
+            if oid == "0" or not evt.get("symbol"):
+                await redis.hdel(orders_open_key, oid)
+                continue
             if evt.get("terminal"):
                 await redis.hdel(orders_open_key, oid)
             else:
@@ -826,6 +836,39 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                         except Exception:
                             display = f"{sym} {expiry}"
                     enriched.setdefault("display_symbol", display)
+                # Order-side enrichment: orderType + price fields are
+                # what makes the frontend Orders panel actually readable.
+                # IB mutates trailStopPrice on the live Order object as
+                # the trail walks, so we re-read on every status event
+                # — the panel surfaces the current trigger price without
+                # any extra polling on our side.
+                if meta is not None and meta.get("order") is not None:
+                    o_obj = meta["order"]
+                    order_type = getattr(o_obj, "orderType", None) or None
+                    lmt = getattr(o_obj, "lmtPrice", None)
+                    aux = getattr(o_obj, "auxPrice", None)
+                    trail_pct = getattr(o_obj, "trailingPercent", None)
+                    trail_stop = getattr(o_obj, "trailStopPrice", None)
+                    # IB uses sentinel 1.7976931348623157e+308 for "unset".
+                    def _clean(v: object) -> object:
+                        if v is None:
+                            return None
+                        try:
+                            f = float(v)  # type: ignore[arg-type]
+                        except (TypeError, ValueError):
+                            return v
+                        if f == 0.0 or f > 1e300:
+                            return None
+                        return f
+                    enriched.setdefault("order_type", order_type)
+                    enriched.setdefault("limit_price", _clean(lmt))
+                    # For TRAIL orders IB updates trailStopPrice as it
+                    # walks; for STP/STP_LMT the trigger lives in auxPrice.
+                    # Surface whichever is set as ``stop_price``.
+                    enriched.setdefault(
+                        "stop_price", _clean(trail_stop) or _clean(aux),
+                    )
+                    enriched.setdefault("trailing_percent", _clean(trail_pct))
                 await redis.hset(orders_open_key, oid, _json.dumps(enriched))
 
     def _get_trade_meta(ib_order_id: str) -> tuple[str, str, str, int, str]:

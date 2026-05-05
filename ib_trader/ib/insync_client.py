@@ -1295,13 +1295,19 @@ class InsyncClient(IBClientBase):
                 "total_qty": Decimal,  # original totalQuantity (static)
                 "remaining": Decimal,  # IB's current remaining (volatile)
                 "contract": Contract,  # ib-async Contract object
+                "order": Order,        # ib-async Order object (live)
             }
 
         Callers that only need a subset can pick fields off the dict.
-        ``contract`` is the ib-async Contract — exposed because
-        consumers (orders-open enrichment in engine/main.py) need
-        ``expiry`` / ``trading_class`` / ``multiplier`` for futures
-        display. Treat it as opaque-with-documented-attributes.
+        ``contract`` and ``order`` are the live ib-async objects — exposed
+        because consumers (orders-open enrichment in engine/main.py) need
+        contract fields (``expiry`` / ``trading_class`` / ``multiplier``)
+        for display, and order fields (``orderType`` / ``lmtPrice`` /
+        ``auxPrice`` / ``trailingPercent`` / ``trailStopPrice``) to render
+        the Type and Price columns correctly. The ``order`` object is
+        live — IB mutates ``trailStopPrice`` server-side as the stop
+        walks, so re-reading on every status event surfaces the current
+        trigger. Treat both as opaque-with-documented-attributes.
         """
         trade = self.__active_trades.get(str(ib_order_id))
         if trade is None:
@@ -1337,6 +1343,7 @@ class InsyncClient(IBClientBase):
             "total_qty": total_qty,
             "remaining": remaining,
             "contract": contract,
+            "order": order,
         }
 
     def register_fill_callback(self, callback, ib_order_id: str | None = None) -> None:

@@ -66,9 +66,10 @@ export interface Order {
   side: 'BUY' | 'SELL';
   quantity: number;
   filledQty: number;
-  orderType: 'LMT' | 'MKT' | 'STP' | 'STP_LMT' | 'MOC';
+  orderType: 'LMT' | 'MKT' | 'STP' | 'STP_LMT' | 'MOC' | 'TRAIL' | 'TRAIL_LIMIT' | string;
   limitPrice?: number;
   stopPrice?: number;
+  trailingPercent?: number;
   status: OrderStatus;
   source: OrderSource;
   submittedAt: Date;

@@ -32,18 +32,20 @@ export function OrdersPanel({ compact = false }: { compact?: boolean }) {
       .then(r => r.ok ? r.json() : [])
       .then(apiOrders => {
         setOrders(apiOrders.map((o: any) => ({
-          id: o.id,
+          id: String(o.ib_order_id ?? o.id ?? ''),
           symbol: o.symbol,
           side: o.side,
-          quantity: Number(o.qty_requested),
-          filledQty: Number(o.qty_filled),
+          quantity: Number(o.target_qty ?? 0),
+          filledQty: Number(o.filled_qty ?? 0),
           orderType: o.order_type,
           status: o.status?.toLowerCase(),
           source: 'system' as const,
-          submittedAt: parseUTC(o.placed_at),
-          lastUpdate: parseUTC(o.placed_at),
-          limitPrice: o.price_placed ? Number(o.price_placed) : undefined,
-          avgFillPrice: o.avg_fill_price ? Number(o.avg_fill_price) : undefined,
+          submittedAt: parseUTC(o.ts),
+          lastUpdate: parseUTC(o.ts),
+          limitPrice: o.limit_price != null ? Number(o.limit_price) : undefined,
+          stopPrice: o.stop_price != null ? Number(o.stop_price) : undefined,
+          trailingPercent: o.trailing_percent != null ? Number(o.trailing_percent) : undefined,
+          avgFillPrice: o.avg_price != null ? Number(o.avg_price) : undefined,
           sec_type: o.sec_type,
           expiry: o.expiry,
           trading_class: o.trading_class,
@@ -100,7 +102,11 @@ export function OrdersPanel({ compact = false }: { compact?: boolean }) {
                       {order.side}
                     </span>
                   </td>
-                  <td style={{ color: 'var(--text-secondary)' }}>{order.orderType}</td>
+                  <td style={{ color: 'var(--text-secondary)' }}>
+                    {order.orderType === 'TRAIL' && order.trailingPercent
+                      ? `TRAIL ${order.trailingPercent}%`
+                      : order.orderType}
+                  </td>
                   <td className="font-mono">{order.quantity}</td>
                   {!compact && (
                     <td className="font-mono">
