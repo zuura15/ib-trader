@@ -4,7 +4,14 @@ import type { HistoryBar } from '../../api/client';
 export const VISIBLE_MINUTES = 90;
 export const PRELOAD_HOURS = 24;
 export const REFRESH_INTERVAL_MS = 30_000;
-export const BAR_SIZE = '1 min';
+// 3-min bars: enough resolution to see intraday structure without the
+// chart shifting per-minute on a quiet tape. With VISIBLE_MINUTES=90,
+// the default view shows ~30 bars; the RSI(14) lookback is 42 minutes
+// of price action, which is a sensible scale for swing context.
+export const BAR_SIZE = '3 mins';
+// Seconds per bar — used to round live ticks down to the bar's start
+// time so sub-bar updates land on the same bar (no per-tick shift).
+export const BAR_SECONDS = 3 * 60;
 
 // v2: bumped to discard ranges saved by an earlier build where transient
 // auto-fit states could persist as ~2-min "zooms". Old `v1` entries are
@@ -13,6 +20,17 @@ export const BAR_SIZE = '1 min';
 const ZOOM_STORAGE_KEY = 'ib-chart-zoom-v2';
 export type SavedRange = { from: number; to: number };
 export type Point = { time: UTCTimestamp; value: number };
+/** Full OHLC bar with the same local-as-UTC time shift as Point. Used
+ *  by support/resistance detection (which needs wick high/low) and by
+ *  the live-tick handler (which folds sub-bar ticks into high/low/close
+ *  in place). */
+export type Bar = {
+  time: UTCTimestamp;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
 
 export function targetKey(t: { symbol: string; secType: string; conId: number | null }): string {
   // con_id is unambiguous per IB contract; symbol+secType is the
@@ -50,8 +68,8 @@ export function saveRange(key: string, range: SavedRange | null): void {
   } catch { /* quota — ignore */ }
 }
 
-export function toPoints(bars: HistoryBar[]): Point[] {
-  const out: Point[] = [];
+export function toBars(bars: HistoryBar[]): Bar[] {
+  const out: Bar[] = [];
   for (const b of bars) {
     const date = new Date(b.ts);
     const ms = date.getTime();
@@ -61,13 +79,20 @@ export function toPoints(bars: HistoryBar[]): Point[] {
     // user's local wall time. Per-bar so DST flips stay correct.
     const tzOffsetMs = date.getTimezoneOffset() * 60_000;
     const t = Math.floor((ms - tzOffsetMs) / 1000);
-    out.push({ time: t as UTCTimestamp, value: b.close });
+    out.push({
+      time: t as UTCTimestamp,
+      open: b.open, high: b.high, low: b.low, close: b.close,
+    });
   }
   out.sort((a, b) => a.time - b.time);
   for (let i = out.length - 1; i > 0; i--) {
     if (out[i].time === out[i - 1].time) out.splice(i, 1);
   }
   return out;
+}
+
+export function toPoints(bars: HistoryBar[]): Point[] {
+  return toBars(bars).map((b) => ({ time: b.time, value: b.close }));
 }
 
 export function localUtcSeconds(date: Date): UTCTimestamp {
@@ -88,5 +113,6 @@ export function themeColors() {
     rsi: v('--accent-purple', '#a855f7'),
     bullish: v('--accent-green', '#16a34a'),
     bearish: v('--accent-red', '#dc2626'),
+    archived: v('--accent-yellow', '#f7bd5c'),
   };
 }

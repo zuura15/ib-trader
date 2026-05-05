@@ -7,16 +7,21 @@ import {
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
-  type SavedRange,
-  VISIBLE_MINUTES, PRELOAD_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE,
+  type SavedRange, type Bar,
+  VISIBLE_MINUTES, PRELOAD_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
   targetKey, loadSavedRange, saveRange,
-  toPoints, themeColors, localUtcSeconds,
+  toBars, themeColors, localUtcSeconds,
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
+import { detectSupportResistance } from './supportResistance';
 import type { ChartTarget } from '../../data/store';
 
 export interface SymbolChartHandle {
   resetZoom: () => void;
+  /** Hide the auto-drawn support/resistance lines for the current
+   *  target. They re-detect (and re-show) on the next refresh tick or
+   *  when the user changes target. */
+  clearSupportResistance: () => void;
 }
 
 interface Props {
@@ -27,6 +32,10 @@ interface Props {
   showRsi?: boolean;
   /** Render the placeholder "Click a row…" message when target is null. */
   placeholder?: string | null;
+  /** Show broken/archived S/R lines (amber dashed). Off by default;
+   *  the line stays in the SR engine state for ``breakStaleBars`` but
+   *  is filtered out of render unless this is true. */
+  showBrokenSr?: boolean;
   /** Optional callback invoked whenever loading state changes. */
   onLoadingChange?: (loading: boolean) => void;
   /** Optional callback for errors. */
@@ -39,6 +48,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     visibleMinutes = VISIBLE_MINUTES,
     showRsi = true,
     placeholder = 'Click a row in Positions or Watchlist to chart it.',
+    showBrokenSr = false,
     onLoadingChange,
     onError,
   }: Props,
@@ -52,7 +62,49 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const divergenceSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  // Auto-detected support/resistance lines on the price pane. Recreated
+  // every refresh; `srHiddenRef` lets the user dismiss them for the
+  // current target via the Clear-SR button (re-shows on target switch).
+  const srSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  const srHiddenRef = useRef(false);
+  // Track ``showBrokenSr`` via ref so the throttled recompute closure
+  // sees fresh values without re-subscribing on every prop change.
+  const showBrokenSrRef = useRef(showBrokenSr);
+  useEffect(() => {
+    showBrokenSrRef.current = showBrokenSr;
+    // Re-render lines on toggle so the user sees the change immediately
+    // rather than waiting for the next zoom/tick.
+    scheduleSrRecomputeRef.current?.();
+  }, [showBrokenSr]);
+  // Debounced SR recompute. Set inside the chart-create effect (since
+  // it captures the chart instance); the visible-range subscription
+  // calls into it via this ref so we don't have to re-subscribe each
+  // time the closure changes.
+  const scheduleSrRecomputeRef = useRef<(() => void) | null>(null);
+  // Below this many bars, SR detection is skipped entirely — the
+  // existing lines stay on screen. 30 bars × 3 min = 90 min.
+  const SR_MIN_BARS = 30;
+  // Tracks the most-recent live-tick's rounded bar time. Used to
+  // detect bar-close events (boundary crossings) and trigger an SR
+  // recompute. Null until the first live tick arrives for the
+  // current target.
+  const lastTickBarSecRef = useRef<number | null>(null);
+  // Full OHLC bars that mirror the price series. The price series
+  // itself only carries close (it's a LineSeries), so SR detection
+  // — which needs wick high/low for pivot detection — reads from
+  // this ref instead. Kept in sync by load() (replaces the array)
+  // and the live-tick handler (in-place fold of high/low/close).
+  const barsRef = useRef<Bar[]>([]);
   const userRangeRef = useRef<SavedRange | null>(null);
+  // Gate live-tick updates until historical data has been loaded at
+  // least once. Without this, a live quote landing in the ~1-3s window
+  // before getHistory() returns adds a single point to an empty series;
+  // lightweight-charts then auto-fits the time scale to that one point
+  // (a 1-second-wide window that scrolls per-tick) and the historical
+  // setVisibleRange that runs later doesn't always reclaim the wide
+  // window. Symptom: chart loads "almost realtime per second" instead
+  // of the configured 90-min view.
+  const historicalLoadedRef = useRef(false);
 
   const [theme, setTheme] = useState<string>(
     () => document.documentElement.getAttribute('data-theme') || 'light',
@@ -99,6 +151,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // stays in view. Default is true in v5; set explicitly so it
         // can't regress to false on a future lib update.
         shiftVisibleRangeOnNewBar: true,
+        // Always reserve a few bars of empty space on the right edge.
+        // Without this the most-recent bar (which is up to 3 min behind
+        // wall-clock with our 3-min bar rounding) sits flush against
+        // the right border and the time between "last bar's start"
+        // and "now" is invisible — the user sees the chart "stop" 2-3
+        // min before clock. 4 bars × 3 min = 12 min of headroom keeps
+        // the live mark + horizontal price line clearly in view.
+        rightOffset: 4,
       },
       rightPriceScale: { borderColor: colors.grid },
       crosshair: { mode: 1 },
@@ -106,7 +166,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     const series = chart.addSeries(LineSeries, {
       color: colors.line,
       lineWidth: 2,
-      priceLineVisible: false,
+      // ``priceLineVisible: true`` draws a horizontal dashed line at
+      // the latest data point's value, with a price label on the
+      // right axis. It floats with every ``series.update()`` call,
+      // so it's the visible "this chart is live and this is the
+      // current price" cue that TradingView shows. Without it the
+      // last point updates in place but the visual delta within the
+      // bar is hard to perceive on a slow-moving instrument.
+      priceLineVisible: true,
       lastValueVisible: true,
     });
 
@@ -140,6 +207,161 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     divergenceSeriesRef.current = [];
     setChartVersion((v) => v + 1);
 
+    // SR detection helper, scoped to this chart instance. Reads the
+    // current visible time range, slices the price series to the
+    // bars in view, runs detection, draws lines. Skipped when the
+    // visible window is below SR_MIN_BARS (90 min on a 3-min chart).
+    let srTimer: ReturnType<typeof setTimeout> | null = null;
+    const recomputeSr = (): void => {
+      const ch = chartRef.current;
+      if (!ch) return;
+      const allBars = barsRef.current;
+      if (allBars.length === 0) return;
+      const range = ch.timeScale().getVisibleRange();
+      if (!range || range.from == null || range.to == null) return;
+      const fromTime = Number(range.from);
+      const toTime = Number(range.to);
+      // Find first/last bar indices within the visible time range.
+      let fromIdx = -1;
+      let toIdx = -1;
+      for (let i = 0; i < allBars.length; i++) {
+        if (allBars[i].time >= fromTime) { fromIdx = i; break; }
+      }
+      for (let i = allBars.length - 1; i >= 0; i--) {
+        if (allBars[i].time <= toTime) { toIdx = i; break; }
+      }
+      if (fromIdx < 0 || toIdx < 0 || toIdx <= fromIdx) return;
+      const widthBars = toIdx - fromIdx + 1;
+      // Below 90 min: leave the existing lines alone. Zoom-ins below
+      // default don't disturb the chart per user spec.
+      if (widthBars < SR_MIN_BARS) return;
+
+      // Wipe + redraw.
+      for (const ds of srSeriesRef.current) {
+        try { ch.removeSeries(ds); } catch { /* already gone */ }
+      }
+      srSeriesRef.current = [];
+      if (srHiddenRef.current) return;
+
+      const slice = allBars.slice(fromIdx, toIdx + 1);
+      const lines = detectSupportResistance(slice);
+      const colors = themeColors();
+      // Counter for human-readable line labels rendered on the right
+      // axis. Numbered in detection order; lets the user point at a
+      // specific line in conversation ("L3 looks wrong"). Logged to
+      // console alongside so the data is one F12 away.
+      let labelCounter = 0;
+      const lineLog: Record<string, unknown>[] = [];
+      for (const line of lines) {
+        const isBroken = line.breakIdx != null;
+        // Broken lines are noisy at zoom-out and clutter the active
+        // structure the user is reading. The header toggle decides
+        // whether they render; the engine still tracks them so a
+        // toggle-on shows them without a recompute lag.
+        if (isBroken && !showBrokenSrRef.current) continue;
+        labelCounter += 1;
+        const label = `L${labelCounter}`;
+        // Color hierarchy:
+        //   • broken (any touches) → amber/yellow, dashed — "archived"
+        //     line that recently gave way; kept on screen briefly so
+        //     the user sees what just broke
+        //   • confirmed (3+ touches) → green (support) / red (resistance)
+        //   • tentative (2 touches, anchor pair only) → blue
+        // The blue → green/red transition gives a clear visual cue
+        // when a forming trend earns its third confirmation touch.
+        const confirmed = line.touches >= 3;
+        const color = isBroken
+          ? colors.archived
+          : confirmed
+            ? line.type === 'support' ? colors.bullish : colors.bearish
+            : colors.line;
+        const ds = ch.addSeries(LineSeries, {
+          color,
+          lineWidth: 1,
+          // lightweight-charts LineStyle: 0=solid, 1=dotted, 2=dashed.
+          // Visual hierarchy: confirmed = solid (most prominent),
+          // tentative 2-touch = dotted (forming, less committed),
+          // broken/archived = dashed (gave way; kept on screen briefly).
+          lineStyle: isBroken ? 2 : confirmed ? 0 : 1,
+          priceLineVisible: false,
+          // Show the label + line price on the right axis. Tiny visual
+          // cost; lets the user identify a specific line by name.
+          lastValueVisible: true,
+          title: label,
+          crosshairMarkerVisible: false,
+        });
+        // line.fromIdx / toIdx are local to the slice; map back via
+        // ``slice[i].time`` for the actual chart time. Price comes
+        // from the line algebra so it draws straight regardless of
+        // the close at the endpoint bar.
+        const startTime = slice[line.fromIdx].time;
+        const endTime = slice[line.toIdx].time;
+        const startPrice = line.slope * line.fromIdx + line.intercept;
+        const endPrice = line.slope * line.toIdx + line.intercept;
+        ds.setData([
+          { time: startTime, value: startPrice },
+          { time: endTime, value: endPrice },
+        ]);
+        srSeriesRef.current.push(ds);
+        // Companion debug log — same number as on the chart.
+        const startBarTime = new Date((startTime as number) * 1000).toISOString();
+        const endBarTime = new Date((endTime as number) * 1000).toISOString();
+        const anchorBTime = new Date(
+          (slice[line.anchorBIdx].time as number) * 1000,
+        ).toISOString();
+        lineLog.push({
+          label, type: line.type, touches: line.touches,
+          fromIdx: line.fromIdx,
+          anchorBIdx: line.anchorBIdx,
+          toIdx: line.toIdx,
+          startTime: startBarTime,
+          anchorBTime,
+          endTime: endBarTime,
+          startPrice: Number(startPrice.toFixed(2)),
+          endPrice: Number(endPrice.toFixed(2)),
+          slope: Number(line.slope.toFixed(4)),
+          breakIdx: line.breakIdx,
+          breakTime: line.breakIdx != null
+            ? new Date((slice[line.breakIdx].time as number) * 1000).toISOString()
+            : null,
+          isBroken, confirmed,
+        });
+      }
+      if (lineLog.length > 0) {
+        // eslint-disable-next-line no-console
+        console.table(lineLog);
+      }
+    };
+    // Throttle: cap at one recompute per ``SR_THROTTLE_MS``. Leading-
+    // edge fire so a fresh event takes effect immediately; trailing
+    // fire on the cool-down to capture the latest state if more
+    // events arrived during the window. Used by zoom/pan, the 30s
+    // refresh, the bar-close boundary trigger, AND live ticks — but
+    // throttled so a fast tape doesn't churn the detector.
+    //
+    // Why live ticks too: SR *touches* are evaluated on closed bars
+    // (a brief wick shouldn't count as confirmation), but *break
+    // detection* on an existing line should reflect the live price.
+    // Otherwise a clear breach can sit on screen as a still-active
+    // line for up to 3 min until the next bar boundary fires.
+    const SR_THROTTLE_MS = 1000;
+    let lastSrFireMs = 0;
+    scheduleSrRecomputeRef.current = () => {
+      const now = Date.now();
+      const elapsed = now - lastSrFireMs;
+      if (elapsed >= SR_THROTTLE_MS) {
+        lastSrFireMs = now;
+        recomputeSr();
+        return;
+      }
+      if (srTimer) return;  // trailing fire already scheduled
+      srTimer = setTimeout(() => {
+        srTimer = null;
+        lastSrFireMs = Date.now();
+        recomputeSr();
+      }, SR_THROTTLE_MS - elapsed);
+    };
+
     chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
       if (!range || range.from == null || range.to == null) return;
       const from = Number(range.from);
@@ -152,16 +374,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (to - from < 5 * 60) return;
       const r: SavedRange = { from, to };
       userRangeRef.current = r;
+      // Re-run SR detection over the new visible range (debounced —
+      // zoom emits many events). Detection self-skips when width is
+      // below the 90 min minimum, so zoom-ins below default leave
+      // the existing lines alone.
+      scheduleSrRecomputeRef.current?.();
       const tgt = targetRef.current;
       if (tgt) saveRange(targetKey(tgt), r);
     });
 
     return () => {
+      if (srTimer) clearTimeout(srTimer);
+      scheduleSrRecomputeRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
       rsiSeriesRef.current = null;
       divergenceSeriesRef.current = [];
+      srSeriesRef.current = [];
+      barsRef.current = [];
     };
   }, [theme, showRsi]);
 
@@ -175,8 +406,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         for (const ds of divergenceSeriesRef.current) {
           try { chart.removeSeries(ds); } catch { /* already gone */ }
         }
+        for (const ds of srSeriesRef.current) {
+          try { chart.removeSeries(ds); } catch { /* already gone */ }
+        }
       }
       divergenceSeriesRef.current = [];
+      srSeriesRef.current = [];
+      barsRef.current = [];
       onError?.(null);
       userRangeRef.current = null;
       return;
@@ -185,6 +421,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     let cancelled = false;
     let firstLoad = true;
     userRangeRef.current = null;
+    // Reset the gate so live ticks for a new target don't sneak into
+    // the previous target's series during the brief window between
+    // target change and the new historical load.
+    historicalLoadedRef.current = false;
+    // New target → re-show SR lines (the dismiss state is per-target,
+    // not global). The detection itself runs after setData below.
+    srHiddenRef.current = false;
+    // Forget the previous target's last-tick bar so the first tick
+    // for the new target doesn't trigger a spurious SR recompute.
+    lastTickBarSecRef.current = null;
+    // Forget the previous target's OHLC bars too — fresh load() will
+    // repopulate. Avoids a moment where SR detection runs against
+    // mismatched price-series + bars-ref content during target swap.
+    barsRef.current = [];
     let retryDelayMs = 1500;
     const RETRY_MAX_MS = 8_000;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -201,7 +451,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
         retryDelayMs = 1500;
         if (cancelled) return;
-        const points = toPoints(bars);
+        const fullBars = toBars(bars);
+        const points = fullBars.map((b) => ({ time: b.time, value: b.close }));
+        // Stash the OHLC-rich bars so SR detection (which needs wick
+        // high/low) has access. The lightweight-charts price series
+        // only carries close, so we keep this parallel structure.
+        barsRef.current = fullBars;
         const series = seriesRef.current;
         const rsiSeries = rsiSeriesRef.current;
         const chart = chartRef.current;
@@ -210,6 +465,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const savedRange = firstLoad ? loadSavedRange(targetKey(target)) : null;
         const prevRange = userRangeRef.current ?? savedRange;
         series.setData(points);
+        // Historical bars are now in the series — safe to let live
+        // ticks update past this point without auto-fit-to-one-point
+        // pathology.
+        historicalLoadedRef.current = true;
 
         if (rsiSeries && points.length >= RSI_DEFAULTS.period + 1) {
           const closes = points.map((p) => p.value);
@@ -245,6 +504,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             divergenceSeriesRef.current.push(ds);
           }
         }
+
+        // Auto support/resistance on the price pane. Detection scope =
+        // chart's currently visible time range. Below the 90-min
+        // minimum the helper no-ops (preserves existing lines so a
+        // user zoom-in doesn't blank the chart).
+        scheduleSrRecomputeRef.current?.();
 
         if (firstLoad) {
           firstLoad = false;
@@ -355,13 +620,55 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type !== 'quote' || msg.symbol !== target.symbol) return;
+          // Drop ticks until the historical setData has populated the
+          // series. lightweight-charts auto-fits the time scale to the
+          // first few points if it gets data in an empty series, and
+          // ticks landing during the ~1-3s historical-fetch window
+          // would create a 1-second visible window that the later
+          // setVisibleRange can't always reclaim. After historical
+          // data is in, normal ticks just shift the existing window
+          // forward keeping its width.
+          if (!historicalLoadedRef.current) return;
           const series = seriesRef.current;
           if (!series) return;
           const lastStr = msg.data?.last;
           if (lastStr == null) return;
           const last = parseFloat(String(lastStr));
           if (!Number.isFinite(last)) return;
-          series.update({ time: localUtcSeconds(new Date()), value: last });
+          // Round down to the bar boundary (BAR_SECONDS = 3 min) so
+          // ticks within the same bar update the existing bar in
+          // place. The visible window then only shifts when a real
+          // bar boundary crosses (every 3 min) — matching the user's
+          // mental model "this is a 3-min chart, advance one bar at
+          // a time."
+          const nowSec = localUtcSeconds(new Date());
+          const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS;
+          series.update({ time: barSec as UTCTimestamp, value: last });
+          lastTickBarSecRef.current = barSec;
+          // Mirror the update into the OHLC bars ref so SR pivot
+          // detection (which reads bar.high / bar.low) sees the live
+          // wick. Within the same 3-min bar: extend high/low and
+          // overwrite close. New bar boundary: append a fresh bar
+          // with all four fields = current tick.
+          const allBars = barsRef.current;
+          const lastBar = allBars[allBars.length - 1];
+          if (lastBar && lastBar.time === barSec) {
+            lastBar.close = last;
+            if (last > lastBar.high) lastBar.high = last;
+            if (last < lastBar.low) lastBar.low = last;
+          } else {
+            allBars.push({
+              time: barSec as UTCTimestamp,
+              open: last, high: last, low: last, close: last,
+            });
+          }
+          // Trigger SR re-evaluation on every live tick. The throttle
+          // inside scheduleSrRecomputeRef caps actual recomputes at
+          // 1/sec so fast-tape charts don't churn. This is what
+          // catches a clear break the moment it happens — without
+          // it, the line would visually lag up to 3 min until the
+          // next bar-close trigger.
+          scheduleSrRecomputeRef.current?.();
         } catch { /* malformed frame — ignore */ }
       };
       ws.onclose = () => { if (!closed) retry = setTimeout(open, 2000); };
@@ -400,6 +707,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const tgt = targetRef.current;
       if (tgt) saveRange(targetKey(tgt), range);
     },
+    clearSupportResistance: () => {
+      // Drop the currently-rendered SR overlay series and set the gate
+      // so the next refresh tick (and subsequent ones for this target)
+      // skip drawing them. Switching to a different target resets the
+      // gate so SR re-shows automatically.
+      const chart = chartRef.current;
+      if (chart) {
+        for (const ds of srSeriesRef.current) {
+          try { chart.removeSeries(ds); } catch { /* already gone */ }
+        }
+      }
+      srSeriesRef.current = [];
+      srHiddenRef.current = true;
+    },
   }), [visibleMinutes]);
 
   return (
@@ -421,3 +742,4 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     </div>
   );
 });
+
