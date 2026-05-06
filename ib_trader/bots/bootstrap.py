@@ -241,12 +241,27 @@ def bootstrap_bots_from_yaml(
 
 
 def _insert_row(session_factory: scoped_session, d: BotDefinition) -> None:
-    """Insert a new SQLite row that mirrors ``d``."""
+    """Insert a new SQLite row that mirrors ``d``.
+
+    On a fresh deploy ``ib-engine``, ``ib-api``, and ``ib-bots`` all
+    bootstrap concurrently — each one snapshots the empty bots table,
+    then races to insert the same set. The losers hit
+    ``UNIQUE constraint failed: bots.name``. Catch and ignore: if the
+    row exists by the time we commit, another bootstrap process won
+    the race and the post-condition (row present) holds either way.
+    """
+    from sqlalchemy.exc import IntegrityError
     now = datetime.now(timezone.utc)
     fields = _definition_to_row_fields(d)
     bot = Bot(**fields, created_at=now, updated_at=now, status=BotStatus.STOPPED)
     repo = BotRepository(session_factory)
-    repo.create(bot)
+    try:
+        repo.create(bot)
+    except IntegrityError:
+        logger.info(
+            '{"event": "BOT_BOOTSTRAP_INSERT_RACED", "id": "%s", "name": "%s"}',
+            d.id, d.name,
+        )
 
 
 def _update_row(
