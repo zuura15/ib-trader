@@ -307,8 +307,14 @@ def main(db: str, env: str, settings_path: str, symbols_path: str, smoke: bool,
         sys.exit(1)
 
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    # Daemon uses client_id + 1 to avoid conflict with REPL
-    repl_client_id = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
+    # Daemon uses (REPL client ID) + 1 to avoid conflict with the REPL
+    # process. REPL default comes from hostname (1 prod, 2 dev). IB_CLIENT_ID
+    # env var still overrides.
+    from ib_trader.config import environment
+    repl_client_id = int(env_vars.get(
+        "IB_CLIENT_ID",
+        settings.get("ib_client_id", environment.default_client_id()),
+    ))
     daemon_client_id = repl_client_id + 1
     settings["ib_client_id"] = daemon_client_id
 

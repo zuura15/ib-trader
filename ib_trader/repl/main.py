@@ -423,7 +423,12 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
         sys.exit(1)
 
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", settings.get("ib_client_id", 1)))
+    # Hostname-derived default client ID — see ib_trader.config.environment.
+    from ib_trader.config import environment
+    settings["ib_client_id"] = int(env_vars.get(
+        "IB_CLIENT_ID",
+        settings.get("ib_client_id", environment.default_client_id()),
+    ))
 
     # Probe the Gateway and detect paper/live before constructing the
     # IB client. See ib_trader.ib.gateway_probe for details.

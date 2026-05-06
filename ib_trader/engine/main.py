@@ -86,7 +86,13 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
     symbols = load_symbols(symbols_path)
 
     settings["ib_host"] = env_vars.get("IB_HOST", settings.get("ib_host", "127.0.0.1"))
-    settings["ib_client_id"] = int(env_vars.get("IB_CLIENT_ID", 1))
+    # Default client ID is hostname-derived (1 for prod box, 2 for dev)
+    # so two boxes connecting to the same Gateway don't collide on the
+    # client-ID slot. IB_CLIENT_ID env var still overrides if set.
+    from ib_trader.config import environment
+    settings["ib_client_id"] = int(env_vars.get(
+        "IB_CLIENT_ID", environment.default_client_id(),
+    ))
 
     # Probe the Gateway and detect paper/live from managedAccounts before
     # the engine enters its main loop. This sets settings["ib_port"],

@@ -70,11 +70,14 @@ class Reconciler:
         open_orders = await self._ib.get_open_orders()
         ib_positions = await self._get_ib_positions()
 
-        # Build maps from orderRef
+        # Build maps from orderRef. Ignore foreign-host orders — when
+        # prod and dev both connect to the same Gateway, IB shows all
+        # account orders to both, but each box should only reconcile
+        # its own.
         our_orders = {}  # {(bot_ref, symbol): order_info}
         for order in open_orders:
             ref_info = decode_order_ref(order.get("order_ref", "") or "")
-            if ref_info:
+            if ref_info and ref_info.is_local:
                 key = (ref_info.bot_ref, ref_info.symbol)
                 our_orders[key] = {
                     "ib_order_id": order["ib_order_id"],

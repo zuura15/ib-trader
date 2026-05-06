@@ -40,7 +40,10 @@ REQUIRED_SETTINGS_KEYS = [
     "daemon_tui_refresh_seconds",
 ]
 
-REQUIRED_ENV_KEYS = ["IB_HOST", "IB_PORT", "IB_CLIENT_ID", "IB_ACCOUNT_ID"]
+# IB_CLIENT_ID is no longer required — defaulted from hostname via
+# ib_trader.config.environment (1 for prod box, 2 for dev). The env var
+# remains an optional override.
+REQUIRED_ENV_KEYS = ["IB_HOST", "IB_PORT", "IB_ACCOUNT_ID"]
 
 
 def load_settings(settings_path: str = "config/settings.yaml") -> dict:
