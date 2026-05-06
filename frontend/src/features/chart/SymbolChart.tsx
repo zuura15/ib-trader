@@ -72,15 +72,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const showBrokenSrRef = useRef(showBrokenSr);
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
-    // Re-render lines on toggle so the user sees the change immediately
-    // rather than waiting for the next zoom/tick.
-    scheduleSrRecomputeRef.current?.();
+    // Re-render lines on toggle. ``force=true`` bypasses the SR_MIN_BARS
+    // early-exit so the toggle takes effect even when zoomed in below
+    // 90 min — passive zoom/pan triggers still respect that guard.
+    scheduleSrRecomputeRef.current?.(true);
   }, [showBrokenSr]);
   // Debounced SR recompute. Set inside the chart-create effect (since
   // it captures the chart instance); the visible-range subscription
   // calls into it via this ref so we don't have to re-subscribe each
   // time the closure changes.
-  const scheduleSrRecomputeRef = useRef<(() => void) | null>(null);
+  const scheduleSrRecomputeRef = useRef<((force?: boolean) => void) | null>(null);
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
   const SR_MIN_BARS = 30;
@@ -96,6 +97,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // and the live-tick handler (in-place fold of high/low/close).
   const barsRef = useRef<Bar[]>([]);
   const userRangeRef = useRef<SavedRange | null>(null);
+  // Y-axis zoom persistence. lightweight-charts doesn't fire an event
+  // for price-scale changes (only time-scale), so we sample the
+  // current price range at refresh time and restore it after setData.
+  // Cleared on target change and on Reset-Zoom (which auto-scales).
+  const userPriceRangeRef = useRef<{ from: number; to: number } | null>(null);
   // Gate live-tick updates until historical data has been loaded at
   // least once. Without this, a live quote landing in the ~1-3s window
   // before getHistory() returns adds a single point to an empty series;
@@ -146,11 +152,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         timeVisible: true,
         secondsVisible: false,
         borderColor: colors.grid,
-        // When live ticks land past the current visible range, slide
-        // the window forward (preserving its width) so the price tail
-        // stays in view. Default is true in v5; set explicitly so it
-        // can't regress to false on a future lib update.
-        shiftVisibleRangeOnNewBar: true,
+        // Don't auto-shift the viewport when a new bar arrives. The
+        // user's current pan/zoom is sticky — only the "Reset Zoom"
+        // button (or a fresh symbol load) snaps back to the live
+        // edge. This is the right tradeoff for analysis: examining
+        // an older window shouldn't get yanked forward every 3 min
+        // just because a new bar formed.
+        shiftVisibleRangeOnNewBar: false,
         // Always reserve a few bars of empty space on the right edge.
         // Without this the most-recent bar (which is up to 3 min behind
         // wall-clock with our 3-min bar rounding) sits flush against
@@ -212,7 +220,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // bars in view, runs detection, draws lines. Skipped when the
     // visible window is below SR_MIN_BARS (90 min on a 3-min chart).
     let srTimer: ReturnType<typeof setTimeout> | null = null;
-    const recomputeSr = (): void => {
+    const recomputeSr = (forceRecompute = false): void => {
       const ch = chartRef.current;
       if (!ch) return;
       const allBars = barsRef.current;
@@ -232,9 +240,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       if (fromIdx < 0 || toIdx < 0 || toIdx <= fromIdx) return;
       const widthBars = toIdx - fromIdx + 1;
-      // Below 90 min: leave the existing lines alone. Zoom-ins below
-      // default don't disturb the chart per user spec.
-      if (widthBars < SR_MIN_BARS) return;
+      // Below 90 min on a passive trigger (zoom/pan/tick): leave the
+      // existing lines alone — recomputing on a small slice would
+      // produce short-span lines that thrash on each zoom. A FORCED
+      // trigger (broken-toggle) must redraw regardless so the
+      // toggle takes effect at any zoom.
+      if (widthBars < SR_MIN_BARS && !forceRecompute) return;
 
       // Wipe + redraw.
       for (const ds of srSeriesRef.current) {
@@ -261,20 +272,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         if (isBroken && !showBrokenSrRef.current) continue;
         labelCounter += 1;
         const label = `L${labelCounter}`;
-        // Color hierarchy:
-        //   • broken (any touches) → amber/yellow, dashed — "archived"
-        //     line that recently gave way; kept on screen briefly so
-        //     the user sees what just broke
-        //   • confirmed (3+ touches) → green (support) / red (resistance)
-        //   • tentative (2 touches, anchor pair only) → blue
-        // The blue → green/red transition gives a clear visual cue
-        // when a forming trend earns its third confirmation touch.
+        // Color is type-driven so support and resistance are always
+        // visually distinct. Broken is amber dashed regardless. The
+        // earlier "tentative blue" tier collapsed support and
+        // resistance into the same color in magnetic mode (every
+        // line is 2-touch by construction), making resistance
+        // invisible-as-support — fixed by colouring by type always.
         const confirmed = line.touches >= 3;
         const color = isBroken
           ? colors.archived
-          : confirmed
-            ? line.type === 'support' ? colors.bullish : colors.bearish
-            : colors.line;
+          : line.type === 'support' ? colors.bullish : colors.bearish;
         const ds = ch.addSeries(LineSeries, {
           color,
           lineWidth: 1,
@@ -284,11 +291,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // broken/archived = dashed (gave way; kept on screen briefly).
           lineStyle: isBroken ? 2 : confirmed ? 0 : 1,
           priceLineVisible: false,
-          // Show the label + line price on the right axis. Tiny visual
-          // cost; lets the user identify a specific line by name.
-          lastValueVisible: true,
-          title: label,
+          lastValueVisible: false,
           crosshairMarkerVisible: false,
+          // Exclude SR lines from the right price scale's auto-fit.
+          // Otherwise a deeply-anchored support that extends below
+          // the visible price range pulls the auto-scaled Y window
+          // wide, squashing the actual price polyline to a sliver.
+          autoscaleInfoProvider: () => null,
         });
         // line.fromIdx / toIdx are local to the slice; map back via
         // ``slice[i].time`` for the actual chart time. Price comes
@@ -327,10 +336,79 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           isBroken, confirmed,
         });
       }
-      if (lineLog.length > 0) {
-        // eslint-disable-next-line no-console
-        console.table(lineLog);
-      }
+      // Always stash diagnostic snapshot on window — even when 0
+      // lines drew, so the user can introspect why. Includes pivot
+      // times so we can verify pivot-detection is finding what the
+      // user expects (e.g. ``__sr.pivotLowsAt`` lists every detected
+      // pivot-low close time in the visible slice).
+      type SrLogRow = (typeof lineLog)[number];
+      type SliceBar = { t: string; close: number };
+      type SrGlobal = {
+        lines: SrLogRow[];
+        byLabel: (l: string) => SrLogRow | undefined;
+        pivotLowsAt: string[];
+        pivotHighsAt: string[];
+        sliceFrom: string;
+        sliceTo: string;
+        slice: SliceBar[];
+        priceAt: (timeSubstr: string) => SliceBar | undefined;
+      };
+      // Recompute pivot indices on the same slice the detector saw,
+      // for the diagnostic. Cheap: O(N).
+      const sliceCloses = slice.map((b) => b.close);
+      const findLocalExtrema = (type: 'low' | 'high'): string[] => {
+        const out: string[] = [];
+        for (let i = 1; i < sliceCloses.length - 1; i++) {
+          const v = sliceCloses[i];
+          const l = sliceCloses[i - 1];
+          const r = sliceCloses[i + 1];
+          const ok = type === 'low' ? (v < l && v < r) : (v > l && v > r);
+          if (ok) {
+            out.push(new Date((slice[i].time as number) * 1000).toISOString());
+          }
+        }
+        return out;
+      };
+      const sliceBars: SliceBar[] = slice.map((b) => ({
+        t: new Date((b.time as number) * 1000).toISOString(),
+        close: b.close,
+      }));
+      const stash: SrGlobal = {
+        lines: lineLog,
+        byLabel: (l: string) => lineLog.find((r) => r.label === l),
+        pivotLowsAt: findLocalExtrema('low'),
+        pivotHighsAt: findLocalExtrema('high'),
+        sliceFrom: new Date((slice[0].time as number) * 1000).toISOString(),
+        sliceTo: new Date(
+          (slice[slice.length - 1].time as number) * 1000,
+        ).toISOString(),
+        slice: sliceBars,
+        priceAt: (substr: string) =>
+          sliceBars.find((b) => b.t.includes(substr)),
+      };
+      (window as unknown as { __sr: SrGlobal }).__sr = stash;
+      // Stash silently — auto-printing on every recompute drowns out
+      // anything the user types in the console. Inspect via __sr.* on
+      // demand.
+      // Also POST a compact snapshot to the API debug log so the
+      // server-side ``logs/sr-debug.log`` is tailable. Throttled by
+      // the recompute throttle already; the API rotates by size.
+      const snapshot = {
+        target: targetRef.current?.symbol,
+        sliceFrom: stash.sliceFrom,
+        sliceTo: stash.sliceTo,
+        pivotLowsAt: stash.pivotLowsAt,
+        pivotHighsAt: stash.pivotHighsAt,
+        lines: stash.lines,
+        slice: stash.slice,
+      };
+      void fetch('/api/debug/log/sr-debug', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(snapshot),
+      }).catch(() => {
+        // server-side debug log is best-effort; ignore network errors
+      });
     };
     // Throttle: cap at one recompute per ``SR_THROTTLE_MS``. Leading-
     // edge fire so a fresh event takes effect immediately; trailing
@@ -346,21 +424,65 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // line for up to 3 min until the next bar boundary fires.
     const SR_THROTTLE_MS = 1000;
     let lastSrFireMs = 0;
-    scheduleSrRecomputeRef.current = () => {
+    // High-water mark of ``force`` across all calls in the current
+    // throttle window. If any caller passed force=true, the eventual
+    // trailing fire runs with force=true. Without this, a force=false
+    // event that queues a trailing timer would shadow a later
+    // force=true call (codex flagged: toggle silently no-ops).
+    let pendingForce = false;
+    scheduleSrRecomputeRef.current = (force = false) => {
       const now = Date.now();
       const elapsed = now - lastSrFireMs;
       if (elapsed >= SR_THROTTLE_MS) {
         lastSrFireMs = now;
-        recomputeSr();
+        pendingForce = false;
+        recomputeSr(force);
         return;
       }
+      pendingForce = pendingForce || force;
       if (srTimer) return;  // trailing fire already scheduled
       srTimer = setTimeout(() => {
         srTimer = null;
         lastSrFireMs = Date.now();
-        recomputeSr();
+        const f = pendingForce;
+        pendingForce = false;
+        recomputeSr(f);
       }, SR_THROTTLE_MS - elapsed);
     };
+
+    // Capture Y-axis zoom on every user interaction with the chart
+    // container. lightweight-charts has no priceScale-change event, so
+    // we watch DOM events that *might* have changed it (wheel, mouse
+    // release, touch end) and re-read the price range. Debounced
+    // (rAF) to avoid hammering localStorage on every wheel tick.
+    let yCaptureScheduled = false;
+    const captureYRange = (): void => {
+      if (yCaptureScheduled) return;
+      yCaptureScheduled = true;
+      requestAnimationFrame(() => {
+        yCaptureScheduled = false;
+        const pr = chart.priceScale('right').getVisibleRange();
+        if (!pr) return;
+        const cur = userPriceRangeRef.current;
+        if (cur && cur.from === pr.from && cur.to === pr.to) return;
+        userPriceRangeRef.current = { from: pr.from, to: pr.to };
+        const tgt = targetRef.current;
+        const xRange = userRangeRef.current;
+        if (tgt && xRange) {
+          saveRange(targetKey(tgt), {
+            ...xRange,
+            priceFrom: pr.from,
+            priceTo: pr.to,
+          });
+        }
+      });
+    };
+    const containerEl = containerRef.current;
+    if (containerEl) {
+      containerEl.addEventListener('wheel', captureYRange, { passive: true });
+      containerEl.addEventListener('mouseup', captureYRange);
+      containerEl.addEventListener('touchend', captureYRange);
+    }
 
     chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
       if (!range || range.from == null || range.to == null) return;
@@ -372,8 +494,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // single point and we'd persist a 1-minute "zoom" the user never
       // chose. Anything narrower than 5 min isn't a user interaction.
       if (to - from < 5 * 60) return;
-      const r: SavedRange = { from, to };
+      // Capture the current Y range alongside time. Time-range
+      // changes fire on most user interactions (pan, X-zoom), so
+      // this catches Y zooms made just before a pan. Pure-Y
+      // interactions are also covered by the DOM-event capture
+      // above.
+      const pr = chart.priceScale('right').getVisibleRange();
+      const r: SavedRange = {
+        from, to,
+        priceFrom: pr?.from,
+        priceTo: pr?.to,
+      };
       userRangeRef.current = r;
+      if (pr) {
+        userPriceRangeRef.current = { from: pr.from, to: pr.to };
+      }
       // Re-run SR detection over the new visible range (debounced —
       // zoom emits many events). Detection self-skips when width is
       // below the 90 min minimum, so zoom-ins below default leave
@@ -386,6 +521,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     return () => {
       if (srTimer) clearTimeout(srTimer);
       scheduleSrRecomputeRef.current = null;
+      if (containerEl) {
+        containerEl.removeEventListener('wheel', captureYRange);
+        containerEl.removeEventListener('mouseup', captureYRange);
+        containerEl.removeEventListener('touchend', captureYRange);
+      }
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -415,6 +555,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       barsRef.current = [];
       onError?.(null);
       userRangeRef.current = null;
+      userPriceRangeRef.current = null;
       return;
     }
 
@@ -464,6 +605,40 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
         const savedRange = firstLoad ? loadSavedRange(targetKey(target)) : null;
         const prevRange = userRangeRef.current ?? savedRange;
+        // Hydrate Y-zoom from localStorage on the very first load so a
+        // hard refresh restores the user's price-axis zoom. On
+        // subsequent in-session loads, we re-read the live price scale
+        // (it may have changed via Y-axis pinch which doesn't fire a
+        // time-range event) and persist that updated value.
+        const priceScale = chart.priceScale('right');
+        if (firstLoad) {
+          if (
+            savedRange?.priceFrom != null && savedRange?.priceTo != null
+          ) {
+            userPriceRangeRef.current = {
+              from: savedRange.priceFrom,
+              to: savedRange.priceTo,
+            };
+          }
+        } else {
+          const currentPriceRange = priceScale.getVisibleRange();
+          if (currentPriceRange) {
+            userPriceRangeRef.current = {
+              from: currentPriceRange.from,
+              to: currentPriceRange.to,
+            };
+            // Persist alongside time range so a hard refresh keeps it.
+            const tgt = targetRef.current;
+            const cur = userRangeRef.current;
+            if (tgt && cur) {
+              saveRange(targetKey(tgt), {
+                ...cur,
+                priceFrom: currentPriceRange.from,
+                priceTo: currentPriceRange.to,
+              });
+            }
+          }
+        }
         series.setData(points);
         // Historical bars are now in the series — safe to let live
         // ticks update past this point without auto-fit-to-one-point
@@ -531,6 +706,35 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             from: prevRange.from as UTCTimestamp,
             to: prevRange.to as UTCTimestamp,
           });
+        }
+        // Restore the user's Y-axis zoom. On firstLoad the ref was
+        // hydrated above from the per-target saved range (so it's the
+        // saved Y for THIS symbol, not stale data from another). If
+        // there's no saved Y for this target, fall back to a
+        // sensible default: 3× the visible-window amplitude centered
+        // on the price polyline. The default gives ample headroom
+        // for support/resistance lines that extend above or below
+        // the price without squashing the actual chart.
+        if (userPriceRangeRef.current) {
+          try {
+            priceScale.setVisibleRange(userPriceRangeRef.current);
+          } catch { /* range invalid for current data — skip */ }
+        } else {
+          // Use the visible time window we just set above so the
+          // 3× amplitude reflects what the user actually sees, not
+          // the full 24h preload.
+          const visTo = Number(
+            chart.timeScale().getVisibleRange()?.to ?? 0,
+          );
+          const visFrom = Number(
+            chart.timeScale().getVisibleRange()?.from ?? 0,
+          );
+          const def = visTo > visFrom
+            ? computeDefaultYRange(barsRef.current, visFrom, visTo)
+            : null;
+          if (def) {
+            try { priceScale.setVisibleRange(def); } catch { /* ignore */ }
+          }
         }
         onError?.(null);
       } catch (e: any) {
@@ -689,6 +893,38 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Imperative reset-zoom handle for the parent toolbar. Anchors `to`
   // at wall-clock "now" so the live tail stays in view (same reasoning
   // as the firstLoad default-range branch above).
+  // Default Y-axis range = 3× the visible polyline's amplitude,
+  // centered on its midpoint. The ~1/3 padding above and below gives
+  // SR lines visible headroom without squashing the chart.
+  //
+  // IMPORTANT: amplitude is computed ONLY over bars within the
+  // visible time window. Using the full 24h preload would expand
+  // the default to a 24h range (~$400 on gold) instead of the user's
+  // current 90-min view (~$40), making the chart sliver-sized.
+  const computeDefaultYRange = (
+    bars: Bar[],
+    fromTimeSec: number,
+    toTimeSec: number,
+  ): { from: number; to: number } | null => {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const b of bars) {
+      const t = b.time as number;
+      if (t < fromTimeSec || t > toTimeSec) continue;
+      const v = b.close;
+      if (!Number.isFinite(v)) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+    const center = (min + max) / 2;
+    const amp = max - min;
+    if (amp <= 0) {
+      return { from: center * 0.99, to: center * 1.01 };
+    }
+    return { from: center - 1.5 * amp, to: center + 1.5 * amp };
+  };
+
   useImperativeHandle(ref, () => ({
     resetZoom: () => {
       const chart = chartRef.current;
@@ -706,6 +942,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       userRangeRef.current = range;
       const tgt = targetRef.current;
       if (tgt) saveRange(targetKey(tgt), range);
+      // Reset Y-axis to the 3×-amplitude default (centered) over
+      // the visible time window so the chart isn't squashed by SR
+      // lines extending beyond the price polyline.
+      const def = computeDefaultYRange(
+        barsRef.current, range.from, range.to,
+      );
+      if (def) {
+        try { chart.priceScale('right').setVisibleRange(def); } catch { /* ignore */ }
+      }
+      userPriceRangeRef.current = null;
     },
     clearSupportResistance: () => {
       // Drop the currently-rendered SR overlay series and set the gate

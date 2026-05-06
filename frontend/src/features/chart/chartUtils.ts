@@ -18,7 +18,17 @@ export const BAR_SECONDS = 3 * 60;
 // orphaned (small handful of bytes per target — left for the browser to
 // evict on its own).
 const ZOOM_STORAGE_KEY = 'ib-chart-zoom-v2';
-export type SavedRange = { from: number; to: number };
+export type SavedRange = {
+  from: number;
+  to: number;
+  /** Optional price-axis (Y) range. lightweight-charts has no
+   *  priceScale-change event, so we capture this opportunistically
+   *  (on time-range change + on the 30s refresh) and persist it
+   *  alongside the time range. Older entries without these fields
+   *  still load correctly — the chart auto-fits Y. */
+  priceFrom?: number;
+  priceTo?: number;
+};
 export type Point = { time: UTCTimestamp; value: number };
 /** Full OHLC bar with the same local-as-UTC time shift as Point. Used
  *  by support/resistance detection (which needs wick high/low) and by
