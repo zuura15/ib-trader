@@ -367,6 +367,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         bg.setAttribute('stroke', themeNow.background);
         bg.setAttribute('stroke-width', '2');
         bg.setAttribute('opacity', opacity);
+        // Re-enable pointer events on the badge alone (the parent
+        // SVG has pointer-events:none so chart pan/zoom isn't
+        // intercepted). Native SVG <title> gives a hover tooltip
+        // showing the signal's price + bar time + active state.
+        bg.setAttribute('pointer-events', 'auto');
+        bg.style.cursor = 'help';
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        const sideLabel = sig.side === 'B' ? 'Buy' : 'Sell';
+        const sigDate = new Date((sig.time as number) * 1000);
+        const timeStr = sigDate.toLocaleString(undefined, {
+          month: 'short', day: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        });
+        const ageBars = Math.floor((nowSec - (sig.time as number)) / BAR_SECONDS);
+        const stateStr = isActive
+          ? `active (${ageBars}/${signalActiveBarsRef.current} bars used)`
+          : `expired (${ageBars} bars ago)`;
+        title.textContent
+          = `${sideLabel} signal\nPrice: ${sig.price.toFixed(2)}\nTime: ${timeStr}\n${stateStr}`;
+        bg.appendChild(title);
         svg.appendChild(bg);
         const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         txt.setAttribute('x', String(x));
