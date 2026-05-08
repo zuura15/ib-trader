@@ -2,8 +2,9 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries,
+  createChart, ColorType, LineSeries, createSeriesMarkers,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
+  type ISeriesMarkersPluginApi, type SeriesMarker, type Time,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -66,6 +67,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // every refresh; `srHiddenRef` lets the user dismiss them for the
   // current target via the Clear-SR button (re-shows on target switch).
   const srSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  // Buy/Sell signal markers attached to the price series. Populated
+  // when an uptrending support or downtrending resistance accumulates
+  // 3+ pivot touches — see the SR recompute below for the placement
+  // rule.
+  const srMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const srHiddenRef = useRef(false);
   // Track ``showBrokenSr`` via ref so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
@@ -271,6 +277,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         try { ch.removeSeries(ds); } catch { /* already gone */ }
       }
       srSeriesRef.current = [];
+      // Clear buy/sell markers — they'll be repopulated below if any
+      // confirmed (3+ touches) directional lines remain.
+      try { srMarkersRef.current?.setMarkers([]); } catch { /* ignore */ }
       if (srHiddenRef.current) return;
 
       const slice = allBars.slice(fromIdx, toIdx + 1);
@@ -282,6 +291,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // console alongside so the data is one F12 away.
       let labelCounter = 0;
       const lineLog: Record<string, unknown>[] = [];
+      // Buy/Sell signals: collected during the line loop, applied once
+      // afterwards. Triggered by uptrending support / downtrending
+      // resistance with 3+ pivot touches (intact, not broken). Marker
+      // sits at the line's most-recent pivot bar.
+      const signalMarkers: SeriesMarker<Time>[] = [];
+      const signalSeen = new Set<number>();
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
         // Broken lines are noisy at zoom-out and clutter the active
@@ -331,6 +346,31 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           { time: endTime, value: endPrice },
         ]);
         srSeriesRef.current.push(ds);
+
+        // Signal: uptrending support or downtrending resistance with
+        // 3+ confirming pivot touches → buy/sell indicator. Marker
+        // anchored at the line's anchor-B (most-recent construction
+        // pivot). Broken lines are already filtered above.
+        if (confirmed) {
+          const isBuy = line.type === 'support' && line.slope > 0;
+          const isSell = line.type === 'resistance' && line.slope < 0;
+          if (isBuy || isSell) {
+            const anchorIdx = line.anchorBIdx;
+            const dedupKey = (anchorIdx << 1) | (isBuy ? 1 : 0);
+            if (!signalSeen.has(dedupKey)) {
+              signalSeen.add(dedupKey);
+              signalMarkers.push({
+                time: slice[anchorIdx].time,
+                position: isBuy ? 'belowBar' : 'aboveBar',
+                shape: isBuy ? 'circle' : 'square',
+                color: isBuy ? colors.bullish : colors.bearish,
+                text: isBuy ? 'B' : 'S',
+                size: 2,
+              });
+            }
+          }
+        }
+
         // Companion debug log — same number as on the chart.
         const startBarTime = new Date((startTime as number) * 1000).toISOString();
         const endBarTime = new Date((endTime as number) * 1000).toISOString();
@@ -355,6 +395,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           isBroken, confirmed,
         });
       }
+
+      // Apply collected buy/sell markers in one shot. The plugin is
+      // created lazily on the first signal so charts with no
+      // confirmed lines don't pay the cost.
+      if (signalMarkers.length > 0) {
+        const series = seriesRef.current;
+        if (series) {
+          // Markers must be sorted by time ascending — lightweight-charts
+          // assumes monotonic input and renders incorrectly otherwise.
+          signalMarkers.sort((a, b) =>
+            (a.time as number) - (b.time as number),
+          );
+          if (!srMarkersRef.current) {
+            srMarkersRef.current = createSeriesMarkers(series, signalMarkers);
+          } else {
+            srMarkersRef.current.setMarkers(signalMarkers);
+          }
+        }
+      }
+
       // Always stash diagnostic snapshot on window — even when 0
       // lines drew, so the user can introspect why. Includes pivot
       // times so we can verify pivot-detection is finding what the
@@ -564,6 +624,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       rsiSeriesRef.current = null;
       divergenceSeriesRef.current = [];
       srSeriesRef.current = [];
+      srMarkersRef.current = null;
       barsRef.current = [];
     };
   }, [theme, showRsi]);

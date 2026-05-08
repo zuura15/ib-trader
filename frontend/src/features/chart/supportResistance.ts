@@ -210,13 +210,27 @@ function detectOneSide(
       );
       if (isCoincident) continue;
 
+      // Count pivots that sit on the line within tolerance. Q and P
+      // contribute by construction; additional collinear pivots upgrade
+      // a "tentative" 2-touch fan member into a "confirmed" 3+-touch
+      // line. Range covers any pivot of the same type from the line's
+      // start (q) through the post-anchor extension (lastBarIdx) so
+      // post-P retests count too.
+      let touches = 0;
+      for (const pivIdx of pivots) {
+        if (pivIdx < q || pivIdx > lastBarIdx) continue;
+        const lineAt = slope * pivIdx + intercept;
+        if (Math.abs(closes[pivIdx] - lineAt) <= tol) touches++;
+      }
+      if (touches < 2) touches = 2; // safety: q & P should always count
+
       out.push({
         type,
         fromIdx: q,
         anchorBIdx: P,
         toIdx: breakIdx ?? lastBarIdx,
         slope, intercept,
-        touches: 2,
+        touches,
         breakIdx,
       });
     }
