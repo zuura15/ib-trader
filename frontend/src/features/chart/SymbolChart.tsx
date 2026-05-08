@@ -322,11 +322,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const ts = ch.timeScale();
       const LETTER_OFFSET_PX = 36;   // distance from bar to letter
       // Active window is ``signalActiveBars`` bars from the anchor.
-      // Computed once per repaint against ``Date.now()`` so badges
-      // dim naturally as bars roll over without needing an SR
-      // recompute to flip them.
-      const nowSec = Math.floor(Date.now() / 1000);
+      // ``sig.time`` is stored in lightweight-charts' shifted-UTC
+      // form (local wallclock as if UTC — see ``localUtcSeconds``),
+      // so ``nowSec`` must use the same shift for elapsed-time math
+      // and tooltip display to land on the right wallclock moment.
+      const nowSec = localUtcSeconds(new Date()) as number;
       const activeWindowSec = signalActiveBarsRef.current * BAR_SECONDS;
+      const tzOffsetSec = new Date().getTimezoneOffset() * 60;
       for (const sig of srSignalsRef.current) {
         const x = ts.timeToCoordinate(sig.time);
         const yPrice = ser.priceToCoordinate(sig.price);
@@ -375,7 +377,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         bg.style.cursor = 'help';
         const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
         const sideLabel = sig.side === 'B' ? 'Buy' : 'Sell';
-        const sigDate = new Date((sig.time as number) * 1000);
+        // Convert shifted-UTC back to real UTC so toLocaleString
+        // applies the tz offset exactly once and lands on the
+        // correct local wallclock moment.
+        const sigDate = new Date(((sig.time as number) + tzOffsetSec) * 1000);
         const timeStr = sigDate.toLocaleString(undefined, {
           month: 'short', day: 'numeric',
           hour: '2-digit', minute: '2-digit', hour12: false,
