@@ -252,7 +252,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     overlaySvg.setAttribute(
       'style',
       'position:absolute;inset:0;width:100%;height:100%;'
-      + 'pointer-events:none;overflow:visible;',
+      + 'pointer-events:none;overflow:visible;z-index:10;',
     );
     el.style.position = el.style.position || 'relative';
     el.appendChild(overlaySvg);
@@ -266,8 +266,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Empty + repaint. Cheap (handful of children); keeps the
       // logic linear instead of diffing.
       while (svg.firstChild) svg.removeChild(svg.firstChild);
+      // Skip on tiny chart panes — the stacked-charts sparklines are
+      // ~46px tall, so a letter 28px above the bar lands outside the
+      // pane and looks broken. Buy/sell signals are an analyst tool;
+      // they belong on the main chart, not on overview thumbnails.
+      const svgRect = svg.getBoundingClientRect();
+      if (svgRect.height < 120) return;
       const ts = ch.timeScale();
-      const LETTER_OFFSET_PX = 28;   // distance from bar to letter
+      const LETTER_OFFSET_PX = 36;   // distance from bar to letter
       for (const sig of srSignalsRef.current) {
         const x = ts.timeToCoordinate(sig.time);
         const yPrice = ser.priceToCoordinate(sig.price);
@@ -285,24 +291,31 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         ln.setAttribute('stroke', 'var(--text-primary, #000)');
         ln.setAttribute('stroke-width', '1');
         svg.appendChild(ln);
-        // Letter: bold, color-coded by side, centered on (x, yLetter).
-        // White stroke gives a halo against the polyline / SR lines so
-        // the letter stays readable on any chart background.
+        // Badge: colored circle + white letter centered. Designed to
+        // be unmistakable on any background — a bare-text approach
+        // failed in light mode (white halo blended into the white
+        // panel background, leaving only ~10px of green-on-white text
+        // that was easy to miss).
+        const themeNow = themeColors();
+        const badgeColor = sig.side === 'B' ? themeNow.bullish : themeNow.bearish;
+        const RADIUS = 12;
+        const bg = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        bg.setAttribute('cx', String(x));
+        bg.setAttribute('cy', String(yLetter));
+        bg.setAttribute('r', String(RADIUS));
+        bg.setAttribute('fill', badgeColor);
+        bg.setAttribute('stroke', themeNow.background);
+        bg.setAttribute('stroke-width', '2');
+        svg.appendChild(bg);
         const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         txt.setAttribute('x', String(x));
         txt.setAttribute('y', String(yLetter));
         txt.setAttribute('text-anchor', 'middle');
-        txt.setAttribute('dominant-baseline', 'middle');
-        txt.setAttribute('font-size', '18');
+        txt.setAttribute('dominant-baseline', 'central');
+        txt.setAttribute('font-size', '15');
         txt.setAttribute('font-weight', '800');
         txt.setAttribute('font-family', 'system-ui, sans-serif');
-        const themeNow = themeColors();
-        txt.setAttribute(
-          'fill', sig.side === 'B' ? themeNow.bullish : themeNow.bearish,
-        );
-        txt.setAttribute('stroke', themeNow.background);
-        txt.setAttribute('stroke-width', '3');
-        txt.setAttribute('paint-order', 'stroke fill');
+        txt.setAttribute('fill', themeNow.background);
         txt.textContent = sig.side;
         svg.appendChild(txt);
       }
