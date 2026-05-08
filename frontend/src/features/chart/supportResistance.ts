@@ -37,16 +37,24 @@ export interface SROptions {
   /** Bars to keep a broken line visible after the violating close. */
   breakStaleBars: number;
   /** Allowed deviation, as a fraction of the slice's average close,
-   *  for both the q→P channel rule and post-P break detection.
-   *  Absorbs cent-level noise around pivots without letting clear
-   *  visual crossings pass. 0.00005 ≈ $0.24 on gold at $4700,
+   *  for the q→P channel rule and post-P break detection. Strict —
+   *  any close on the wrong side of the line beyond this band
+   *  invalidates / breaks the line. 0.00005 ≈ $0.24 on gold at $4700,
    *  ≈ $0.025 on a $500 stock, ≈ $0.005 on a $100 stock. */
   toleranceFraction: number;
+  /** Allowed deviation for *touch* counting (the third+ pivot that
+   *  upgrades a 2-touch tentative line into a confirmed one). Looser
+   *  than ``toleranceFraction`` because a pivot that sits a bit above
+   *  a support line is still respecting it — the line isn't broken,
+   *  it's just slightly off-anchor on that pivot. 0.0002 ≈ $0.95 on
+   *  gold at $4700, ≈ $0.10 on a $500 stock. */
+  touchToleranceFraction: number;
 }
 
 export const SR_DEFAULTS: SROptions = {
   breakStaleBars: 20,
   toleranceFraction: 0.00005,
+  touchToleranceFraction: 0.0002,
 };
 
 const EPS = 1e-6;
@@ -130,6 +138,7 @@ function detectOneSide(
   const avgClose =
     closes.reduce((s, v) => s + v, 0) / Math.max(1, closes.length);
   const tol = Math.max(EPS, avgClose * opts.toleranceFraction);
+  const touchTol = Math.max(tol, avgClose * opts.touchToleranceFraction);
 
   // Process pivots most-recent → oldest. Newer pivots' lines are
   // emitted first and constrain older candidates, not the other way
@@ -210,17 +219,18 @@ function detectOneSide(
       );
       if (isCoincident) continue;
 
-      // Count pivots that sit on the line within tolerance. Q and P
-      // contribute by construction; additional collinear pivots upgrade
-      // a "tentative" 2-touch fan member into a "confirmed" 3+-touch
-      // line. Range covers any pivot of the same type from the line's
-      // start (q) through the post-anchor extension (lastBarIdx) so
-      // post-P retests count too.
+      // Count pivots that sit on the line within ``touchTol`` (looser
+      // than the channel/break tolerance — see ``touchToleranceFraction``
+      // doc). Q and P contribute by construction; additional collinear
+      // pivots upgrade a "tentative" 2-touch fan member into a
+      // "confirmed" 3+-touch line. Range covers any pivot of the same
+      // type from the line's start (q) through the post-anchor
+      // extension (lastBarIdx) so post-P retests count too.
       let touches = 0;
       for (const pivIdx of pivots) {
         if (pivIdx < q || pivIdx > lastBarIdx) continue;
         const lineAt = slope * pivIdx + intercept;
-        if (Math.abs(closes[pivIdx] - lineAt) <= tol) touches++;
+        if (Math.abs(closes[pivIdx] - lineAt) <= touchTol) touches++;
       }
       if (touches < 2) touches = 2; // safety: q & P should always count
 
