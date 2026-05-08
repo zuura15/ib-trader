@@ -97,6 +97,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // and the live-tick handler (in-place fold of high/low/close).
   const barsRef = useRef<Bar[]>([]);
   const userRangeRef = useRef<SavedRange | null>(null);
+  // Logical-range mirror of the user's current viewport. Captured
+  // alongside ``userRangeRef`` on every pan/zoom so we can restore
+  // pan position in *bar-index* space across periodic ``load()``
+  // refreshes. Time-domain restoration loses the user's "empty space
+  // past the last bar" because lightweight-charts re-clamps `to` to
+  // data bounds when ``setData`` runs; the logical-domain API
+  // survives this because it stores positions as bar indices that
+  // re-anchor on the new data set.
+  const userLogicalRangeRef = useRef<{ from: number; to: number } | null>(null);
   // Y-axis zoom persistence. lightweight-charts doesn't fire an event
   // for price-scale changes (only time-scale), so we sample the
   // current price range at refresh time and restore it after setData.
@@ -168,7 +177,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // the live mark + horizontal price line clearly in view.
         rightOffset: 4,
       },
-      rightPriceScale: { borderColor: colors.grid },
+      // ``scaleMargins`` reserves the top and bottom thirds of the
+      // chart as empty space, so the auto-fitted price polyline fills
+      // the middle third — exactly the "amp = 1/3 of chart, centered"
+      // rule. Auto-scale is left on (default true) so the polyline
+      // re-fits to that middle band as new bars come in, without
+      // fighting our setVisibleRange. Manual Y-zoom (wheel/pinch)
+      // still overrides this by switching auto-scale off.
+      rightPriceScale: {
+        borderColor: colors.grid,
+        scaleMargins: { top: 0.25, bottom: 0.25 },
+      },
       crosshair: { mode: 1 },
     });
     const series = chart.addSeries(LineSeries, {
@@ -494,11 +513,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // single point and we'd persist a 1-minute "zoom" the user never
       // chose. Anything narrower than 5 min isn't a user interaction.
       if (to - from < 5 * 60) return;
-      // Capture the current Y range alongside time. Time-range
-      // changes fire on most user interactions (pan, X-zoom), so
-      // this catches Y zooms made just before a pan. Pure-Y
-      // interactions are also covered by the DOM-event capture
-      // above.
+      // X pan/zoom does NOT touch the Y axis — user's manual Y zoom
+      // (if any) is respected until the next reset / periodic
+      // refresh / container resize. Auto-fit triggers live in those
+      // three places, not here.
       const pr = chart.priceScale('right').getVisibleRange();
       const r: SavedRange = {
         from, to,
@@ -506,8 +524,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         priceTo: pr?.to,
       };
       userRangeRef.current = r;
-      if (pr) {
-        userPriceRangeRef.current = { from: pr.from, to: pr.to };
+      const lr = chart.timeScale().getVisibleLogicalRange();
+      if (lr) {
+        userLogicalRangeRef.current = { from: lr.from, to: lr.to };
       }
       // Re-run SR detection over the new visible range (debounced —
       // zoom emits many events). Detection self-skips when width is
@@ -518,9 +537,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (tgt) saveRange(targetKey(tgt), r);
     });
 
+    // Re-fit Y when the chart pane resizes (drawer collapse/expand,
+    // window resize, full-screen toggle). lightweight-charts updates
+    // its internal layout on container size change but doesn't
+    // re-autoscale the price axis, so we trigger it explicitly.
+    let resizeObserver: ResizeObserver | null = null;
+    if (containerEl && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        try { chart.priceScale('right').setAutoScale(true); } catch { /* ignore */ }
+      });
+      resizeObserver.observe(containerEl);
+    }
+
     return () => {
       if (srTimer) clearTimeout(srTimer);
       scheduleSrRecomputeRef.current = null;
+      if (resizeObserver) resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener('wheel', captureYRange);
         containerEl.removeEventListener('mouseup', captureYRange);
@@ -556,6 +588,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       onError?.(null);
       userRangeRef.current = null;
       userPriceRangeRef.current = null;
+      userLogicalRangeRef.current = null;
       return;
     }
 
@@ -701,41 +734,28 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             from: (nowSec - widthSec) as UTCTimestamp,
             to: nowSec,
           });
+        } else if (userLogicalRangeRef.current) {
+          // Prefer logical range so any empty space the user kept past
+          // the last bar is preserved when new bars arrive — see ref
+          // declaration for the rationale.
+          try {
+            chart.timeScale().setVisibleLogicalRange(
+              userLogicalRangeRef.current,
+            );
+          } catch { /* range invalid for current data — skip */ }
         } else if (prevRange) {
           chart.timeScale().setVisibleRange({
             from: prevRange.from as UTCTimestamp,
             to: prevRange.to as UTCTimestamp,
           });
         }
-        // Restore the user's Y-axis zoom. On firstLoad the ref was
-        // hydrated above from the per-target saved range (so it's the
-        // saved Y for THIS symbol, not stale data from another). If
-        // there's no saved Y for this target, fall back to a
-        // sensible default: 3× the visible-window amplitude centered
-        // on the price polyline. The default gives ample headroom
-        // for support/resistance lines that extend above or below
-        // the price without squashing the actual chart.
-        if (userPriceRangeRef.current) {
-          try {
-            priceScale.setVisibleRange(userPriceRangeRef.current);
-          } catch { /* range invalid for current data — skip */ }
-        } else {
-          // Use the visible time window we just set above so the
-          // 3× amplitude reflects what the user actually sees, not
-          // the full 24h preload.
-          const visTo = Number(
-            chart.timeScale().getVisibleRange()?.to ?? 0,
-          );
-          const visFrom = Number(
-            chart.timeScale().getVisibleRange()?.from ?? 0,
-          );
-          const def = visTo > visFrom
-            ? computeDefaultYRange(barsRef.current, visFrom, visTo)
-            : null;
-          if (def) {
-            try { priceScale.setVisibleRange(def); } catch { /* ignore */ }
-          }
-        }
+        // Periodic refresh re-fits Y to the polyline's current
+        // amplitude (rule: amp = 1/3 of chart, centered, via
+        // scaleMargins). Drops any manual Y the user had — by
+        // design: refresh, reset, and resize all snap Y back; only
+        // X-only pan/zoom respects an in-progress manual Y.
+        try { priceScale.setAutoScale(true); } catch { /* ignore */ }
+        userPriceRangeRef.current = null;
         onError?.(null);
       } catch (e: any) {
         if (cancelled) return;
@@ -890,41 +910,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
   }, [target?.symbol, target?.secType, chartVersion]);
 
-  // Imperative reset-zoom handle for the parent toolbar. Anchors `to`
-  // at wall-clock "now" so the live tail stays in view (same reasoning
-  // as the firstLoad default-range branch above).
-  // Default Y-axis range = 3× the visible polyline's amplitude,
-  // centered on its midpoint. The ~1/3 padding above and below gives
-  // SR lines visible headroom without squashing the chart.
-  //
-  // IMPORTANT: amplitude is computed ONLY over bars within the
-  // visible time window. Using the full 24h preload would expand
-  // the default to a 24h range (~$400 on gold) instead of the user's
-  // current 90-min view (~$40), making the chart sliver-sized.
-  const computeDefaultYRange = (
-    bars: Bar[],
-    fromTimeSec: number,
-    toTimeSec: number,
-  ): { from: number; to: number } | null => {
-    let min = Infinity;
-    let max = -Infinity;
-    for (const b of bars) {
-      const t = b.time as number;
-      if (t < fromTimeSec || t > toTimeSec) continue;
-      const v = b.close;
-      if (!Number.isFinite(v)) continue;
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
-    if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
-    const center = (min + max) / 2;
-    const amp = max - min;
-    if (amp <= 0) {
-      return { from: center * 0.99, to: center * 1.01 };
-    }
-    return { from: center - 1.5 * amp, to: center + 1.5 * amp };
-  };
-
   useImperativeHandle(ref, () => ({
     resetZoom: () => {
       const chart = chartRef.current;
@@ -940,17 +925,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         to: range.to as UTCTimestamp,
       });
       userRangeRef.current = range;
+      userLogicalRangeRef.current = null;
       const tgt = targetRef.current;
       if (tgt) saveRange(targetKey(tgt), range);
-      // Reset Y-axis to the 3×-amplitude default (centered) over
-      // the visible time window so the chart isn't squashed by SR
-      // lines extending beyond the price polyline.
-      const def = computeDefaultYRange(
-        barsRef.current, range.from, range.to,
-      );
-      if (def) {
-        try { chart.priceScale('right').setVisibleRange(def); } catch { /* ignore */ }
-      }
+      // Reset Y to the "polyline fills the middle third, centered"
+      // rule. scaleMargins is reapplied here defensively so an
+      // HMR-preserved chart instance from before this change picks
+      // up the 1/3 + 1/3 margins; setAutoScale(true) lets the chart
+      // auto-fit the polyline into the remaining middle third.
+      const priceScale = chart.priceScale('right');
+      try {
+        priceScale.applyOptions({
+          scaleMargins: { top: 0.25, bottom: 0.25 },
+        });
+      } catch { /* ignore */ }
+      try { priceScale.setAutoScale(true); } catch { /* ignore */ }
       userPriceRangeRef.current = null;
     },
     clearSupportResistance: () => {

@@ -37,16 +37,16 @@ export interface SROptions {
   /** Bars to keep a broken line visible after the violating close. */
   breakStaleBars: number;
   /** Allowed deviation, as a fraction of the slice's average close,
-   *  for channel-rule, touch, and break checks. 0.0005 = 0.05%
-   *  (≈$2.35 on gold at $4700, ≈$0.025 on a $50 stock) absorbs
-   *  cent-level wobbles without letting macro breaches pass.
-   *  Set to 0 (or use EPS) for strict magnetic-mode. */
+   *  for both the q→P channel rule and post-P break detection.
+   *  Absorbs cent-level noise around pivots without letting clear
+   *  visual crossings pass. 0.00005 ≈ $0.24 on gold at $4700,
+   *  ≈ $0.025 on a $500 stock, ≈ $0.005 on a $100 stock. */
   toleranceFraction: number;
 }
 
 export const SR_DEFAULTS: SROptions = {
   breakStaleBars: 20,
-  toleranceFraction: 0.0005,
+  toleranceFraction: 0.00005,
 };
 
 const EPS = 1e-6;
@@ -127,9 +127,6 @@ function detectOneSide(
 ): SRLine[] {
   const out: SRLine[] = [];
   const lastBarIdx = closes.length - 1;
-  // Tolerance as a price-domain band. EPS still guards FP noise on
-  // exact-anchor evaluation; tolerance absorbs cent-scale wobbles
-  // that would otherwise kill visually-clean lines.
   const avgClose =
     closes.reduce((s, v) => s + v, 0) / Math.max(1, closes.length);
   const tol = Math.max(EPS, avgClose * opts.toleranceFraction);
@@ -162,6 +159,8 @@ function detectOneSide(
       const intercept = closes[P] - slope * P;
 
       // Channel rule against the chart polyline between q and P.
+      // Strict: an SR line is invalid if price crosses it anywhere
+      // along its drawn range. EPS only guards FP noise.
       let valid = true;
       for (let i = q + 1; i < P; i++) {
         const lineAt = slope * i + intercept;
@@ -175,7 +174,8 @@ function detectOneSide(
       // Channel rule against existing trend lines between q and P.
       if (crossesAny(slope, intercept, q, P, out)) continue;
 
-      // Post-P break detection on the chart line.
+      // Post-P break detection. Same strict rule: any close on the
+      // wrong side of the line marks the line broken.
       let breakIdx: number | null = null;
       for (let i = P + 1; i <= lastBarIdx; i++) {
         const lineAt = slope * i + intercept;
