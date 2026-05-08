@@ -286,18 +286,23 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         ln.setAttribute('stroke-width', '1');
         svg.appendChild(ln);
         // Letter: bold, color-coded by side, centered on (x, yLetter).
+        // White stroke gives a halo against the polyline / SR lines so
+        // the letter stays readable on any chart background.
         const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         txt.setAttribute('x', String(x));
         txt.setAttribute('y', String(yLetter));
         txt.setAttribute('text-anchor', 'middle');
         txt.setAttribute('dominant-baseline', 'middle');
-        txt.setAttribute('font-size', '13');
-        txt.setAttribute('font-weight', '700');
+        txt.setAttribute('font-size', '18');
+        txt.setAttribute('font-weight', '800');
         txt.setAttribute('font-family', 'system-ui, sans-serif');
         const themeNow = themeColors();
         txt.setAttribute(
           'fill', sig.side === 'B' ? themeNow.bullish : themeNow.bearish,
         );
+        txt.setAttribute('stroke', themeNow.background);
+        txt.setAttribute('stroke-width', '3');
+        txt.setAttribute('paint-order', 'stroke fill');
         txt.textContent = sig.side;
         svg.appendChild(txt);
       }
