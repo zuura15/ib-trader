@@ -626,10 +626,13 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
                 bid = ticker_data.get("bid")
                 ask = ticker_data.get("ask")
                 last = ticker_data.get("last")
-                if bid and ask:
-                    market_price = str(round((float(bid) + float(ask)) / 2, 4))
-                elif last:
+                # Prefer last-trade so the positions market price matches
+                # what the chart polyline and watchlist display. Fall back
+                # to mid only when no trade has printed (illiquid symbols).
+                if last:
                     market_price = str(last)
+                elif bid and ask:
+                    market_price = str(round((float(bid) + float(ask)) / 2, 4))
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
 
@@ -1178,10 +1181,13 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
                 bid = ticker_data.get("bid")
                 ask = ticker_data.get("ask")
                 last = ticker_data.get("last")
-                if bid and ask:
-                    market_price = str(round((float(bid) + float(ask)) / 2, 4))
-                elif last:
+                # Prefer last-trade so the positions market price matches
+                # what the chart polyline and watchlist display. Fall back
+                # to mid only when no trade has printed (illiquid symbols).
+                if last:
                     market_price = str(last)
+                elif bid and ask:
+                    market_price = str(round((float(bid) + float(ask)) / 2, 4))
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
 

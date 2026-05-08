@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { useStore } from '../../data/store';
 import { PanelShell } from '../../components/PanelShell';
 import { WatchlistConfig } from './WatchlistConfig';
@@ -27,28 +27,6 @@ function changeColor(v: string | null): string {
   return 'var(--text-secondary)';
 }
 
-function RefreshCountdown({ interval }: { interval: number }) {
-  const [sec, setSec] = useState(interval);
-  const ref = useRef(0);
-
-  useEffect(() => {
-    ref.current = interval;
-    setSec(interval);
-    const timer = setInterval(() => {
-      ref.current -= 1;
-      if (ref.current <= 0) ref.current = interval;
-      setSec(ref.current);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [interval]);
-
-  return (
-    <span style={{ fontSize: 10, color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
-      ↻ {sec}s
-    </span>
-  );
-}
-
 export function WatchlistPanel({ compact = false }: { compact?: boolean }) {
   const watchlist = useStore((s) => s.watchlist);
   const selectedChartTarget = useStore((s) => s.selectedChartTarget);
@@ -58,7 +36,6 @@ export function WatchlistPanel({ compact = false }: { compact?: boolean }) {
   return (
     <PanelShell title="Watchlist" accent="green" right={
       <div className="flex items-center gap-2">
-        <RefreshCountdown interval={5} />
         <button
           onClick={() => setConfigOpen(true)}
           style={{
