@@ -717,29 +717,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // event that queues a trailing timer would shadow a later
     // force=true call (codex flagged: toggle silently no-ops).
     let pendingForce = false;
-    // When the tab is hidden, suspend SR recomputes — they're the
-    // most expensive thing per chart (O(N²) pivot fan + DOM churn
-    // for 6+ chart instances). On visibility-restore we fire a
-    // single forced recompute so the chart is current when the user
-    // looks back. Live-tick handling skips its in-place updates too
-    // (see ws.onmessage).
-    let tabHiddenSeenSr = false;
-    const onVisChange = () => {
-      if (document.hidden) return;
-      if (tabHiddenSeenSr) {
-        tabHiddenSeenSr = false;
-        scheduleSrRecomputeRef.current?.(true);
-      }
-    };
-    document.addEventListener('visibilitychange', onVisChange);
-
     scheduleSrRecomputeRef.current = (force = false) => {
-      if (document.hidden) {
-        // Remember that we skipped at least once so visibility-restore
-        // schedules a refresh instead of relying on the next tick.
-        tabHiddenSeenSr = true;
-        return;
-      }
       const now = Date.now();
       const elapsed = now - lastSrFireMs;
       if (elapsed >= SR_THROTTLE_MS) {
@@ -849,7 +827,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (srTimer) clearTimeout(srTimer);
       scheduleSrRecomputeRef.current = null;
       repositionSrSignalsRef.current = null;
-      document.removeEventListener('visibilitychange', onVisChange);
       if (resizeObserver) resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener('wheel', captureYRange);
@@ -1079,31 +1056,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!seriesRef.current || !chartRef.current) return;
 
     load();
-    let id: ReturnType<typeof setInterval> | null = null;
-    const startInterval = () => {
-      if (id == null) id = setInterval(load, REFRESH_INTERVAL_MS);
-    };
-    const stopInterval = () => {
-      if (id != null) { clearInterval(id); id = null; }
-    };
-    if (!document.hidden) startInterval();
-    // Pause the periodic refetch while the tab is hidden — multiple
-    // charts × 30s × hidden-tab is wasted bandwidth and JSON parses.
-    // On visibility-restore: fire one immediate ``load()`` so the
-    // chart is current, then resume the interval.
-    const onVisLoad = () => {
-      if (document.hidden) {
-        stopInterval();
-      } else {
-        load();
-        startInterval();
-      }
-    };
-    document.addEventListener('visibilitychange', onVisLoad);
+    const id = setInterval(load, REFRESH_INTERVAL_MS);
     return () => {
       cancelled = true;
-      stopInterval();
-      document.removeEventListener('visibilitychange', onVisLoad);
+      clearInterval(id);
       if (retryTimer) clearTimeout(retryTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1168,12 +1124,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       };
       ws.onmessage = (ev) => {
         try {
-          // Drop tick processing while the tab is hidden. The series
-          // catches up via the periodic ``load()`` REST refresh on
-          // visibility-restore, and the SR scheduler also schedules
-          // a forced recompute then. This is the single biggest
-          // browser-CPU drain when the tab is in the background.
-          if (document.hidden) return;
           const msg = JSON.parse(ev.data);
           if (msg.type !== 'quote' || msg.symbol !== target.symbol) return;
           // Drop ticks until the historical setData has populated the

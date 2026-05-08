@@ -19,16 +19,8 @@ function BarCloseCountdown() {
       setText(`${mm}:${String(ss).padStart(2, '0')}`);
     };
     tick();
-    let id: ReturnType<typeof setInterval> | null = null;
-    const start = () => { if (id == null) { tick(); id = setInterval(tick, 1000); } };
-    const stop = () => { if (id != null) { clearInterval(id); id = null; } };
-    if (!document.hidden) start();
-    const onVis = () => { document.hidden ? stop() : start(); };
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      stop();
-      document.removeEventListener('visibilitychange', onVis);
-    };
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
   }, []);
   return (
     <span
