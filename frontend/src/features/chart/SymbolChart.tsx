@@ -2,9 +2,8 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, createSeriesMarkers,
+  createChart, ColorType, LineSeries,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
-  type ISeriesMarkersPluginApi, type SeriesMarker, type Time,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -67,11 +66,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // every refresh; `srHiddenRef` lets the user dismiss them for the
   // current target via the Clear-SR button (re-shows on target switch).
   const srSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
-  // Buy/Sell signal markers attached to the price series. Populated
-  // when an uptrending support or downtrending resistance accumulates
-  // 3+ pivot touches — see the SR recompute below for the placement
-  // rule.
-  const srMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  // Buy/Sell letters drawn on an SVG overlay positioned over the
+  // chart canvas. Each signal is { time, price, side } — the letter
+  // floats above (S) or below (B) the bar with a black leader line
+  // back to the exact (time, price) on the polyline. Repositioned on
+  // every visible-range change and resize.
+  type Signal = { time: UTCTimestamp; price: number; side: 'B' | 'S' };
+  const srSignalsRef = useRef<Signal[]>([]);
+  const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
   // Track ``showBrokenSr`` via ref so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
@@ -88,6 +90,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // calls into it via this ref so we don't have to re-subscribe each
   // time the closure changes.
   const scheduleSrRecomputeRef = useRef<((force?: boolean) => void) | null>(null);
+  // Repaints the SVG overlay with current ``srSignalsRef`` content.
+  // Set inside the chart-create effect (captures chart + container).
+  // Called from the SR recompute and from pan/zoom/resize events.
+  const repositionSrSignalsRef = useRef<(() => void) | null>(null);
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
   const SR_MIN_BARS = 30;
@@ -238,6 +244,65 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     seriesRef.current = series;
     rsiSeriesRef.current = rsi;
     divergenceSeriesRef.current = [];
+
+    // SVG overlay for SR buy/sell signal letters. Sits on top of the
+    // chart canvas; pointer-events: none so it never intercepts
+    // pan/zoom. Repositioned on every visible-range change and resize.
+    const overlaySvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    overlaySvg.setAttribute(
+      'style',
+      'position:absolute;inset:0;width:100%;height:100%;'
+      + 'pointer-events:none;overflow:visible;',
+    );
+    el.style.position = el.style.position || 'relative';
+    el.appendChild(overlaySvg);
+    srOverlayRef.current = overlaySvg;
+
+    repositionSrSignalsRef.current = () => {
+      const svg = srOverlayRef.current;
+      const ch = chartRef.current;
+      const ser = seriesRef.current;
+      if (!svg || !ch || !ser) return;
+      // Empty + repaint. Cheap (handful of children); keeps the
+      // logic linear instead of diffing.
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      const ts = ch.timeScale();
+      const LETTER_OFFSET_PX = 28;   // distance from bar to letter
+      for (const sig of srSignalsRef.current) {
+        const x = ts.timeToCoordinate(sig.time);
+        const yPrice = ser.priceToCoordinate(sig.price);
+        if (x == null || yPrice == null) continue;
+        const yLetter = sig.side === 'B'
+          ? yPrice + LETTER_OFFSET_PX
+          : yPrice - LETTER_OFFSET_PX;
+        // Leader line: black, solid, 1px, from the price point on the
+        // polyline to the letter's anchor.
+        const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        ln.setAttribute('x1', String(x));
+        ln.setAttribute('y1', String(yPrice));
+        ln.setAttribute('x2', String(x));
+        ln.setAttribute('y2', String(yLetter));
+        ln.setAttribute('stroke', 'var(--text-primary, #000)');
+        ln.setAttribute('stroke-width', '1');
+        svg.appendChild(ln);
+        // Letter: bold, color-coded by side, centered on (x, yLetter).
+        const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        txt.setAttribute('x', String(x));
+        txt.setAttribute('y', String(yLetter));
+        txt.setAttribute('text-anchor', 'middle');
+        txt.setAttribute('dominant-baseline', 'middle');
+        txt.setAttribute('font-size', '13');
+        txt.setAttribute('font-weight', '700');
+        txt.setAttribute('font-family', 'system-ui, sans-serif');
+        const themeNow = themeColors();
+        txt.setAttribute(
+          'fill', sig.side === 'B' ? themeNow.bullish : themeNow.bearish,
+        );
+        txt.textContent = sig.side;
+        svg.appendChild(txt);
+      }
+    };
+
     setChartVersion((v) => v + 1);
 
     // SR detection helper, scoped to this chart instance. Reads the
@@ -277,9 +342,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         try { ch.removeSeries(ds); } catch { /* already gone */ }
       }
       srSeriesRef.current = [];
-      // Clear buy/sell markers — they'll be repopulated below if any
-      // confirmed (3+ touches) directional lines remain.
-      try { srMarkersRef.current?.setMarkers([]); } catch { /* ignore */ }
+      // Clear buy/sell signals — they'll be repopulated below if any
+      // confirmed (3+ touches) directional lines remain. The overlay
+      // is repainted from the ref on every visible-range change and
+      // resize, so emptying the ref is sufficient to make stale
+      // letters disappear on the next reposition tick.
+      srSignalsRef.current = [];
+      repositionSrSignalsRef.current?.();
       if (srHiddenRef.current) return;
 
       const slice = allBars.slice(fromIdx, toIdx + 1);
@@ -291,11 +360,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // console alongside so the data is one F12 away.
       let labelCounter = 0;
       const lineLog: Record<string, unknown>[] = [];
-      // Buy/Sell signals: collected during the line loop, applied once
-      // afterwards. Triggered by uptrending support / downtrending
-      // resistance with 3+ pivot touches (intact, not broken). Marker
-      // sits at the line's most-recent pivot bar.
-      const signalMarkers: SeriesMarker<Time>[] = [];
+      // Buy/Sell signals: collected during the line loop, painted via
+      // SVG overlay afterwards. Triggered by uptrending support /
+      // downtrending resistance with 3+ pivot touches (intact, not
+      // broken). Anchored at the line's most-recent pivot bar.
+      const signals: Signal[] = [];
       const signalSeen = new Set<number>();
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
@@ -348,9 +417,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         srSeriesRef.current.push(ds);
 
         // Signal: uptrending support or downtrending resistance with
-        // 3+ confirming pivot touches → buy/sell indicator. Marker
-        // anchored at the line's anchor-B (most-recent construction
-        // pivot). Broken lines are already filtered above.
+        // 3+ confirming pivot touches → buy/sell indicator. Anchored
+        // at the line's anchor-B (most-recent construction pivot).
+        // Broken lines already filtered above. Price comes from the
+        // line algebra (not the close at that bar) so the leader
+        // line lands on the exact pivot the line is constructed on.
         if (confirmed) {
           const isBuy = line.type === 'support' && line.slope > 0;
           const isSell = line.type === 'resistance' && line.slope < 0;
@@ -359,13 +430,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             const dedupKey = (anchorIdx << 1) | (isBuy ? 1 : 0);
             if (!signalSeen.has(dedupKey)) {
               signalSeen.add(dedupKey);
-              signalMarkers.push({
-                time: slice[anchorIdx].time,
-                position: isBuy ? 'belowBar' : 'aboveBar',
-                shape: isBuy ? 'circle' : 'square',
-                color: isBuy ? colors.bullish : colors.bearish,
-                text: isBuy ? 'B' : 'S',
-                size: 2,
+              signals.push({
+                time: slice[anchorIdx].time as UTCTimestamp,
+                price: line.slope * anchorIdx + line.intercept,
+                side: isBuy ? 'B' : 'S',
               });
             }
           }
@@ -396,24 +464,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
       }
 
-      // Apply collected buy/sell markers in one shot. The plugin is
-      // created lazily on the first signal so charts with no
-      // confirmed lines don't pay the cost.
-      if (signalMarkers.length > 0) {
-        const series = seriesRef.current;
-        if (series) {
-          // Markers must be sorted by time ascending — lightweight-charts
-          // assumes monotonic input and renders incorrectly otherwise.
-          signalMarkers.sort((a, b) =>
-            (a.time as number) - (b.time as number),
-          );
-          if (!srMarkersRef.current) {
-            srMarkersRef.current = createSeriesMarkers(series, signalMarkers);
-          } else {
-            srMarkersRef.current.setMarkers(signalMarkers);
-          }
-        }
-      }
+      // Stash signals on the ref and paint via the overlay. Painting
+      // is also re-run on visible-range changes and resize so the
+      // letters and leader lines track pan/zoom.
+      srSignalsRef.current = signals;
+      repositionSrSignalsRef.current?.();
 
       // Always stash diagnostic snapshot on window — even when 0
       // lines drew, so the user can introspect why. Includes pivot
@@ -541,6 +596,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       requestAnimationFrame(() => {
         yCaptureScheduled = false;
         const pr = chart.priceScale('right').getVisibleRange();
+        // Repaint signals on any Y change (wheel/pinch/axis drag).
+        repositionSrSignalsRef.current?.();
         if (!pr) return;
         const cur = userPriceRangeRef.current;
         if (cur && cur.from === pr.from && cur.to === pr.to) return;
@@ -593,6 +650,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // below the 90 min minimum, so zoom-ins below default leave
       // the existing lines alone.
       scheduleSrRecomputeRef.current?.();
+      // Reposition the buy/sell letters and their leader lines for
+      // the new viewport — independent of whether SR re-detects.
+      repositionSrSignalsRef.current?.();
       const tgt = targetRef.current;
       if (tgt) saveRange(targetKey(tgt), r);
     });
@@ -605,6 +665,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (containerEl && typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver(() => {
         try { chart.priceScale('right').setAutoScale(true); } catch { /* ignore */ }
+        repositionSrSignalsRef.current?.();
       });
       resizeObserver.observe(containerEl);
     }
@@ -612,19 +673,24 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     return () => {
       if (srTimer) clearTimeout(srTimer);
       scheduleSrRecomputeRef.current = null;
+      repositionSrSignalsRef.current = null;
       if (resizeObserver) resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener('wheel', captureYRange);
         containerEl.removeEventListener('mouseup', captureYRange);
         containerEl.removeEventListener('touchend', captureYRange);
       }
+      if (srOverlayRef.current && srOverlayRef.current.parentNode) {
+        srOverlayRef.current.parentNode.removeChild(srOverlayRef.current);
+      }
+      srOverlayRef.current = null;
+      srSignalsRef.current = [];
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
       rsiSeriesRef.current = null;
       divergenceSeriesRef.current = [];
       srSeriesRef.current = [];
-      srMarkersRef.current = null;
       barsRef.current = [];
     };
   }, [theme, showRsi]);
