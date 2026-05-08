@@ -147,6 +147,7 @@ export function StackedChartsPane() {
                   <SymbolChart
                     target={target}
                     placeholder={null}
+                    enableSr={false}
                   />
                 </div>
               </div>
