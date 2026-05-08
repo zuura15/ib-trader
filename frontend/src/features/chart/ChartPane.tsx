@@ -44,11 +44,27 @@ export function ChartPane() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  // SR-line filters. All three are hidden by default to keep the
-  // active "with-trend" structure (uptrending supports + downtrending
-  // resistances) front-and-centre; toggle to surface counter-trend
-  // or recently-broken lines when needed.
+  // SR-line filters. All three booleans are hidden by default to keep
+  // the active "with-trend" structure (uptrending supports +
+  // downtrending resistances) front-and-centre; toggle to surface
+  // counter-trend or recently-broken lines when needed.
+  // ``brokenMinutes`` is the lookback window for "Broken" — persisted
+  // globally in localStorage so it carries across reloads and applies
+  // to every chart instance.
+  const BROKEN_MIN_KEY = 'ib-trader:chart:broken-minutes';
   const [showBrokenSr, setShowBrokenSr] = useState(false);
+  const [brokenMinutes, setBrokenMinutesState] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(BROKEN_MIN_KEY);
+      const n = raw ? parseInt(raw, 10) : NaN;
+      return Number.isFinite(n) && n > 0 ? n : 30;
+    } catch { return 30; }
+  });
+  const setBrokenMinutes = (n: number) => {
+    const clamped = Math.max(3, Math.min(720, Math.round(n)));
+    setBrokenMinutesState(clamped);
+    try { localStorage.setItem(BROKEN_MIN_KEY, String(clamped)); } catch { /* ignore */ }
+  };
   const [showCounterSupport, setShowCounterSupport] = useState(false);
   const [showCounterResistance, setShowCounterResistance] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -144,8 +160,52 @@ export function ChartPane() {
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>
                   Show extra S/R lines:
                 </div>
+                <label
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '3px 0', cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={showBrokenSr}
+                    onChange={(e) => setShowBrokenSr(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  <span style={{ flex: 1 }}>Broken (amber dashed)</span>
+                  <input
+                    type="number"
+                    min={3}
+                    max={720}
+                    step={3}
+                    value={brokenMinutes}
+                    disabled={!showBrokenSr}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value, 10);
+                      if (Number.isFinite(n)) setBrokenMinutes(n);
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    title="Minutes back to keep broken lines visible (saved globally)"
+                    style={{
+                      width: 56, fontSize: 11,
+                      padding: '1px 3px',
+                      border: '1px solid var(--border-default)',
+                      borderRadius: 3,
+                      background: showBrokenSr ? 'var(--panel-bg, #fff)' : 'transparent',
+                      color: showBrokenSr ? 'var(--text-primary)' : 'var(--text-muted)',
+                      fontVariantNumeric: 'tabular-nums',
+                    }}
+                  />
+                  <span
+                    style={{
+                      fontSize: 10,
+                      color: showBrokenSr ? 'var(--text-secondary)' : 'var(--text-muted)',
+                    }}
+                  >
+                    min
+                  </span>
+                </label>
                 {([
-                  ['Broken (amber dashed)', showBrokenSr, setShowBrokenSr],
                   ['Counter-trend support (down-sloping)', showCounterSupport, setShowCounterSupport],
                   ['Counter-trend resistance (up-sloping)', showCounterResistance, setShowCounterResistance],
                 ] as const).map(([label, val, set]) => (
@@ -196,6 +256,7 @@ export function ChartPane() {
           ref={chartRef}
           target={target}
           showBrokenSr={showBrokenSr}
+          brokenMinutes={brokenMinutes}
           showCounterSupport={showCounterSupport}
           showCounterResistance={showCounterResistance}
           onLoadingChange={setLoading}

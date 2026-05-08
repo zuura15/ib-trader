@@ -36,6 +36,10 @@ interface Props {
    *  the line stays in the SR engine state for ``breakStaleBars`` but
    *  is filtered out of render unless this is true. */
   showBrokenSr?: boolean;
+  /** How far back to keep broken S/R lines visible, in minutes.
+   *  Maps internally to ``SROptions.breakStaleBars`` via the 3-min
+   *  bar size. Only effective when ``showBrokenSr`` is true. */
+  brokenMinutes?: number;
   /** Show down-sloping support lines. Off by default — a support
    *  whose pivots step DOWN through time is counter-trend (price is
    *  making lower lows on each touch), so the line predicts further
@@ -60,6 +64,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     showRsi = true,
     placeholder = 'Click a row in Positions or Watchlist to chart it.',
     showBrokenSr = false,
+    brokenMinutes = 30,
     showCounterSupport = false,
     showCounterResistance = false,
     onLoadingChange,
@@ -91,17 +96,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
+  const brokenMinutesRef = useRef(brokenMinutes);
   const showCounterSupportRef = useRef(showCounterSupport);
   const showCounterResistanceRef = useRef(showCounterResistance);
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
+    brokenMinutesRef.current = brokenMinutes;
     showCounterSupportRef.current = showCounterSupport;
     showCounterResistanceRef.current = showCounterResistance;
     // Re-render lines on toggle. ``force=true`` bypasses the SR_MIN_BARS
     // early-exit so the toggle takes effect even when zoomed in below
     // 90 min — passive zoom/pan triggers still respect that guard.
     scheduleSrRecomputeRef.current?.(true);
-  }, [showBrokenSr, showCounterSupport, showCounterResistance]);
+  }, [showBrokenSr, brokenMinutes, showCounterSupport, showCounterResistance]);
   // Debounced SR recompute. Set inside the chart-create effect (since
   // it captures the chart instance); the visible-range subscription
   // calls into it via this ref so we don't have to re-subscribe each
@@ -387,7 +394,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (srHiddenRef.current) return;
 
       const slice = allBars.slice(fromIdx, toIdx + 1);
-      const lines = detectSupportResistance(slice);
+      // Map "show broken for N minutes" to bar count. BAR_SECONDS=180
+      // (3 min). When the broken toggle is off the value is irrelevant
+      // — broken lines get filtered out at render anyway — but we
+      // still keep ``breakStaleBars`` permissive enough that the
+      // engine retains them for an immediate toggle-on.
+      const breakStaleBars = Math.max(
+        1, Math.ceil((brokenMinutesRef.current ?? 30) * 60 / BAR_SECONDS),
+      );
+      const lines = detectSupportResistance(slice, { breakStaleBars });
       const colors = themeColors();
       // Counter for human-readable line labels rendered on the right
       // axis. Numbered in detection order; lets the user point at a
