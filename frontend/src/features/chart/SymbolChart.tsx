@@ -36,6 +36,17 @@ interface Props {
    *  the line stays in the SR engine state for ``breakStaleBars`` but
    *  is filtered out of render unless this is true. */
   showBrokenSr?: boolean;
+  /** Show down-sloping support lines. Off by default — a support
+   *  whose pivots step DOWN through time is counter-trend (price is
+   *  making lower lows on each touch), so the line predicts further
+   *  weakness rather than a bounce. Useful for some traders, off by
+   *  default for the standard with-trend reading. */
+  showCounterSupport?: boolean;
+  /** Show up-sloping resistance lines. Off by default — symmetric to
+   *  ``showCounterSupport``: a resistance whose pivots step UP is
+   *  also counter-trend (price is making higher highs on each
+   *  rejection), arguing the resistance is weakening. */
+  showCounterResistance?: boolean;
   /** Optional callback invoked whenever loading state changes. */
   onLoadingChange?: (loading: boolean) => void;
   /** Optional callback for errors. */
@@ -49,6 +60,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     showRsi = true,
     placeholder = 'Click a row in Positions or Watchlist to chart it.',
     showBrokenSr = false,
+    showCounterSupport = false,
+    showCounterResistance = false,
     onLoadingChange,
     onError,
   }: Props,
@@ -75,16 +88,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const srSignalsRef = useRef<Signal[]>([]);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
-  // Track ``showBrokenSr`` via ref so the throttled recompute closure
+  // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
+  const showCounterSupportRef = useRef(showCounterSupport);
+  const showCounterResistanceRef = useRef(showCounterResistance);
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
+    showCounterSupportRef.current = showCounterSupport;
+    showCounterResistanceRef.current = showCounterResistance;
     // Re-render lines on toggle. ``force=true`` bypasses the SR_MIN_BARS
     // early-exit so the toggle takes effect even when zoomed in below
     // 90 min — passive zoom/pan triggers still respect that guard.
     scheduleSrRecomputeRef.current?.(true);
-  }, [showBrokenSr]);
+  }, [showBrokenSr, showCounterSupport, showCounterResistance]);
   // Debounced SR recompute. Set inside the chart-create effect (since
   // it captures the chart instance); the visible-range subscription
   // calls into it via this ref so we don't have to re-subscribe each
@@ -391,6 +408,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // whether they render; the engine still tracks them so a
         // toggle-on shows them without a recompute lag.
         if (isBroken && !showBrokenSrRef.current) continue;
+        // Counter-trend filter: drop down-sloping supports and
+        // up-sloping resistances unless explicitly opted-in. These
+        // lines argue *against* their own type (lower lows under a
+        // support, higher highs above a resistance) so most readings
+        // start cleaner without them. Slope==0 (horizontal) is kept
+        // either way since it's an honest level, not counter-trend.
+        const counterSupport = line.type === 'support' && line.slope < 0;
+        const counterResistance = line.type === 'resistance' && line.slope > 0;
+        if (counterSupport && !showCounterSupportRef.current) continue;
+        if (counterResistance && !showCounterResistanceRef.current) continue;
         labelCounter += 1;
         const label = `L${labelCounter}`;
         // Color is type-driven so support and resistance are always

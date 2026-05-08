@@ -44,18 +44,50 @@ export function ChartPane() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  // Hide broken/archived S/R lines by default — they pile up at
-  // zoom-out and obscure the active structure. Toggle to surface
-  // recently-broken lines when needed.
+  // SR-line filters. All three are hidden by default to keep the
+  // active "with-trend" structure (uptrending supports + downtrending
+  // resistances) front-and-centre; toggle to surface counter-trend
+  // or recently-broken lines when needed.
   const [showBrokenSr, setShowBrokenSr] = useState(false);
+  const [showCounterSupport, setShowCounterSupport] = useState(false);
+  const [showCounterResistance, setShowCounterResistance] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
 
-  // Esc closes fullscreen.
+  // Esc closes fullscreen and the filter popover.
   useEffect(() => {
-    if (!fullscreen) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFullscreen(false); };
+    if (!fullscreen && !filtersOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (filtersOpen) setFiltersOpen(false);
+      else if (fullscreen) setFullscreen(false);
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [fullscreen]);
+  }, [fullscreen, filtersOpen]);
+
+  // Click-outside closes the filter popover.
+  const filtersWrapRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!filtersOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (filtersWrapRef.current && !filtersWrapRef.current.contains(e.target as Node)) {
+        setFiltersOpen(false);
+      }
+    };
+    // Defer registration so the click that opened the popover doesn't
+    // immediately close it.
+    const id = setTimeout(() => {
+      document.addEventListener('mousedown', onClick);
+    }, 0);
+    return () => {
+      clearTimeout(id);
+      document.removeEventListener('mousedown', onClick);
+    };
+  }, [filtersOpen]);
+
+  const activeFilterCount = (showBrokenSr ? 1 : 0)
+    + (showCounterSupport ? 1 : 0)
+    + (showCounterResistance ? 1 : 0);
 
   const headerLabel = target ? `${target.symbol} · ${target.secType}` : 'Chart';
   const right = (
@@ -83,20 +115,59 @@ export function ChartPane() {
           >
             Clear S/R
           </button>
-          <button
-            onClick={() => setShowBrokenSr((v) => !v)}
-            title={showBrokenSr
-              ? 'Hide recently-broken S/R lines (amber dashed)'
-              : 'Show recently-broken S/R lines (amber dashed)'}
-            style={{
-              background: showBrokenSr ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
-              border: '1px solid var(--border-default)',
-              color: showBrokenSr ? '#000' : 'var(--text-secondary)',
-              padding: '1px 6px', borderRadius: 3, cursor: 'pointer',
-            }}
-          >
-            {showBrokenSr ? 'Broken: on' : 'Broken: off'}
-          </button>
+          <div ref={filtersWrapRef} style={{ position: 'relative' }}>
+            <button
+              onClick={() => setFiltersOpen((v) => !v)}
+              title="S/R line filters"
+              style={{
+                background: activeFilterCount > 0
+                  ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
+                border: '1px solid var(--border-default)',
+                color: activeFilterCount > 0 ? '#000' : 'var(--text-secondary)',
+                padding: '1px 6px', borderRadius: 3, cursor: 'pointer',
+              }}
+            >
+              SR filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+            </button>
+            {filtersOpen && (
+              <div
+                style={{
+                  position: 'absolute', top: 'calc(100% + 4px)', right: 0,
+                  zIndex: 1000, minWidth: 220,
+                  background: 'var(--panel-bg, #fff)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 4, padding: '6px 8px',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+                  fontSize: 11, color: 'var(--text-primary)',
+                }}
+              >
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>
+                  Show extra S/R lines:
+                </div>
+                {([
+                  ['Broken (amber dashed)', showBrokenSr, setShowBrokenSr],
+                  ['Counter-trend support (down-sloping)', showCounterSupport, setShowCounterSupport],
+                  ['Counter-trend resistance (up-sloping)', showCounterResistance, setShowCounterResistance],
+                ] as const).map(([label, val, set]) => (
+                  <label
+                    key={label}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      padding: '3px 0', cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={val}
+                      onChange={(e) => set(e.target.checked)}
+                      style={{ cursor: 'pointer' }}
+                    />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
           <BarCloseCountdown />
           <button
             onClick={() => setFullscreen((v) => !v)}
@@ -125,6 +196,8 @@ export function ChartPane() {
           ref={chartRef}
           target={target}
           showBrokenSr={showBrokenSr}
+          showCounterSupport={showCounterSupport}
+          showCounterResistance={showCounterResistance}
           onLoadingChange={setLoading}
           onError={setError}
         />
