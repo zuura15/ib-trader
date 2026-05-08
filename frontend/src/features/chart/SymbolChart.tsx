@@ -15,6 +15,7 @@ import {
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
 import { detectSupportResistance } from './supportResistance';
 import type { ChartTarget } from '../../data/store';
+import { useUserSetting } from '../../data/userSettings';
 
 export interface SymbolChartHandle {
   resetZoom: () => void;
@@ -83,6 +84,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     repositionSrSignalsRef.current?.();
   }, [target?.conId, target?.symbol, target?.secType]);
 
+  // Global setting: how many bars after firing a signal counts as
+  // "active" before it dims to historical. Read via store hook so a
+  // settings change re-runs the reposition immediately.
+  const signalActiveBars = useUserSetting('signalActiveBars');
+  const signalActiveBarsRef = useRef(signalActiveBars);
+  useEffect(() => {
+    signalActiveBarsRef.current = signalActiveBars;
+    repositionSrSignalsRef.current?.();
+  }, [signalActiveBars]);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
@@ -101,12 +112,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     time: UTCTimestamp;
     price: number;
     side: 'B' | 'S';
-    /** True while the line that fired this signal is still detected
-     *  as confirmed + directional + intact. Flipped to false on the
-     *  first recompute where the line no longer qualifies — the
-     *  badge then dims to indicate "fired here, no longer live"
-     *  without removing the historical mark. */
-    active: boolean;
   };
   const srSignalsRef = useRef<Signal[]>([]);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
@@ -316,6 +321,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (svgRect.height < 120) return;
       const ts = ch.timeScale();
       const LETTER_OFFSET_PX = 36;   // distance from bar to letter
+      // Active window is ``signalActiveBars`` bars from the anchor.
+      // Computed once per repaint against ``Date.now()`` so badges
+      // dim naturally as bars roll over without needing an SR
+      // recompute to flip them.
+      const nowSec = Math.floor(Date.now() / 1000);
+      const activeWindowSec = signalActiveBarsRef.current * BAR_SECONDS;
       for (const sig of srSignalsRef.current) {
         const x = ts.timeToCoordinate(sig.time);
         const yPrice = ser.priceToCoordinate(sig.price);
@@ -323,10 +334,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const yLetter = sig.side === 'B'
           ? yPrice + LETTER_OFFSET_PX
           : yPrice - LETTER_OFFSET_PX;
-        // Stale (no-longer-confirmed) signals dim to ~40% opacity so
-        // the user sees "fired here" without confusing them with a
-        // currently-actionable setup. Hue is preserved.
-        const opacity = sig.active ? '1' : '0.4';
+        // Active iff signal fired within the last ``signalActiveBars``
+        // bars. After that it stays on the chart as a historical mark
+        // (~40% opacity) — visible record of the trigger, but no
+        // longer claiming the trade window is open.
+        const isActive = (nowSec - (sig.time as number)) <= activeWindowSec;
+        const opacity = isActive ? '1' : '0.4';
         // Leader line: black, solid, 1px, from the price point on the
         // polyline to the letter's anchor.
         const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -435,14 +448,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // console alongside so the data is one F12 away.
       let labelCounter = 0;
       const lineLog: Record<string, unknown>[] = [];
-      // Buy/Sell signals: persistent across recomputes. Each recompute
-      // collects the *currently-detected* set of (anchor-bar, side)
-      // signals into ``activeKeys``. Existing signals are then
-      // re-flagged: ``active`` if their key is in ``activeKeys``,
-      // stale otherwise. New keys are appended.
-      // The render reads ``active`` to decide between full-opacity
-      // (live) and dimmed (historical) rendering.
-      const activeKeys = new Set<number>();
+      // Buy/Sell signals: persistent across recomputes. Once a signal
+      // fires at (anchor-bar, side), it stays in ``srSignalsRef``
+      // forever (until target change / Clear-SR). The "active vs
+      // dimmed" decision is purely time-based: a signal is active
+      // for ``signalActiveBars`` bars after its anchor time, then
+      // dims regardless of whether the underlying line is still
+      // detected. Computed in the painter, not here.
       const newSignals: Signal[] = [];
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
@@ -521,7 +533,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             // bar-time is stable).
             const anchorTime = slice[anchorIdx].time as number;
             const dedupKey = (anchorTime << 1) | (isBuy ? 1 : 0);
-            activeKeys.add(dedupKey);
             // Skip if any existing signal already covers this key.
             const alreadyKnown = srSignalsRef.current.some((s) =>
               ((s.time as number) << 1 | (s.side === 'B' ? 1 : 0)) === dedupKey,
@@ -531,7 +542,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                 time: slice[anchorIdx].time as UTCTimestamp,
                 price: line.slope * anchorIdx + line.intercept,
                 side: isBuy ? 'B' : 'S',
-                active: true,
               });
             }
           }
@@ -562,15 +572,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
       }
 
-      // Merge: re-flag existing signals' ``active`` based on whether
-      // their key was re-detected this recompute, then append the
-      // newly-fired ones. Stale signals stay in the ref — that's the
-      // historical-record property the user wants.
-      const merged = srSignalsRef.current.map((s) => ({
-        ...s,
-        active: activeKeys.has(((s.time as number) << 1) | (s.side === 'B' ? 1 : 0)),
-      }));
-      srSignalsRef.current = [...merged, ...newSignals];
+      // Append newly-fired signals (existing ones already kept).
+      srSignalsRef.current = [...srSignalsRef.current, ...newSignals];
       repositionSrSignalsRef.current?.();
 
       // Always stash diagnostic snapshot on window — even when 0

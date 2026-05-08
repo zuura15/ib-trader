@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { useStore } from '../../data/store';
 import { formatCurrency, formatDuration } from '../../utils/format';
 import type { LayoutVariant, ThemeMode } from '../../types';
+import { SettingsModal } from '../settings/SettingsModal';
 
 const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
   { id: 'dark',     label: 'Midnight', icon: '🌑' },
@@ -20,6 +22,7 @@ const variantLabels: Record<LayoutVariant, string> = {
 export function GlobalHeader() {
   const { global, activeVariant, setVariant, theme, setTheme, dataMode, wsConnected } = useStore();
   const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, sessionUptime } = global;
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const healthyCount = Object.values(serviceHealth).filter(Boolean).length;
   const totalServices = Object.keys(serviceHealth).length;
@@ -154,7 +157,24 @@ export function GlobalHeader() {
             ))}
           </div>
         </div>
+
+        {/* Settings */}
+        <button
+          onClick={() => setSettingsOpen(true)}
+          title="Settings"
+          aria-label="Open settings"
+          className="rounded border cursor-pointer"
+          style={{
+            borderColor: 'var(--border-default)', background: 'var(--bg-primary)',
+            color: 'var(--text-secondary)',
+            width: 32, height: 32, fontSize: 16,
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          ⚙
+        </button>
       </div>
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </header>
   );
 }

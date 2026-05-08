@@ -3,6 +3,7 @@ import { PanelShell } from '../../components/PanelShell';
 import { useStore } from '../../data/store';
 import { SymbolChart, type SymbolChartHandle } from './SymbolChart';
 import { BAR_SECONDS, VISIBLE_MINUTES } from './chartUtils';
+import { setUserSetting, useUserSetting } from '../../data/userSettings';
 
 /** Mini countdown chip showing time until the next 3-min bar closes
  *  in M:SS format. Updates every second. Used in the ChartPane
@@ -48,22 +49,15 @@ export function ChartPane() {
   // the active "with-trend" structure (uptrending supports +
   // downtrending resistances) front-and-centre; toggle to surface
   // counter-trend or recently-broken lines when needed.
-  // ``brokenMinutes`` is the lookback window for "Broken" — persisted
-  // globally in localStorage so it carries across reloads and applies
-  // to every chart instance.
-  const BROKEN_MIN_KEY = 'ib-trader:chart:broken-minutes';
+  // ``brokenMinutes`` lives in the global user-settings store so the
+  // popover spinner here and the Settings modal stay in sync.
   const [showBrokenSr, setShowBrokenSr] = useState(false);
-  const [brokenMinutes, setBrokenMinutesState] = useState<number>(() => {
-    try {
-      const raw = localStorage.getItem(BROKEN_MIN_KEY);
-      const n = raw ? parseInt(raw, 10) : NaN;
-      return Number.isFinite(n) && n > 0 ? n : 30;
-    } catch { return 30; }
-  });
+  const brokenMinutes = useUserSetting('brokenLookbackMinutes');
   const setBrokenMinutes = (n: number) => {
-    const clamped = Math.max(3, Math.min(720, Math.round(n)));
-    setBrokenMinutesState(clamped);
-    try { localStorage.setItem(BROKEN_MIN_KEY, String(clamped)); } catch { /* ignore */ }
+    setUserSetting(
+      'brokenLookbackMinutes',
+      Math.max(3, Math.min(720, Math.round(n))),
+    );
   };
   const [showCounterSupport, setShowCounterSupport] = useState(false);
   const [showCounterResistance, setShowCounterResistance] = useState(false);
