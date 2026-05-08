@@ -747,7 +747,9 @@ class InsyncClient(IBClientBase):
         if oca_group:
             order.ocaGroup = oca_group
             order.ocaType = 1  # CANCEL_WITH_BLOCK
-        overnight = is_overnight_session()
+        # Overnight-venue tagging is a US-equity (Blue Ocean ATS) feature.
+        # IB rejects includeOvernight on FUT/OPT/FOP with error 10362.
+        overnight = is_overnight_session() and (contract.secType or "STK") == "STK"
         if overnight:
             # During overnight session (8 PM – 3:50 AM ET), set includeOvernight
             # so SMART routing participates in the overnight venue (Blue Ocean ATS).
@@ -801,7 +803,7 @@ class InsyncClient(IBClientBase):
         order.outsideRth = outside_rth
         if order_ref:
             order.orderRef = order_ref
-        overnight = is_overnight_session()
+        overnight = is_overnight_session() and (contract.secType or "STK") == "STK"
         if overnight:
             order.includeOvernight = True
             order.tif = "DAY"
@@ -930,7 +932,10 @@ class InsyncClient(IBClientBase):
         trade.order.lmtPrice = float(new_price)
         trade.order.outsideRth = True  # ib_async resets this on TWS echo-back (GitHub #141)
         # Preserve includeOvernight + DAY tif on amendments during overnight.
-        overnight = is_overnight_session()
+        # STK only — IB rejects includeOvernight on FUT/OPT/FOP (error 10362).
+        overnight = is_overnight_session() and (
+            getattr(trade.contract, "secType", "STK") or "STK"
+        ) == "STK"
         if overnight:
             trade.order.includeOvernight = True
             trade.order.tif = "DAY"
