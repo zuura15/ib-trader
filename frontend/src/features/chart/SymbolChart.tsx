@@ -75,6 +75,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
 
+  // Wipe sticky buy/sell signals when the user switches to a different
+  // symbol. Without this, MGCM6's historical badges would render on
+  // ESM6's chart at the same wallclock pivot times — confusing.
+  useEffect(() => {
+    srSignalsRef.current = [];
+    repositionSrSignalsRef.current?.();
+  }, [target?.conId, target?.symbol, target?.secType]);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
@@ -89,7 +97,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // floats above (S) or below (B) the bar with a black leader line
   // back to the exact (time, price) on the polyline. Repositioned on
   // every visible-range change and resize.
-  type Signal = { time: UTCTimestamp; price: number; side: 'B' | 'S' };
+  type Signal = {
+    time: UTCTimestamp;
+    price: number;
+    side: 'B' | 'S';
+    /** True while the line that fired this signal is still detected
+     *  as confirmed + directional + intact. Flipped to false on the
+     *  first recompute where the line no longer qualifies — the
+     *  badge then dims to indicate "fired here, no longer live"
+     *  without removing the historical mark. */
+    active: boolean;
+  };
   const srSignalsRef = useRef<Signal[]>([]);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
@@ -305,6 +323,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const yLetter = sig.side === 'B'
           ? yPrice + LETTER_OFFSET_PX
           : yPrice - LETTER_OFFSET_PX;
+        // Stale (no-longer-confirmed) signals dim to ~40% opacity so
+        // the user sees "fired here" without confusing them with a
+        // currently-actionable setup. Hue is preserved.
+        const opacity = sig.active ? '1' : '0.4';
         // Leader line: black, solid, 1px, from the price point on the
         // polyline to the letter's anchor.
         const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -314,6 +336,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         ln.setAttribute('y2', String(yLetter));
         ln.setAttribute('stroke', 'var(--text-primary, #000)');
         ln.setAttribute('stroke-width', '1');
+        ln.setAttribute('opacity', opacity);
         svg.appendChild(ln);
         // Badge: colored circle + white letter centered. Designed to
         // be unmistakable on any background — a bare-text approach
@@ -330,6 +353,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         bg.setAttribute('fill', badgeColor);
         bg.setAttribute('stroke', themeNow.background);
         bg.setAttribute('stroke-width', '2');
+        bg.setAttribute('opacity', opacity);
         svg.appendChild(bg);
         const txt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         txt.setAttribute('x', String(x));
@@ -340,6 +364,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         txt.setAttribute('font-weight', '800');
         txt.setAttribute('font-family', 'system-ui, sans-serif');
         txt.setAttribute('fill', themeNow.background);
+        txt.setAttribute('opacity', opacity);
         txt.textContent = sig.side;
         svg.appendChild(txt);
       }
@@ -384,13 +409,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         try { ch.removeSeries(ds); } catch { /* already gone */ }
       }
       srSeriesRef.current = [];
-      // Clear buy/sell signals — they'll be repopulated below if any
-      // confirmed (3+ touches) directional lines remain. The overlay
-      // is repainted from the ref on every visible-range change and
-      // resize, so emptying the ref is sufficient to make stale
-      // letters disappear on the next reposition tick.
-      srSignalsRef.current = [];
-      repositionSrSignalsRef.current?.();
+      // Note: SR LINES wipe on every recompute (they reflect current
+      // structure). SIGNALS do NOT — once a B/S has fired at a given
+      // pivot, it stays as a historical mark. A signal disappearing
+      // because the underlying fan rotated or the line later broke
+      // is misleading: the buy/sell was either valid at the time or
+      // it wasn't, and the user wants the record either way. Reset
+      // happens on target change or Clear-SR (handled elsewhere).
       if (srHiddenRef.current) return;
 
       const slice = allBars.slice(fromIdx, toIdx + 1);
@@ -410,12 +435,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // console alongside so the data is one F12 away.
       let labelCounter = 0;
       const lineLog: Record<string, unknown>[] = [];
-      // Buy/Sell signals: collected during the line loop, painted via
-      // SVG overlay afterwards. Triggered by uptrending support /
-      // downtrending resistance with 3+ pivot touches (intact, not
-      // broken). Anchored at the line's most-recent pivot bar.
-      const signals: Signal[] = [];
-      const signalSeen = new Set<number>();
+      // Buy/Sell signals: persistent across recomputes. Each recompute
+      // collects the *currently-detected* set of (anchor-bar, side)
+      // signals into ``activeKeys``. Existing signals are then
+      // re-flagged: ``active`` if their key is in ``activeKeys``,
+      // stale otherwise. New keys are appended.
+      // The render reads ``active`` to decide between full-opacity
+      // (live) and dimmed (historical) rendering.
+      const activeKeys = new Set<number>();
+      const newSignals: Signal[] = [];
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
         // Broken lines are noisy at zoom-out and clutter the active
@@ -487,13 +515,23 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const isSell = line.type === 'resistance' && line.slope < 0;
           if (isBuy || isSell) {
             const anchorIdx = line.anchorBIdx;
-            const dedupKey = (anchorIdx << 1) | (isBuy ? 1 : 0);
-            if (!signalSeen.has(dedupKey)) {
-              signalSeen.add(dedupKey);
-              signals.push({
+            // Dedup against existing fired signals AND new ones in
+            // this recompute. Bar-time is the canonical axis (idx is
+            // slice-local and shifts as the visible window slides;
+            // bar-time is stable).
+            const anchorTime = slice[anchorIdx].time as number;
+            const dedupKey = (anchorTime << 1) | (isBuy ? 1 : 0);
+            activeKeys.add(dedupKey);
+            // Skip if any existing signal already covers this key.
+            const alreadyKnown = srSignalsRef.current.some((s) =>
+              ((s.time as number) << 1 | (s.side === 'B' ? 1 : 0)) === dedupKey,
+            );
+            if (!alreadyKnown) {
+              newSignals.push({
                 time: slice[anchorIdx].time as UTCTimestamp,
                 price: line.slope * anchorIdx + line.intercept,
                 side: isBuy ? 'B' : 'S',
+                active: true,
               });
             }
           }
@@ -524,10 +562,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
       }
 
-      // Stash signals on the ref and paint via the overlay. Painting
-      // is also re-run on visible-range changes and resize so the
-      // letters and leader lines track pan/zoom.
-      srSignalsRef.current = signals;
+      // Merge: re-flag existing signals' ``active`` based on whether
+      // their key was re-detected this recompute, then append the
+      // newly-fired ones. Stale signals stay in the ref — that's the
+      // historical-record property the user wants.
+      const merged = srSignalsRef.current.map((s) => ({
+        ...s,
+        active: activeKeys.has(((s.time as number) << 1) | (s.side === 'B' ? 1 : 0)),
+      }));
+      srSignalsRef.current = [...merged, ...newSignals];
       repositionSrSignalsRef.current?.();
 
       // Always stash diagnostic snapshot on window — even when 0
@@ -771,6 +814,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       divergenceSeriesRef.current = [];
       srSeriesRef.current = [];
+      srSignalsRef.current = [];
+      repositionSrSignalsRef.current?.();
       barsRef.current = [];
       onError?.(null);
       userRangeRef.current = null;
@@ -1141,6 +1186,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         }
       }
       srSeriesRef.current = [];
+      // Wipe sticky buy/sell signals too — Clear-SR is the explicit
+      // "I want a clean slate" gesture, so historical badges go too.
+      srSignalsRef.current = [];
+      repositionSrSignalsRef.current?.();
       srHiddenRef.current = true;
     },
   }), [visibleMinutes]);
