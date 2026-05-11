@@ -2014,11 +2014,44 @@ class StrategyBotRunner(BotBase):
         # the gap between warmup completion and the XREAD below. If warmup
         # didn't run (e.g. no aggregator), start at "$" as before.
         bar_start = getattr(self, '_last_bar_stream_id', None) or "$"
+
+        # Snapshot the current tail of order_stream and pos_stream BEFORE
+        # the main loop starts. Without this, the bot uses "$" as cursor
+        # which re-resolves to "current tail at the moment of THIS xread"
+        # on every call — meaning any event published during a busy
+        # window (e.g. while ``pipeline.process`` is awaiting the engine
+        # HTTP for an entry submit) silently disappears past the moving
+        # tail. Three back-to-back MNQ fills were lost this way on
+        # 2026-05-11 (ib_order_id 1314 / 1371 / 1431) — the bot stayed
+        # in ENTRY_ORDER_PLACED while IB held 3 contracts, the
+        # entry_timeout reverted state to AWAITING_ENTRY_TRIGGER, the
+        # operator saw "another order fired, no B indicator" and the
+        # next bar fired again.
+        #
+        # Pinning to the actual last-generated-id at startup means new
+        # entries arriving anywhere after this point are picked up on
+        # the next xread, even if there was a gap during a busy
+        # dispatch. ``xrevrange ... count=1`` returns the latest entry;
+        # fall back to "0-0" on an empty stream so xread sees every
+        # entry from the start.
+        async def _snapshot_tail(stream: str) -> str:
+            try:
+                entries = await redis.xrevrange(stream, count=1)
+            except Exception:
+                return "$"
+            if not entries:
+                return "0-0"
+            raw = entries[0][0]
+            return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+        order_cursor = await _snapshot_tail(order_stream)
+        pos_cursor = await _snapshot_tail(pos_stream)
+
         streams = {
             quote_stream: "$",
             bar_stream: bar_start,
-            order_stream: "$",
-            pos_stream: "$",
+            order_stream: order_cursor,
+            pos_stream: pos_cursor,
         }
 
         logger.info(
