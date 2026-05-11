@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Per-box mkcert dev certificates — regenerated via
+# frontend/scripts/setup-certs.sh on each box. Never check these in;
+# the private key is sensitive and the SANs are box-specific.
+/certs/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
