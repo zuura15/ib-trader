@@ -101,6 +101,15 @@ class StrategyBotRunner(BotBase):
             self.strategy_config["_redis"] = config["_redis"]
         if "symbol" in config:
             self.strategy_config["symbol"] = config["symbol"]
+        # ``ref_id`` from the bot YAML overrides the strategy yaml's
+        # default. Otherwise the four chart-signal slots all collapse
+        # onto the strategy's shared ref_id ("chart-signal-default"),
+        # which means every chart-bot order is tagged with the same
+        # orderRef prefix — and the runtime's order-update filter
+        # below can't tell whose fill is whose. Same bug as the WS
+        # subscribe_bot path fixed earlier in this branch.
+        if "ref_id" in config:
+            self.strategy_config["ref_id"] = config["ref_id"]
         # ``sec_type`` is needed by sec-type-aware strategies (chart_signal
         # gates the futures deadzone on it). Merge from the bot YAML so a
         # single strategy YAML can back STK and FUT bots.
@@ -1907,7 +1916,15 @@ class StrategyBotRunner(BotBase):
         pos_stream = StreamNames.position_changes()
 
         # orderRef prefix for filtering — only events matching our bot
-        _order_ref_prefix = f"IBT:{bot_ref}:"
+        # AND this box. The orderRef format is
+        # ``IBT:{host}:{bot_ref}:{symbol}:{side}:{serial}`` (see
+        # ``engine/order_ref.py``), so the prefix must include the host
+        # segment. Without it, ``startswith`` never matches and the bot
+        # silently drops every fill / cancel — caught 2026-05-11 on
+        # chart-bot-4 MNQM6 stuck in ENTRY_ORDER_PLACED after the order
+        # had actually filled on IB.
+        from ib_trader.config import environment as _env
+        _order_ref_prefix = f"IBT:{_env.hostname()}:{bot_ref}:"
 
         # Resume bar stream from the warmup cursor so no bars are dropped in
         # the gap between warmup completion and the XREAD below. If warmup
