@@ -1524,6 +1524,10 @@ class InsyncClient(IBClientBase):
         2106,  # HMDS data farm connection OK
         2107,  # HMDS data farm connection inactive (not an error)
         2108,  # Market data farm connection inactive (not an error)
+        2109,  # "Order Event Warning: Attribute 'Outside RTH' is ignored
+               # based on the order type and destination. PlaceOrder is
+               # now being processed." — IB's informational notice when
+               # we submit during ETH; the order proceeds normally.
         2158,  # Sec-def data farm connection OK
         10340, # ManualOrderIndicator not supported (delayed warning, not an error)
     })
