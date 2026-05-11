@@ -55,6 +55,10 @@ export function BotChart({
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
+  // Mirror the chart's SR-hidden state so the toolbar can show the
+  // inverse toggle label. The chart's ref holds the source of truth;
+  // we bump on click.
+  const [srHidden, setSrHidden] = useState(false);
 
   // SR-line filters — same defaults as ChartPane. ``brokenMinutes``
   // is the global user setting (synced with the Settings modal); the
@@ -127,11 +131,32 @@ export function BotChart({
       }
     : null;
 
+  // Surface the bot's active entry to the chart. We also surface it
+  // while the entry order is in flight (``ENTRY_ORDER_PLACED``) so the
+  // user sees the badge the moment the bot acts, not after the fill
+  // lands — fixes "bot placed an order but the chart shows no B/S"
+  // (2026-05-11).
   const activeEntryBarTime = state.entry_bar_time
-    && (fsmState === 'AWAITING_EXIT_TRIGGER'
+    && (fsmState === 'ENTRY_ORDER_PLACED'
+        || fsmState === 'AWAITING_EXIT_TRIGGER'
         || fsmState === 'EXIT_ORDER_PLACED')
     ? state.entry_bar_time as string
     : null;
+  // Direction drives whether the chart shows a B (long) or S (short)
+  // when synthetically injecting the badge for a bot-fired signal
+  // that the chart's own detection missed. Prefer the runtime-set
+  // ``position_direction`` (LONG/SHORT) over ``entry_line.direction``
+  // (long/short). Bail to null when neither is present — the prior
+  // default-to-long silently rendered green B badges over short
+  // entries on MNQ (2026-05-11).
+  let entrySide: 'long' | 'short' | null = null;
+  if (activeEntryBarTime) {
+    if (state.position_direction === 'SHORT') entrySide = 'short';
+    else if (state.position_direction === 'LONG') entrySide = 'long';
+    else if (state.entry_line?.direction === 'short') entrySide = 'short';
+    else if (state.entry_line?.direction === 'long') entrySide = 'long';
+    // else leave null — caller skips badge injection
+  }
 
   // VOC-mirrored toolbar fragment. Rendered both in the inline header
   // and in the fullscreen header so the controls follow the chart.
@@ -149,15 +174,27 @@ export function BotChart({
         {VISIBLE_MINUTES}m
       </button>
       <button
-        onClick={() => chartRef.current?.clearSupportResistance()}
-        title="Clear auto support/resistance lines (re-detects on symbol change)"
+        onClick={() => {
+          if (srHidden) {
+            chartRef.current?.showSupportResistance();
+            setSrHidden(false);
+          } else {
+            chartRef.current?.clearSupportResistance();
+            setSrHidden(true);
+          }
+        }}
+        title={srHidden
+          ? 'Re-enable auto support/resistance overlay'
+          : 'Hide auto support/resistance lines for this pane'}
         style={{
-          background: 'transparent', border: '1px solid var(--border-default)',
-          color: 'var(--text-secondary)', padding: '1px 6px',
+          background: srHidden ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
+          border: '1px solid var(--border-default)',
+          color: srHidden ? '#000' : 'var(--text-secondary)',
+          padding: '1px 6px',
           borderRadius: 3, cursor: 'pointer',
         }}
       >
-        Clear S/R
+        {srHidden ? 'Show S/R' : 'Clear S/R'}
       </button>
       <div ref={filtersWrapRef} style={{ position: 'relative' }}>
         <button
@@ -305,6 +342,7 @@ export function BotChart({
           showCounterResistance={showCounterResistance}
           entryLine={entryLine}
           activeEntryBarTime={activeEntryBarTime}
+          entrySide={entrySide}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

@@ -23,6 +23,13 @@ export interface SymbolChartHandle {
    *  target. They re-detect (and re-show) on the next refresh tick or
    *  when the user changes target. */
   clearSupportResistance: () => void;
+  /** Inverse of ``clearSupportResistance``: re-enable auto SR overlay
+   *  for the current target without waiting for a target switch. The
+   *  next detection tick redraws lines + badges. */
+  showSupportResistance: () => void;
+  /** Whether SR is currently hidden via clearSupportResistance. Bot
+   *  panes need this to render the right toggle label. */
+  isSupportResistanceHidden: () => boolean;
 }
 
 interface Props {
@@ -80,8 +87,19 @@ interface Props {
    *  represents the bot's active entry — the badge gets a green ring
    *  drawn behind it so the user can see "this is the signal we acted
    *  on". Time is matched against the badge's chart time after
-   *  converting via ``localUtcSeconds``. */
+   *  converting via ``localUtcSeconds``.
+   *
+   *  Also drives **synthetic badge injection**: when the bot's slice or
+   *  algorithm finds a signal the chart's own detection missed, a B or
+   *  S badge is added to ``srSignalsRef`` at this time so the user can
+   *  still see what the bot acted on. ``entrySide`` controls whether
+   *  the injected badge is a buy or a sell. */
   activeEntryBarTime?: string | null;
+  /** Direction of the bot's active entry — ``'long'`` injects a B
+   *  badge, ``'short'`` injects an S. Ignored when
+   *  ``activeEntryBarTime`` is null. Optional for back-compat; defaults
+   *  to ``'long'`` so existing callers keep their behavior. */
+  entrySide?: 'long' | 'short' | null;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -99,6 +117,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     onError,
     entryLine = null,
     activeEntryBarTime = null,
+    entrySide = null,
   }: Props,
   ref,
 ) {
@@ -110,6 +129,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // ESM6's chart at the same wallclock pivot times — confusing.
   useEffect(() => {
     srSignalsRef.current = [];
+    botPinnedBadgeRef.current = null;
     repositionSrSignalsRef.current?.();
   }, [target?.conId, target?.symbol, target?.secType]);
 
@@ -149,8 +169,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     side: 'B' | 'S';
   };
   const srSignalsRef = useRef<Signal[]>([]);
+  // Bot's entry-bar badge lives in its OWN ref so it never gets
+  // evicted by the bounded ``srSignalsRef`` queue. The bounded queue
+  // holds the SR detector's organic 3-touch badges; in a long session
+  // those accumulate and pushed the bot's synthetic entry badge off
+  // the chart (capacity 50). The pinned badge is at most one entry
+  // per chart and is rendered in the same paint loop alongside the
+  // organic badges.
+  const botPinnedBadgeRef = useRef<Signal | null>(null);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
+  // Bumps on Clear/Show toggle so callers (BotChart) can re-render
+  // the toolbar label without polling.
+  const [srHiddenTick, setSrHiddenTick] = useState(0);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -171,9 +202,39 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       activeEntryBarTimeRef.current = Number.isFinite(d.getTime())
         ? (localUtcSeconds(d) as number) : null;
     }
+
+    // Synthetic badge injection: if the bot tells us it acted on a
+    // signal at this time AND no matching badge exists in
+    // ``srSignalsRef`` (the chart's local SR detector either ran on a
+    // narrower slice or hasn't caught up yet), we add one so the user
+    // sees the same signal the bot did. Without this, the chart-bot
+    // pane can silently "miss" a B/S that produced a real order — the
+    // exact "no B/S badge but order placed" gap reported 2026-05-11.
+    const chartT = activeEntryBarTimeRef.current;
+    const side: 'B' | 'S' | null = activeEntryBarTime && entrySide
+      ? (entrySide === 'long' ? 'B' : 'S')
+      : null;
+    if (chartT != null && side != null) {
+      // Store the bot's entry badge in its own pinned slot —
+      // separate from the bounded ``srSignalsRef`` queue so a busy
+      // session can't evict it. ``priceToCoordinate`` needs a price
+      // for the leader line; use the bar's close at the entry time
+      // as a stand-in (the badge floats above/below either way).
+      const bar = barsRef.current.find(
+        (b) => Math.abs((b.time as number) - chartT) < 1,
+      );
+      if (bar) {
+        botPinnedBadgeRef.current = {
+          time: bar.time, price: bar.close, side,
+        };
+      }
+    } else {
+      botPinnedBadgeRef.current = null;
+    }
+
     // Re-paint badges so the ring appears/disappears immediately.
     repositionSrSignalsRef.current?.();
-  }, [activeEntryBarTime]);
+  }, [activeEntryBarTime, entrySide]);
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
     brokenMinutesRef.current = brokenMinutes;
@@ -443,7 +504,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const nowSec = localUtcSeconds(new Date()) as number;
       const activeWindowSec = signalActiveBarsRef.current * BAR_SECONDS;
       const tzOffsetSec = new Date().getTimezoneOffset() * 60;
-      for (const sig of srSignalsRef.current) {
+      // Render organic SR badges plus the bot's pinned entry badge
+      // (if any). Dedupe by (time, side) so a coincidence between the
+      // organic detector and the bot's signal renders once.
+      const allSignals: Signal[] = [...srSignalsRef.current];
+      const pinned = botPinnedBadgeRef.current;
+      if (pinned) {
+        const dup = allSignals.some(
+          (s) => Math.abs((s.time as number) - (pinned.time as number)) < 1
+                 && s.side === pinned.side,
+        );
+        if (!dup) allSignals.push(pinned);
+      }
+      for (const sig of allSignals) {
         const x = ts.timeToCoordinate(sig.time);
         const yPrice = ser.priceToCoordinate(sig.price);
         if (x == null || yPrice == null) continue;
@@ -1388,13 +1461,27 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         }
       }
       srSeriesRef.current = [];
-      // Wipe sticky buy/sell signals too — Clear-SR is the explicit
-      // "I want a clean slate" gesture, so historical badges go too.
+      // Wipe sticky buy/sell signals from the bounded queue.
+      // ``botPinnedBadgeRef`` is intentionally preserved — Clear-SR
+      // is for decluttering the detector overlay; the bot's active
+      // entry marker is operational, not noise. On chart-bot panes
+      // there's no easy way to re-summon it once cleared, so losing
+      // the entry marker would leave the operator visually blind to
+      // their open position.
       srSignalsRef.current = [];
       repositionSrSignalsRef.current?.();
       srHiddenRef.current = true;
+      setSrHiddenTick((n) => n + 1);
     },
-  }), [visibleMinutes]);
+    showSupportResistance: () => {
+      // Re-enable detection + redraw immediately. The next scheduled
+      // recompute tick (within ~1s) will repopulate the overlay.
+      srHiddenRef.current = false;
+      setSrHiddenTick((n) => n + 1);
+      scheduleSrRecomputeRef.current?.(true);
+    },
+    isSupportResistanceHidden: () => srHiddenRef.current,
+  }), [visibleMinutes, srHiddenTick]);
 
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>

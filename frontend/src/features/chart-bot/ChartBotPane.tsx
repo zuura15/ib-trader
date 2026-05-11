@@ -59,6 +59,14 @@ export function ChartBotPane({ slot }: Props) {
   const [bot, setBot] = useState<BotApiShape | null>(null);
   const [botFetchError, setBotFetchError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  // Track in-flight POSTs per action so the button can disable itself.
+  // Without this, an operator clicking Force-quit twice in 50ms fired
+  // two HTTP requests — the second often hit a 409 from the runner's
+  // FSM gate and surfaced as "Quit failed", even when the first one
+  // had already succeeded.
+  const [pendingAction, setPendingAction] = useState<
+    'force-quit' | 'rearm' | 'start' | 'stop' | null
+  >(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,30 +103,29 @@ export function ChartBotPane({ slot }: Props) {
   // shapes that pre-date the field.
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
 
-  const onForceQuit = async () => {
-    setActionMsg('Closing…');
-    const res = await postBotAction(botId, 'force-quit');
-    setActionMsg(res.ok ? 'Quit sent.' : `Quit failed: ${res.detail}`);
-    setTimeout(() => setActionMsg(null), 4000);
+  const runAction = async (
+    action: 'force-quit' | 'rearm' | 'start' | 'stop',
+    pendingMsg: string, okMsg: string, failPrefix: string,
+  ) => {
+    if (pendingAction) return;
+    setPendingAction(action);
+    setActionMsg(pendingMsg);
+    try {
+      const res = await postBotAction(botId, action);
+      setActionMsg(res.ok ? okMsg : `${failPrefix}: ${res.detail}`);
+    } finally {
+      setPendingAction(null);
+      setTimeout(() => setActionMsg(null), 4000);
+    }
   };
-  const onRearm = async () => {
-    setActionMsg('Re-arming…');
-    const res = await postBotAction(botId, 'rearm');
-    setActionMsg(res.ok ? 'Armed.' : `Re-arm failed: ${res.detail}`);
-    setTimeout(() => setActionMsg(null), 4000);
-  };
-  const onStart = async () => {
-    setActionMsg('Starting…');
-    const res = await postBotAction(botId, 'start');
-    setActionMsg(res.ok ? 'Started.' : `Start failed: ${res.detail}`);
-    setTimeout(() => setActionMsg(null), 4000);
-  };
-  const onStop = async () => {
-    setActionMsg('Stopping…');
-    const res = await postBotAction(botId, 'stop');
-    setActionMsg(res.ok ? 'Stopped.' : `Stop failed: ${res.detail}`);
-    setTimeout(() => setActionMsg(null), 4000);
-  };
+  const onForceQuit = () =>
+    runAction('force-quit', 'Closing…', 'Quit sent.', 'Quit failed');
+  const onRearm = () =>
+    runAction('rearm', 'Re-arming…', 'Armed.', 'Re-arm failed');
+  const onStart = () =>
+    runAction('start', 'Starting…', 'Started.', 'Start failed');
+  const onStop = () =>
+    runAction('stop', 'Stopping…', 'Stopped.', 'Stop failed');
 
   const header = `${symbol ?? '—'} · Slot ${slot}`;
 
@@ -153,11 +160,14 @@ export function ChartBotPane({ slot }: Props) {
         {isStopped && (
           <button
             onClick={onStart}
+            disabled={pendingAction !== null}
             title="Start the bot (it boots armed and watches for 3-touch signals)"
             style={{
               background: 'var(--accent-green)', color: '#fff',
               border: 'none', borderRadius: 3, padding: '2px 8px',
-              fontSize: 11, fontWeight: 600, cursor: 'pointer',
+              fontSize: 11, fontWeight: 600,
+              cursor: pendingAction ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'start' ? 0.5 : 1,
             }}
           >
             Start
@@ -166,11 +176,14 @@ export function ChartBotPane({ slot }: Props) {
         {hasPosition && (
           <button
             onClick={onForceQuit}
+            disabled={pendingAction !== null}
             title="Close at mid (one click, no confirm)"
             style={{
               background: 'var(--accent-red)', color: '#fff',
               border: 'none', borderRadius: 3, padding: '2px 8px',
-              fontSize: 11, fontWeight: 600, cursor: 'pointer',
+              fontSize: 11, fontWeight: 600,
+              cursor: pendingAction ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'force-quit' ? 0.5 : 1,
             }}
           >
             Force quit
@@ -179,11 +192,14 @@ export function ChartBotPane({ slot }: Props) {
         {!isStopped && !hasPosition && !armed && (
           <button
             onClick={onRearm}
+            disabled={pendingAction !== null}
             title="Allow the next 3-touch signal to fire"
             style={{
               background: 'var(--accent-blue)', color: '#fff',
               border: 'none', borderRadius: 3, padding: '2px 8px',
-              fontSize: 11, fontWeight: 600, cursor: 'pointer',
+              fontSize: 11, fontWeight: 600,
+              cursor: pendingAction ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'rearm' ? 0.5 : 1,
             }}
           >
             Re-arm
@@ -192,12 +208,15 @@ export function ChartBotPane({ slot }: Props) {
         {!isStopped && !hasPosition && (
           <button
             onClick={onStop}
+            disabled={pendingAction !== null}
             title="Stop the bot (it stops watching for signals)"
             style={{
               background: 'transparent', color: 'var(--text-muted)',
               border: '1px solid var(--border-default)',
               borderRadius: 3, padding: '2px 6px',
-              fontSize: 11, cursor: 'pointer',
+              fontSize: 11,
+              cursor: pendingAction ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'stop' ? 0.5 : 1,
             }}
           >
             Stop

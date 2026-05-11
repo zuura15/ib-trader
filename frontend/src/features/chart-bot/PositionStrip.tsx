@@ -54,7 +54,12 @@ export function PositionStrip({ state, fsmState }: Props) {
     { label: 'Qty', value: state.qty ?? '—' },
   ];
 
-  const pnl = state.unrealized_pnl ? Number(state.unrealized_pnl) : NaN;
+  // Truthy guard dropped numeric ``0`` and string ``""`` to ``NaN`` and
+  // rendered "—" instead of "+0.00" — explicitly null-check so a flat
+  // round-trip shows P/L correctly.
+  const pnl = state.unrealized_pnl != null && state.unrealized_pnl !== ''
+    ? Number(state.unrealized_pnl)
+    : NaN;
   if (Number.isFinite(pnl)) {
     cells.push({
       label: 'P/L',

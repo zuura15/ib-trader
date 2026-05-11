@@ -35,6 +35,11 @@ export interface BotPositionState {
   } | null;
   entry_bar_time?: string;
   unrealized_pnl?: string;
+  /** Authoritative direction the runtime writes when ``on_entry_filled``
+   *  records the entry. "LONG" for a BUY entry, "SHORT" for a SELL
+   *  entry. Prefer this over ``entry_line.direction`` — the strategy
+   *  may rewrite the line on later bars while the position is held. */
+  position_direction?: 'LONG' | 'SHORT';
   // Catch-all for the rest of the Redis doc
   [key: string]: unknown;
 }
@@ -100,6 +105,15 @@ export function useBotState(
       ws.onclose = () => {
         ws = null;
         if (cancelled) return;
+        // Zero the consumer's view so the UI shows "—" until a fresh
+        // snapshot lands on reconnect. Without this, the last-known
+        // state lingered visibly during the outage and could mislead
+        // the operator into trusting stale entry_line / qty / P&L.
+        try {
+          optsRef.current.onBotState?.({});
+        } catch {
+          /* consumer threw — ignore */
+        }
         const delay = Math.min(30_000, 1000 * Math.pow(2, attempt));
         attempt++;
         timer = setTimeout(connect, delay);
