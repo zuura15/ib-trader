@@ -94,6 +94,12 @@ def load_all_bots(bots_dir: Path | str = DEFAULT_BOTS_DIR) -> list[BotDefinition
     Raises BotConfigError on:
       - duplicate ``id`` across files
       - duplicate ``name`` across files
+      - duplicate ``ref_id`` across files (cross-wires WS state +
+        orderRef filter — copy-paste bug should fail loud)
+      - two enabled bots on the same ``(symbol, sec_type)`` (one bot's
+        force-quit calls cancel-by-symbol which kills BOTH bots'
+        working orders; a 3-touch signal would fire both bots, doubling
+        exposure with no warning)
       - malformed YAML in any file
     """
     base = Path(bots_dir)
@@ -106,6 +112,8 @@ def load_all_bots(bots_dir: Path | str = DEFAULT_BOTS_DIR) -> list[BotDefinition
     defs: list[BotDefinition] = []
     seen_ids: dict[str, str] = {}
     seen_names: dict[str, str] = {}
+    seen_refs: dict[str, str] = {}
+    seen_targets: dict[tuple[str, str], str] = {}
 
     for path in sorted(base.glob("*.y*ml")):
         if path.name.startswith(("_", ".")):
@@ -124,6 +132,38 @@ def load_all_bots(bots_dir: Path | str = DEFAULT_BOTS_DIR) -> list[BotDefinition
                 f"{path}: duplicate bot name {bot.name!r} "
                 f"(also in {seen_names[bot.name]})"
             )
+
+        ref_id = (bot.config.get("ref_id") if isinstance(bot.config, dict)
+                  else None)
+        if ref_id:
+            ref_key = str(ref_id)
+            if ref_key in seen_refs:
+                raise BotConfigError(
+                    f"{path}: duplicate ref_id {ref_key!r} "
+                    f"(also in {seen_refs[ref_key]}). The order-stream "
+                    f"filter and the WS bot resolver key off ref_id; "
+                    f"duplicates cross-wire fills and state between bots."
+                )
+            seen_refs[ref_key] = str(path)
+
+        # Only enforce (symbol, sec_type) uniqueness when both fields
+        # are present in the config. Strategies that don't pin a single
+        # symbol (multi-symbol bots) are exempt.
+        cfg = bot.config if isinstance(bot.config, dict) else {}
+        symbol = cfg.get("symbol")
+        sec_type = cfg.get("sec_type")
+        if symbol and sec_type:
+            target = (str(symbol).upper(), str(sec_type).upper())
+            if target in seen_targets:
+                raise BotConfigError(
+                    f"{path}: duplicate target {target} "
+                    f"(also in {seen_targets[target]}). Two bots on the "
+                    f"same symbol+sec_type fire the same 3-touch signal "
+                    f"twice and one bot's force-quit cancels every open "
+                    f"order on the symbol, taking the other bot's working "
+                    f"order with it."
+                )
+            seen_targets[target] = str(path)
 
         seen_ids[bot.id] = str(path)
         seen_names[bot.name] = str(path)

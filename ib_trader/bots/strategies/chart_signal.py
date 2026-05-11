@@ -206,7 +206,12 @@ class ChartSignalStrategy:
             return actions
         if not ctx.state.get("armed", False):
             return actions
-        if in_futures_deadzone(bar_time):
+        # Futures deadzone only applies to FUT/FOP — the docstring and
+        # the holding-alert path scope to those sec types, but the
+        # entry gate was unconditional and silently blocked STK bots
+        # during 14:00-15:00 PT for no real reason.
+        sec_type = str(self.config.get("sec_type", "STK")).upper()
+        if sec_type in ("FUT", "FOP") and in_futures_deadzone(bar_time):
             # Quiet skip — logging every bar inside the deadzone is noise.
             return actions
 
@@ -380,11 +385,10 @@ class ChartSignalStrategy:
             ))
             return actions
 
-        line_value = anchor_p + slope_per_sec * (
-            bar_time - anchor_t
-        ).total_seconds()
-
-        # Deadzone holding alert — only for FUT/FOP.
+        # Deadzone holding alert — only for FUT/FOP. Fired BEFORE the
+        # staleness check so the operator gets the "you're holding into
+        # the danger zone" warning even when the frozen entry line is
+        # too old to extrapolate safely.
         sec_type = str(self.config.get("sec_type", "STK")).upper()
         if sec_type in ("FUT", "FOP") and in_futures_deadzone(bar_time):
             today = bar_time.date().isoformat()
@@ -405,6 +409,32 @@ class ChartSignalStrategy:
                 actions.append(UpdateState({
                     "last_deadzone_alert_date": today,
                 }))
+
+        # Wallclock extrapolation cap. ``slope_per_sec`` is calibrated
+        # on contiguous in-session bars; multiplying it by a weekend
+        # gap (~60h) drifts the line to an absurd value and triggers a
+        # spurious exit on the first Monday bar. If the gap between
+        # the anchor and the current bar exceeds the cap we surface
+        # the staleness as a WARNING and skip the exit evaluation —
+        # the next bar will let the strategy re-detect a fresh line.
+        elapsed_sec = (bar_time - anchor_t).total_seconds()
+        max_age_hours = float(self.config.get(
+            "entry_line_max_age_hours", 8.0,
+        ))
+        if elapsed_sec > max_age_hours * 3600:
+            actions.append(LogSignal(
+                event_type=LogEventType.RISK,
+                message=(
+                    f"entry line stale by {elapsed_sec / 3600:.1f}h "
+                    f"(cap {max_age_hours:.1f}h) — skipping exit eval; "
+                    f"line will re-detect on next bar"
+                ),
+                payload={"elapsed_hours": elapsed_sec / 3600,
+                         "max_age_hours": max_age_hours},
+            ))
+            return actions
+
+        line_value = anchor_p + slope_per_sec * elapsed_sec
 
         direction = str(entry_line.get("direction", "long")).lower()
         actions.append(LogSignal(

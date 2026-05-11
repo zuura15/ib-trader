@@ -204,8 +204,42 @@ async def _create_and_start_bot(
         logger.debug("settings_load_failed", exc_info=True)
     bot = strategy_cls(defn.id, config, session_factory)
 
+    # Fetch live IB positions for the bot's symbol so on_startup's
+    # _reconcile_state can see an orphan position left behind by a
+    # prior crash-and-force-OFF cycle. Passing [] (the prior default)
+    # meant the reconciler had no signal — it never warned about an
+    # open position the bot had been monitoring before the panic. Best-
+    # effort: a fetch failure shouldn't block the start; the bot still
+    # runs against an empty list as before.
+    open_positions: list = []
+    bot_symbol = (defn.config.get("symbol") if isinstance(defn.config, dict)
+                  else None)
+    if engine_url and bot_symbol:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{engine_url}/engine/positions/refresh",
+                    params={"symbol": bot_symbol},
+                )
+                resp.raise_for_status()
+                payload = resp.json() or {}
+                qty = payload.get("qty")
+                if qty is not None and str(qty) not in ("0", "0.0"):
+                    open_positions = [{
+                        "symbol": bot_symbol,
+                        "qty": str(qty),
+                        "avg_price": str(payload.get("avg_cost") or "0"),
+                    }]
+        except Exception:
+            logger.warning(
+                '{"event": "BOT_STARTUP_POSITION_FETCH_FAILED", '
+                '"bot_id": "%s", "symbol": "%s"}',
+                defn.id, bot_symbol,
+            )
+
     # Initialize the bot (strategy, middleware, aggregator, warmup)
-    await bot.on_startup([])
+    await bot.on_startup(open_positions)
 
     # Log start event
     events_repo = BotEventRepository(session_factory)
