@@ -231,6 +231,11 @@ class InsyncClient(IBClientBase):
         self._expected_disconnect: bool = False
         self._on_unexpected_disconnect = None  # type: ignore[assignment]
         self._on_connected_callback = None  # type: ignore[assignment]
+        # Event-handler binding is idempotent across reconnects. ib_async
+        # ``Event`` objects are += accumulators with no built-in dedup,
+        # so a naïve re-bind on reconnect would fire every handler N
+        # times after N drops.
+        self._handlers_bound: bool = False
 
     def set_disconnect_callback(self, cb) -> None:
         """Register a callback fired on unexpected IB disconnect.
@@ -266,12 +271,17 @@ class InsyncClient(IBClientBase):
             clientId=self._client_id,
             timeout=self._connect_timeout,
         )
-        self.__ib.disconnectedEvent += self._on_disconnected
-        self.__ib.connectedEvent += self._on_connected
-        self.__ib.execDetailsEvent += self._on_exec_details
-        self.__ib.orderStatusEvent += self._on_order_status
-        self.__ib.commissionReportEvent += self._on_commission_report
-        self.__ib.errorEvent += self._on_error
+        # Bind ib_async events exactly once per process. Re-calling
+        # ``connect()`` after an unexpected drop (the engine's reconnect
+        # loop) would otherwise stack a duplicate handler each cycle.
+        if not self._handlers_bound:
+            self.__ib.disconnectedEvent += self._on_disconnected
+            self.__ib.connectedEvent += self._on_connected
+            self.__ib.execDetailsEvent += self._on_exec_details
+            self.__ib.orderStatusEvent += self._on_order_status
+            self.__ib.commissionReportEvent += self._on_commission_report
+            self.__ib.errorEvent += self._on_error
+            self._handlers_bound = True
         self.__ib.reqMarketDataType(self._market_data_type)
         logger.info(
             '{"event": "IB_CONNECTED", "host": "%s", "port": %d, "client_id": %d}',
@@ -1611,13 +1621,17 @@ class InsyncClient(IBClientBase):
             logger.info('{"event": "IB_DISCONNECTED", "expected": true}')
             return
         # Print to stdout so it shows up in `make dev` output even when
-        # nobody is tailing the JSON log file.
+        # nobody is tailing the JSON log file. The engine's
+        # disconnect callback kicks off the reconnect-with-backoff
+        # loop; CATASTROPHIC only fires after 5 minutes of failures
+        # (see ``_reconnect_with_backoff``).
         print(
-            "[ENGINE] CATASTROPHIC: IB Gateway connection lost. "
-            "The engine cannot place or track orders until the Gateway is restarted.",
+            "[ENGINE] IB Gateway connection lost. Reconnecting with "
+            "exponential backoff (CATASTROPHIC after 5 minutes if not "
+            "restored)...",
             flush=True,
         )
-        logger.error('{"event": "IB_DISCONNECTED", "unexpected": true}')
+        logger.warning('{"event": "IB_DISCONNECTED", "unexpected": true}')
         if self._on_unexpected_disconnect is not None:
             try:
                 self._on_unexpected_disconnect()

@@ -436,24 +436,82 @@ def _validate_account_id(ctx: AppContext) -> None:
     )
 
 
+# Reconnect policy on an unexpected IB Gateway drop.
+# Backoff schedule (seconds between attempts): 2, 4, 8, 16, 30, 60, 60, 60...
+# After ``_RECONNECT_CATASTROPHIC_AFTER_SEC`` of unsuccessful retries the
+# WARNING is escalated to CATASTROPHIC; retries continue every 60s until
+# the connection comes back or the engine shuts down.
+_RECONNECT_INITIAL_BACKOFF_SEC: float = 2.0
+_RECONNECT_MAX_BACKOFF_SEC: float = 60.0
+_RECONNECT_CATASTROPHIC_AFTER_SEC: float = 300.0  # 5 minutes
+
+
 def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
-    """Publish a CATASTROPHIC alert to Redis when the IB Gateway drops.
+    """Kick off the reconnect-with-backoff loop on an unexpected drop.
 
-    Called from the ib_async event-loop callback in InsyncClient. Must be
-    fast and non-blocking. Uses ``fire_and_forget_alert`` so the alert
-    lands in ``alerts:active`` (where ``/api/alerts`` reads from and
-    where the UI CatastrophicOverlay triggers off). The prior version
-    wrote to SQLite via ``ctx.alerts.create()``, which the UI never saw
-    — that's why the Gateway dropping silently on 2026-04-22 never
-    surfaced in the header.
+    Called synchronously from the ib_async event-loop callback in
+    InsyncClient (so it must be fast: spawn a task, return). The loop
+    publishes a WARNING ``IB_GATEWAY_RECONNECTING`` alert immediately so
+    the UI shows a non-blocking "reconnecting…" indicator, then tries
+    ``ctx.ib.connect()`` with exponential backoff. If the connection
+    doesn't come back within 5 minutes, the alert is escalated to a
+    CATASTROPHIC ``IB_GATEWAY_DISCONNECTED`` (which the UI overlays as
+    a blocking modal) and retries continue.
 
-    Dedupe: skip if a live IB_GATEWAY_DISCONNECTED is already present in
-    Redis. A flapping connection → one active alert, not a pile.
+    Dedupe: a single live reconnect task at a time. A flapping
+    connection re-enters the callback but the in-flight task remains.
+    """
+    if getattr(ctx, "_ib_reconnect_task", None) is not None:
+        existing = ctx._ib_reconnect_task
+        if existing is not None and not existing.done():
+            return
+    # ``ctx`` is a plain dataclass-like object (``AppContext``); use
+    # setattr to stash a private attribute without touching its schema.
+    ctx._ib_reconnect_task = _spawn_background(_reconnect_with_backoff(ctx))
+
+
+async def _reconnect_with_backoff(ctx: AppContext) -> None:
+    """Reconnect loop with exponential backoff + escalating severity.
+
+    Publishes the WARNING ``IB_GATEWAY_RECONNECTING`` alert up front,
+    retries ``ctx.ib.connect()`` with backoff 2s → 4s → ... → 60s, and
+    after ``_RECONNECT_CATASTROPHIC_AFTER_SEC`` of failures fires the
+    CATASTROPHIC ``IB_GATEWAY_DISCONNECTED`` on top. Both alerts are
+    cleared on successful reconnect via the connectedEvent callback
+    (``_resolve_ib_disconnect_alert``).
     """
     from ib_trader.logging_.alerts import fire_and_forget_alert
     redis = ctx.redis
 
-    async def _dedupe_and_fire():
+    async def _fire_reconnecting_alert():
+        import json as _json
+        try:
+            from ib_trader.redis.state import StateKeys as _SK
+            active = await redis.hgetall(_SK.alerts_active()) if redis else {}
+        except Exception:
+            logger.exception('{"event": "IB_DISCONNECT_ALERT_DEDUPE_FAILED"}')
+            active = {}
+        for _aid, raw in (active or {}).items():
+            try:
+                if _json.loads(raw).get("trigger") == "IB_GATEWAY_RECONNECTING":
+                    return
+            except (TypeError, ValueError):
+                continue
+        fire_and_forget_alert(
+            redis=redis,
+            trigger="IB_GATEWAY_RECONNECTING",
+            severity="WARNING",
+            message=(
+                "IB Gateway disconnected. Reconnecting with backoff — "
+                "trading is paused until the connection is restored."
+            ),
+        )
+        logger.warning(
+            '{"event": "SYSTEM_ALERT_RAISED", "severity": "WARNING", '
+            '"trigger": "IB_GATEWAY_RECONNECTING"}'
+        )
+
+    async def _fire_catastrophic_alert():
         import json as _json
         try:
             from ib_trader.redis.state import StateKeys as _SK
@@ -472,8 +530,9 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
             trigger="IB_GATEWAY_DISCONNECTED",
             severity="CATASTROPHIC",
             message=(
-                "IB Gateway connection lost. The engine cannot place or "
-                "track orders. Restart IB Gateway / TWS to reconnect."
+                "IB Gateway connection has been down for over 5 minutes. "
+                "The engine cannot place or track orders. Restart IB "
+                "Gateway / TWS to reconnect."
             ),
         )
         logger.error(
@@ -481,25 +540,66 @@ def _raise_ib_disconnect_alert(ctx: AppContext) -> None:
             '"trigger": "IB_GATEWAY_DISCONNECTED"}'
         )
 
-    if redis is None:
-        # Early-boot path (no Redis yet). Log at ERROR only — the engine
-        # hasn't connected to Redis so the UI can't render anything anyway.
+    if redis is not None:
+        await _fire_reconnecting_alert()
+    else:
         logger.error(
-            '{"event": "SYSTEM_ALERT_RAISED", "severity": "CATASTROPHIC", '
-            '"trigger": "IB_GATEWAY_DISCONNECTED", '
+            '{"event": "SYSTEM_ALERT_RAISED", "severity": "WARNING", '
+            '"trigger": "IB_GATEWAY_RECONNECTING", '
             '"note": "redis unavailable; UI signal skipped"}'
         )
-        return
-    _spawn_background(_dedupe_and_fire())
+
+    start = asyncio.get_event_loop().time()
+    backoff = _RECONNECT_INITIAL_BACKOFF_SEC
+    attempt = 0
+    catastrophic_fired = False
+
+    while True:
+        attempt += 1
+        try:
+            await asyncio.sleep(backoff)
+            await ctx.ib.connect()
+            logger.info(
+                '{"event": "IB_RECONNECT_SUCCEEDED", "attempt": %d, '
+                '"elapsed_sec": %.1f}',
+                attempt, asyncio.get_event_loop().time() - start,
+            )
+            return  # ``_on_connected`` will clear both alerts
+        except asyncio.CancelledError:
+            logger.info('{"event": "IB_RECONNECT_LOOP_CANCELLED"}')
+            raise
+        except Exception as e:  # pylint: disable=broad-except
+            elapsed = asyncio.get_event_loop().time() - start
+            logger.warning(
+                '{"event": "IB_RECONNECT_FAILED", "attempt": %d, '
+                '"elapsed_sec": %.1f, "next_backoff_sec": %.1f, "error": %s}',
+                attempt, elapsed, min(backoff * 2, _RECONNECT_MAX_BACKOFF_SEC),
+                json.dumps(str(e)),
+            )
+            if (
+                not catastrophic_fired
+                and elapsed >= _RECONNECT_CATASTROPHIC_AFTER_SEC
+                and redis is not None
+            ):
+                await _fire_catastrophic_alert()
+                catastrophic_fired = True
+            backoff = min(backoff * 2, _RECONNECT_MAX_BACKOFF_SEC)
+
+
+_IB_RECONNECT_TRIGGERS: frozenset[str] = frozenset({
+    "IB_GATEWAY_DISCONNECTED",   # CATASTROPHIC, fired after 5 min
+    "IB_GATEWAY_RECONNECTING",   # WARNING, fired immediately
+})
 
 
 def _resolve_ib_disconnect_alert(ctx: AppContext) -> None:
-    """Auto-resolve any live IB_GATEWAY_DISCONNECTED alerts on reconnect.
+    """Auto-resolve live reconnect alerts when the Gateway comes back.
 
-    Called from the ib_async connectedEvent via InsyncClient. Removes the
-    alert from ``alerts:active`` and nudges WS consumers so the UI clears
-    the CATASTROPHIC banner immediately. Stale SQLite rows are left as-is
-    (archival only; the UI never reads them)."""
+    Clears BOTH the WARNING ``IB_GATEWAY_RECONNECTING`` (fired
+    immediately on a drop) and the CATASTROPHIC ``IB_GATEWAY_DISCONNECTED``
+    (escalation after 5 min). Called from the ib_async connectedEvent
+    via InsyncClient. Stale SQLite rows are left as-is (archival only;
+    the UI never reads them)."""
     redis = ctx.redis
     if redis is None:
         return
@@ -515,7 +615,7 @@ def _resolve_ib_disconnect_alert(ctx: AppContext) -> None:
         to_remove: list[str] = []
         for aid, raw in (active or {}).items():
             try:
-                if _json.loads(raw).get("trigger") == "IB_GATEWAY_DISCONNECTED":
+                if _json.loads(raw).get("trigger") in _IB_RECONNECT_TRIGGERS:
                     to_remove.append(aid)
             except (TypeError, ValueError):
                 continue
@@ -527,7 +627,8 @@ def _resolve_ib_disconnect_alert(ctx: AppContext) -> None:
             await publish_activity(redis, "alerts")
             logger.info(
                 '{"event": "SYSTEM_ALERT_RESOLVED", '
-                '"trigger": "IB_GATEWAY_DISCONNECTED", "count": %d}',
+                '"triggers": %s, "count": %d}',
+                _json.dumps(sorted(_IB_RECONNECT_TRIGGERS)),
                 len(to_remove),
             )
         except Exception:

@@ -88,6 +88,49 @@ function CatastrophicOverlay() {
   );
 }
 
+// Non-blocking amber banner shown while the engine is reconnecting to
+// IB Gateway. Triggered by a WARNING alert with trigger
+// IB_GATEWAY_RECONNECTING, fired by ``_raise_ib_disconnect_alert`` in
+// the engine. After 5 min of failed retries the engine escalates to a
+// CATASTROPHIC alert, which the modal overlay above takes over.
+function ReconnectingBanner() {
+  const alerts = useStore((s) => s.alerts);
+  const active = alerts.find(
+    (a) =>
+      a.severity === 'warning'
+      && !a.dismissed
+      && a.title === 'IB_GATEWAY_RECONNECTING',
+  );
+  if (!active) return null;
+  return (
+    <div
+      role="status"
+      style={{
+        flexShrink: 0,
+        background: 'var(--accent-yellow, #f7bd5c)',
+        color: '#000',
+        padding: '4px 12px',
+        fontSize: 12,
+        fontWeight: 500,
+        display: 'flex', alignItems: 'center', gap: 8,
+        borderBottom: '1px solid rgba(0,0,0,0.15)',
+      }}
+    >
+      <span
+        style={{
+          display: 'inline-block',
+          width: 8, height: 8, borderRadius: '50%',
+          background: 'var(--accent-red, #ef4444)',
+        }}
+      />
+      <span style={{ flex: 1 }}>
+        IB Gateway disconnected — reconnecting with exponential backoff.
+        Trading paused. Will escalate after 5 min if not restored.
+      </span>
+    </div>
+  );
+}
+
 const MOBILE_QUERY = '(max-width: 767px)';
 
 // Create the MediaQueryList once at module scope. This is safe because
@@ -129,6 +172,7 @@ export function App() {
     return (
       <>
         <CatastrophicOverlay />
+        <ReconnectingBanner />
         <MobileLayout />
       </>
     );
@@ -137,6 +181,7 @@ export function App() {
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden" style={{ background: 'var(--bg-root)' }}>
       <CatastrophicOverlay />
+      <ReconnectingBanner />
       <GlobalHeader />
       <WorkstationLayout />
     </div>
