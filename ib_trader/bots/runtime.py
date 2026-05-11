@@ -90,6 +90,11 @@ class StrategyBotRunner(BotBase):
         # Merge runtime overrides from bot config
         if "symbol" in config:
             self.strategy_config["symbol"] = config["symbol"]
+        # ``sec_type`` is needed by sec-type-aware strategies (chart_signal
+        # gates the futures deadzone on it). Merge from the bot YAML so a
+        # single strategy YAML can back STK and FUT bots.
+        if "sec_type" in config:
+            self.strategy_config["sec_type"] = config["sec_type"]
 
         # Strategy instance
         self.strategy: Strategy | None = None
@@ -1776,13 +1781,17 @@ class StrategyBotRunner(BotBase):
 
         # Subscribe to bars via engine HTTP API (retry — engine may not be ready yet)
         symbol = self.strategy_config["symbol"]
+        sec_type = str(self.strategy_config.get("sec_type", "STK")).upper()
+        sub_body: dict = {"symbol": symbol, "sec_type": sec_type}
+        # FUT contracts identified by a localSymbol like ``MGCM6`` qualify
+        # via the localSymbol path; no expiry/trading_class needed.
         import httpx
         for attempt in range(10):
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     resp = await client.post(
                         f"{engine_url}/engine/subscribe-bars",
-                        json={"symbol": symbol},
+                        json=sub_body,
                     )
                     resp.raise_for_status()
                     logger.info('{"event": "BARS_SUBSCRIBED_HTTP", "symbol": "%s"}', symbol)
@@ -2539,8 +2548,14 @@ class StrategyBotRunner(BotBase):
                     self.bot_id,
                 )
 
-        # Unsubscribe bars via engine HTTP API
+        # Unsubscribe bars via engine HTTP API. ``sec_type`` mirrors the
+        # subscribe + warmup paths so the engine can qualify FUT/FOP
+        # contracts correctly — without it, IB rejects the qualify with
+        # "No security definition has been found" on every stop for a
+        # futures bot, leaving the WARN trail the operator saw on MGC/
+        # MCL/MES/MNQ teardown.
         symbol = self.strategy_config.get("symbol", "")
+        sec_type = str(self.strategy_config.get("sec_type", "STK")).upper()
         engine_url = self.config.get("_engine_url")
         if engine_url and symbol:
             import httpx
@@ -2548,7 +2563,7 @@ class StrategyBotRunner(BotBase):
                 async with httpx.AsyncClient(timeout=10) as client:
                     await client.post(
                         f"{engine_url}/engine/unsubscribe-bars",
-                        json={"symbol": symbol},
+                        json={"symbol": symbol, "sec_type": sec_type},
                     )
             except Exception:
                 from ib_trader.logging_.alerts import log_and_alert
@@ -2643,6 +2658,59 @@ class StrategyBotRunner(BotBase):
         )
         await self._run_pipeline(actions)
 
+    # ------------------------------------------------------------------
+    # chart_signal one-and-done lifecycle: force-quit + re-arm.
+    # ------------------------------------------------------------------
+    async def force_quit(self) -> dict:
+        """Operator-triggered close of the current round.
+
+        - ``ENTRY_ORDER_PLACED``: cancel the working entry order via
+          ``/engine/cancel-by-symbol``. The normal ``on_entry_cancelled``
+          callback handles the FSM revert to ``AWAITING_ENTRY_TRIGGER``.
+        - ``AWAITING_EXIT_TRIGGER``: place a mid exit via the strategy's
+          ``build_exit_actions``. The fill handler clears position state.
+        - In every state: flip ``armed=False`` immediately so a stale
+          trigger between this call and the cancel/fill can't re-enter.
+          Codex flagged the prior version, which left a working entry
+          un-cancelled — an operator clicking Force quit could still get
+          filled moments later, ending up in a position they meant to
+          abort.
+        """
+        if not self.strategy or not self.ctx:
+            raise RuntimeError("Bot not initialized")
+        await self._refresh_state()
+        symbol = self.strategy_config["symbol"]
+        cur = await self.current_state()
+        await self._write_state({"armed": False})
+        if cur == BotState.AWAITING_EXIT_TRIGGER:
+            await self._execute_force_sell(symbol)
+            return {"symbol": symbol, "action": "FORCE_QUIT",
+                    "exited": True, "cancelled": False, "armed": False}
+        if cur == BotState.ENTRY_ORDER_PLACED:
+            await self._handle_cancel_order({"symbol": symbol})
+            return {"symbol": symbol, "action": "FORCE_QUIT",
+                    "exited": False, "cancelled": True, "armed": False,
+                    "fsm_state": cur.value}
+        return {"symbol": symbol, "action": "FORCE_QUIT",
+                "exited": False, "cancelled": False, "armed": False,
+                "fsm_state": cur.value}
+
+    async def rearm(self) -> dict:
+        """Re-arm the bot for the next round. Rejected while a position
+        is held — Re-arm is for after a closed round, not mid-trade."""
+        if not self.strategy or not self.ctx:
+            raise RuntimeError("Bot not initialized")
+        await self._refresh_state()
+        cur = await self.current_state()
+        if cur in (BotState.ENTRY_ORDER_PLACED,
+                   BotState.AWAITING_EXIT_TRIGGER,
+                   BotState.EXIT_ORDER_PLACED):
+            raise RuntimeError(
+                f"Cannot rearm in state {cur.value} — close the position first."
+            )
+        await self._write_state({"armed": True})
+        return {"action": "REARM", "armed": True, "fsm_state": cur.value}
+
     async def _warmup_from_history(self, symbol: str) -> None:
         """Prefetch historical bars via the engine, then read them from Redis.
 
@@ -2673,11 +2741,18 @@ class StrategyBotRunner(BotBase):
         engine_url = self.config.get("_engine_url")
         if engine_url:
             import httpx
+            warmup_sec_type = str(
+                self.strategy_config.get("sec_type", "STK")
+            ).upper()
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
                     await client.post(
                         f"{engine_url}/engine/warmup-bars",
-                        json={"symbol": symbol, "duration_seconds": duration_seconds},
+                        json={
+                            "symbol": symbol,
+                            "duration_seconds": duration_seconds,
+                            "sec_type": warmup_sec_type,
+                        },
                     )
             except Exception:
                 from ib_trader.logging_.alerts import log_and_alert
@@ -2939,6 +3014,9 @@ def _create_strategy(name: str, config: dict) -> Strategy | None:
     if name == "close_trend_rsi":
         from ib_trader.bots.strategies.close_trend_rsi import CloseTrendRsiStrategy
         return CloseTrendRsiStrategy(config)
+    if name == "chart_signal":
+        from ib_trader.bots.strategies.chart_signal import ChartSignalStrategy
+        return ChartSignalStrategy(config)
     return None
 
 

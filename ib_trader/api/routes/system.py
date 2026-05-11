@@ -41,6 +41,7 @@ async def get_status(redis=Depends(get_redis)):
     hb_list = []
     service_health = {}
     engine_uptime_seconds = 0
+    engine_started_at: str | None = None
 
     if redis:
         for process_name in ("ENGINE", "DAEMON", "API", "BOT_RUNNER", "REPL"):
@@ -58,6 +59,7 @@ async def get_status(redis=Depends(get_redis)):
                     hb_list.append({
                         "process": process_name,
                         "last_seen_at": ts_str,
+                        "started_at": doc.get("started_at"),
                         "pid": doc.get("pid"),
                         "alive": alive,
                         "age_seconds": round(age),
@@ -65,7 +67,24 @@ async def get_status(redis=Depends(get_redis)):
                     service_health[process_name.lower()] = alive
 
                     if process_name == "ENGINE" and alive:
-                        engine_uptime_seconds = round(age)
+                        # ``engine_uptime_seconds`` historically held the
+                        # heartbeat age, which is misleading. Compute real
+                        # uptime from ``started_at`` when the engine writes
+                        # it; fall back to heartbeat age otherwise.
+                        engine_started_at = doc.get("started_at")
+                        if engine_started_at:
+                            try:
+                                started_dt = datetime.fromisoformat(engine_started_at)
+                                if started_dt.tzinfo is None:
+                                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                                engine_uptime_seconds = round(
+                                    (now - started_dt).total_seconds(),
+                                )
+                            except Exception as e:
+                                logger.debug("started_at parse failed", exc_info=e)
+                                engine_uptime_seconds = round(age)
+                        else:
+                            engine_uptime_seconds = round(age)
                 except Exception as e:
                     logger.debug("failed to parse heartbeat for %s", process_name, exc_info=e)
 
@@ -136,5 +155,6 @@ async def get_status(redis=Depends(get_redis)):
         "service_health": service_health,
         "realized_pnl": realized_pnl,
         "engine_uptime_seconds": engine_uptime_seconds,
+        "engine_started_at": engine_started_at,
         "alert_count": alert_count,
     }

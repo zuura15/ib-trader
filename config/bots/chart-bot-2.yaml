@@ -1,0 +1,16 @@
+id: chart-bot-2
+name: "Chart Bot 2 · Micro Oil"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+auto_start: false   # operator-driven Start; banner reminds on each `make dev`
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-2-mcl
+  # MCL = Micro WTI Crude Oil. M6 = June 2026 expiry; roll monthly.
+  symbol: MCLM6
+  sec_type: FUT
+symbols:
+- MCLM6

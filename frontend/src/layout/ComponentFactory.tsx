@@ -15,6 +15,7 @@ import { HelpPanel } from '../features/help/HelpPanel';
 import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
 import { ChartPane } from '../features/chart/ChartPane';
 import { StackedChartsPane } from '../features/chart/StackedChartsPane';
+import { ChartBotPane } from '../features/chart-bot/ChartBotPane';
 
 export function componentFactory(node: TabNode) {
   const component = node.getComponent();
@@ -55,6 +56,8 @@ export function componentFactory(node: TabNode) {
       return <ChartPane />;
     case 'stacked-charts':
       return <StackedChartsPane />;
+    case 'chart-bot':
+      return <ChartBotPane slot={Number(config.slot) || 1} />;
     default:
       return <div className="p-4 text-xs" style={{ color: 'var(--text-muted)' }}>Unknown component: {component}</div>;
   }

@@ -1,0 +1,16 @@
+id: chart-bot-4
+name: "Chart Bot 4 · Micro Nasdaq"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+auto_start: false   # operator-driven Start; banner reminds on each `make dev`
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-4-mnq
+  # MNQ = Micro E-mini Nasdaq-100. M6 = June 2026.
+  symbol: MNQM6
+  sec_type: FUT
+symbols:
+- MNQM6

@@ -308,6 +308,56 @@ async def force_sell(bot_id: str):
     return {"bot_id": bot_id, "state": "EXIT_ORDER_PLACED", **result}
 
 
+@app.post("/bots/{bot_id}/force-quit")
+async def force_quit(bot_id: str):
+    """chart_signal one-and-done close. Cancels any pending entry,
+    fires a mid exit if a position is open, and locks ``armed=False``
+    so the bot can't re-enter until the user clicks Re-arm."""
+    state = _get_state()
+    bot_instances = state["bot_instances"]
+
+    bot = bot_instances.get(bot_id)
+    if bot is None or bot is _RESERVED:
+        raise HTTPException(status_code=409, detail="Bot is not running")
+    if not hasattr(bot, "force_quit"):
+        raise HTTPException(
+            status_code=409,
+            detail="Bot type does not support force-quit",
+        )
+    try:
+        result = await bot.force_quit()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    logger.info('{"event": "BOT_FORCE_QUIT_VIA_HTTP", "bot_id": "%s"}', bot_id)
+    return {"bot_id": bot_id, **result}
+
+
+@app.post("/bots/{bot_id}/rearm")
+async def rearm(bot_id: str):
+    """chart_signal re-arm. Flips ``armed=True`` so the next 3-touch
+    signal can fire. Rejected while a position is held."""
+    state = _get_state()
+    bot_instances = state["bot_instances"]
+
+    bot = bot_instances.get(bot_id)
+    if bot is None or bot is _RESERVED:
+        raise HTTPException(status_code=409, detail="Bot is not running")
+    if not hasattr(bot, "rearm"):
+        raise HTTPException(
+            status_code=409, detail="Bot type does not support rearm",
+        )
+    try:
+        result = await bot.rearm()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    logger.info('{"event": "BOT_REARM_VIA_HTTP", "bot_id": "%s"}', bot_id)
+    return {"bot_id": bot_id, **result}
+
+
 async def start_bot_runner_api(runner_state: dict, port: int = 8082) -> asyncio.Task:
     """Start the bot runner's internal API as a background task."""
     import uvicorn

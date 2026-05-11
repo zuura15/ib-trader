@@ -2,18 +2,28 @@ import { useRef, useCallback } from 'react';
 import { Layout, Model, Actions } from 'flexlayout-react';
 import { useStore } from '../data/store';
 import { componentFactory } from './ComponentFactory';
-import { variantA, variantB, variantC, variantD } from './variants';
+import { variantA, variantB, variantC, variantD, variantT } from './variants';
 import type { LayoutVariant } from '../types';
 
 const STORAGE_PREFIX = 'ib-layout-model-';
 const TABS_PREFIX = 'ib-layout-tabs-';
+
+// Per-variant layout structure version. Bump when the variant's
+// JSON in ``variants.ts`` changes shape in a way that the runtime
+// migration cannot patch in-place (e.g. variant T's 2-col → 3-col
+// rewrite on 2026-05-10). loadModel discards a cached layout whose
+// stored version differs from this and falls back to the default.
+const LAYOUT_VERSION: Partial<Record<LayoutVariant, number>> = {
+  T: 2,
+};
+const VERSION_PREFIX = 'ib-layout-ver-';
 
 // Set to true to log save/load activity to the browser console while
 // debugging tab persistence. Safe to leave on — emits ~1 log per click.
 const DEBUG_TAB_PERSIST = true;
 
 const variantDefaults: Record<LayoutVariant, object> = {
-  A: variantA, B: variantB, C: variantC, D: variantD,
+  A: variantA, B: variantB, C: variantC, D: variantD, T: variantT,
 };
 
 // Identify a tabset by its sorted child tab names. Stable across reloads
@@ -141,6 +151,25 @@ function migrateLayoutJson(raw: any): any {
 
 function loadModel(variant: LayoutVariant): Model {
   let model: Model;
+  // Version gate: if the variant's structure has been bumped since the
+  // cached layout was saved, drop the cache and re-seed from default.
+  // Tab selection is also wiped to avoid pointing at a tab the new
+  // structure doesn't contain.
+  const expectedVer = LAYOUT_VERSION[variant];
+  if (expectedVer !== undefined) {
+    const savedVer = Number(localStorage.getItem(VERSION_PREFIX + variant) ?? '0');
+    if (savedVer !== expectedVer) {
+      try {
+        localStorage.removeItem(STORAGE_PREFIX + variant);
+        localStorage.removeItem(TABS_PREFIX + variant);
+        localStorage.setItem(VERSION_PREFIX + variant, String(expectedVer));
+      } catch { /* quota — ignore */ }
+      if (DEBUG_TAB_PERSIST) {
+        console.info('[tabs] variant', variant, 'layout version bump',
+          savedVer, '→', expectedVer, '— cache cleared');
+      }
+    }
+  }
   try {
     const saved = localStorage.getItem(STORAGE_PREFIX + variant);
     if (saved) {

@@ -77,6 +77,7 @@ def _load_one(path: Path) -> BotDefinition:
         broker=str(raw.get("broker", "ib")),
         tick_interval_seconds=int(raw.get("tick_interval_seconds", 10)),
         manual_entry_only=bool(raw.get("manual_entry_only", False)),
+        auto_start=bool(raw.get("auto_start", False)),
         config=dict(raw.get("config") or {}),
         symbols=symbols,
         source_path=str(path),

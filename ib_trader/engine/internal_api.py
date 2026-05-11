@@ -97,6 +97,13 @@ class SubscribeBarsRequest(BaseModel):
 
     symbol: str
     interval: str = "5s"
+    # Optional sec_type so the engine can qualify FUT/FOP/OPT bots
+    # correctly. Bots without this field land on the legacy default
+    # ("STK") — exactly what was happening before chart_signal added
+    # futures support and silently broke on MGCM6/MES/MNQ/MCL.
+    sec_type: Optional[str] = None
+    expiry: Optional[str] = None
+    trading_class: Optional[str] = None
 
 
 class WarmupBarsRequest(BaseModel):
@@ -104,12 +111,18 @@ class WarmupBarsRequest(BaseModel):
 
     symbol: str
     duration_seconds: int = 7200
+    sec_type: Optional[str] = None
+    expiry: Optional[str] = None
+    trading_class: Optional[str] = None
 
 
 class UnsubscribeBarsRequest(BaseModel):
     """Request body for unsubscribing from realtime bars."""
 
     symbol: str
+    sec_type: Optional[str] = None
+    expiry: Optional[str] = None
+    trading_class: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -265,7 +278,14 @@ async def subscribe_bars(req: SubscribeBarsRequest):
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
     try:
-        info = await _ctx.ib.qualify_contract(req.symbol)
+        qualify_kwargs: dict = {}
+        if req.sec_type:
+            qualify_kwargs["sec_type"] = req.sec_type
+        if req.expiry:
+            qualify_kwargs["expiry"] = req.expiry
+        if req.trading_class:
+            qualify_kwargs["trading_class"] = req.trading_class
+        info = await _ctx.ib.qualify_contract(req.symbol, **qualify_kwargs)
         con_id = info["con_id"]
         # Wire a Redis publisher so live bars flow to bar:{symbol}:5s where
         # bots XREAD them. Without this callback, IB receives bars but they
@@ -296,7 +316,11 @@ async def warmup_bars(req: WarmupBarsRequest):
     from ib_trader.engine.service import _handle_warmup_bars
 
     try:
-        output = await _handle_warmup_bars(req.symbol, req.duration_seconds, _ctx)
+        output = await _handle_warmup_bars(
+            req.symbol, req.duration_seconds, _ctx,
+            sec_type=req.sec_type, expiry=req.expiry,
+            trading_class=req.trading_class,
+        )
         return {"status": "ok", "symbol": req.symbol, "output": output}
     except Exception as e:
         logger.exception('{"event": "WARMUP_BARS_FAILED", "symbol": "%s"}', req.symbol)
@@ -310,7 +334,14 @@ async def unsubscribe_bars(req: UnsubscribeBarsRequest):
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
     try:
-        info = await _ctx.ib.qualify_contract(req.symbol)
+        qualify_kwargs: dict = {}
+        if req.sec_type:
+            qualify_kwargs["sec_type"] = req.sec_type
+        if req.expiry:
+            qualify_kwargs["expiry"] = req.expiry
+        if req.trading_class:
+            qualify_kwargs["trading_class"] = req.trading_class
+        info = await _ctx.ib.qualify_contract(req.symbol, **qualify_kwargs)
         con_id = info["con_id"]
         await _ctx.ib.unsubscribe_realtime_bars(con_id)
         await _ctx.ib.unsubscribe_market_data(con_id)

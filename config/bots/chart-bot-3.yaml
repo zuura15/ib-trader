@@ -1,0 +1,16 @@
+id: chart-bot-3
+name: "Chart Bot 3 · Micro SPX"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+auto_start: false   # operator-driven Start; banner reminds on each `make dev`
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-3-mes
+  # MES = Micro E-mini S&P 500. M6 = June 2026.
+  symbol: MESM6
+  sec_type: FUT
+symbols:
+- MESM6

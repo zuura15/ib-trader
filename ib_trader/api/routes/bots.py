@@ -140,6 +140,12 @@ def _serialize_bot_from_defn(
         except Exception as e:
             logger.debug("failed to load strategy config", exc_info=e)
 
+    # Surface a flat ``sec_type`` so frontend consumers (chart-bot
+    # panes that build a ChartTarget from this response) don't have to
+    # crack open the YAML config. Falls back to ``"STK"`` to preserve
+    # legacy bot shapes.
+    bot_sec_type = str(defn.config.get("sec_type") or "STK").upper()
+
     return {
         "id": defn.id,
         "name": defn.name,
@@ -159,6 +165,7 @@ def _serialize_bot_from_defn(
         "pnl_today": "0",
         "symbols_json": json.dumps(list(defn.symbols)) if defn.symbols else "[]",
         "ref_id": ref_id,
+        "sec_type": bot_sec_type,
         "max_shares": max_shares,
         "max_position_value": str(max_position_value) if max_position_value is not None else None,
         "position": {
@@ -458,6 +465,46 @@ async def force_sell(bot_id: str, redis=Depends(get_redis)):
             status_code=504,
             detail="Bot runner did not respond within 260s; the SELL may still be in flight — check the positions and orders panes before retrying.",
         ) from e
+
+
+@router.post("/{bot_id}/force-quit", status_code=202)
+async def force_quit(bot_id: str, redis=Depends(get_redis)):
+    """chart_signal one-and-done close — proxies to the runner.
+
+    Sends a mid exit if a position is open and locks ``armed=False`` so
+    the bot can't re-enter until the user explicitly re-arms.
+    """
+    _get_defn_or_404(bot_id)
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=260) as c:
+            resp = await c.post(f"{_runner_url()}/bots/{bot_id}/force-quit")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
+    except httpx.ReadTimeout as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Bot runner did not respond within 260s; the exit may still be in flight — check positions/orders before retrying.",
+        ) from e
+
+
+@router.post("/{bot_id}/rearm", status_code=202)
+async def rearm(bot_id: str, redis=Depends(get_redis)):
+    """chart_signal re-arm — proxies to the runner. Flips
+    ``armed=True``; rejected with 409 while a position is held."""
+    _get_defn_or_404(bot_id)
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.post(f"{_runner_url()}/bots/{bot_id}/rearm")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
 
 
 @router.post("/{bot_id}/reset", status_code=202)

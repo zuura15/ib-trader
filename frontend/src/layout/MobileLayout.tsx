@@ -10,7 +10,8 @@ import { LogStream } from '../features/logs/LogStream';
 import { BotsPanel } from '../features/bots/BotsPanel';
 import { BotLogStream } from '../features/bots/BotLogStream';
 import { BotActivity } from '../features/bots/BotActivity';
-const TABS = ['Trade', 'Watch', 'Orders', 'Bots', 'Activity', 'Logs'] as const;
+import { MobileChartBots } from '../features/chart-bot/MobileChartBots';
+const TABS = ['Trade', 'Watch', 'Orders', 'Charts', 'Bots', 'Activity', 'Logs'] as const;
 
 // ---------------------------------------------------------------------------
 // Vertical resize handle for the mobile Trade tab split
@@ -377,7 +378,18 @@ export function MobileLayout() {
           </div>
         </div>
 
-        {/* Tab 4: Bots — bot controls + bot log */}
+        {/* Tab 4: Charts — chart-bot pane with a 1..4 slot picker */}
+        <div
+          id="tabpanel-Charts"
+          role="tabpanel"
+          aria-labelledby="tab-Charts"
+          className="flex flex-col shrink-0 w-screen h-full"
+          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
+        >
+          <MobileChartBots />
+        </div>
+
+        {/* Tab 5: Bots — bot controls + bot log */}
         <div
           id="tabpanel-Bots"
           role="tabpanel"

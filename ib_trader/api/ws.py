@@ -439,9 +439,11 @@ async def _stream_bot_state_to_ws(websocket: WebSocket, redis, bot_ref: str, sym
     from ib_trader.redis.streams import StreamNames
     from ib_trader.redis.state import StateStore
 
-    # Resolve bot_ref → UUID via registry
+    # Resolve bot_ref → UUID via registry. The client may pass any of
+    # ``id``, ``ref_id``, or display ``name`` — ``resolve`` checks
+    # all three.
     from ib_trader.bots import registry_config
-    defn = registry_config.get_by_name(bot_ref)
+    defn = registry_config.resolve(bot_ref)
     if defn is None:
         return
     bot_key = f"bot:{defn.id}"

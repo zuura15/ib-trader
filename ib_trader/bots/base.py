@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    # Name kept for back-compat; returns server-local (PT) per CLAUDE.md's
+    # "Datetimes stored, compared, and displayed in server-local timezone"
+    # rule. The bot_events ``recorded_at`` column displays exactly what we
+    # write here, so PT-aware times come out as PT in DB dumps.
+    return datetime.now().astimezone()
 
 
 class BotBase(ABC):

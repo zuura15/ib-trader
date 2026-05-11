@@ -38,6 +38,17 @@ class BotDefinition:
     # account but we still want the full exit / trailing-stop machinery.
     manual_entry_only: bool = False
 
+    # When True, the bot-runner spawns this bot automatically at process
+    # boot — but only when its prior state is OFF or AWAITING_ENTRY_TRIGGER.
+    # Bots that were in a panic state (ENTRY_ORDER_PLACED /
+    # AWAITING_EXIT_TRIGGER / EXIT_ORDER_PLACED / ERRORED) still get the
+    # CATASTROPHIC alert + force OFF and require manual Start. Lets long-
+    # running chart_signal slots survive ``make dev`` restarts without
+    # forgotten Start clicks; defaults False to preserve existing behavior
+    # for sawtooth_rsi / close_trend_rsi bots that an operator may have
+    # deliberately parked.
+    auto_start: bool = False
+
     # Opaque strategy config dict loaded from the bot YAML's `config:`
     # block. Typically contains `strategy_config` (path to a strategy
     # YAML), `symbol`, `qty`, `max_orders`, etc. Shape is strategy-specific

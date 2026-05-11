@@ -240,6 +240,104 @@ export const variantC: IJsonModel = {
   },
 };
 
+// Variant T — Trader (chart-signal bots)
+// 3-column layout:
+//   Left column (~22%):  Console (top) · Stash tabset (bottom)
+//   Middle column (~39%): Slot 1 (top, MGC) · Slot 2 (bottom, MCL)
+//   Right column (~39%):  Slot 3 (top, MES) · Slot 4 (bottom, MNQ)
+//
+// flexlayout-react axis alternation: the root ``row`` lays out
+// children horizontally; each child ``row`` stacks its tabsets
+// vertically. So a "column" here is a nested ``row``.
+export const variantT: IJsonModel = {
+  global: globalConfig,
+  borders: [
+    {
+      type: 'border',
+      location: 'bottom',
+      size: 120,
+      children: [
+        { type: 'tab', name: 'Help', component: 'help' },
+      ],
+    },
+  ],
+  layout: {
+    type: 'row',
+    weight: 100,
+    children: [
+      // Left column — Console on top, Stash tabset on bottom.
+      {
+        type: 'row',
+        weight: 22,
+        children: [
+          {
+            type: 'tabset',
+            weight: 40,
+            children: [
+              { type: 'tab', name: 'Console', component: 'console' },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 60,
+            children: [
+              { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
+              { type: 'tab', name: 'Positions', component: 'positions', config: { compact: true } },
+              { type: 'tab', name: 'Watchlist', component: 'watchlist', config: { compact: true } },
+              { type: 'tab', name: 'Alerts', component: 'alerts' },
+              { type: 'tab', name: 'Logs', component: 'logs' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
+              { type: 'tab', name: 'Bots', component: 'bots' },
+            ],
+          },
+        ],
+      },
+      // Middle column — Slot 1 (top) + Slot 2 (bottom).
+      {
+        type: 'row',
+        weight: 39,
+        children: [
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Slot 1 · Micro Gold', component: 'chart-bot', config: { slot: 1 } },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Slot 2 · Micro Oil', component: 'chart-bot', config: { slot: 2 } },
+            ],
+          },
+        ],
+      },
+      // Right column — Slot 3 (top) + Slot 4 (bottom).
+      {
+        type: 'row',
+        weight: 39,
+        children: [
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Slot 3 · Micro SPX', component: 'chart-bot', config: { slot: 3 } },
+            ],
+          },
+          {
+            type: 'tabset',
+            weight: 50,
+            children: [
+              { type: 'tab', name: 'Slot 4 · Micro Nasdaq', component: 'chart-bot', config: { slot: 4 } },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+};
+
 // Variant D — Bot / Automation Supervision
 // Bot widgets prominent, alerts visible, automation-first
 export const variantD: IJsonModel = {

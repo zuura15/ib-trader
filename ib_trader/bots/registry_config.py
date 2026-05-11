@@ -90,6 +90,27 @@ def get_by_name(name: str) -> BotDefinition | None:
     return None
 
 
+def resolve(ident: str) -> BotDefinition | None:
+    """Look up a bot definition by id, ref_id, or display name (in that
+    order). Used by surfaces that accept any of those identifiers —
+    e.g. the WebSocket ``subscribe_bot`` handler, which the frontend
+    calls with whatever is most convenient (``id`` for chart-bots,
+    ``ref_id`` for legacy panels)."""
+    if not ident:
+        return None
+    with _lock:
+        for d in _definitions:
+            if d.id == ident:
+                return d
+        for d in _definitions:
+            if d.config.get("ref_id") == ident:
+                return d
+        for d in _definitions:
+            if d.name == ident:
+                return d
+    return None
+
+
 def clear() -> None:
     """Forget everything — test helper."""
     global _definitions, _loaded_dir

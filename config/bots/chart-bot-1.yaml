@@ -1,0 +1,22 @@
+id: chart-bot-1
+name: "Chart Bot 1 · Micro Gold"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: false
+# auto_start kept off intentionally — operator picks when each chart
+# slot resumes. The bot-runner advertises the OFF state in its
+# startup banner so a forgotten Start click is hard to miss.
+auto_start: false
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  # Per-bot ref_id keeps the WS state subscription unique. All four
+  # chart_signal bots share the same strategy yaml, so they'd
+  # collide on the strategy's ref_id without this.
+  ref_id: chart-bot-1-mgc
+  # June 2026 contract (M6). Roll to Q6 (Aug) before late-June expiry.
+  symbol: MGCM6
+  sec_type: FUT
+symbols:
+- MGCM6

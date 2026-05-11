@@ -1596,17 +1596,27 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
 
 
 async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
-    """Write ENGINE heartbeat to Redis (primary) and SQLite (audit)."""
+    """Write ENGINE heartbeat to Redis (primary) and SQLite (audit).
+
+    Each heartbeat carries ``started_at`` — the engine process's launch
+    timestamp captured once at loop entry. The /api/status endpoint
+    surfaces this so the UI can show the "up since …" chip without
+    needing a separate startup-marker key.
+    """
     from ib_trader.redis.state import StateKeys
     import json as _json
 
     interval = ctx.settings.get("heartbeat_interval_seconds", 30)
+    started_at = _now_iso()
     while True:
         try:
             # Redis — primary, with TTL auto-expiry
             if ctx.redis is not None:
                 key = StateKeys.process_heartbeat("ENGINE")
-                val = _json.dumps({"pid": pid, "ts": _now_iso()})
+                val = _json.dumps({
+                    "pid": pid, "ts": _now_iso(),
+                    "started_at": started_at,
+                })
                 await ctx.redis.setex(key, StateKeys.PROCESS_HEARTBEAT_TTL, val)
             # SQLite — archival
             ctx.heartbeats.upsert("ENGINE", pid)
@@ -1616,8 +1626,10 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+    # Server-local (PT) per CLAUDE.md — surfaces as a PT-offset ISO in
+    # every heartbeat / status response.
+    from datetime import datetime
+    return datetime.now().astimezone().isoformat()
 
 
 if __name__ == "__main__":

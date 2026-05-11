@@ -6,7 +6,7 @@ export type OrderSource = 'manual' | 'bot' | 'system' | 'external';
 export type CommandStatus = 'queued' | 'running' | 'success' | 'failure';
 export type BotStatus = 'running' | 'stopped' | 'error' | 'paused';
 export type AlertSeverity = 'catastrophic' | 'warning';
-export type LayoutVariant = 'A' | 'B' | 'C' | 'D';
+export type LayoutVariant = 'A' | 'B' | 'C' | 'D' | 'T';
 export type ThemeMode = 'dark' | 'charcoal' | 'navy' | 'mocha' | 'light';
 
 export interface WatchlistItem {
@@ -49,6 +49,11 @@ export interface GlobalState {
   unrealizedPnl: number;
   realizedPnl: number;
   sessionUptime: number;
+  /** ISO timestamp the engine process started at. Surfaces in the
+   *  global header as "UP SINCE …" so the user can see when the
+   *  current ``make dev`` stack came up. ``null`` until the engine
+   *  publishes its first heartbeat. */
+  engineStartedAt: string | null;
 }
 
 export interface LogEntry {

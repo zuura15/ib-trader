@@ -33,7 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    # Name kept for back-compat; returns server-local (PT) per CLAUDE.md.
+    # Mirrors ``bots/base.py:_now_utc`` so all bot_events rows share one
+    # timezone convention regardless of which middleware wrote them.
+    return datetime.now().astimezone()
 
 
 # ---------------------------------------------------------------------------

@@ -150,7 +150,35 @@ export const useStore = create<AppStore>((set, get) => ({
     set({ selectedChartTarget: next });
   },
 
-  activeVariant: (localStorage.getItem('ib-layout-variant') as LayoutVariant) || 'A',
+  activeVariant: ((): LayoutVariant => {
+    // URL override: lets the user deep-link to a specific layout.
+    //   /bots.aspx           → Trader (variant T)
+    //   ?variant=T (or #…)   → Trader (escape hatch for A/B/C/D too)
+    // Default boot path (root / unknown path) reads from localStorage
+    // or falls back to 'A' as before. Any URL override is persisted so
+    // a reload without the URL still lands on the same layout until
+    // the user switches via the header.
+    const valid: LayoutVariant[] = ['A', 'B', 'C', 'D', 'T'];
+    const pathMap: Record<string, LayoutVariant> = {
+      '/bots.aspx': 'T',
+    };
+    try {
+      const url = new URL(window.location.href);
+      const fromPath = pathMap[url.pathname.toLowerCase()];
+      const fromQuery = url.searchParams.get('variant') ?? '';
+      const fromHash = url.hash.replace(/^#/, '')
+        .split('&')
+        .map((p) => p.split('='))
+        .find(([k]) => k === 'variant')?.[1] ?? '';
+      const candidate = (fromPath || fromQuery || fromHash).toString().toUpperCase();
+      if (valid.includes(candidate as LayoutVariant)) {
+        localStorage.setItem('ib-layout-variant', candidate);
+        return candidate as LayoutVariant;
+      }
+    } catch { /* malformed URL — fall through */ }
+    const saved = localStorage.getItem('ib-layout-variant') as LayoutVariant;
+    return valid.includes(saved) ? saved : 'A';
+  })(),
   setVariant: (v) => {
     localStorage.setItem('ib-layout-variant', v);
     set({ activeVariant: v });
@@ -173,6 +201,7 @@ export const useStore = create<AppStore>((set, get) => ({
     unrealizedPnl: 6232.50,
     realizedPnl: 6260.25,
     sessionUptime: 15780,
+    engineStartedAt: null,
   },
   updateGlobal: (partial) => set((s) => ({ global: { ...s.global, ...partial } })),
 
@@ -704,6 +733,7 @@ function applyStatusPayload(
     staleData: false,
     realizedPnl: status.realized_pnl || 0,
     sessionUptime: status.engine_uptime_seconds || 0,
+    engineStartedAt: status.engine_started_at || null,
   });
 }
 

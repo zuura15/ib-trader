@@ -24,10 +24,23 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-EPS = 1e-6
-TOLERANCE_FRACTION = 0.0005
-BREAK_STALE_BARS = 20
-MIN_TOUCHES = 3   # spec: 3rd-touch entry trigger
+# Repo-root sys.path hop so this script runs as a standalone too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from ib_trader.signals.sr_fan import (  # noqa: E402
+    EPS,
+    TOLERANCE_FRACTION,
+    BREAK_STALE_BARS,
+    MIN_TOUCHES,
+    TrendLine as Line,
+    crosses_any,
+    detect_lines,
+    find_pivot_highs,
+    find_pivot_lows,
+)
+
 # Per-instrument $-per-point multiplier. STK=1, MGC=10, MES=5, ES=50.
 MULTIPLIER = 10
 RSI_PERIOD = 14   # matches frontend RSI_DEFAULTS
@@ -71,146 +84,6 @@ class Bar:
     def mid(self) -> float:
         # BID_ASK feed: open=avg_bid, close=avg_ask. Mid = (bid+ask)/2.
         return (self.open + self.close) / 2.0
-
-
-@dataclass
-class Line:
-    from_idx: int
-    anchor_b_idx: int
-    slope: float
-    intercept: float
-    touches: int
-    break_idx: int | None
-
-    def value_at(self, idx: int) -> float:
-        return self.slope * idx + self.intercept
-
-
-def find_pivot_lows(closes: list[float]) -> list[int]:
-    """Strict 1/1 local minima on the close polyline."""
-    out: list[int] = []
-    for i in range(1, len(closes) - 1):
-        v, l, r = closes[i], closes[i - 1], closes[i + 1]
-        if v < l and v < r:
-            out.append(i)
-    return out
-
-
-def find_pivot_highs(closes: list[float]) -> list[int]:
-    """Strict 1/1 local maxima on the close polyline."""
-    out: list[int] = []
-    for i in range(1, len(closes) - 1):
-        v, l, r = closes[i], closes[i - 1], closes[i + 1]
-        if v > l and v > r:
-            out.append(i)
-    return out
-
-
-def crosses_any(slope: float, intercept: float, from_idx: int,
-                to_idx: int, others: list[Line]) -> bool:
-    for e in others:
-        lo = max(from_idx, e.from_idx)
-        hi = min(to_idx, e.anchor_b_idx if e.break_idx is None else e.break_idx)
-        # Use end-of-drawn-range; here we use anchor_b_idx as a proxy
-        # since lines extend to lastBarIdx in the live algo. For
-        # backtest fidelity we use the real upper bound (caller
-        # passes to_idx).
-        if lo >= hi:
-            continue
-        dm = slope - e.slope
-        if abs(dm) < EPS:
-            continue
-        x = (e.intercept - intercept) / dm
-        if lo + EPS < x < hi - EPS:
-            return True
-    return False
-
-
-def detect_lines(closes: list[float], up_to: int,
-                 type_: str) -> list[Line]:
-    """Run the iterative-fan SR detection on closes[0..up_to] and
-    return all surviving lines for one side (``type_`` = 'support' or
-    'resistance'). No look-ahead beyond ``up_to``.
-    """
-    if up_to < 2:
-        return []
-    sub = closes[: up_to + 1]
-    if type_ == 'support':
-        pivots = find_pivot_lows(sub)
-    else:
-        pivots = find_pivot_highs(sub)
-    if len(pivots) < 2:
-        return []
-    last_idx = up_to
-    avg = sum(sub) / len(sub)
-    tol = max(EPS, avg * TOLERANCE_FRACTION)
-
-    def violates(close_v: float, line_v: float) -> bool:
-        return (close_v < line_v - tol) if type_ == 'support' \
-            else (close_v > line_v + tol)
-
-    out: list[Line] = []
-    for pi in range(len(pivots) - 1, 0, -1):
-        P = pivots[pi]
-        candidates: list[tuple[int, float]] = []
-        for qi in range(pi - 1, -1, -1):
-            Q = pivots[qi]
-            slope = (sub[P] - sub[Q]) / (P - Q)
-            candidates.append((Q, slope))
-        # Steepest first. Support → DESC (steep up first); resistance
-        # → ASC (steep down first). Tiebreak older Q first.
-        if type_ == 'support':
-            candidates.sort(key=lambda x: (-x[1], x[0]))
-        else:
-            candidates.sort(key=lambda x: (x[1], x[0]))
-
-        for Q, slope in candidates:
-            intercept = sub[P] - slope * P
-            # Channel rule against polyline.
-            valid = True
-            for i in range(Q + 1, P):
-                if violates(sub[i], slope * i + intercept):
-                    valid = False
-                    break
-            if not valid:
-                continue
-            # Cross-rejection against already-emitted lines (same side).
-            if crosses_any(slope, intercept, Q, P, out):
-                continue
-            # Post-P break detection on the chart polyline.
-            break_idx: int | None = None
-            for i in range(P + 1, last_idx + 1):
-                if violates(sub[i], slope * i + intercept):
-                    break_idx = i
-                    break
-            if break_idx is not None and (last_idx - break_idx) > BREAK_STALE_BARS:
-                continue
-
-            # Touch counting.
-            touch_end = break_idx if break_idx is not None else last_idx
-            touches = 2
-            for p in pivots:
-                if p == Q or p == P or p < Q or p > touch_end:
-                    continue
-                if abs(sub[p] - (slope * p + intercept)) <= tol:
-                    touches += 1
-            if touches < 2:
-                continue
-
-            # Coincident-line dedup.
-            coincident = any(
-                abs(e.slope - slope) < EPS and abs(e.intercept - intercept) < EPS
-                for e in out
-            )
-            if coincident:
-                continue
-
-            out.append(Line(
-                from_idx=Q, anchor_b_idx=P, slope=slope,
-                intercept=intercept, touches=touches, break_idx=break_idx,
-            ))
-
-    return out
 
 
 @dataclass

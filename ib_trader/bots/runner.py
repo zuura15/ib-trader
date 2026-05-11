@@ -330,6 +330,63 @@ async def run_bot_runner(session_factory: scoped_session,
             )
         # OFF: nothing to do.
 
+    # Auto-start pass — runs AFTER the force-OFF sweep so the panic
+    # branch is honored first. Any bot whose YAML carries ``auto_start:
+    # true`` and whose prior state was non-panic (OFF or
+    # AWAITING_ENTRY_TRIGGER, both of which the panic branch never
+    # touches with state>OFF anyway) gets spawned automatically.
+    # Lets the user iterate on chart_signal slots through ``make dev``
+    # restarts without re-clicking Start on every slot. Panic-state
+    # bots that were force-OFF still require an explicit Start so the
+    # operator confirms the broker-side state first.
+    for defn in all_defs:
+        if not getattr(defn, "auto_start", False):
+            continue
+        try:
+            from ib_trader.redis.state import StateStore
+            doc = await StateStore(redis).get(f"bot:{defn.id}") or {} \
+                if redis is not None else {}
+            prior_state_str = doc.get("state", BotState.OFF.value)
+            try:
+                prior_state = BotState(prior_state_str)
+            except ValueError:
+                prior_state = BotState.OFF
+        except Exception:
+            logger.exception(
+                '{"event": "BOT_AUTOSTART_STATE_LOAD_FAILED", "bot_id": "%s"}',
+                defn.id,
+            )
+            continue
+        if prior_state in _PANIC_STATES:
+            logger.info(
+                '{"event": "BOT_AUTOSTART_SKIPPED_PANIC", '
+                '"bot_id": "%s", "prior_state": "%s"}',
+                defn.id, prior_state.value,
+            )
+            continue
+        try:
+            bot, task = await _create_and_start_bot(
+                defn, session_factory, redis=redis, engine_url=engine_url,
+            )
+            bot_instances[defn.id] = bot
+            running_tasks[defn.id] = task
+            # Drive the FSM out of OFF the same way the HTTP /start
+            # handler does. Without this the bot's *task* is running
+            # but its persisted state stays OFF, which the next
+            # supervisory pass interprets as a stale crashed bot and
+            # force-OFFs again — the exact "bot doesn't start" loop
+            # the user reported on 2026-05-10.
+            await bot.on_start(symbol=defn.config.get("symbol"))
+            logger.info(
+                '{"event": "BOT_AUTOSTARTED", "bot_id": "%s"}',
+                defn.id,
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "BOT_AUTOSTART_FAILED", "bot_id": "%s"}',
+                defn.id,
+            )
+
     # Main loop: just clean up crashed tasks. All lifecycle commands
     # flow through the runner's internal HTTP API via direct method calls.
     while True:

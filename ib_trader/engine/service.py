@@ -210,7 +210,11 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
     return verb
 
 
-async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContext) -> str:
+async def _handle_warmup_bars(
+    symbol: str, duration_seconds: int, ctx: AppContext,
+    *, sec_type: str | None = None,
+    expiry: str | None = None, trading_class: str | None = None,
+) -> str:
     """Fetch historical 5-sec bars and publish to the Redis bar stream.
 
     Bots read warmup bars via XREAD on bar:{symbol}:5s (from "0") — same
@@ -218,7 +222,14 @@ async def _handle_warmup_bars(symbol: str, duration_seconds: int, ctx: AppContex
     """
     from ib_trader.redis.streams import StreamWriter, StreamNames
 
-    contract_info = await ctx.ib.qualify_contract(symbol)
+    qualify_kwargs: dict = {}
+    if sec_type:
+        qualify_kwargs["sec_type"] = sec_type
+    if expiry:
+        qualify_kwargs["expiry"] = expiry
+    if trading_class:
+        qualify_kwargs["trading_class"] = trading_class
+    contract_info = await ctx.ib.qualify_contract(symbol, **qualify_kwargs)
     con_id = contract_info["con_id"]
     contract = ctx.ib._contract_cache.get(con_id)
 

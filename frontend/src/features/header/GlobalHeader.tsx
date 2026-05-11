@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useStore } from '../../data/store';
-import { formatCurrency, formatDuration } from '../../utils/format';
+import { formatCurrency } from '../../utils/format';
 import type { LayoutVariant, ThemeMode } from '../../types';
 import { SettingsModal } from '../settings/SettingsModal';
 
@@ -17,11 +17,25 @@ const variantLabels: Record<LayoutVariant, string> = {
   B: 'Modern',
   C: 'Command',
   D: 'Bots',
+  T: 'Trader',
 };
 
 export function GlobalHeader() {
   const { global, activeVariant, setVariant, theme, setTheme, dataMode, wsConnected } = useStore();
-  const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, sessionUptime } = global;
+  const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, engineStartedAt } = global;
+  // Format "up since" with the engine's start timestamp. The backend
+  // writes it as a timezone-aware ISO (server-local PT); ``new Date``
+  // honors the offset, ``toLocaleTimeString`` then renders in the
+  // browser's locale time.
+  const upSinceLabel = (() => {
+    if (!engineStartedAt) return null;
+    const d = new Date(engineStartedAt);
+    if (!Number.isFinite(d.getTime())) return null;
+    // Drop the year/seconds — the chip is tight.
+    const date = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `${date}, ${time}`;
+  })();
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const healthyCount = Object.values(serviceHealth).filter(Boolean).length;
@@ -103,10 +117,19 @@ export function GlobalHeader() {
           </div>
         </div>
 
-        {/* Uptime */}
-        {sessionUptime > 0 && (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            UP {formatDuration(sessionUptime * 1000)}
+        {/* Uptime — static "up since …" only. The running counter was
+            removed (2026-05-10) because ``formatDuration(sessionUptime)``
+            recomputed on every poll tick, forcing a header re-render
+            every ~2s and keeping the tab hot when nothing was changing.
+            The hover tooltip carries the full datetime for precision. */}
+        {upSinceLabel && (
+          <div
+            style={{ fontSize: 11, color: 'var(--text-muted)' }}
+            title={engineStartedAt
+              ? `Engine started ${new Date(engineStartedAt).toLocaleString()}`
+              : undefined}
+          >
+            up since {upSinceLabel}
           </div>
         )}
 
@@ -141,7 +164,7 @@ export function GlobalHeader() {
             Layout
           </div>
           <div className="flex gap-1">
-            {(['A', 'B', 'C', 'D'] as LayoutVariant[]).map((v) => (
+            {(['A', 'B', 'C', 'D', 'T'] as LayoutVariant[]).map((v) => (
               <button
                 key={v}
                 onClick={() => setVariant(v)}

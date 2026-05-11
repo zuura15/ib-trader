@@ -62,6 +62,26 @@ interface Props {
   onLoadingChange?: (loading: boolean) => void;
   /** Optional callback for errors. */
   onError?: (msg: string | null) => void;
+  /** Bot-mode overlay. When set, draws the chart_signal bot's frozen
+   *  entry line in a distinct orange weight on top of the regular SR
+   *  overlay. The line is projected across the entire price history
+   *  via ``price = anchorPrice + slopePerSec * (chartTime - anchorChartTime)``.
+   *  Chart times are shifted-UTC (see ``localUtcSeconds``); the prop
+   *  carries the bot's real-UTC ISO anchor and we shift internally. */
+  entryLine?: {
+    /** Real-UTC ISO timestamp of the line's anchor pivot (P bar). */
+    anchorTime: string;
+    /** Price at the anchor pivot. */
+    anchorPrice: number;
+    /** Per-second slope in price-per-second. */
+    slopePerSec: number;
+  } | null;
+  /** Bot-mode badge highlight. Real-UTC ISO of the bar whose B/S badge
+   *  represents the bot's active entry — the badge gets a green ring
+   *  drawn behind it so the user can see "this is the signal we acted
+   *  on". Time is matched against the badge's chart time after
+   *  converting via ``localUtcSeconds``. */
+  activeEntryBarTime?: string | null;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -77,6 +97,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     showCounterResistance = false,
     onLoadingChange,
     onError,
+    entryLine = null,
+    activeEntryBarTime = null,
   }: Props,
   ref,
 ) {
@@ -110,6 +132,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // every refresh; `srHiddenRef` lets the user dismiss them for the
   // current target via the Clear-SR button (re-shows on target switch).
   const srSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  // Bot-mode: the chart_signal strategy's frozen entry line. Lives on
+  // its own series so the SR recompute (which wipes ``srSeriesRef``)
+  // doesn't erase it on every pan/zoom. Created/torn down with the
+  // chart; data updated by an effect when the ``entryLine`` prop or
+  // the bar history changes.
+  const entryLineSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   // Buy/Sell letters drawn on an SVG overlay positioned over the
   // chart canvas. Each signal is { time, price, side } — the letter
   // floats above (S) or below (B) the bar with a black leader line
@@ -129,16 +157,34 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const brokenMinutesRef = useRef(brokenMinutes);
   const showCounterSupportRef = useRef(showCounterSupport);
   const showCounterResistanceRef = useRef(showCounterResistance);
+  // Bot-mode prop mirrors. Read by the SVG badge painter and the
+  // entry-line series effect.
+  const entryLineRef = useRef(entryLine);
+  const activeEntryBarTimeRef = useRef<number | null>(null);
+  useEffect(() => { entryLineRef.current = entryLine; }, [entryLine]);
+  useEffect(() => {
+    // Convert real-UTC ISO to chart-time (shifted UTC). null clears.
+    if (!activeEntryBarTime) {
+      activeEntryBarTimeRef.current = null;
+    } else {
+      const d = new Date(activeEntryBarTime);
+      activeEntryBarTimeRef.current = Number.isFinite(d.getTime())
+        ? (localUtcSeconds(d) as number) : null;
+    }
+    // Re-paint badges so the ring appears/disappears immediately.
+    repositionSrSignalsRef.current?.();
+  }, [activeEntryBarTime]);
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
     brokenMinutesRef.current = brokenMinutes;
     showCounterSupportRef.current = showCounterSupport;
     showCounterResistanceRef.current = showCounterResistance;
-    // Re-render lines on toggle. ``force=true`` bypasses the SR_MIN_BARS
-    // early-exit so the toggle takes effect even when zoomed in below
-    // 90 min — passive zoom/pan triggers still respect that guard.
+    // Re-render lines on toggle. The viewport gate is gone (detection
+    // now runs on a fixed recent-bars slice), so this is just a
+    // straight re-detect to pick up the new filter state.
     scheduleSrRecomputeRef.current?.(true);
   }, [showBrokenSr, brokenMinutes, showCounterSupport, showCounterResistance]);
+
   // Debounced SR recompute. Set inside the chart-create effect (since
   // it captures the chart instance); the visible-range subscription
   // calls into it via this ref so we don't have to re-subscribe each
@@ -150,7 +196,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const repositionSrSignalsRef = useRef<(() => void) | null>(null);
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
-  const SR_MIN_BARS = 30;
+  // The old ``SR_MIN_BARS`` viewport gate was removed (2026-05-10): it
+  // suppressed *all* SR detection when the visible window was below 90
+  // min, which silently dropped 2- and 3-touch lines whose endpoints
+  // were all inside a tighter zoom. Detection now runs at every zoom,
+  // but still on the **visible-range slice** — the user explicitly
+  // opted to keep off-screen pivots out of the picture so the chart
+  // doesn't paint lines that look "from nowhere" without zooming out.
+  // Wider trend detection is a zoom-out gesture, by design.
   // Tracks the most-recent live-tick's rounded bar time. Used to
   // detect bar-close events (boundary crossings) and trigger an SR
   // recompute. Null until the first live tick arrives for the
@@ -191,6 +244,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     () => document.documentElement.getAttribute('data-theme') || 'light',
   );
   const [chartVersion, setChartVersion] = useState(0);
+
+  // Bot-mode: project the frozen entry line across the bar history.
+  // Recomputes whenever the line prop or chart version changes; the
+  // chart-create effect bumps ``chartVersion`` once the entryLine
+  // series is ready, so we don't fire before the series exists. When
+  // the prop is null (no open position / disarmed), clear the series.
+  useEffect(() => {
+    const ser = entryLineSeriesRef.current;
+    if (!ser) return;
+    const bars = barsRef.current;
+    if (!entryLine || bars.length < 2) {
+      try { ser.setData([]); } catch { /* series torn down */ }
+      return;
+    }
+    const anchorDate = new Date(entryLine.anchorTime);
+    if (!Number.isFinite(anchorDate.getTime())) {
+      try { ser.setData([]); } catch { /* ignore */ }
+      return;
+    }
+    const anchorChartSec = localUtcSeconds(anchorDate) as number;
+    const startTime = bars[0].time as UTCTimestamp;
+    const endTime = bars[bars.length - 1].time as UTCTimestamp;
+    const valueAt = (t: number) =>
+      entryLine.anchorPrice + entryLine.slopePerSec * (t - anchorChartSec);
+    try {
+      ser.setData([
+        { time: startTime, value: valueAt(Number(startTime)) },
+        { time: endTime, value: valueAt(Number(endTime)) },
+      ]);
+    } catch { /* series torn down between render and effect */ }
+  }, [entryLine, chartVersion]);
 
   // Theme observer.
   useEffect(() => {
@@ -299,6 +383,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     rsiSeriesRef.current = rsi;
     divergenceSeriesRef.current = [];
 
+    // Bot-mode: dedicated series for the chart_signal entry line. Kept
+    // separate from ``srSeriesRef`` so the SR recompute (which wipes
+    // those on every pan/zoom) doesn't take this with it. Orange and
+    // a touch thicker than detected SR lines so it's obviously the
+    // one the bot is acting on. ``autoscaleInfoProvider: null`` so a
+    // far-projected slope can't squash the price scale.
+    entryLineSeriesRef.current = chart.addSeries(LineSeries, {
+      color: 'rgba(255, 153, 0, 0.95)',
+      lineWidth: 2,
+      lineStyle: 0,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      autoscaleInfoProvider: () => null,
+    });
+
     // SVG overlay for SR buy/sell signal letters. Sits on top of the
     // chart canvas; pointer-events: none so it never intercepts
     // pan/zoom. Repositioned on every visible-range change and resize.
@@ -312,7 +412,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     el.appendChild(overlaySvg);
     srOverlayRef.current = overlaySvg;
 
-    repositionSrSignalsRef.current = () => {
+    // Inner paint. Don't call directly; use the rAF-coalesced wrapper
+    // assigned to ``repositionSrSignalsRef.current`` below. Reading
+    // ``ts.timeToCoordinate`` right after a ``series.update()`` returns
+    // stale coordinates because lightweight-charts hasn't relaid out
+    // yet — deferring to the next animation frame makes the badge
+    // positions track the polyline exactly.
+    let srRafQueued = false;
+    const paintSrSignals = () => {
       const svg = srOverlayRef.current;
       const ch = chartRef.current;
       const ser = seriesRef.current;
@@ -368,6 +475,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const themeNow = themeColors();
         const badgeColor = sig.side === 'B' ? themeNow.bullish : themeNow.bearish;
         const RADIUS = 12;
+        // Bot-mode: when this badge represents the bot's active entry,
+        // paint a glowing green ring BEHIND the badge so it's
+        // immediately obvious which signal we acted on. Matched on
+        // chart-time (shifted-UTC); the ref carries the converted
+        // value so the comparison stays cheap.
+        const activeEntryT = activeEntryBarTimeRef.current;
+        if (activeEntryT != null
+            && Math.abs((sig.time as number) - activeEntryT) < 1) {
+          const ring = document.createElementNS(
+            'http://www.w3.org/2000/svg', 'circle',
+          );
+          ring.setAttribute('cx', String(x));
+          ring.setAttribute('cy', String(yLetter));
+          ring.setAttribute('r', String(RADIUS + 6));
+          ring.setAttribute('fill', 'none');
+          ring.setAttribute('stroke', themeNow.bullish);
+          ring.setAttribute('stroke-width', '3');
+          ring.setAttribute('opacity', '0.85');
+          svg.appendChild(ring);
+        }
         const bg = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
         bg.setAttribute('cx', String(x));
         bg.setAttribute('cy', String(yLetter));
@@ -415,14 +542,33 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
     };
 
+    // rAF-coalesced wrapper. Multiple back-to-back ``reposition`` calls
+    // (live tick → recompute → SR detect → reposition) collapse to a
+    // single paint on the next animation frame, AFTER lightweight-charts
+    // has committed its layout update from the preceding setData/update
+    // call. Without this, badges would briefly land on pre-update bar
+    // coordinates and visibly trail the polyline on every tick.
+    repositionSrSignalsRef.current = () => {
+      if (srRafQueued) return;
+      srRafQueued = true;
+      requestAnimationFrame(() => {
+        srRafQueued = false;
+        paintSrSignals();
+      });
+    };
+
     setChartVersion((v) => v + 1);
 
-    // SR detection helper, scoped to this chart instance. Reads the
-    // current visible time range, slices the price series to the
-    // bars in view, runs detection, draws lines. Skipped when the
-    // visible window is below SR_MIN_BARS (90 min on a 3-min chart).
+    // SR detection helper, scoped to this chart instance. Runs over
+    // the bars currently in the visible time range — so zooming in
+    // shows tighter local structure and zooming out picks up longer
+    // trends. The earlier ``SR_MIN_BARS`` viewport gate was removed:
+    // it bailed out under 90 min visible and suppressed *all* SR
+    // detection, even for lines whose endpoints were both inside the
+    // tighter window. Detection now runs at every zoom; the
+    // throttle in ``scheduleSrRecomputeRef`` (1/sec) keeps it cheap.
     let srTimer: ReturnType<typeof setTimeout> | null = null;
-    const recomputeSr = (forceRecompute = false): void => {
+    const recomputeSr = (_forceRecompute = false): void => {
       // Sparkline / overview instances opt out of SR detection
       // entirely — see ``enableSr`` prop. Big CPU win when many
       // small charts are mounted (stacked-charts pane).
@@ -430,12 +576,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const ch = chartRef.current;
       if (!ch) return;
       const allBars = barsRef.current;
-      if (allBars.length === 0) return;
+      if (allBars.length < 3) return;
       const range = ch.timeScale().getVisibleRange();
       if (!range || range.from == null || range.to == null) return;
       const fromTime = Number(range.from);
       const toTime = Number(range.to);
-      // Find first/last bar indices within the visible time range.
       let fromIdx = -1;
       let toIdx = -1;
       for (let i = 0; i < allBars.length; i++) {
@@ -445,13 +590,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         if (allBars[i].time <= toTime) { toIdx = i; break; }
       }
       if (fromIdx < 0 || toIdx < 0 || toIdx <= fromIdx) return;
-      const widthBars = toIdx - fromIdx + 1;
-      // Below 90 min on a passive trigger (zoom/pan/tick): leave the
-      // existing lines alone — recomputing on a small slice would
-      // produce short-span lines that thrash on each zoom. A FORCED
-      // trigger (broken-toggle) must redraw regardless so the
-      // toggle takes effect at any zoom.
-      if (widthBars < SR_MIN_BARS && !forceRecompute) return;
 
       // Wipe + redraw.
       for (const ds of srSeriesRef.current) {
@@ -467,6 +605,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // happens on target change or Clear-SR (handled elsewhere).
       if (srHiddenRef.current) return;
 
+      // Detection slice = bars in the visible time range. Off-screen
+      // pivots are intentionally excluded so the chart never paints a
+      // line anchored to something the user can't see; zooming out is
+      // the explicit gesture for longer-trend detection.
       const slice = allBars.slice(fromIdx, toIdx + 1);
       // Map "show broken for N minutes" to bar count. BAR_SECONDS=180
       // (3 min). When the broken toggle is off the value is irrelevant
@@ -844,6 +986,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       rsiSeriesRef.current = null;
       divergenceSeriesRef.current = [];
       srSeriesRef.current = [];
+      entryLineSeriesRef.current = null;
       barsRef.current = [];
     };
   }, [theme, showRsi]);
@@ -1175,6 +1318,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // it, the line would visually lag up to 3 min until the
           // next bar-close trigger.
           scheduleSrRecomputeRef.current?.();
+          // Reposition the SR signal badges directly. ``subscribeVisible
+          // TimeRangeChange`` does NOT fire when lightweight-charts
+          // auto-extends the right edge for new data — so without this,
+          // the chart pans forward but the B/S badges stay pinned at
+          // their old pixel coordinates and "fall off" the price
+          // polyline. The SR recompute itself is debounced (1/sec) and
+          // sometimes early-exits, so it can't be relied on to
+          // reposition every tick.
+          repositionSrSignalsRef.current?.();
         } catch { /* malformed frame — ignore */ }
       };
       ws.onclose = () => { if (!closed) retry = setTimeout(open, 2000); };

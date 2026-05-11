@@ -110,6 +110,30 @@ async def run(session_factory) -> None:
     await start_bot_runner_api(runner_state, port=runner_api_port)
     print(f"[BOTS] Internal API on 127.0.0.1:{runner_api_port}")
 
+    # ── chart-bot heads-up banner ─────────────────────────────────
+    # Chart bots intentionally come up OFF on every restart — the
+    # safety design forces the operator to confirm broker-side state
+    # before resuming. Without an in-your-face reminder, it's easy to
+    # miss a forgotten Start click for half an hour. List every
+    # chart_signal slot in the runner's stdout so the message lands
+    # alongside the other ``[BOTS]`` startup lines the operator is
+    # already scanning.
+    try:
+        chart_slots = [
+            d for d in registry_config.all_definitions()
+            if d.config.get("strategy_name") == "chart_signal"
+        ]
+    except Exception:
+        chart_slots = []
+    if chart_slots:
+        print(
+            f"[BOTS] ⚠ {len(chart_slots)} chart_signal bot(s) are OFF — "
+            f"click Start in the Trader pane to resume each slot:"
+        )
+        for d in chart_slots:
+            symbol = d.config.get("symbol", "—")
+            print(f"[BOTS]   · {d.id}  ({d.name})  symbol={symbol}")
+
     try:
         from ib_trader.bots.runner import run_bot_runner
         await run_bot_runner(

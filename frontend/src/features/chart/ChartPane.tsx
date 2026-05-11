@@ -7,8 +7,9 @@ import { setUserSetting, useUserSetting } from '../../data/userSettings';
 
 /** Mini countdown chip showing time until the next 3-min bar closes
  *  in M:SS format. Updates every second. Used in the ChartPane
- *  header next to the toolbar buttons. */
-function BarCloseCountdown() {
+ *  header next to the toolbar buttons. Exported so BotChart can use
+ *  the same chip — keeps the two toolbars visually identical. */
+export function BarCloseCountdown() {
   const [text, setText] = useState<string>('');
   useEffect(() => {
     const tick = () => {

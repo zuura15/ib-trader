@@ -1,0 +1,37 @@
+# Chart-Signal Strategy
+# 3-touch SR fan: long on uptrending support, exit on bar-close below
+# the entry line. One-and-done per arm (manual re-arm required).
+# Long-only in v1.
+
+name: chart_signal
+version: "1.0"
+ref_id: chart-signal-default
+
+# Per-bot YAMLs override the symbol/sec_type fields below. This file
+# carries the algo defaults.
+symbol: SPY            # placeholder; per-bot config overrides
+sec_type: STK          # STK | ETF | FUT | FOP — drives the deadzone check
+
+# Bar configuration
+bar_size_seconds: 180   # 3-minute bars; must match frontend chart
+# The aggregator is used only as a 3-min "tick" — the strategy fetches
+# its own bars from ``/engine/history`` (same as the view-only chart),
+# so we don't need it to buffer a long lookback. ``lookback_bars: 1``
+# unblocks the runtime's ``get_bar_window`` gate after the first 3-min
+# bar, and the strategy ignores the window the runtime hands it.
+lookback_bars: 1
+# How much history the bot fetches from ``/engine/history`` per
+# 3-min eval. Mirrors the view-only chart's default visible range
+# so both surfaces compute SR on the same slice.
+history_hours: 2
+
+# Quantity — per-bot override possible via UI in a future iteration.
+qty_default: 1
+
+# Order strategies
+order_strategy: mid     # entry: mid limit (futures spreads tight)
+exit_order_strategy: mid
+
+# Risk knobs — kept minimal. The exit is the SR line itself.
+max_position_value: 100000
+max_shares: 100
