@@ -297,21 +297,38 @@ class ChartSignalStrategy:
                 "top_resistances": _top(resistances),
             },
         ))
-        # Freshness gate: the bot must enter when the 3rd touch is
-        # NEWLY confirmed, not on every subsequent bar a stale 3-touch
-        # line remains valid. Without this the bot fires whenever
-        # ``armed=True`` and a qualifying line exists, even if the
-        # last pivot touching it was 20 bars ago — diverging from the
-        # chart's B/S badges (which are placed ONCE at the anchor and
-        # don't re-fire). On 2026-05-11 chart-bot-4 fired three BUYs
-        # at 13:45 / 13:49 / 13:52 on the SAME support line whose
-        # anchor was at 13:24; the user saw a single B on the chart
-        # and reasonably expected no further entries.
+        # Freshness gates — two guards, both must pass.
         #
-        # Rule: the line's most-recent touching pivot must be within
-        # ``max_touch_age_bars`` of ``last_idx`` (default 2 — the just-
-        # confirmed pivot at ``last_idx-1``, with one bar of grace).
-        max_age = int(self.config.get("max_touch_age_bars", 2))
+        # Guard 1: TOUCH COUNT INCREASED ON THIS BAR.
+        # ``find_pivot_lows`` / ``find_pivot_highs`` walk i in
+        # [1, len-2] — a pivot at bar X is confirmed when bar X+1
+        # closes (X+1 is the right neighbor). So the just-confirmed
+        # pivot on this evaluation is at ``last_idx - 1``. The bot
+        # may only fire if that newly-confirmed pivot lies ON the
+        # chosen line (within touch_tolerance) — otherwise the touch
+        # count didn't go up on this bar and we're reacting to a
+        # stale 3-touch line that already existed for several bars.
+        #
+        # A future retest — a later pivot landing on the same line
+        # within touch_tol — also satisfies this guard, so the user's
+        # "price bounces off the line again → fresh trigger" semantic
+        # works for free.
+        #
+        # Guard 2: WALLCLOCK SIGNAL AGE.
+        # The indicator appears on the chart at bar close. Default
+        # ``max_signal_age_seconds = 10`` (5 is the tighter
+        # alternative). If the BAR event was queued during a daemon
+        # restart and we're processing it more than that many seconds
+        # after the bar closed, the user-visible "B/S just lit up on
+        # the chart" window has passed. Drop the signal.
+        #
+        # Background: pre-fix, the bot fired on every bar a 3-touch
+        # line remained valid (no anchor-freshness check), and on
+        # 2026-05-11 chart-bot-4 fired three BUYs at 13:45 / 13:49 /
+        # 13:52 on a line anchored at 13:24. The chart showed a
+        # single B at 13:24; the user reasonably expected no further
+        # entries on that same line. These two guards align bot
+        # firing with the chart's NEW-badge semantic.
         TOUCH_FRAC = float(self.config.get(
             "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
         ))
@@ -319,50 +336,58 @@ class ChartSignalStrategy:
         touch_tol = max(1e-6, avg_close * TOUCH_FRAC)
         support_pivots = find_pivot_lows(closes)
         resistance_pivots = find_pivot_highs(closes)
+        new_pivot_idx = last_idx - 1   # the just-confirmed pivot
 
-        def _latest_touch(line, side_pivots):
-            latest = -1
-            for p in side_pivots:
-                if p < line.from_idx or p > last_idx:
-                    continue
-                if abs(closes[p] - (line.intercept + line.slope * p)) <= touch_tol:
-                    latest = max(latest, p)
-            return latest
+        def _has_new_touch(line, side_pivots) -> bool:
+            if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
+                return False
+            line_at = line.intercept + line.slope * new_pivot_idx
+            return abs(closes[new_pivot_idx] - line_at) <= touch_tol
 
-        def _is_fresh(line, side_pivots) -> tuple[bool, int]:
-            lt = _latest_touch(line, side_pivots)
-            if lt < 0:
-                return False, lt
-            return (last_idx - lt) <= max_age, lt
-
-        long_fresh, long_lt = (False, -1)
-        short_fresh, short_lt = (False, -1)
-        if long_line is not None:
-            long_fresh, long_lt = _is_fresh(long_line, support_pivots)
-        if short_line is not None:
-            short_fresh, short_lt = _is_fresh(short_line, resistance_pivots)
-
-        if not long_fresh:
+        long_has_new = (long_line is not None
+                        and _has_new_touch(long_line, support_pivots))
+        short_has_new = (short_line is not None
+                          and _has_new_touch(short_line, resistance_pivots))
+        if not long_has_new:
             long_line = None
-        if not short_fresh:
+        if not short_has_new:
             short_line = None
 
         if long_line is None and short_line is None:
-            # Surface why nothing qualified so the diagnostic chain is
-            # not "BAR row shows longs/shorts > 0 but no entry."
-            if long_lt >= 0 or short_lt >= 0:
-                actions.append(LogSignal(
-                    event_type=LogEventType.SKIP,
-                    message=(
-                        f"3-touch lines too stale "
-                        f"(long_lt={long_lt} short_lt={short_lt} "
-                        f"last_idx={last_idx} max_age={max_age})"
-                    ),
-                    payload={"long_latest_touch": long_lt,
-                             "short_latest_touch": short_lt,
-                             "last_idx": last_idx,
-                             "max_touch_age_bars": max_age},
-                ))
+            actions.append(LogSignal(
+                event_type=LogEventType.SKIP,
+                message=(
+                    f"3-touch line(s) found but no new pivot landed on "
+                    f"any of them this bar (new_pivot_idx={new_pivot_idx})"
+                ),
+                payload={"new_pivot_idx": new_pivot_idx,
+                         "last_idx": last_idx,
+                         "new_is_pivot_low": new_pivot_idx in support_pivots,
+                         "new_is_pivot_high": new_pivot_idx in resistance_pivots},
+            ))
+            return actions
+
+        # Guard 2 — wallclock signal age. Compare bar-close wallclock
+        # to ``datetime.now()``; if the gap exceeds the configured
+        # cap we drop the signal (queued/stale bar event).
+        from datetime import timedelta as _td
+        max_signal_age_s = float(self.config.get(
+            "max_signal_age_seconds", 10,
+        ))
+        bar_close_dt = bar_time + _td(seconds=self.bar_seconds)
+        now_dt = datetime.now(timezone.utc)
+        elapsed_s = (now_dt - bar_close_dt).total_seconds()
+        if elapsed_s > max_signal_age_s:
+            actions.append(LogSignal(
+                event_type=LogEventType.SKIP,
+                message=(
+                    f"signal too old to act on — bar closed "
+                    f"{elapsed_s:.1f}s ago (cap {max_signal_age_s:.1f}s)"
+                ),
+                payload={"elapsed_seconds": round(elapsed_s, 2),
+                         "max_signal_age_seconds": max_signal_age_s,
+                         "bar_close": bar_close_dt.isoformat()},
+            ))
             return actions
 
         if long_line and short_line:

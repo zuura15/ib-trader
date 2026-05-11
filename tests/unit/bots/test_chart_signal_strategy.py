@@ -32,6 +32,15 @@ def _default_config(sec_type: str = "FUT") -> dict:
         "qty_default": 1,
         "order_strategy": "mid",
         "exit_order_strategy": "mid",
+        # Tests build BarCompleted events anchored at START_UTC
+        # (2026-05-10) which is hours-to-days behind real wallclock.
+        # The wallclock-signal-age gate would reject every such bar
+        # in normal flow — bump the cap so existing semantic tests
+        # (3-touch detection, exit eval, deadzone, fills, etc.) are
+        # not gated on real-time-vs-fixture-time. The signal-age
+        # gate has its own dedicated tests that build wallclock-
+        # recent bar events and use the production-default cap.
+        "max_signal_age_seconds": 10 ** 9,
     }
 
 
@@ -151,21 +160,21 @@ class TestEntry:
         assert not any(isinstance(a, PlaceOrder) for a in actions)
 
     @pytest.mark.asyncio
-    async def test_stale_3touch_blocked_by_freshness_gate(self):
-        """The 3-touch line is valid but the latest touching pivot is
-        far from the current bar — the bot must NOT fire on the stale
-        signal. Matches the user's 2026-05-11 MNQ observation: chart
-        showed a B at the anchor, then no new B for 20+ minutes, but
-        the bot fired a fresh BUY anyway because ``armed=True`` and
-        the line was still 3-touch."""
+    async def test_stale_anchor_blocked_no_new_touch(self):
+        """The 3-touch line is valid but the just-confirmed pivot on
+        this bar isn't on the line — the bot must NOT fire on the
+        stale signal. Matches the user's 2026-05-11 MNQ observation:
+        chart showed a B at the anchor, no new B for 20+ minutes, but
+        the bot fired a fresh BUY because ``armed=True`` and the line
+        was still 3-touch."""
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx()
         # 9-bar zigzag (4-touch support, last pivot at idx 7) followed
         # by 6 monotonically-increasing bars. The bars stay well above
         # the line (no break, no new touching pivot), so the line is
-        # still 4-touch and not broken — but the latest touching pivot
-        # is still idx 7. last_idx = 14; age = 7 → above the default
-        # max_touch_age_bars (2).
+        # still 4-touch and not broken — but the just-confirmed pivot
+        # at idx 13 isn't a pivot at all (closes monotonic upward), so
+        # guard 1 rejects.
         closes = ZIGZAG_CLOSES + [14.2, 14.5, 14.8, 15.1, 15.4, 15.7]
         bars = _zigzag_bars(START_UTC, closes)
         event = BarCompleted(symbol="MGCM6", bar=bars[-1],
@@ -181,14 +190,75 @@ class TestEntry:
         assert skips, "expected a SKIP log row explaining the stale gate"
 
     @pytest.mark.asyncio
-    async def test_freshness_gate_allows_fresh_3rd_touch(self):
+    async def test_fresh_3rd_touch_fires(self):
         """Sanity inverse: on the bar where the 3rd touch is freshly
-        confirmed, the bot fires normally."""
+        confirmed (the just-confirmed pivot at last_idx-1 is on the
+        line), the bot fires normally."""
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx()
         # ZIGZAG_CLOSES at idx=8 has the freshest pivot at idx 7 (just
-        # confirmed by closing bar 8). age = 1 → within max_age = 2.
+        # confirmed by closing bar 8) sitting on the support line. The
+        # latest pivot IS the new pivot → guard 1 passes.
         bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES)
+        event = BarCompleted(symbol="MGCM6", bar=bars[-1],
+                             window=bars, bar_count=len(bars))
+        actions = await s.on_event(event, ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place and place[0].side == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_signal_age_timeout_blocks_stale_bar_event(self):
+        """Even when the touch count just increased (guard 1 passes),
+        the wallclock signal-age cap rejects a bar event whose close
+        was longer ago than ``max_signal_age_seconds``. Simulates a
+        bar event queued during a daemon restart.
+
+        Uses sec_type=STK so the test isn't sensitive to wallclock
+        landing in the FUT/FOP 14:00-15:00 PT deadzone (which would
+        short-circuit ``_on_bar`` before our guards run)."""
+        from datetime import datetime, timezone, timedelta
+        cfg = _default_config(sec_type="STK")
+        cfg["max_signal_age_seconds"] = 5  # tight cap for this test
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        # Latest bar's close = now - 30s → elapsed 30s > 5s cap.
+        # Build bars so the latest bar's start time = now - 30s -
+        # BAR_SECONDS, with closes that produce a fresh 3-touch.
+        last_bar_close = datetime.now(timezone.utc) - timedelta(seconds=30)
+        last_bar_start = last_bar_close - timedelta(seconds=BAR_SECONDS)
+        first_bar_start = last_bar_start - timedelta(
+            seconds=BAR_SECONDS * (len(ZIGZAG_CLOSES) - 1),
+        )
+        bars = _zigzag_bars(first_bar_start, ZIGZAG_CLOSES)
+        event = BarCompleted(symbol="MGCM6", bar=bars[-1],
+                             window=bars, bar_count=len(bars))
+        actions = await s.on_event(event, ctx)
+        # No entry — wallclock gate blocked.
+        assert not any(isinstance(a, PlaceOrder) for a in actions), \
+            f"expected no PlaceOrder on wallclock-stale event, got {actions}"
+        from ib_trader.bots.strategy import LogSignal, LogEventType
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                  and a.event_type == LogEventType.SKIP
+                  and "too old" in a.message]
+        assert skips, "expected a SKIP log row with 'too old' message"
+
+    @pytest.mark.asyncio
+    async def test_signal_age_default_passes_in_normal_flow(self):
+        """A bar event whose close was just now (within the default
+        10s cap) passes guard 2 and fires normally. STK to avoid the
+        FUT deadzone short-circuit (see sibling test)."""
+        from datetime import datetime, timezone, timedelta
+        cfg = _default_config(sec_type="STK")
+        cfg["max_signal_age_seconds"] = 10
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        # Latest bar's close = now (just closed) → elapsed ≈ 0s.
+        last_bar_close = datetime.now(timezone.utc)
+        last_bar_start = last_bar_close - timedelta(seconds=BAR_SECONDS)
+        first_bar_start = last_bar_start - timedelta(
+            seconds=BAR_SECONDS * (len(ZIGZAG_CLOSES) - 1),
+        )
+        bars = _zigzag_bars(first_bar_start, ZIGZAG_CLOSES)
         event = BarCompleted(symbol="MGCM6", bar=bars[-1],
                              window=bars, bar_count=len(bars))
         actions = await s.on_event(event, ctx)
