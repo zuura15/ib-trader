@@ -87,7 +87,18 @@ class StrategyBotRunner(BotBase):
         with open(config_path) as f:
             self.strategy_config = yaml.safe_load(f)
 
-        # Merge runtime overrides from bot config
+        # Merge runtime overrides from bot config. ``_redis`` and
+        # ``_engine_url`` are runtime handles the strategy reaches for
+        # via ``self.config.get(...)`` — without them threaded in,
+        # ``chart_signal._fetch_history`` thinks the engine is
+        # unreachable and falls back to the 1-bar deque, then early-
+        # exits at ``len(closes) < 4``. That left the bot dispatching
+        # bars but never logging any (root cause of the 2026-05-11
+        # 8:48 MGCM6 / 8:42 MESM6 missed-fire incidents).
+        if "_engine_url" in config:
+            self.strategy_config["_engine_url"] = config["_engine_url"]
+        if "_redis" in config:
+            self.strategy_config["_redis"] = config["_redis"]
         if "symbol" in config:
             self.strategy_config["symbol"] = config["symbol"]
         # ``sec_type`` is needed by sec-type-aware strategies (chart_signal
