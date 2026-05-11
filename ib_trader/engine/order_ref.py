@@ -33,7 +33,12 @@ class OrderRefInfo:
     host: str
     bot_ref: str
     symbol: str
-    side: str  # "B" (buy/entry) or "S" (sell/exit)
+    # "B" (BUY) or "S" (SELL). Encodes order DIRECTION only — do NOT
+    # infer leg (entry vs exit) from this. A bidirectional strategy
+    # opens shorts with SELL and closes them with BUY; treating side as
+    # leg silently broke every short trade (chart_signal, 2026-05-11).
+    # Leg should be derived from the bot's FSM state at fill time.
+    side: str
     serial: int
 
     @property
@@ -60,7 +65,7 @@ def encode(bot_ref: str, symbol: str, side: str, serial: int) -> str:
         bot_ref: Bot reference ID from strategy config (e.g., "saw-rsi").
                  Use "manual" for orders placed via REPL/API.
         symbol: Order symbol (e.g., "QQQ").
-        side: "B" for buy/entry, "S" for sell/exit.
+        side: "B" for BUY, "S" for SELL. Direction only — not leg.
         serial: Trade serial number (0-999).
 
     Returns:

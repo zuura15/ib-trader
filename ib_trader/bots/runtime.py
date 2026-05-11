@@ -219,14 +219,23 @@ class StrategyBotRunner(BotBase):
 
     # ------------------------------------------------------------------
 
-    async def _apply_fill(self, *, bot_ref: str, symbol: str, side: str,
+    async def _apply_fill(self, *, bot_ref: str, symbol: str,
+                          leg: str, side: str,
                           qty: Decimal, price: Decimal, commission: Decimal,
                           ib_order_id: str) -> None:
-        """Apply a terminal fill to the bot's state and dispatch to strategy.
+        """Apply a terminal fill's auxiliary bookkeeping (trail/stop math,
+        avg_price) to the bot doc.
 
-        The order ledger accumulates partials and emits one terminal event
-        with cumulative qty/avg_price. Bot manages one position at a time
-        — fills always apply to the current position.
+        ``leg`` is "entry" or "exit" — dispatched by the caller from the
+        current FSM state so it survives bidirectional strategies that
+        open shorts with SELL. ``side`` is the raw IB BUY/SELL of this
+        fill (used to derive long-vs-short direction for trail/stop math
+        on the entry leg).
+
+        Strategy notification is NOT re-fired here. ``on_entry_filled`` /
+        ``on_exit_filled`` already notified the strategy with the correct
+        side. A second side-based notify here used to double-fire the
+        strategy's ``_on_fill`` AND passed the wrong side for shorts.
         """
         await self._refresh_state()
         # GH #87: a previous version computed ``existing_qty`` here
@@ -237,21 +246,26 @@ class StrategyBotRunner(BotBase):
         # cleared qty to Python ``None``. Removed.
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        if side == "B":
+        if leg == "entry":
             new_qty = qty  # terminal fill — cumulative qty from ledger
-            fill_event = OrderFilled(
-                trade_serial=None, symbol=symbol, side="BUY",
-                fill_price=price, qty=qty, commission=commission,
-                ib_order_id=ib_order_id,
-            )
-            # Compute stop levels from strategy config so the UI shows
-            # meaningful data immediately — before the first quote tick.
-            exit_cfg = self.strategy_config.get("exit", {}) if isinstance(self.strategy_config.get("exit"), dict) else {}
+            # Direction-aware trail/stop math. Long entry: stop BELOW
+            # entry, trail activates ABOVE. Short entry: flipped — stop
+            # ABOVE, activation BELOW. Without this flip the bot wrote
+            # nonsense stops for shorts (stop "below" a short entry is
+            # in profit territory).
+            is_long = side == "BUY"
+            exit_cfg = (self.strategy_config.get("exit", {})
+                        if isinstance(self.strategy_config.get("exit"), dict)
+                        else {})
             hard_sl_pct = Decimal(str(exit_cfg.get("hard_stop_loss_pct", 0.003)))
             trail_act_pct = Decimal(str(exit_cfg.get("trail_activation_pct", 0.00005)))
             trail_width = Decimal(str(exit_cfg.get("trail_width_pct", 0.0005)))
-            hard_stop = price * (1 - hard_sl_pct)
-            trail_activation_price = price * (1 + trail_act_pct)
+            if is_long:
+                hard_stop = price * (1 - hard_sl_pct)
+                trail_activation_price = price * (1 + trail_act_pct)
+            else:
+                hard_stop = price * (1 + hard_sl_pct)
+                trail_activation_price = price * (1 - trail_act_pct)
             # Idempotency: preserve entry_price / entry_time / high_water_mark
             # if they're already set from a previous call on the same position.
             # Today _apply_fill only runs once per order, but any future
@@ -270,20 +284,16 @@ class StrategyBotRunner(BotBase):
                 "trail_activation_price": str(trail_activation_price.quantize(Decimal("0.01"))),
                 "trail_width_pct": str(trail_width),
                 "trail_activated": False,
+                "position_direction": "LONG" if is_long else "SHORT",
             }
         else:
-            # SELL branch. FSM has already written qty (post-decrement)
-            # + cleared entry fields on full exit. _apply_fill must NOT
+            # Exit leg. FSM has already written qty (post-decrement) +
+            # cleared entry fields on full exit. _apply_fill must NOT
             # re-decrement qty or resurrect cleared entry fields from
             # the stale ctx.state snapshot. We only update avg_price
             # here; everything else is FSM's authority. Plaster fix
             # pending the Part B FSM architectural cleanup that
             # dissolves _apply_fill entirely.
-            fill_event = OrderFilled(
-                trade_serial=None, symbol=symbol, side="SELL",
-                fill_price=price, qty=qty, commission=commission,
-                ib_order_id=ib_order_id,
-            )
             try:
                 fresh_doc = await self._read_state_doc() or {}
             except Exception:
@@ -294,11 +304,6 @@ class StrategyBotRunner(BotBase):
             }
         engine_fields["updated_at"] = now_iso
         await self._write_state(engine_fields)
-
-        # Strategy tick — trail/exit bookkeeping runs inside on_event.
-        actions = await self.strategy.on_event(fill_event, self.ctx)
-        if actions:
-            await self._run_pipeline(actions)
 
         # NOTE: realized-P&L recording and the daily-trade counter are
         # driven by the FSM's ``record_trade_closed`` side effect on
@@ -905,19 +910,33 @@ class StrategyBotRunner(BotBase):
         yet (the HTTP call hasn't returned); callers may pass the
         ``_PENDING_ORDER_ID`` sentinel and patch the real id after the
         response.
+
+        Returns ``ENTRY_ORDER_PLACED`` on success, or ``None`` on FSM
+        rejection (state was not AWAITING_ENTRY_TRIGGER inside the
+        lock). Callers MUST treat None as a hard abort — the order has
+        NOT been queued, and the lock-observed state may differ from
+        whatever the caller saw outside the lock.
         """
         async with self._state_lock:
             doc = await self._load_doc()
             cur = BotState(doc.get("state", BotState.OFF.value))
             if cur != BotState.AWAITING_ENTRY_TRIGGER:
                 self._log_invalid(cur, "on_place_entry_order")
-                return cur
+                return None
             patch = {
                 "order_qty": str(qty),
                 "filled_qty": "0",
                 "serial": serial if serial is not None else doc.get("serial"),
                 "order_origin": origin,
                 "symbol": symbol or doc.get("symbol"),
+                # Stamp the placement time so ``check_entry_timeout`` can
+                # fire after the configured ``entry_timeout_seconds``.
+                # Without this, chart_signal entries (which never wrote
+                # entry_time at submission time, only at fill time) sat
+                # unfilled forever — no timeout, no operator visibility.
+                # on_entry_filled overwrites this with the fill time so
+                # downstream "time since fill" reads remain correct.
+                "entry_time": now_iso(),
             }
             if ib_order_id is not None:
                 patch["ib_order_id"] = ib_order_id
@@ -929,19 +948,26 @@ class StrategyBotRunner(BotBase):
     async def on_place_exit_order(
         self, *, symbol: str, qty, order_type: str = "mid",
         origin: str = "strategy", ib_order_id: str | None = None,
-    ) -> BotState:
+    ) -> BotState | None:
         """Transition AWAITING_EXIT_TRIGGER → EXIT_ORDER_PLACED.
 
         Mirrors ``on_place_entry_order`` for the exit side. Resets
         ``exit_retries`` — a fresh exit cycle starts the retry count
         over; ``on_exit_filled`` bumps it on terminal partials.
+
+        Returns ``EXIT_ORDER_PLACED`` on success, or ``None`` on FSM
+        rejection (state was not AWAITING_EXIT_TRIGGER inside the lock).
+        Callers MUST treat None as a hard abort — the prior return-the-
+        unchanged-state pattern let a stale pre-state read past a
+        rejection and silently double-submitted exit orders when a
+        bar-close and force-quit raced (2026-05-11).
         """
         async with self._state_lock:
             doc = await self._load_doc()
             cur = BotState(doc.get("state", BotState.OFF.value))
             if cur != BotState.AWAITING_EXIT_TRIGGER:
                 self._log_invalid(cur, "on_place_exit_order")
-                return cur
+                return None
             patch = {
                 "order_qty": str(qty),
                 "filled_qty": "0",
@@ -957,6 +983,7 @@ class StrategyBotRunner(BotBase):
 
     async def on_entry_filled(
         self, *, qty: Decimal, price: Decimal, terminal: bool,
+        side: str = "BUY",
         commission: Decimal = Decimal("0"), serial: int | None = None,
     ) -> BotState:
         """Apply an entry fill event from the engine order ledger.
@@ -966,7 +993,15 @@ class StrategyBotRunner(BotBase):
           to AWAITING_EXIT_TRIGGER, notify strategy.
         - ``terminal=True`` with ``qty == 0``: treat as cancelled (safety
           net — normal zero-fill path routes through ``on_entry_cancelled``).
+
+        ``side`` is the raw IB side ("BUY"/"SELL") of the entry leg. It is
+        passed to the strategy notify event and used to derive the
+        ``position_direction`` ("LONG"/"SHORT") so subsequent exit-leg
+        bookkeeping (P&L sign, retry direction) works for both sides.
+        Defaults to "BUY" for backwards compatibility with long-only
+        strategies and tests that predate bidirectional support.
         """
+        position_direction = "LONG" if side == "BUY" else "SHORT"
         async with self._state_lock:
             doc = await self._load_doc()
             cur = BotState(doc.get("state", BotState.OFF.value))
@@ -1009,6 +1044,7 @@ class StrategyBotRunner(BotBase):
                     "trail_activated": False,
                     "trail_reset_count": 0,          # reset for this trade
                     "entry_serial": doc.get("serial"),
+                    "position_direction": position_direction,
                     # Snapshot the entry order's ib_order_id NOW — once the
                     # exit is placed, doc["ib_order_id"] is overwritten with
                     # the exit's id and the entry reference is lost. Needed
@@ -1032,7 +1068,7 @@ class StrategyBotRunner(BotBase):
                     )
                 else:
                     event = OrderFilled(
-                        trade_serial=serial, symbol=symbol, side="BUY",
+                        trade_serial=serial, symbol=symbol, side=side,
                         fill_price=price, qty=qty, commission=commission,
                         ib_order_id=doc.get("ib_order_id") or "",
                     )
@@ -1049,6 +1085,7 @@ class StrategyBotRunner(BotBase):
 
     async def on_exit_filled(
         self, *, qty: Decimal, price: Decimal, terminal: bool,
+        side: str = "SELL",
         commission: Decimal = Decimal("0"), serial: int | None = None,
     ) -> BotState:
         """Apply an exit fill event.
@@ -1058,6 +1095,14 @@ class StrategyBotRunner(BotBase):
           transition to AWAITING_ENTRY_TRIGGER.
         - ``terminal=True`` with residual: retry up to ``_MAX_EXIT_RETRIES``,
           escalate to ERRORED afterwards.
+
+        ``side`` is the raw IB side ("BUY"/"SELL") of the exit leg. For a
+        long exit it is "SELL"; for a short exit (buy-to-cover) it is
+        "BUY". Direction is derived from this for P&L sign and is also
+        passed to the strategy notify and retry-submit so both sides
+        work. Falls back to ``position_direction`` on the doc if the
+        caller is a legacy long-only test. Defaults to "SELL" to preserve
+        long-only behavior when callers don't pass the parameter.
 
         Mirrors ``_h_exit_filled`` from the deleted FSM.
         """
@@ -1070,6 +1115,13 @@ class StrategyBotRunner(BotBase):
             order_qty = Decimal(str(doc.get("order_qty") or "0"))
             position_qty = Decimal(str(doc.get("qty") or "0"))
             symbol = doc.get("symbol")
+            # Direction: from explicit side ("SELL" → LONG exit,
+            # "BUY" → SHORT exit), else fall back to position_direction
+            # the entry wrote, else LONG for legacy state docs.
+            position_direction = (
+                doc.get("position_direction")
+                or ("LONG" if side == "SELL" else "SHORT")
+            )
 
             if not terminal:
                 doc["filled_qty"] = str(qty)
@@ -1100,17 +1152,23 @@ class StrategyBotRunner(BotBase):
             # once we have confidence in the drift fix.
             if new_position_qty == 0:
                 entry_price = Decimal(str(doc.get("entry_price") or "0"))
-                realized_pnl = (
-                    (price - entry_price) * position_qty
-                    if entry_price > 0 else Decimal("0")
-                )
+                # Direction-aware P&L. Long: (exit - entry) * qty.
+                # Short: (entry - exit) * qty.
+                if entry_price > 0:
+                    realized_pnl = (
+                        (price - entry_price) * position_qty
+                        if position_direction == "LONG"
+                        else (entry_price - price) * position_qty
+                    )
+                else:
+                    realized_pnl = Decimal("0")
                 # Snapshot fields needed for the bot-trade record before
                 # clear_position_fields() wipes them.
                 record_close_args = {
                     "realized_pnl": str(realized_pnl),
                     "serial": doc.get("serial"),
                     "symbol": symbol,
-                    "direction": "LONG",
+                    "direction": position_direction,
                     "entry_price": str(entry_price),
                     "entry_qty": str(position_qty),
                     "entry_time": doc.get("entry_time"),
@@ -1174,6 +1232,10 @@ class StrategyBotRunner(BotBase):
                         "symbol": symbol,
                         "qty": str(new_position_qty),
                         "attempt": prior_retries + 1,
+                        # Closing direction: long → SELL to flatten,
+                        # short → BUY to cover. Hardcoded SELL here
+                        # broke every short retry.
+                        "side": "SELL" if position_direction == "LONG" else "BUY",
                         "reason": (
                             f"terminal residual: {residual_on_order}/{order_qty} "
                             f"unsold on order, {new_position_qty} remain in position"
@@ -1220,7 +1282,7 @@ class StrategyBotRunner(BotBase):
         if notify_kind == "filled" and self.strategy is not None and symbol:
             try:
                 event = OrderFilled(
-                    trade_serial=serial, symbol=symbol, side="SELL",
+                    trade_serial=serial, symbol=symbol, side=side,
                     fill_price=price, qty=qty, commission=commission,
                     ib_order_id=doc.get("ib_order_id") or "",
                 )
@@ -1319,11 +1381,16 @@ class StrategyBotRunner(BotBase):
                     ib_order_id=self._PENDING_ORDER_ID,
                     serial=self.ctx.state.get("trade_serial") if self.ctx else None,
                 )
-            # If the FSM refused the transition (returned the prior
-            # state unchanged), abort before the engine call. Letting
-            # the order proceed past a rejected FSM is the bug the
-            # routing change above prevents — defense in depth.
-            if new_state == pre_state and pre_state != BotState.AWAITING_EXIT_TRIGGER:
+            # If the FSM refused the transition the handler returns
+            # ``None`` (post 2026-05-11). Abort before the engine call.
+            # The earlier ``new_state == pre_state`` check let a stale
+            # pre-state read past a rejection — when a bar-close
+            # transition won the lock between the pre-state read above
+            # and the handler's lock acquisition, force-quit's stale
+            # pre_state=AWAITING_EXIT_TRIGGER vs the handler's
+            # new_state=EXIT_ORDER_PLACED (rejected) compared unequal
+            # and the pipeline fired a SECOND exit on IB.
+            if new_state is None:
                 logger.warning(
                     '{"event": "BOT_ORDER_REFUSED_AT_FSM", "bot_id": "%s", '
                     '"symbol": "%s", "side": "%s", "origin": "%s", '
@@ -1494,18 +1561,35 @@ class StrategyBotRunner(BotBase):
         )
 
     async def _handle_retry_exit_order(self, args: dict) -> None:
-        """Place a follow-up SELL for the residual when an exit order
+        """Place a follow-up closing order for the residual when an exit
         terminated with unsold shares.
 
         Uses the engine's ``/engine/orders`` endpoint directly (bypassing
         the strategy pipeline) so the retry stays local to the FSM's
         decision. The orderRef is tagged with the bot_ref so the fill
         events route back into this bot's order-stream handler.
+
+        ``args["side"]`` carries the closing direction ("SELL" for a long
+        exit, "BUY" for a short exit). Hardcoded SELL here previously
+        meant every short retry SOLD MORE instead of buying-to-cover,
+        compounding the short rather than closing it. Defaults to SELL
+        when caller didn't supply for backwards compatibility.
         """
         symbol = args.get("symbol")
         qty = args.get("qty")
         engine_url = self.config.get("_engine_url")
-        bot_ref = self.config.get("bot_ref") or self.config.get("ref")
+        # Bot identifier on the orderRef. ``ref_id`` is the canonical
+        # field deployed bots carry (see config/bots/*.yaml); the
+        # ``bot_ref`` / ``ref`` fallbacks cover legacy configs and
+        # earlier test fixtures. Without this, retry orders went out
+        # without the bot tag and the fill events failed the orderRef
+        # prefix filter — fills routed nowhere.
+        bot_ref = (
+            self.config.get("ref_id")
+            or self.config.get("bot_ref")
+            or self.config.get("ref")
+        )
+        side = args.get("side") or "SELL"
         if not (symbol and qty and engine_url):
             logger.warning(
                 '{"event": "RETRY_EXIT_SKIPPED_INCOMPLETE", "bot_id": "%s"}',
@@ -1514,8 +1598,8 @@ class StrategyBotRunner(BotBase):
             return
         logger.warning(
             '{"event": "BOT_EXIT_RETRY", "bot_id": "%s", "symbol": "%s", '
-            '"qty": "%s", "attempt": %d, "reason": "%s"}',
-            self.bot_id, symbol, qty, int(args.get("attempt") or 0),
+            '"side": "%s", "qty": "%s", "attempt": %d, "reason": "%s"}',
+            self.bot_id, symbol, side, qty, int(args.get("attempt") or 0),
             args.get("reason", ""),
         )
         # Session-aware aggressive-mid retry — matches the strategy
@@ -1531,7 +1615,7 @@ class StrategyBotRunner(BotBase):
                     f"{engine_url}/engine/orders",
                     json={
                         "symbol": symbol,
-                        "side": "SELL",
+                        "side": side,
                         "qty": str(qty),
                         "order_type": "smart_market",
                         "bot_ref": bot_ref,
@@ -2240,16 +2324,43 @@ class StrategyBotRunner(BotBase):
                 qty_dec = Decimal(filled_qty_str)
                 price_dec = Decimal(avg_price_str or "0")
                 comm_dec = Decimal(data.get("total_commission", "0"))
+                # Route by FSM state, NOT by the raw BUY/SELL side. The
+                # historical ``BUY → entry / SELL → exit`` mapping is
+                # only correct for long-only strategies. chart_signal
+                # opens shorts with SELL — under the old routing every
+                # short entry fired ``on_exit_filled``, the FSM rejected
+                # the transition (state was ENTRY_ORDER_PLACED), and the
+                # bot ended up holding a real short it didn't know
+                # about. (Caught 2026-05-11 on chart-bot-3 MESM6.)
+                #
+                # Mirror the cancel dispatcher just below: pre-read the
+                # FSM state and dispatch by leg. Side stays available
+                # for direction-aware bookkeeping inside the handler.
+                pre_state = await self.current_state()
+                fill_leg: str | None = None
                 try:
-                    if side == "BUY":
+                    if pre_state in (BotState.ENTRY_ORDER_PLACED,
+                                     BotState.AWAITING_ENTRY_TRIGGER):
+                        fill_leg = "entry"
                         await self.on_entry_filled(
                             qty=qty_dec, price=price_dec, terminal=terminal,
+                            side=side or "BUY",
+                            commission=comm_dec,
+                        )
+                    elif pre_state == BotState.EXIT_ORDER_PLACED:
+                        fill_leg = "exit"
+                        await self.on_exit_filled(
+                            qty=qty_dec, price=price_dec, terminal=terminal,
+                            side=side or "SELL",
                             commission=comm_dec,
                         )
                     else:
-                        await self.on_exit_filled(
-                            qty=qty_dec, price=price_dec, terminal=terminal,
-                            commission=comm_dec,
+                        logger.warning(
+                            '{"event": "FILL_IN_UNEXPECTED_STATE", '
+                            '"bot_id": "%s", "symbol": "%s", "side": "%s", '
+                            '"state": "%s", "ib_order_id": "%s"}',
+                            self.bot_id, symbol, side or "",
+                            pre_state.value, event_ib_order_id,
                         )
                 except Exception:
                     logger.exception(
@@ -2257,10 +2368,11 @@ class StrategyBotRunner(BotBase):
                         self.bot_id,
                     )
                 # On terminal fills, update strat:* key for UI consumers.
-                if terminal:
+                if terminal and fill_leg is not None:
                     await self._apply_fill(
                         bot_ref=bot_ref, symbol=symbol,
-                        side=side[0] if side else "",
+                        leg=fill_leg,
+                        side=side or "",
                         qty=qty_dec, price=price_dec, commission=comm_dec,
                         ib_order_id=data.get("ib_order_id", ""),
                     )
@@ -2529,12 +2641,20 @@ class StrategyBotRunner(BotBase):
         into ERRORED in those windows. Engine-level liveness — "is ANY
         symbol ticking right now?" — is the real "something broke"
         signal.
+
+        Runs in BOTH AWAITING_ENTRY_TRIGGER and AWAITING_EXIT_TRIGGER.
+        The earlier exit-only gate meant a bot armed but with a dead
+        history fetch / expired contract / disconnected stream sat
+        silently with no alert — the worst class of failure. A bot
+        that can't see ticks can't fire entries either; the operator
+        deserves to know.
         """
         if not self.strategy or not self.ctx:
             return
         await self._refresh_state()
-        if self.ctx.fsm_state != BotState.AWAITING_EXIT_TRIGGER:
-            return  # Stale quotes only matter when monitoring exits
+        if self.ctx.fsm_state not in (BotState.AWAITING_ENTRY_TRIGGER,
+                                      BotState.AWAITING_EXIT_TRIGGER):
+            return  # Stale quotes don't matter outside the watching states
 
         per_symbol_elapsed = time.monotonic() - self._last_quote_time
         symbol = self.strategy_config.get("symbol", "")
@@ -2742,6 +2862,12 @@ class StrategyBotRunner(BotBase):
           callback handles the FSM revert to ``AWAITING_ENTRY_TRIGGER``.
         - ``AWAITING_EXIT_TRIGGER``: place a mid exit via the strategy's
           ``build_exit_actions``. The fill handler clears position state.
+        - ``EXIT_ORDER_PLACED``: cancel the in-flight (possibly stale,
+          too-tight) limit exit, synchronously revert to
+          AWAITING_EXIT_TRIGGER, and submit a fresh mid exit. The
+          operator clicked Force quit — they want the close NOW. The
+          earlier version of this method silently no-op'd in this
+          state, returning a 200 while leaving the stale limit waiting.
         - In every state: flip ``armed=False`` immediately so a stale
           trigger between this call and the cancel/fill can't re-enter.
           Codex flagged the prior version, which left a working entry
@@ -2764,6 +2890,27 @@ class StrategyBotRunner(BotBase):
             return {"symbol": symbol, "action": "FORCE_QUIT",
                     "exited": False, "cancelled": True, "armed": False,
                     "fsm_state": cur.value}
+        if cur == BotState.EXIT_ORDER_PLACED:
+            # Cancel the stale in-flight exit, synchronously revert to
+            # AWAITING_EXIT_TRIGGER so the follow-up mid isn't rejected
+            # by the on_place_exit_order FSM gate, then resubmit. The
+            # on_exit_cancelled callback that fires later from the
+            # order:updates stream will see state already moved and
+            # log_invalid → no-op.
+            await self._handle_cancel_order({"symbol": symbol})
+            async with self._state_lock:
+                doc = await self._load_doc()
+                lock_state = BotState(doc.get("state", BotState.OFF.value))
+                if lock_state == BotState.EXIT_ORDER_PLACED:
+                    patch = {"order_qty": None, "filled_qty": "0"}
+                    await self._apply_transition(
+                        doc, BotState.AWAITING_EXIT_TRIGGER, patch,
+                        "force_quit_cancel_and_replace",
+                    )
+            await self._execute_force_sell(symbol)
+            return {"symbol": symbol, "action": "FORCE_QUIT",
+                    "exited": True, "cancelled": True, "armed": False,
+                    "fsm_state": BotState.AWAITING_EXIT_TRIGGER.value}
         return {"symbol": symbol, "action": "FORCE_QUIT",
                 "exited": False, "cancelled": False, "armed": False,
                 "fsm_state": cur.value}

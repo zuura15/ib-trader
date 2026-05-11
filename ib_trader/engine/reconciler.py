@@ -241,11 +241,16 @@ class Reconciler:
         Returns the new position state based on IB's view.
         """
         if not current_state:
-            # No prior state — derive from IB
+            # No prior state — derive from IB. Categorize by what the
+            # broker actually shows, not by the orderRef side digit.
+            # "B"/"S" encodes BUY/SELL direction — for a bidirectional
+            # strategy that's orthogonal to entry-vs-exit. A working
+            # order with no held position is opening (ENTERING); a
+            # working order with a held position is reducing (EXITING).
             if has_position:
-                return OPEN
+                return EXITING if has_order else OPEN
             if has_order:
-                return ENTERING if order_side == "B" else EXITING
+                return ENTERING
             return FLAT
 
         if current_state == ENTERING:
@@ -273,8 +278,10 @@ class Reconciler:
 
         if current_state == FLAT:
             if has_order:
-                # Repair: FLAT but IB has our order — update to match IB
-                new_state = ENTERING if order_side == "B" else EXITING
+                # Repair: FLAT but IB has our order — categorize by
+                # position presence (entering vs reducing), not the
+                # order's BUY/SELL direction which only encodes side.
+                new_state = EXITING if has_position else ENTERING
                 logger.warning(
                     '{"event": "RECONCILER_FLAT_REPAIRED", "side": "%s", "new_state": "%s"}',
                     order_side, new_state,

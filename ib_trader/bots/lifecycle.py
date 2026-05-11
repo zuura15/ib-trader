@@ -113,6 +113,15 @@ def clear_position_fields() -> dict:
         "trail_activated": False,
         "order_qty": None,
         "filled_qty": "0",
+        # chart_signal additions — without these in the reset patch,
+        # a stale entry_line / entry_bar_time / position_direction
+        # survived cancel + force-OFF, and the chart-bot UI kept
+        # drawing the previous round's entry line after the operator
+        # re-armed. Strategies that don't use these fields write None
+        # to no-ops.
+        "entry_line": None,
+        "entry_bar_time": None,
+        "position_direction": None,
     }
 
 

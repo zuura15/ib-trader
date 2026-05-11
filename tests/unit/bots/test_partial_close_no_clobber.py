@@ -189,7 +189,7 @@ def test_apply_fill_does_not_crash_on_qty_none():
     import asyncio
     # Should NOT raise InvalidOperation on the dead `existing_qty` line.
     asyncio.run(runner._apply_fill(
-        bot_ref="test-bot", symbol="GLD", side="S",
+        bot_ref="test-bot", symbol="GLD", leg="exit", side="SELL",
         qty=Decimal("44"), price=Decimal("429.0"),
         commission=Decimal("0"), ib_order_id="ib-1202",
     ))

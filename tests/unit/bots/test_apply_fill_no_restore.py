@@ -112,11 +112,14 @@ async def test_full_exit_does_not_resurrect_entry_price():
     runner = _make_runner(store)
 
     # Simulate the order-stream terminal fill handler calling _apply_fill
-    # for a SELL that fully closed the 15-share position.
+    # for an exit-leg fill that fully closed the 15-share position. Post-
+    # 2026-05-11: caller is dispatcher-aware and passes ``leg`` instead
+    # of inferring it from side.
     await runner._apply_fill(
         bot_ref="test-bot",
         symbol="QQQ",
-        side="S",
+        leg="exit",
+        side="SELL",
         qty=Decimal("15"),
         price=Decimal("644.30"),
         commission=Decimal("1.00"),
@@ -124,11 +127,11 @@ async def test_full_exit_does_not_resurrect_entry_price():
     )
 
     final = store._doc
-    # qty must be 0 — new_qty = 15 - 15 = 0.
-    assert final.get("qty") == "0"
-    # entry_price and entry_time must REMAIN cleared (not resurrected).
+    # Exit leg only writes avg_price + updated_at. entry_price and
+    # entry_time must REMAIN cleared (not resurrected).
     assert final.get("entry_price") is None
     assert final.get("entry_time") is None
+    assert final.get("avg_price") == "644.30"
 
 
 @pytest.mark.asyncio
@@ -150,7 +153,7 @@ async def test_partial_exit_preserves_entry_from_fresh_doc():
     runner.ctx.state["entry_price"] = "999.99"  # stale
 
     await runner._apply_fill(
-        bot_ref="test-bot", symbol="QQQ", side="S",
+        bot_ref="test-bot", symbol="QQQ", leg="exit", side="SELL",
         qty=Decimal("10"),  # this fill — cumulative 10 sold
         price=Decimal("644.30"),
         commission=Decimal("0.50"),
@@ -158,7 +161,7 @@ async def test_partial_exit_preserves_entry_from_fresh_doc():
     )
 
     final = store._doc
-    # new_qty = existing 15 - 10 = 5 (existing_qty from ctx.state.qty).
+    # Exit leg leaves qty alone — FSM owns the residual decrement.
     assert final.get("qty") == "5"
     # entry_price came from the fresh doc, NOT the polluted ctx.state.
     assert final.get("entry_price") == "644.26"
