@@ -1276,20 +1276,55 @@ class StrategyBotRunner(BotBase):
             except ValueError:
                 pre_state = BotState.OFF
             prior_states.append(pre_state)
-            if order.side == "BUY":
-                await self.on_place_entry_order(
+            # Route by ``order.origin`` + FSM state, NOT by side. The
+            # historical ``BUY → entry / SELL → exit`` mapping is wrong
+            # for bidirectional strategies (chart_signal opens shorts
+            # with SELL). When a long-only assumption met a SELL-to-
+            # open, the pipeline tried ``on_place_exit_order``, the FSM
+            # rejected it (``FSM_INVALID_TRANSITION``), but the rest of
+            # the pipeline still fired the order on IB — leaving the
+            # bot blind to a real position it just opened. Caught
+            # 2026-05-11 on chart-bot-3 MESM6.
+            #
+            # New routing:
+            #   - origin == "exit"  → exit path (closes/covers)
+            #   - else              → entry path
+            # FSM gates handle the rest: ``on_place_entry_order`` only
+            # accepts state=AWAITING_ENTRY_TRIGGER and ``on_place_
+            # exit_order`` only accepts state=AWAITING_EXIT_TRIGGER, so
+            # a misrouted attempt now FAILS LOUDLY before the engine
+            # POST instead of falling through.
+            is_exit = getattr(order, "origin", "strategy") == "exit"
+            if is_exit:
+                new_state = await self.on_place_exit_order(
+                    symbol=order.symbol, qty=order.qty,
+                    order_type=order.order_type,
+                    origin=getattr(order, "origin", "strategy"),
+                    ib_order_id=self._PENDING_ORDER_ID,
+                )
+            else:
+                new_state = await self.on_place_entry_order(
                     symbol=order.symbol, qty=order.qty,
                     order_type=order.order_type,
                     origin=getattr(order, "origin", "strategy"),
                     ib_order_id=self._PENDING_ORDER_ID,
                     serial=self.ctx.state.get("trade_serial") if self.ctx else None,
                 )
-            else:
-                await self.on_place_exit_order(
-                    symbol=order.symbol, qty=order.qty,
-                    order_type=order.order_type,
-                    origin=getattr(order, "origin", "strategy"),
-                    ib_order_id=self._PENDING_ORDER_ID,
+            # If the FSM refused the transition (returned the prior
+            # state unchanged), abort before the engine call. Letting
+            # the order proceed past a rejected FSM is the bug the
+            # routing change above prevents — defense in depth.
+            if new_state == pre_state and pre_state != BotState.AWAITING_EXIT_TRIGGER:
+                logger.warning(
+                    '{"event": "BOT_ORDER_REFUSED_AT_FSM", "bot_id": "%s", '
+                    '"symbol": "%s", "side": "%s", "origin": "%s", '
+                    '"state": "%s", "reason": "FSM rejected transition"}',
+                    self.bot_id, order.symbol, order.side,
+                    getattr(order, "origin", "strategy"), pre_state.value,
+                )
+                raise RuntimeError(
+                    f"FSM refused {order.side} ({getattr(order, 'origin', 'strategy')}) "
+                    f"in state {pre_state.value}",
                 )
             self._recent_submit_times.append(time.monotonic())
 
