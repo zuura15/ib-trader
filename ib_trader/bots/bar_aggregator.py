@@ -125,11 +125,28 @@ class BarAggregator:
         }
 
     @classmethod
-    def from_state_dict(cls, data: dict) -> BarAggregator:
-        """Reconstruct aggregator from persisted state."""
+    def from_state_dict(
+        cls, data: dict,
+        *,
+        lookback_bars_override: int | None = None,
+    ) -> BarAggregator:
+        """Reconstruct aggregator from persisted state.
+
+        ``lookback_bars_override`` lets the caller honor the *current*
+        bot config when restoring an aggregator whose state file was
+        written under a different lookback. Without this, a yaml edit
+        from ``lookback_bars: 60`` to ``1`` is silently ignored on
+        restart — the deque keeps its old maxlen and ``get_bar_window``
+        still gates on the stale value, so the bot looks running but
+        never receives BarCompleted dispatches.
+        """
         agg = cls(
             target_seconds=data["target_seconds"],
-            lookback_bars=data["lookback_bars"],
+            lookback_bars=(
+                lookback_bars_override
+                if lookback_bars_override is not None
+                else data["lookback_bars"]
+            ),
         )
         for bar in data.get("completed", []):
             agg._completed.append(bar)

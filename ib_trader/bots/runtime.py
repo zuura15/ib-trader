@@ -1727,13 +1727,23 @@ class StrategyBotRunner(BotBase):
             bar_seconds = bar_sub.params.get("bar_seconds", 180)
             lookback = bar_sub.params.get("lookback", 100)
 
-            # Try to restore aggregator state
+            # Try to restore aggregator state. The override forces the
+            # restored aggregator to honor the *current* config's
+            # lookback_bars; without it, a yaml lookback edit (e.g.
+            # 60 → 1 for chart_signal) silently does nothing on
+            # restart — the deque keeps its old maxlen and the
+            # runtime's ``get_bar_window`` gate never opens.
             agg_state = load_state_from_file(STATE_DIR, self.bot_id,
                                               f"{self.strategy_config['symbol']}-agg")
             if agg_state:
-                self.aggregator = BarAggregator.from_state_dict(agg_state)
-                logger.info('{"event": "AGGREGATOR_RESTORED", "bars": %d}',
-                            self.aggregator.buffered_bars)
+                self.aggregator = BarAggregator.from_state_dict(
+                    agg_state, lookback_bars_override=lookback,
+                )
+                logger.info(
+                    '{"event": "AGGREGATOR_RESTORED", "bars": %d, '
+                    '"lookback_bars": %d}',
+                    self.aggregator.buffered_bars, lookback,
+                )
             else:
                 self.aggregator = BarAggregator(bar_seconds, lookback)
 

@@ -7,7 +7,7 @@ All datetimes are stored in server-local timezone.
 import uuid
 from sqlalchemy import (
     Column, String, Integer, Numeric, Boolean,
-    DateTime, Enum, ForeignKey, Text
+    DateTime, Enum, ForeignKey, Index, Text
 )
 from sqlalchemy.orm import DeclarativeBase
 import enum
@@ -338,6 +338,16 @@ class BotEvent(Base):
     payload_json   = Column(Text, nullable=True)           # Structured JSON for machine-readable data
     trade_serial   = Column(Integer, nullable=True)
     recorded_at    = Column(DateTime, nullable=False)
+
+    # Composite indexes drive ``scripts/debug/explain.py`` — "events for
+    # bot X around time Y" is a hot lookup when troubleshooting missed
+    # signals/orders. Time-only and event-type variants cover the cross-
+    # bot and per-category queries the same script runs.
+    __table_args__ = (
+        Index("ix_bot_events_bot_recorded", "bot_id", "recorded_at"),
+        Index("ix_bot_events_recorded", "recorded_at"),
+        Index("ix_bot_events_type_recorded", "event_type", "recorded_at"),
+    )
 
 
 class BotTrade(Base):
