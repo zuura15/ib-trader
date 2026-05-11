@@ -55,7 +55,10 @@ from ib_trader.bots.strategy import (
 from ib_trader.logging_.alerts import fire_and_forget_alert
 from ib_trader.signals.sr_fan import (
     MIN_TOUCHES,
+    TOUCH_TOLERANCE_FRACTION,
     detect_lines,
+    find_pivot_highs,
+    find_pivot_lows,
     in_futures_deadzone,
 )
 
@@ -294,6 +297,74 @@ class ChartSignalStrategy:
                 "top_resistances": _top(resistances),
             },
         ))
+        # Freshness gate: the bot must enter when the 3rd touch is
+        # NEWLY confirmed, not on every subsequent bar a stale 3-touch
+        # line remains valid. Without this the bot fires whenever
+        # ``armed=True`` and a qualifying line exists, even if the
+        # last pivot touching it was 20 bars ago — diverging from the
+        # chart's B/S badges (which are placed ONCE at the anchor and
+        # don't re-fire). On 2026-05-11 chart-bot-4 fired three BUYs
+        # at 13:45 / 13:49 / 13:52 on the SAME support line whose
+        # anchor was at 13:24; the user saw a single B on the chart
+        # and reasonably expected no further entries.
+        #
+        # Rule: the line's most-recent touching pivot must be within
+        # ``max_touch_age_bars`` of ``last_idx`` (default 2 — the just-
+        # confirmed pivot at ``last_idx-1``, with one bar of grace).
+        max_age = int(self.config.get("max_touch_age_bars", 2))
+        TOUCH_FRAC = float(self.config.get(
+            "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+        ))
+        avg_close = sum(closes) / max(1, len(closes))
+        touch_tol = max(1e-6, avg_close * TOUCH_FRAC)
+        support_pivots = find_pivot_lows(closes)
+        resistance_pivots = find_pivot_highs(closes)
+
+        def _latest_touch(line, side_pivots):
+            latest = -1
+            for p in side_pivots:
+                if p < line.from_idx or p > last_idx:
+                    continue
+                if abs(closes[p] - (line.intercept + line.slope * p)) <= touch_tol:
+                    latest = max(latest, p)
+            return latest
+
+        def _is_fresh(line, side_pivots) -> tuple[bool, int]:
+            lt = _latest_touch(line, side_pivots)
+            if lt < 0:
+                return False, lt
+            return (last_idx - lt) <= max_age, lt
+
+        long_fresh, long_lt = (False, -1)
+        short_fresh, short_lt = (False, -1)
+        if long_line is not None:
+            long_fresh, long_lt = _is_fresh(long_line, support_pivots)
+        if short_line is not None:
+            short_fresh, short_lt = _is_fresh(short_line, resistance_pivots)
+
+        if not long_fresh:
+            long_line = None
+        if not short_fresh:
+            short_line = None
+
+        if long_line is None and short_line is None:
+            # Surface why nothing qualified so the diagnostic chain is
+            # not "BAR row shows longs/shorts > 0 but no entry."
+            if long_lt >= 0 or short_lt >= 0:
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"3-touch lines too stale "
+                        f"(long_lt={long_lt} short_lt={short_lt} "
+                        f"last_idx={last_idx} max_age={max_age})"
+                    ),
+                    payload={"long_latest_touch": long_lt,
+                             "short_latest_touch": short_lt,
+                             "last_idx": last_idx,
+                             "max_touch_age_bars": max_age},
+                ))
+            return actions
+
         if long_line and short_line:
             if short_line.touches > long_line.touches:
                 chosen, direction, kind = short_line, "short", "resistance"

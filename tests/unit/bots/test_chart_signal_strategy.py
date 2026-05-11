@@ -150,6 +150,51 @@ class TestEntry:
         actions = await s.on_event(event, ctx)
         assert not any(isinstance(a, PlaceOrder) for a in actions)
 
+    @pytest.mark.asyncio
+    async def test_stale_3touch_blocked_by_freshness_gate(self):
+        """The 3-touch line is valid but the latest touching pivot is
+        far from the current bar — the bot must NOT fire on the stale
+        signal. Matches the user's 2026-05-11 MNQ observation: chart
+        showed a B at the anchor, then no new B for 20+ minutes, but
+        the bot fired a fresh BUY anyway because ``armed=True`` and
+        the line was still 3-touch."""
+        s = ChartSignalStrategy(_default_config())
+        ctx = _make_ctx()
+        # 9-bar zigzag (4-touch support, last pivot at idx 7) followed
+        # by 6 monotonically-increasing bars. The bars stay well above
+        # the line (no break, no new touching pivot), so the line is
+        # still 4-touch and not broken — but the latest touching pivot
+        # is still idx 7. last_idx = 14; age = 7 → above the default
+        # max_touch_age_bars (2).
+        closes = ZIGZAG_CLOSES + [14.2, 14.5, 14.8, 15.1, 15.4, 15.7]
+        bars = _zigzag_bars(START_UTC, closes)
+        event = BarCompleted(symbol="MGCM6", bar=bars[-1],
+                             window=bars, bar_count=len(bars))
+        actions = await s.on_event(event, ctx)
+        # No entry — freshness gate blocked.
+        assert not any(isinstance(a, PlaceOrder) for a in actions), \
+            f"expected no PlaceOrder on stale 3-touch, got {actions}"
+        # Surface log explains why.
+        from ib_trader.bots.strategy import LogSignal, LogEventType
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                  and a.event_type == LogEventType.SKIP]
+        assert skips, "expected a SKIP log row explaining the stale gate"
+
+    @pytest.mark.asyncio
+    async def test_freshness_gate_allows_fresh_3rd_touch(self):
+        """Sanity inverse: on the bar where the 3rd touch is freshly
+        confirmed, the bot fires normally."""
+        s = ChartSignalStrategy(_default_config())
+        ctx = _make_ctx()
+        # ZIGZAG_CLOSES at idx=8 has the freshest pivot at idx 7 (just
+        # confirmed by closing bar 8). age = 1 → within max_age = 2.
+        bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES)
+        event = BarCompleted(symbol="MGCM6", bar=bars[-1],
+                             window=bars, bar_count=len(bars))
+        actions = await s.on_event(event, ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place and place[0].side == "BUY"
+
 
 class TestShortEntry:
     """Bot enters short on a 3-touch downtrending resistance and exits
