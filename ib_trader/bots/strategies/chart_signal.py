@@ -253,6 +253,22 @@ class ChartSignalStrategy:
         # were silent on every barbarewhere the algorithm decided not to
         # act. Touches per side (best of) makes algorithm divergence
         # vs the frontend obvious.
+        # Dump the top raw candidates per side so we can tell which
+        # filter rejected an "obviously valid" line. Sort by touches
+        # desc; tiebreak by absolute slope desc (steeper first). Per-
+        # line payload fields: touches / slope_per_bar / break_idx
+        # (None = not broken). When ``longs=0`` but ``supports_found>0``
+        # the top_supports list explains why nothing qualified.
+        def _top(lines, k=5):
+            ranked = sorted(lines, key=lambda l: (-l.touches, -abs(l.slope)))
+            return [
+                {"touches": l.touches,
+                 "slope": round(l.slope, 4),
+                 "break_idx": l.break_idx,
+                 "from": l.from_idx, "anchor": l.anchor_b_idx}
+                for l in ranked[:k]
+            ]
+
         actions.append(LogSignal(
             event_type=LogEventType.BAR,
             message=(
@@ -269,6 +285,8 @@ class ChartSignalStrategy:
                 "best_short_slope": short_line.slope if short_line else None,
                 "supports_found": len(supports),
                 "resistances_found": len(resistances),
+                "top_supports": _top(supports),
+                "top_resistances": _top(resistances),
             },
         ))
         if long_line and short_line:
