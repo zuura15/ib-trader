@@ -12,5 +12,9 @@ config:
   # MNQ = Micro E-mini Nasdaq-100. M6 = June 2026.
   symbol: MNQM6
   sec_type: FUT
+  # Micro Nasdaq: $2/point. Used by P/L math + trail target.
+  contract_multiplier: 2
+  # Trailing dip: 0.02% × 29,395 pts × $2 ≈ $11.76 per contract per move.
+  trail_width_pct: 0.0002
 symbols:
 - MNQM6

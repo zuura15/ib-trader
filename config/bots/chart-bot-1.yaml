@@ -18,5 +18,9 @@ config:
   # June 2026 contract (M6). Roll to Q6 (Aug) before late-June expiry.
   symbol: MGCM6
   sec_type: FUT
+  # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
+  contract_multiplier: 10
+  # Trailing dip: 0.02% × $4,741 × 10 ≈ $9.48 per contract per move.
+  trail_width_pct: 0.0002
 symbols:
 - MGCM6

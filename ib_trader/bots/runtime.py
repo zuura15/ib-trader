@@ -115,6 +115,15 @@ class StrategyBotRunner(BotBase):
         # single strategy YAML can back STK and FUT bots.
         if "sec_type" in config:
             self.strategy_config["sec_type"] = config["sec_type"]
+        # ``contract_multiplier`` and ``trail_width_pct`` are per-symbol
+        # tunables (MGC = 10 oz/contract, MCL = 100, MES = $5/pt, MNQ =
+        # $2/pt; trail percentages chosen so the dollar giveback is
+        # ~$10/contract regardless of symbol). Mirror from the bot YAML
+        # so a single strategy yaml can back differently-multiplied
+        # contracts without forking.
+        for k in ("contract_multiplier", "trail_width_pct"):
+            if k in config:
+                self.strategy_config[k] = config[k]
 
         # Strategy instance
         self.strategy: Strategy | None = None
@@ -1152,13 +1161,20 @@ class StrategyBotRunner(BotBase):
             # once we have confidence in the drift fix.
             if new_position_qty == 0:
                 entry_price = Decimal(str(doc.get("entry_price") or "0"))
-                # Direction-aware P&L. Long: (exit - entry) * qty.
-                # Short: (entry - exit) * qty.
+                # Contract multiplier — futures use a notional
+                # multiplier (MGC = 10, MCL = 100, MES = 5, MNQ = 2).
+                # Without it, recorded realized_pnl was raw price diff
+                # × qty, off by 2-100× depending on symbol. STK = 1.
+                mult = Decimal(str(
+                    self.strategy_config.get("contract_multiplier", "1")
+                ))
+                # Direction-aware P&L. Long: (exit - entry) * qty * mult.
+                # Short: (entry - exit) * qty * mult.
                 if entry_price > 0:
                     realized_pnl = (
-                        (price - entry_price) * position_qty
+                        (price - entry_price) * position_qty * mult
                         if position_direction == "LONG"
-                        else (entry_price - price) * position_qty
+                        else (entry_price - price) * position_qty * mult
                     )
                 else:
                     realized_pnl = Decimal("0")

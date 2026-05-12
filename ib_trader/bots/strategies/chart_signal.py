@@ -105,10 +105,18 @@ class ChartSignalStrategy:
                 "entry_price": "decimal|null",
                 "entry_time": "str|null",
                 "entry_bar_time": "str|null",
-                "entry_line": "dict|null",  # {slope_per_sec, anchor_time, anchor_price, touches, kind, slope_per_bar, intercept, anchor_b_idx}
+                "entry_line": "dict|null",  # {slope_per_sec, anchor_time, anchor_price, touches, kind, slope_per_bar, intercept, anchor_b_idx, from_time, from_idx}
                 "qty": "decimal|null",
                 "last_price": "decimal|null",
                 "unrealized_pnl": "decimal|null",
+                # Trailing-dip exit (Change B). HWM = highest bar
+                # close since entry (long); LWM = lowest (short).
+                # active_stop = max(line, trail) for long, min for
+                # short. exit_reason recorded on close.
+                "high_water_mark": "decimal|null",
+                "low_water_mark": "decimal|null",
+                "active_stop": "decimal|null",
+                "exit_reason": "str|null",
                 "last_deadzone_alert_date": "str|null",
             },
             version="1.0",
@@ -410,6 +418,14 @@ class ChartSignalStrategy:
         anchor_b_price = float(window[chosen.anchor_b_idx].get(
             "close", closes[chosen.anchor_b_idx]
         )) if 0 <= chosen.anchor_b_idx < len(window) else closes[chosen.anchor_b_idx]
+        # Q (first construction pivot) timestamp — the chart clips the
+        # rendered entry-line at this point so the operator only sees
+        # the section the bot actually validated. Without ``from_time``
+        # the chart extrapolates the line all the way back to ``bars[0]``
+        # which looks like a long-running trend the bot never claimed.
+        anchor_q_time = _parse_ts(
+            window[chosen.from_idx].get("timestamp_utc")
+        ) if 0 <= chosen.from_idx < len(window) else None
         slope_per_sec = chosen.slope / self.bar_seconds
 
         entry_line_doc = {
@@ -422,6 +438,7 @@ class ChartSignalStrategy:
             "anchor_price": anchor_b_price,
             "anchor_b_idx": chosen.anchor_b_idx,
             "from_idx": chosen.from_idx,
+            "from_time": (anchor_q_time or anchor_b_time or bar_time).isoformat(),
             "touches": chosen.touches,
         }
 
@@ -533,28 +550,90 @@ class ChartSignalStrategy:
         line_value = anchor_p + slope_per_sec * elapsed_sec
 
         direction = str(entry_line.get("direction", "long")).lower()
+
+        # Trailing-dip stop alongside the line-breach exit: track the
+        # bar-close water mark since entry and exit whenever a bar
+        # closes more than ``trail_width_pct`` away from it. Without
+        # this the only exit was line-breach, which converges with
+        # price over time (the line's slope moves it toward the
+        # bar's close every bar) — bot could give back a multi-tick
+        # favorable move while waiting for the line to catch up. Per-
+        # bot ``trail_width_pct`` (default 0.0003) sized so the
+        # dollar giveback per contract is ~$10 regardless of symbol.
+        from decimal import Decimal as _D
+        bar_close_d = _D(str(bar_close))
+        trail_pct = _D(str(self.config.get("trail_width_pct", "0.0003")))
+        line_value_d = _D(str(line_value))
+
+        breach_trail = False
+        trail_stop_d = _D("0")
+        water_mark_update: dict = {}
+        if direction == "long":
+            hwm_raw = ctx.state.get("high_water_mark")
+            try:
+                cur_hwm = _D(str(hwm_raw)) if hwm_raw not in (None, "") \
+                    else bar_close_d
+            except Exception:  # noqa: BLE001
+                cur_hwm = bar_close_d
+            hwm = max(cur_hwm, bar_close_d)
+            trail_stop_d = hwm * (_D("1") - trail_pct)
+            active_stop = max(line_value_d, trail_stop_d)
+            water_mark_update = {
+                "high_water_mark": str(hwm),
+                "active_stop": str(active_stop),
+            }
+            breach_trail = bar_close_d < trail_stop_d
+        else:  # short
+            lwm_raw = ctx.state.get("low_water_mark")
+            try:
+                cur_lwm = _D(str(lwm_raw)) if lwm_raw not in (None, "") \
+                    else bar_close_d
+            except Exception:  # noqa: BLE001
+                cur_lwm = bar_close_d
+            lwm = min(cur_lwm, bar_close_d)
+            trail_stop_d = lwm * (_D("1") + trail_pct)
+            active_stop = min(line_value_d, trail_stop_d)
+            water_mark_update = {
+                "low_water_mark": str(lwm),
+                "active_stop": str(active_stop),
+            }
+            breach_trail = bar_close_d > trail_stop_d
+
+        breach_line = (bar_close < line_value) if direction == "long" \
+            else (bar_close > line_value)
+
         actions.append(LogSignal(
             event_type=LogEventType.EXIT_CHECK,
             message=(
                 f"bar close={bar_close:.4f} vs {direction} line="
-                f"{line_value:.4f}"
+                f"{line_value:.4f} trail={float(trail_stop_d):.4f}"
             ),
             payload={"close": bar_close, "line_value": line_value,
+                     "trail_stop": float(trail_stop_d),
                      "direction": direction,
                      "bar_time": bar_time.isoformat()},
         ))
+        actions.append(UpdateState(water_mark_update))
 
-        # Long: break = close below the entry support.
-        # Short: break = close above the entry resistance.
-        broken = (bar_close < line_value) if direction == "long" \
-            else (bar_close > line_value)
-        if broken:
+        if breach_line or breach_trail:
+            if breach_line and breach_trail:
+                reason = "both"
+            elif breach_trail:
+                reason = "trail_stop"
+            else:
+                reason = "line_breach"
+            actions.append(UpdateState({"exit_reason": reason}))
             verb = "support" if direction == "long" else "resistance"
             cmp = "<" if direction == "long" else ">"
+            detail = (
+                f"3-min bar close {bar_close:.4f} {cmp} "
+                + (f"trail {float(trail_stop_d):.4f}" if breach_trail
+                   and not breach_line
+                   else f"entry {verb} {line_value:.4f}")
+                + f" [{reason}]"
+            )
             return actions + self.build_exit_actions(
-                ctx, ExitType.TRAILING_STOP,
-                f"3-min bar close {bar_close:.4f} {cmp} entry "
-                f"{verb} {line_value:.4f}",
+                ctx, ExitType.TRAILING_STOP, detail,
             )
         return actions
 
@@ -578,9 +657,14 @@ class ChartSignalStrategy:
             return []
         entry_line = ctx.state.get("entry_line") or {}
         direction = str(entry_line.get("direction", "long")).lower()
+        # Contract multiplier — futures contracts have a notional
+        # multiplier (MGC = 10 oz, MCL = 100 bbl, MES = $5/pt, MNQ =
+        # $2/pt). Without it the surfaced "P/L" was the raw price diff
+        # — off by 2-100× depending on the symbol. STK defaults to 1.
+        mult = Decimal(str(self.config.get("contract_multiplier", "1")))
         # Long: profit when last > entry. Short: profit when last < entry.
-        unrealized = (last - entry_price) * qty if direction == "long" \
-            else (entry_price - last) * qty
+        unrealized = (last - entry_price) * qty * mult if direction == "long" \
+            else (entry_price - last) * qty * mult
         return [UpdateState({
             "last_price": str(last),
             "unrealized_pnl": str(unrealized),
@@ -653,11 +737,13 @@ class ChartSignalStrategy:
             entry_price = Decimal(
                 str(ctx.state.get("entry_price", "0") or "0")
             )
-            # Long P/L = (exit - entry) * qty. Short P/L = (entry - exit) * qty.
+            mult = Decimal(str(self.config.get("contract_multiplier", "1")))
+            # Long P/L = (exit - entry) * qty * mult.
+            # Short P/L = (entry - exit) * qty * mult.
             if entry_price > 0:
-                pnl = (event.fill_price - entry_price) * event.qty \
+                pnl = (event.fill_price - entry_price) * event.qty * mult \
                     if direction == "long" \
-                    else (entry_price - event.fill_price) * event.qty
+                    else (entry_price - event.fill_price) * event.qty * mult
             else:
                 pnl = Decimal("0")
             actions.extend([
@@ -677,6 +763,13 @@ class ChartSignalStrategy:
                     "entry_time": None,
                     "entry_bar_time": None,
                     "unrealized_pnl": None,
+                    # Trailing-dip state cleared so the next round
+                    # starts fresh (water marks initialize from the
+                    # first bar after re-arm).
+                    "high_water_mark": None,
+                    "low_water_mark": None,
+                    "active_stop": None,
+                    "exit_reason": None,
                 }),
             ])
         return actions

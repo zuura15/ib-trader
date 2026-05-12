@@ -82,6 +82,12 @@ interface Props {
     anchorPrice: number;
     /** Per-second slope in price-per-second. */
     slopePerSec: number;
+    /** Optional Real-UTC ISO of Q (the older construction pivot).
+     *  When present, the chart clips the line render to start here
+     *  instead of projecting backward to ``bars[0]``. Pre-Q the line
+     *  carries no validation — drawing it across pre-Q history looks
+     *  like a trend the bot validated when it never did. */
+    fromTime?: string;
   } | null;
   /** Bot-mode badge highlight. Real-UTC ISO of the bar whose B/S badge
    *  represents the bot's active entry — the badge gets a green ring
@@ -325,7 +331,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       return;
     }
     const anchorChartSec = localUtcSeconds(anchorDate) as number;
-    const startTime = bars[0].time as UTCTimestamp;
+    // Clip the line's left endpoint at Q when the bot provides it.
+    // Without ``fromTime``, the line is projected backward to
+    // ``bars[0]``, which historically read as a long-running trend
+    // the bot never validated. With ``fromTime``, the line starts at
+    // Q (the first construction pivot) — pre-Q region has no line.
+    let startTime = bars[0].time as UTCTimestamp;
+    if (entryLine.fromTime) {
+      const fromDate = new Date(entryLine.fromTime);
+      if (Number.isFinite(fromDate.getTime())) {
+        const fromChartSec = localUtcSeconds(fromDate) as number;
+        if (fromChartSec > (bars[0].time as number)) {
+          startTime = fromChartSec as UTCTimestamp;
+        }
+      }
+    }
     const endTime = bars[bars.length - 1].time as UTCTimestamp;
     const valueAt = (t: number) =>
       entryLine.anchorPrice + entryLine.slopePerSec * (t - anchorChartSec);

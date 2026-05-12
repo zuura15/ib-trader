@@ -132,6 +132,11 @@ class TestEntry:
         assert line["touches"] >= 3
         assert line["slope_per_bar"] == pytest.approx(0.5)
         assert line["slope_per_sec"] == pytest.approx(0.5 / BAR_SECONDS)
+        # Change A — chart clip: ``from_time`` must be present so the
+        # frontend can clip the entry-line render at Q. Q is the first
+        # construction pivot at from_idx=1 (close 9.0 at START + 1×180s).
+        assert "from_time" in line
+        assert line["from_time"]   # non-empty ISO
 
     @pytest.mark.asyncio
     async def test_armed_false_blocks_entry(self):
@@ -565,6 +570,181 @@ class TestExit:
         actions = await s.on_event(event, ctx)
         assert not any(isinstance(a, PlaceOrder) and a.side == "SELL"
                        for a in actions)
+
+
+class TestTrailingDip:
+    """Change B: trailing-dip exit alongside line-breach, whichever
+    fires first. HWM (long) / LWM (short) track the bar-close water
+    mark since entry; exit when ``bar_close`` deviates from the mark
+    by more than ``trail_width_pct``."""
+
+    def _long_state(self, hwm: str | None = None) -> dict:
+        anchor_time = (START_UTC + timedelta(seconds=BAR_SECONDS * 7)).isoformat()
+        s = {
+            "armed": False, "qty": "1", "entry_price": "12.0",
+            "entry_line": {
+                "kind": "support", "direction": "long",
+                "slope_per_bar": 0.5, "intercept": 8.5,
+                "slope_per_sec": 0.5 / BAR_SECONDS,
+                "anchor_time": anchor_time, "anchor_price": 12.0,
+                "anchor_b_idx": 7, "from_idx": 1, "touches": 4,
+            },
+        }
+        if hwm is not None:
+            s["high_water_mark"] = hwm
+        return s
+
+    @pytest.mark.asyncio
+    async def test_long_trail_stop_fires_before_line_breach(self):
+        """Position ran up to HWM=20, then bar closes at 19.99 — 0.05%
+        below HWM, well above the line. trail_width_pct=0.0003 (0.03%)
+        → trail_stop = 20 × 0.9997 = 19.994. Close 19.99 < 19.994 →
+        trail exit. Line at idx 9 is 13.0, close 19.99 > 13.0 → line
+        does NOT breach. Reason must be ``trail_stop``."""
+        cfg = _default_config(sec_type="STK")
+        cfg["trail_width_pct"] = 0.0003
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(state=self._long_state(hwm="20"),
+                         fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+                         config=cfg)
+        bar_time = START_UTC + timedelta(seconds=BAR_SECONDS * 9)
+        bar = _bar(bar_time, close=19.99)
+        event = BarCompleted(symbol="MGCM6", bar=bar, window=[bar],
+                             bar_count=1)
+        actions = await s.on_event(event, ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                  and a.side == "SELL"]
+        assert sells, f"expected SELL exit, got {actions}"
+        # exit_reason persisted via UpdateState
+        ups = [a for a in actions if isinstance(a, UpdateState)
+                and "exit_reason" in a.state]
+        assert ups and ups[0].state["exit_reason"] == "trail_stop"
+
+    @pytest.mark.asyncio
+    async def test_long_line_breach_when_no_trail_room(self):
+        """Position barely moved, no profit. Bar closes below the line
+        but well within the trail. Reason must be ``line_breach``."""
+        cfg = _default_config(sec_type="STK")
+        cfg["trail_width_pct"] = 0.05  # very loose so trail can't fire first
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(state=self._long_state(hwm="12.5"),
+                         fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+                         config=cfg)
+        # Line at idx 9 = 13.0. Close 12.5 < 13.0 → line breach.
+        # Trail (with 5% pct): hwm=12.5 × 0.95 = 11.875. Close 12.5 > 11.875
+        # → trail does NOT breach.
+        bar_time = START_UTC + timedelta(seconds=BAR_SECONDS * 9)
+        bar = _bar(bar_time, close=12.5)
+        event = BarCompleted(symbol="MGCM6", bar=bar, window=[bar],
+                             bar_count=1)
+        actions = await s.on_event(event, ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                  and a.side == "SELL"]
+        assert sells, f"expected SELL exit, got {actions}"
+        ups = [a for a in actions if isinstance(a, UpdateState)
+                and "exit_reason" in a.state]
+        assert ups and ups[0].state["exit_reason"] == "line_breach"
+
+    @pytest.mark.asyncio
+    async def test_short_trail_fires_on_low_water_mark_rise(self):
+        """Short held; price dipped to LWM=10, then bar closes at
+        10.005 — 0.05% above LWM. trail_width_pct=0.0003 → trail_stop
+        = 10 × 1.0003 = 10.003. Close 10.005 > 10.003 → trail exit.
+        Line at idx 9 (downtrending resistance) at 14.5, close 10.005
+        < 14.5 → line does NOT breach."""
+        cfg = _default_config(sec_type="STK")
+        cfg["trail_width_pct"] = 0.0003
+        s = ChartSignalStrategy(cfg)
+        anchor_time = (START_UTC + timedelta(seconds=BAR_SECONDS * 7)).isoformat()
+        state = {
+            "armed": False, "qty": "1", "entry_price": "11.0",
+            "entry_line": {
+                "kind": "resistance", "direction": "short",
+                "slope_per_bar": -0.5, "intercept": 19,
+                "slope_per_sec": -0.5 / BAR_SECONDS,
+                "anchor_time": anchor_time, "anchor_price": 15.5,
+                "anchor_b_idx": 7, "from_idx": 1, "touches": 4,
+            },
+            "low_water_mark": "10",
+        }
+        ctx = _make_ctx(state=state,
+                         fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+                         config=cfg)
+        bar_time = START_UTC + timedelta(seconds=BAR_SECONDS * 9)
+        bar = _bar(bar_time, close=10.005)
+        event = BarCompleted(symbol="MGCM6", bar=bar, window=[bar],
+                             bar_count=1)
+        actions = await s.on_event(event, ctx)
+        covers = [a for a in actions if isinstance(a, PlaceOrder)
+                   and a.side == "BUY"]
+        assert covers, f"expected BUY cover, got {actions}"
+        ups = [a for a in actions if isinstance(a, UpdateState)
+                and "exit_reason" in a.state]
+        assert ups and ups[0].state["exit_reason"] == "trail_stop"
+
+
+class TestMultiplierAwarePnl:
+    """Change C: unrealized P/L surfaced by ``_on_quote`` and the
+    realized P/L from ``_on_fill`` exit must include the contract
+    multiplier so the strip reads dollars, not raw price diff."""
+
+    @pytest.mark.asyncio
+    async def test_unrealized_pnl_uses_contract_multiplier(self):
+        cfg = _default_config(sec_type="FUT")
+        cfg["contract_multiplier"] = 10   # MGC = 10 oz/contract
+        anchor_time = START_UTC.isoformat()
+        entry_line = {
+            "kind": "support", "direction": "long",
+            "slope_per_bar": 0.5, "intercept": 8.5,
+            "slope_per_sec": 0.5 / BAR_SECONDS,
+            "anchor_time": anchor_time, "anchor_price": 4741.20,
+            "anchor_b_idx": 7, "from_idx": 1, "touches": 3,
+        }
+        ctx = _make_ctx(
+            state={"armed": False, "qty": "1", "entry_price": "4741.20",
+                   "entry_line": entry_line},
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER, config=cfg,
+        )
+        s = ChartSignalStrategy(cfg)
+        q = QuoteUpdate(symbol="MGCM6",
+                         bid=Decimal("4742.10"), ask=Decimal("4742.30"),
+                         last=Decimal("4742.20"),
+                         timestamp=datetime.now(timezone.utc))
+        actions = await s.on_event(q, ctx)
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        assert ups
+        st = ups[0].state
+        # (4742.20 - 4741.20) × 1 contract × 10 oz = $10.00
+        assert Decimal(st["unrealized_pnl"]) == Decimal("10.00")
+
+    @pytest.mark.asyncio
+    async def test_short_unrealized_pnl_uses_contract_multiplier(self):
+        cfg = _default_config(sec_type="FUT")
+        cfg["contract_multiplier"] = 5    # MES
+        anchor_time = START_UTC.isoformat()
+        entry_line = {
+            "kind": "resistance", "direction": "short",
+            "slope_per_bar": -0.1, "intercept": 100,
+            "slope_per_sec": -0.1 / BAR_SECONDS,
+            "anchor_time": anchor_time, "anchor_price": 7420,
+            "anchor_b_idx": 7, "from_idx": 1, "touches": 3,
+        }
+        ctx = _make_ctx(
+            state={"armed": False, "qty": "1", "entry_price": "7420",
+                   "entry_line": entry_line},
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER, config=cfg,
+        )
+        s = ChartSignalStrategy(cfg)
+        q = QuoteUpdate(symbol="MESM6",
+                         bid=Decimal("7417"), ask=Decimal("7419"),
+                         last=Decimal("7418"),
+                         timestamp=datetime.now(timezone.utc))
+        actions = await s.on_event(q, ctx)
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        assert ups
+        st = ups[0].state
+        # (7420 - 7418) × 1 × 5 = $10
+        assert Decimal(st["unrealized_pnl"]) == Decimal("10")
 
 
 class TestFills:

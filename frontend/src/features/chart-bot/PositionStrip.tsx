@@ -40,16 +40,20 @@ export function PositionStrip({ state, fsmState }: Props) {
   const inPosition = fsmState === 'AWAITING_EXIT_TRIGGER'
     || fsmState === 'EXIT_ORDER_PLACED';
 
+  // Stop value the bot would actually act on. ``active_stop`` is
+  // bot-authoritative = max/min of line and trail per direction.
+  // Falls back to the projected line for legacy state docs.
+  const stopValue: string = state.active_stop != null && state.active_stop !== ''
+    ? fmt(state.active_stop)
+    : (lineNow == null ? '—' : fmt(lineNow));
+
   const cells: { label: string; value: string; tone?: 'pos' | 'neg' }[] = [
     {
       label: 'Entry',
       value: state.entry_price ? fmt(state.entry_price) : '—',
     },
     { label: '@', value: fmtTime(state.entry_time) },
-    {
-      label: 'Stop line',
-      value: lineNow == null ? '—' : fmt(lineNow),
-    },
+    { label: 'Stop', value: stopValue },
     { label: 'Last', value: fmt(state.last_price) },
     { label: 'Qty', value: state.qty ?? '—' },
   ];
@@ -61,9 +65,12 @@ export function PositionStrip({ state, fsmState }: Props) {
     ? Number(state.unrealized_pnl)
     : NaN;
   if (Number.isFinite(pnl)) {
+    // Backend now bakes the contract multiplier into ``unrealized_pnl``
+    // so the surfaced number is dollars, not raw price diff. Prefix
+    // with $ so it reads as currency.
     cells.push({
       label: 'P/L',
-      value: (pnl >= 0 ? '+' : '') + pnl.toFixed(2),
+      value: (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2),
       tone: pnl >= 0 ? 'pos' : 'neg',
     });
   } else {

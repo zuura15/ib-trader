@@ -31,6 +31,12 @@ export interface BotPositionState {
     anchor_time?: string;
     anchor_price?: number;
     anchor_b_idx?: number;
+    /** Wallclock ISO of Q — the older construction pivot. Used by
+     *  the chart to clip the entry-line render at the start of the
+     *  bot's validation window so we don't backward-project across
+     *  hours of unrelated price action. */
+    from_time?: string;
+    from_idx?: number;
     touches?: number;
   } | null;
   entry_bar_time?: string;
@@ -40,6 +46,16 @@ export interface BotPositionState {
    *  entry. Prefer this over ``entry_line.direction`` — the strategy
    *  may rewrite the line on later bars while the position is held. */
   position_direction?: 'LONG' | 'SHORT';
+  /** Trailing-dip state surfaced by chart_signal (and set by the
+   *  runtime's ``_apply_fill`` on entry). ``active_stop`` is the
+   *  effective stop = max(line_value, trail_stop) for longs,
+   *  min(...) for shorts. PositionStrip prefers this over the
+   *  projected line value so the operator sees the actual exit
+   *  trigger. ``exit_reason`` records which gate fired on close. */
+  high_water_mark?: string;
+  low_water_mark?: string;
+  active_stop?: string;
+  exit_reason?: 'line_breach' | 'trail_stop' | 'both' | null;
   // Catch-all for the rest of the Redis doc
   [key: string]: unknown;
 }

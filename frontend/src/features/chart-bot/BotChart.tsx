@@ -128,6 +128,11 @@ export function BotChart({
         anchorTime: state.entry_line.anchor_time,
         anchorPrice: state.entry_line.anchor_price,
         slopePerSec: state.entry_line.slope_per_sec,
+        // Q timestamp — the chart clips the line render to start here
+        // instead of projecting backward across the full visible
+        // window (which historically looked like a long-running trend
+        // the bot never validated).
+        fromTime: state.entry_line.from_time,
       }
     : null;
 

@@ -12,5 +12,9 @@ config:
   # MCL = Micro WTI Crude Oil. M6 = June 2026 expiry; roll monthly.
   symbol: MCLM6
   sec_type: FUT
+  # Micro Crude: 100 bbl/contract. Used by P/L math + trail target.
+  contract_multiplier: 100
+  # Trailing dip: 0.13% × $75 × 100 ≈ $9.75 per contract per move.
+  trail_width_pct: 0.0013
 symbols:
 - MCLM6

@@ -12,5 +12,9 @@ config:
   # MES = Micro E-mini S&P 500. M6 = June 2026.
   symbol: MESM6
   sec_type: FUT
+  # Micro E-mini S&P: $5/point. Used by P/L math + trail target.
+  contract_multiplier: 5
+  # Trailing dip: 0.03% × 7,420 pts × $5 ≈ $11.13 per contract per move.
+  trail_width_pct: 0.0003
 symbols:
 - MESM6
