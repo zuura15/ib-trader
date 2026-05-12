@@ -254,15 +254,31 @@ class ChartSignalStrategy:
 
         # Pull bars from /engine/history so the bot and the view-only
         # chart see identical input. The runtime hands us
-        # ``event.window`` from the in-process aggregator, which lags
-        # warmup dedup; we ignore it here on the entry path. Fall back
-        # to the runtime window only if the HTTP fetch comes up empty
-        # (engine down / network blip).
+        # ``event.window`` from the in-process aggregator; we prefer
+        # the HTTP fetch (IB-canonical, matches the chart) and fall
+        # back to the runtime window only if the fetch comes up empty.
+        #
+        # IB's historical-data API typically lags the live bar close
+        # by a slot: when the 09:48-09:51 bar closes at 09:51:00, the
+        # HTTP fetch at 09:51:06 still returns data through 09:48 —
+        # so the bot's "just-confirmed pivot" sits one bar older than
+        # what the chart shows, and clean low-touch entries like the
+        # 2026-05-12 MGCM6 09:48 setup were missed. Bridge the lag by
+        # appending the local aggregator's just-closed bar when it's
+        # newer than ``fetched``'s last entry.
         fetched = await self._fetch_history()
+        local_window = event.window or []
         if fetched:
-            window = fetched
+            window = list(fetched)
+            if local_window:
+                latest_ts_fetched = window[-1].get("timestamp_utc") or ""
+                for bar in local_window:
+                    bar_ts = bar.get("timestamp_utc") or ""
+                    if bar_ts and bar_ts > latest_ts_fetched:
+                        window.append(bar)
+                        latest_ts_fetched = bar_ts
         else:
-            window = event.window or []
+            window = list(local_window)
         if not window:
             return actions
         closes = [float(b.get("close", 0)) for b in window]

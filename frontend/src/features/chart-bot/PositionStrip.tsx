@@ -91,20 +91,12 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
   // Stop value the bot would actually act on. ``active_stop`` is
   // bot-authoritative = max/min of line and trail per direction.
   // Falls back to the projected line for legacy state docs.
-  const stopValue: string = state.active_stop != null && state.active_stop !== ''
-    ? fmt(state.active_stop)
-    : (lineNow == null ? '—' : fmt(lineNow));
-
-  const cells: { label: string; value: string; tone?: 'pos' | 'neg' }[] = [
-    {
-      label: 'Entry',
-      value: state.entry_price ? fmt(state.entry_price) : '—',
-    },
-    { label: '@', value: fmtTime(state.entry_time) },
-    { label: 'Stop', value: stopValue },
-    { label: 'Last', value: fmt(state.last_price) },
-    { label: 'Qty', value: state.qty ?? '—' },
-  ];
+  const stopNum: number | null =
+    state.active_stop != null && state.active_stop !== ''
+      ? Number(state.active_stop)
+      : (lineNow ?? null);
+  const stopValue: string = stopNum == null || !Number.isFinite(stopNum)
+    ? '—' : stopNum.toFixed(2);
 
   // Truthy guard dropped numeric ``0`` and string ``""`` to ``NaN`` and
   // rendered "—" instead of "+0.00" — explicitly null-check so a flat
@@ -112,18 +104,42 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
   const pnl = state.unrealized_pnl != null && state.unrealized_pnl !== ''
     ? Number(state.unrealized_pnl)
     : NaN;
-  if (Number.isFinite(pnl)) {
-    // Backend now bakes the contract multiplier into ``unrealized_pnl``
-    // so the surfaced number is dollars, not raw price diff. Prefix
-    // with $ so it reads as currency.
-    cells.push({
-      label: 'P/L',
-      value: (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2),
-      tone: pnl >= 0 ? 'pos' : 'neg',
-    });
-  } else {
-    cells.push({ label: 'P/L', value: '—' });
+  const entryNum = state.entry_price != null && state.entry_price !== ''
+    ? Number(state.entry_price) : NaN;
+  const lastNum = state.last_price != null && state.last_price !== ''
+    ? Number(state.last_price) : NaN;
+
+  // PL-at-stop = pnl × (stop − entry) / (last − entry).
+  // multiplier × qty × sign cancels out, so the derivation works
+  // without knowing the contract multiplier. Falls back to '—' early
+  // in a trade when last == entry (denominator is zero / pnl is 0).
+  let pnlAtStop: number | null = null;
+  if (
+    Number.isFinite(pnl) && Number.isFinite(entryNum)
+    && Number.isFinite(lastNum) && stopNum != null
+    && Number.isFinite(stopNum) && lastNum !== entryNum
+  ) {
+    pnlAtStop = pnl * (stopNum - entryNum) / (lastNum - entryNum);
   }
+
+  const pnlValue = Number.isFinite(pnl)
+    ? (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2)
+    : '—';
+  const pnlTone: 'pos' | 'neg' | undefined = Number.isFinite(pnl)
+    ? (pnl >= 0 ? 'pos' : 'neg') : undefined;
+
+  const entryValue = state.entry_price ? fmt(state.entry_price) : '—';
+  const qtyStr = state.qty != null && state.qty !== '' ? String(state.qty) : null;
+  const entryWithQty = qtyStr != null
+    ? `${entryValue} (${qtyStr})`
+    : entryValue;
+  const cells: { label: string; value: string; tone?: 'pos' | 'neg' }[] = [
+    { label: '@', value: fmtTime(state.entry_time) },
+    { label: 'Entry', value: entryWithQty },
+    { label: 'Last', value: fmt(state.last_price) },
+    { label: 'Stop', value: stopValue },
+    { label: 'P/L', value: pnlValue, tone: pnlTone },
+  ];
 
   return (
     <div
@@ -135,7 +151,7 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
         gap: 14,
         padding: '0 10px',
         background: inPosition
-          ? 'var(--bg-secondary, rgba(80, 200, 120, 0.06))'
+          ? 'rgba(59,130,246,0.10)'
           : 'var(--bg-primary)',
         borderTop: '1px solid var(--border-default)',
         fontSize: 11,
@@ -154,6 +170,18 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
                    : 'var(--text-primary)',
               fontWeight: 600,
             }}>{value}</span>
+            {isPnl && pnlAtStop != null && (
+              <span style={{ color: 'var(--text-muted)' }}>
+                (
+                <span style={{
+                  color: pnlAtStop >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+                  fontWeight: 600,
+                }}>
+                  {pnlAtStop >= 0 ? '+$' : '-$'}{Math.abs(pnlAtStop).toFixed(2)}
+                </span>
+                <span>&nbsp;@stop</span>)
+              </span>
+            )}
             {isPnl && botId && pnl24h != null && (
               <span style={{ color: 'var(--text-muted)' }}>
                 (24h:&nbsp;

@@ -396,13 +396,19 @@ export function BotChart({
     </div>
   );
 
+  // Faint blue tint applied across the whole pane while a position
+  // is held — header + chart canvas + position strip — so the
+  // active bot is unmistakable across the multi-pane workstation.
+  const inPosition = fsmState === 'AWAITING_EXIT_TRIGGER'
+    || fsmState === 'EXIT_ORDER_PLACED';
+  const ACTIVE_TINT = 'rgba(59,130,246,0.10)';
   const headerRow = (
     <div
       style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: '4px 8px',
         borderBottom: '1px solid var(--border-default)',
-        background: 'var(--bg-primary)',
+        background: inPosition ? ACTIVE_TINT : 'var(--bg-primary)',
         flexShrink: 0,
         minHeight: 28,
       }}
@@ -431,6 +437,7 @@ export function BotChart({
           entryLine={entryLine}
           activeEntryBarTime={activeEntryBarTime}
           entrySide={entrySide}
+          paneBackground={inPosition ? ACTIVE_TINT : null}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

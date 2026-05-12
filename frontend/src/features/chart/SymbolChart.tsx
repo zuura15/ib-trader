@@ -125,6 +125,12 @@ interface Props {
    *  ``activeEntryBarTime`` is null. Optional for back-compat; defaults
    *  to ``'long'`` so existing callers keep their behavior. */
   entrySide?: 'long' | 'short' | null;
+  /** Optional CSS color applied to the chart's layout background.
+   *  Used by chart-bot panes to tint the entire pane (faint blue)
+   *  when a position is held, so the active bot is unmistakable
+   *  across the multi-pane workstation. When ``null``/undefined,
+   *  the chart falls back to the theme's panel background. */
+  paneBackground?: string | null;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -143,6 +149,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     entryLine = null,
     activeEntryBarTime = null,
     entrySide = null,
+    paneBackground = null,
   }: Props,
   ref,
 ) {
@@ -375,6 +382,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       ]);
     } catch { /* series torn down between render and effect */ }
   }, [entryLine, chartVersion]);
+
+  // Apply a custom pane background when the parent asks for one
+  // (chart-bot panes tint blue while a position is held). Drives the
+  // chart's ``layout.background`` directly via applyOptions so we
+  // don't have to rebuild the chart on every fsm-state change.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const fallback = themeColors().background;
+    try {
+      chart.applyOptions({
+        layout: {
+          background: {
+            type: ColorType.Solid,
+            color: paneBackground ?? fallback,
+          },
+        },
+      });
+    } catch { /* chart torn down between render and effect */ }
+  }, [paneBackground, chartVersion]);
 
   // Theme observer.
   useEffect(() => {
@@ -1077,8 +1104,61 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       });
     };
     const containerEl = containerRef.current;
+    // Wheel/touchpad-scroll routing:
+    //   over Y axis  → zoom Y only (lightweight-charts default).
+    //                   ``captureYRange`` then persists the new Y so
+    //                   the next 30s refresh restores it.
+    //   over X axis  → zoom X only (lightweight-charts default).
+    //                   No Y update; signals repaint after the X
+    //                   range change.
+    //   over body    → X zooms (lightweight-charts default), AND we
+    //                   re-fit Y to centre the polyline in the
+    //                   middle third (scaleMargins 0.25/0.25). The
+    //                   prior persisted Y is cleared so the autofit
+    //                   sticks across the next refresh.
+    const onWheel = (e: WheelEvent): void => {
+      if (!containerEl) return;
+      const rect = containerEl.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      let psW = 0;
+      let tsH = 0;
+      try { psW = chart.priceScale('right').width(); } catch { /* ignore */ }
+      try { tsH = chart.timeScale().height(); } catch { /* ignore */ }
+      const overYAxis = psW > 0 && mouseX > rect.width - psW;
+      const overXAxis = !overYAxis && tsH > 0 && mouseY > rect.height - tsH;
+      if (overYAxis) {
+        captureYRange();
+        return;
+      }
+      if (overXAxis) {
+        // X-only: don't touch Y. Just keep signal badges aligned
+        // after the time scale settles.
+        requestAnimationFrame(() => repositionSrSignalsRef.current?.());
+        return;
+      }
+      // Body wheel: re-fit Y to the polyline. Drop the persisted Y
+      // so a subsequent refresh respects the auto-fit instead of
+      // restoring an older manual zoom.
+      requestAnimationFrame(() => {
+        try { chart.priceScale('right').setAutoScale(true); }
+        catch { /* ignore */ }
+        userPriceRangeRef.current = null;
+        const tgt = targetRef.current;
+        const xr = userRangeRef.current;
+        if (tgt && xr) {
+          // Persist X-only — strip any stored priceFrom/priceTo so
+          // a hard refresh doesn't re-apply the stale Y.
+          saveRange(targetKey(tgt), { from: xr.from, to: xr.to });
+        }
+        repositionSrSignalsRef.current?.();
+      });
+    };
     if (containerEl) {
-      containerEl.addEventListener('wheel', captureYRange, { passive: true });
+      containerEl.addEventListener('wheel', onWheel, { passive: true });
+      // Drag-to-zoom on the Y axis ends with a mouseup; touch
+      // pinch ends with touchend. Both should persist whatever Y
+      // the user landed on.
       containerEl.addEventListener('mouseup', captureYRange);
       containerEl.addEventListener('touchend', captureYRange);
     }
@@ -1139,7 +1219,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       repositionSrSignalsRef.current = null;
       if (resizeObserver) resizeObserver.disconnect();
       if (containerEl) {
-        containerEl.removeEventListener('wheel', captureYRange);
+        containerEl.removeEventListener('wheel', onWheel);
         containerEl.removeEventListener('mouseup', captureYRange);
         containerEl.removeEventListener('touchend', captureYRange);
       }
