@@ -446,8 +446,14 @@ async def refresh_position(symbol: str):
     """
     if _ctx is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
+    # All IB calls must go through the snake_case wrapper (per
+    # CLAUDE.md / ADR on ib/base.py). ``reqPositionsAsync`` is the
+    # raw ib-async camelCase; calling it directly bypasses the
+    # wrapper's timeout + rate-limit + audit hooks AND raises
+    # ``AttributeError`` because the wrapper doesn't expose
+    # camelCase passthroughs.
     try:
-        await asyncio.wait_for(_ctx.ib.reqPositionsAsync(), timeout=10)
+        await _ctx.ib.req_positions_async(timeout=10)
     except asyncio.TimeoutError as e:
         raise HTTPException(status_code=504, detail="reqPositions timed out") from e
     for p in _ctx.positions_cache:
