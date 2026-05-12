@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
 import { VISIBLE_MINUTES } from '../chart/chartUtils';
@@ -55,10 +56,58 @@ export function BotChart({
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
+  // Outer ref used by the screenshot button — html2canvas captures
+  // this node which wraps the chart, the toolbar header, and the
+  // PositionStrip strip below. The fullscreen overlay also points
+  // its capture target here when active.
+  const paneRef = useRef<HTMLDivElement | null>(null);
   // Mirror the chart's SR-hidden state so the toolbar can show the
   // inverse toggle label. The chart's ref holds the source of truth;
   // we bump on click.
   const [srHidden, setSrHidden] = useState(false);
+  // Transient screenshot feedback ("Copied!" / "Capture failed").
+  // Surfaces in the toolbar next to the camera button for ~2s.
+  const [shotMsg, setShotMsg] = useState<string | null>(null);
+  const [shotBusy, setShotBusy] = useState(false);
+
+  const captureToClipboard = async () => {
+    if (shotBusy) return;
+    const node = paneRef.current;
+    if (!node) return;
+    setShotBusy(true);
+    setShotMsg('Capturing…');
+    try {
+      // ``backgroundColor: null`` preserves the theme-aware panel bg.
+      // ``useCORS`` and ``logging: false`` keep the console quiet.
+      // ``scale`` matches the device pixel ratio so the screenshot
+      // is crisp on HiDPI displays.
+      const canvas = await html2canvas(node, {
+        backgroundColor: null,
+        useCORS: true,
+        logging: false,
+        scale: window.devicePixelRatio || 1,
+      });
+      const blob: Blob | null = await new Promise((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/png'),
+      );
+      if (!blob) throw new Error('toBlob returned null');
+      // ClipboardItem + navigator.clipboard.write needs a secure
+      // context — mkcert HTTPS already gives us that. Falls back to
+      // an inline error message if the browser blocks the write
+      // (e.g. permissions revoked, focus lost).
+      await navigator.clipboard.write([
+        new ClipboardItem({ 'image/png': blob }),
+      ]);
+      setShotMsg('Copied');
+    } catch (e) {
+      setShotMsg(`Capture failed: ${
+        e instanceof Error ? e.message : String(e)
+      }`);
+    } finally {
+      setShotBusy(false);
+      setTimeout(() => setShotMsg(null), 2500);
+    }
+  };
 
   // SR-line filters — same defaults as ChartPane. ``brokenMinutes``
   // is the global user setting (synced with the Settings modal); the
@@ -300,6 +349,25 @@ export function BotChart({
       </div>
       <BarCloseCountdown />
       <button
+        onClick={captureToClipboard}
+        disabled={shotBusy}
+        title="Copy this chart + bot UI to clipboard as PNG"
+        style={{
+          background: 'transparent', border: '1px solid var(--border-default)',
+          color: 'var(--text-secondary)', padding: '1px 6px',
+          borderRadius: 3,
+          cursor: shotBusy ? 'wait' : 'pointer',
+          opacity: shotBusy ? 0.6 : 1,
+        }}
+      >
+        📷
+      </button>
+      {shotMsg && (
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+          {shotMsg}
+        </span>
+      )}
+      <button
         onClick={() => setFullscreen((v) => !v)}
         title={fullscreen ? 'Exit fullscreen (Esc)' : 'Open fullscreen'}
         style={{
@@ -370,6 +438,7 @@ export function BotChart({
           </div>
         </div>
         <div
+          ref={paneRef}
           style={{
             position: 'fixed', inset: 0, zIndex: 9999,
             background: 'var(--panel-bg, #fff)',
@@ -384,7 +453,11 @@ export function BotChart({
   }
 
   return (
-    <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
+    <div
+      ref={paneRef}
+      className="flex flex-col h-full"
+      style={{ minHeight: 0 }}
+    >
       {showHeader && headerRow}
       {chartBody}
     </div>
