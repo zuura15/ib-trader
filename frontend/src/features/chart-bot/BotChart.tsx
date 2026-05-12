@@ -7,6 +7,7 @@ import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import type { ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
 import { PositionStrip } from './PositionStrip';
+import { getBotTrades } from '../../api/client';
 
 interface Props {
   /** Bot identity. Frontend convention: ``chart-bot-<slot>``. */
@@ -179,6 +180,57 @@ export function BotChart({
     subscribeBot: true,
     onBotState: (s) => setState(s),
   });
+
+  // Historical bot fires for the last 24 h — rendered on the chart
+  // as persistent B/S badges so the operator always has a visible
+  // record of "the bot did fire here, on this bar". Polled every
+  // 30 s; closed-trade inserts are infrequent enough that a faster
+  // cadence wouldn't add anything. ``barTime`` is the slot-start
+  // ISO from the bot's ``entry_bar_time`` field (= the bar that
+  // triggered the entry).
+  const [historicalFires, setHistoricalFires] = useState<
+    { barTime: string; side: 'long' | 'short'; price: number }[]
+  >([]);
+  useEffect(() => {
+    if (!botId) return;
+    let cancelled = false;
+    const HORIZON_MS = 24 * 60 * 60 * 1000;
+    const tick = async () => {
+      try {
+        const trades = await getBotTrades(botId, 500);
+        if (cancelled) return;
+        const cutoff = Date.now() - HORIZON_MS;
+        const out: { barTime: string; side: 'long' | 'short'; price: number }[] = [];
+        for (const t of trades) {
+          if (!t.entry_time) continue;
+          const entryMs = new Date(t.entry_time).getTime();
+          if (!Number.isFinite(entryMs) || entryMs < cutoff) continue;
+          const price = Number(t.entry_price);
+          if (!Number.isFinite(price)) continue;
+          // Round entry_time DOWN to the 3-min slot start. The bot
+          // fires at bar close (~5 s into the next slot), so the
+          // trigger bar's slot-start = floor(entry_time - 3 min)
+          // aligned to 3-min boundaries. /api/bot-trades doesn't
+          // currently surface entry_bar_time directly.
+          const slotStart = Math.floor((entryMs - 180_000) / 180_000) * 180_000;
+          const dir = (t.direction || '').toUpperCase();
+          const side: 'long' | 'short' =
+            dir === 'SHORT' || dir === 'SELL' ? 'short' : 'long';
+          out.push({
+            barTime: new Date(slotStart).toISOString(),
+            side,
+            price,
+          });
+        }
+        setHistoricalFires(out);
+      } catch {
+        /* keep last good value on transient error */
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 30_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [botId]);
 
   const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
   const target: ChartTarget | null = symbol
@@ -450,6 +502,7 @@ export function BotChart({
           entrySide={entrySide}
           paneBackground={inPosition ? ACTIVE_TINT : null}
           suppressAutoSignals
+          historicalFires={historicalFires}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

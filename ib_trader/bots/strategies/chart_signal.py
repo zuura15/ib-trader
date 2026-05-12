@@ -568,6 +568,11 @@ class ChartSignalStrategy:
         side = "BUY" if direction == "long" else "SELL"
         label = "BUY — uptrending support" if direction == "long" \
             else "SELL — downtrending resistance"
+        # Diagnostic snapshot: dump the closes window around the new
+        # pivot + the bot's pivot-membership decision so post-hoc
+        # investigations (``explain.py``) don't have to reverse-
+        # engineer whether the strict-pivot gate was satisfied.
+        diag_window = closes[max(0, new_pivot_idx - 2): new_pivot_idx + 3]
         actions.append(LogSignal(
             event_type=LogEventType.SIGNAL,
             message=(
@@ -575,7 +580,19 @@ class ChartSignalStrategy:
                 f"slope/bar={chosen.slope:.4f})"
             ),
             payload={"qty": qty, "entry_line": entry_line_doc,
-                     "bar_time": bar_time.isoformat()},
+                     "bar_time": bar_time.isoformat(),
+                     "diag": {
+                         "n_bars": len(closes),
+                         "last_idx": last_idx,
+                         "new_pivot_idx": new_pivot_idx,
+                         "closes_around_pivot": [
+                             round(c, 4) for c in diag_window
+                         ],
+                         "new_is_pivot_low":
+                             new_pivot_idx in support_pivots,
+                         "new_is_pivot_high":
+                             new_pivot_idx in resistance_pivots,
+                     }},
         ))
         actions.append(PlaceOrder(
             symbol=self.config["symbol"],

@@ -139,6 +139,14 @@ interface Props {
    *  placed an order at that bar". Defaults to false (view-only
    *  panes continue to show auto-detected signals). */
   suppressAutoSignals?: boolean;
+  /** Explicit historical-fire markers: one entry per actual bot
+   *  order placed in the lookback window. ``barTime`` is the
+   *  trigger bar's slot-start ISO (real-UTC), ``side`` drives
+   *  whether a B (long) or S (short) renders. Used alongside
+   *  ``suppressAutoSignals`` so the bot pane always shows the
+   *  operator a 24 h record of where it fired, even after the
+   *  active entry has exited. */
+  historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -159,6 +167,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     entrySide = null,
     paneBackground = null,
     suppressAutoSignals = false,
+    historicalFires,
   }: Props,
   ref,
 ) {
@@ -230,6 +239,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const showCounterSupportRef = useRef(showCounterSupport);
   const showCounterResistanceRef = useRef(showCounterResistance);
   const suppressAutoSignalsRef = useRef(suppressAutoSignals);
+  // Historical bot fires, kept in chart-time (shifted UTC) form so
+  // the SR recompute loop can splice them directly into srSignalsRef
+  // without converting on every iteration.
+  const historicalFiresRef = useRef<Signal[]>([]);
   // Set true by ``withFrozenViewport`` for the duration of an async
   // callback (e.g. html2canvas capture). The custom ResizeObserver
   // checks this and skips its setAutoScale(true) re-fit so a layout
@@ -283,6 +296,33 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // Re-paint badges so the ring appears/disappears immediately.
     repositionSrSignalsRef.current?.();
   }, [activeEntryBarTime, entrySide]);
+  // Convert prop fires (real-UTC ISO + price) into chart-time
+  // Signal entries on every change. The painter reads from
+  // ``historicalFiresRef`` which the SR recompute splices in.
+  useEffect(() => {
+    if (!historicalFires || historicalFires.length === 0) {
+      historicalFiresRef.current = [];
+      repositionSrSignalsRef.current?.();
+      return;
+    }
+    const out: Signal[] = [];
+    for (const f of historicalFires) {
+      const d = new Date(f.barTime);
+      if (!Number.isFinite(d.getTime())) continue;
+      const t = localUtcSeconds(d) as UTCTimestamp;
+      out.push({
+        time: t,
+        price: f.price,
+        side: f.side === 'short' ? 'S' : 'B',
+      });
+    }
+    historicalFiresRef.current = out;
+    // Force the painter to repaint so newly-fetched fires show up
+    // immediately rather than waiting for the next SR recompute.
+    srSignalsRef.current = out;
+    repositionSrSignalsRef.current?.();
+  }, [historicalFires]);
+
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
     brokenMinutesRef.current = brokenMinutes;
@@ -987,9 +1027,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // badges from earlier recomputes (or older sessions before
       // suppression was enabled) would otherwise stick around even
       // after the gate flips off — defeating the "B/S = real order"
-      // invariant. Clear the cache every recompute when suppressed.
+      // invariant. When suppressed, the only badges that survive
+      // are the explicit historical bot fires the parent passes in.
       const merged = suppressAutoSignalsRef.current
-        ? []
+        ? [...historicalFiresRef.current]
         : [...srSignalsRef.current, ...newSignals];
       if (merged.length > MAX_SIGNALS) {
         merged.sort((a, b) => (a.time as number) - (b.time as number));

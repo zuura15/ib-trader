@@ -2028,7 +2028,17 @@ class StrategyBotRunner(BotBase):
         # Warmup: prefetch historical 3-min bars to fill the aggregator immediately
         await self._warmup_from_history(symbol)
         self._warmup_complete = True
-        self._signal_cooldown_until = time.monotonic() + 15  # no signals for 15s after startup
+        # 60-second post-warmup cooldown. The first 3-min bar boundary
+        # after restart lands ~30-60 s in, and the bot would fire on
+        # any pre-existing 3+touch line at that bar — surprising the
+        # operator who's still loading the UI. Blocking that first
+        # evaluation forces the bot to watch at least one full 3-min
+        # bar form post-restart before it's allowed to act.
+        # Configurable via strategy YAML (``post_warmup_cooldown_s``).
+        cooldown_s = float(
+            self.strategy_config.get("post_warmup_cooldown_s", 60),
+        )
+        self._signal_cooldown_until = time.monotonic() + cooldown_s
 
         # Run strategy startup
         actions = await self.strategy.on_start(self.ctx)
