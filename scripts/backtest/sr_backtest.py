@@ -44,6 +44,31 @@ from ib_trader.signals.sr_fan import (  # noqa: E402
 # Per-instrument $-per-point multiplier. STK=1, MGC=10, MES=5, ES=50.
 MULTIPLIER = 10
 RSI_PERIOD = 14   # matches frontend RSI_DEFAULTS
+ATR_PERIOD = 14   # standard Wilder ATR length
+
+
+def compute_atr(bars: list["Bar"], period: int = ATR_PERIOD) -> list[float | None]:
+    """Wilder's ATR. Returns one value per bar — None until ``period``
+    true ranges have been observed. True Range uses the prior close,
+    so out[0] is always None."""
+    out: list[float | None] = [None] * len(bars)
+    if len(bars) < period + 1:
+        return out
+    trs: list[float] = []
+    for i in range(1, len(bars)):
+        prev_c = bars[i - 1].close
+        b = bars[i]
+        trs.append(max(b.high - b.low,
+                       abs(b.high - prev_c),
+                       abs(b.low - prev_c)))
+    # Seed with simple average of first ``period`` TRs (Wilder seed).
+    seed = sum(trs[:period]) / period
+    out[period] = seed
+    atr = seed
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+        out[i + 1] = atr
+    return out
 
 
 def compute_rsi(closes: list[float], period: int = RSI_PERIOD) -> list[float | None]:
@@ -99,7 +124,9 @@ class Trade:
     exit_t: str | None = None
     exit_idx: int | None = None
     exit_price: float | None = None
-    exit_reason: str | None = None  # 'BREAK' | 'EOD'
+    # 'BREAK' (line breach), 'TRAIL' (trailing dip/rise),
+    # 'BOTH' (both gates fired on same bar), 'EOD' (end of data).
+    exit_reason: str | None = None
 
     @property
     def pnl(self) -> float:
@@ -224,6 +251,214 @@ def run_backtest(bars: list[Bar], direction: str,
                 line_touches=line.touches,
             )
             break
+
+    if open_trade is not None:
+        open_trade.exit_t = bars[-1].t
+        open_trade.exit_idx = len(bars) - 1
+        open_trade.exit_price = bars[-1].close
+        open_trade.exit_reason = "EOD"
+        trades.append(open_trade)
+
+    return trades
+
+
+def run_backtest_live(
+    bars: list[Bar],
+    *,
+    trail_width_pct: float = 0.0003,
+    cooldown_bars: int = 1,
+    history_bars: int = 40,
+    rsi_long_max: float | None = None,
+    rsi_short_min: float | None = None,
+    utc_hour_range: tuple[int, int] | None = None,
+    atr_mult: float | None = None,
+    atr_period: int = ATR_PERIOD,
+) -> list[Trade]:
+    """Mirrors current chart_signal live rules:
+    - Single position at a time, EITHER side.
+    - Entry: 3rd-touch on uptrending support (long) OR downtrending
+      resistance (short), with the just-confirmed pivot at t-1 ON the
+      line. Tie → prefer long.
+    - Exit: bar close beyond the entry line OR bar close past the
+      water mark by trail_width_pct, whichever fires first.
+    - After exit, ``cooldown_bars`` bars must pass before the next
+      entry (matches the live runtime's ``cooldown_until`` on the
+      doc post round-trip).
+
+    The original ``run_backtest`` runs independent per-side passes
+    that can hold long and short simultaneously — kept for backward
+    compatibility but doesn't match the live bot's one-position
+    semantic.
+    """
+    closes = [b.close for b in bars]
+    avg = sum(closes) / max(1, len(closes))
+    tol = max(EPS, avg * TOLERANCE_FRACTION)
+    rsi = compute_rsi(closes)
+    # ATR-scaled trail uses the bar-by-bar ATR series. None until
+    # ``atr_period`` bars have elapsed.
+    atr_series = compute_atr(bars, atr_period) if atr_mult is not None else None
+
+    trades: list[Trade] = []
+    open_trade: Trade | None = None
+    cooldown_until_idx = -1
+    hwm = -float('inf')
+    lwm = float('inf')
+
+    for t in range(2, len(bars) - 1):
+        if open_trade is not None:
+            line_at_t = (
+                open_trade.line_slope * t + open_trade.line_intercept
+            )
+            if atr_series is not None:
+                atr_t = atr_series[t]
+                # During warm-up (ATR not yet defined) fall back to the
+                # % trail. Avoids skipping the early-window trades that
+                # would otherwise have no exit gate.
+                trail_delta = (atr_mult * atr_t) if atr_t is not None else None
+            else:
+                trail_delta = None
+            if open_trade.side == 'LONG':
+                hwm = max(hwm, closes[t])
+                if trail_delta is not None:
+                    trail_stop = hwm - trail_delta
+                else:
+                    trail_stop = (hwm * (1 - trail_width_pct)
+                                  if trail_width_pct > 0 else -float('inf'))
+                breach_line = closes[t] < line_at_t - tol
+                breach_trail = closes[t] < trail_stop
+            else:
+                lwm = min(lwm, closes[t])
+                if trail_delta is not None:
+                    trail_stop = lwm + trail_delta
+                else:
+                    trail_stop = (lwm * (1 + trail_width_pct)
+                                  if trail_width_pct > 0 else float('inf'))
+                breach_line = closes[t] > line_at_t + tol
+                breach_trail = closes[t] > trail_stop
+            if breach_line or breach_trail:
+                # Live fills happen within ~1-5s of bar close, not a
+                # full bar later. Approximate as the trigger bar's
+                # close price (matches the strategy's mid-order fill
+                # near the bar boundary). Modeling exit at bar t+1's
+                # mid baked in a full bar of slippage on every trade
+                # — caught 2026-05-12 when live results showed
+                # winners ~$30 vs backtest losers ~$14.
+                open_trade.exit_t = bars[t].t
+                open_trade.exit_idx = t
+                open_trade.exit_price = bars[t].close
+                if breach_line and breach_trail:
+                    open_trade.exit_reason = "BOTH"
+                elif breach_trail:
+                    open_trade.exit_reason = "TRAIL"
+                else:
+                    open_trade.exit_reason = "BREAK"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+            continue
+
+        # Cooldown after a recent exit.
+        if t <= cooldown_until_idx:
+            continue
+
+        # Time-of-day filter (UTC hour ∈ [lo, hi)) — None = always.
+        if utc_hour_range is not None:
+            ts = bars[t].t  # ISO-8601 string, e.g. 2026-05-12T14:30:00+00:00
+            try:
+                hour = int(ts[11:13])
+            except (ValueError, IndexError):
+                hour = -1
+            lo, hi = utc_hour_range
+            if not (lo <= hour < hi):
+                continue
+
+        # Try both sides; the just-confirmed pivot at t-1 must be on
+        # the chosen line.
+        new_low = closes[t - 1] < closes[t - 2] and closes[t - 1] < closes[t]
+        new_high = closes[t - 1] > closes[t - 2] and closes[t - 1] > closes[t]
+
+        # Sliding history window: matches live chart_signal's 2h
+        # ``/engine/history`` fetch (history_bars = 40 × 3min). Each
+        # candidate's detect_lines runs on this window, not on the
+        # cumulative slice. Anchor_b_idx is relative to the window,
+        # so the just-confirmed-pivot check uses the window's
+        # last-but-one index.
+        win_start = max(0, t - history_bars + 1)
+        slice_closes = closes[win_start:t + 1]
+        if len(slice_closes) < 4:
+            continue
+        window_last = len(slice_closes) - 1
+        window_new_pivot = window_last - 1
+
+        long_line = None
+        if new_low:
+            if rsi_long_max is None or (
+                rsi[t - 1] is not None and rsi[t - 1] <= rsi_long_max
+            ):
+                for line in detect_lines(
+                    slice_closes, up_to=window_last, type_='support',
+                ):
+                    if (line.anchor_b_idx == window_new_pivot
+                            and line.slope > 0
+                            and line.touches >= MIN_TOUCHES):
+                        long_line = line
+                        break
+
+        short_line = None
+        if new_high:
+            if rsi_short_min is None or (
+                rsi[t - 1] is not None and rsi[t - 1] >= rsi_short_min
+            ):
+                for line in detect_lines(
+                    slice_closes, up_to=window_last, type_='resistance',
+                ):
+                    if (line.anchor_b_idx == window_new_pivot
+                            and line.slope < 0
+                            and line.touches >= MIN_TOUCHES):
+                        short_line = line
+                        break
+
+        chosen_line = None
+        chosen_side = None
+        if long_line and short_line:
+            if short_line.touches > long_line.touches:
+                chosen_line, chosen_side = short_line, 'SHORT'
+            else:
+                chosen_line, chosen_side = long_line, 'LONG'
+        elif long_line:
+            chosen_line, chosen_side = long_line, 'LONG'
+        elif short_line:
+            chosen_line, chosen_side = short_line, 'SHORT'
+
+        if chosen_line is None:
+            continue
+
+        # Live fires entry order immediately on bar close and fills
+        # within ~1-5s at market mid — well inside the same bar.
+        # Approximate as the trigger bar's close. Modeling entry at
+        # bar t+1's mid baked in a full bar of slippage (same fix as
+        # the exit side above).
+        # Convert the line's slope/intercept from window-relative to
+        # absolute (bar-index) frame so the exit-check projection
+        # ``slope * t + intercept`` works against absolute t.
+        abs_slope = chosen_line.slope
+        abs_intercept = chosen_line.intercept - chosen_line.slope * win_start
+        open_trade = Trade(
+            side=chosen_side,
+            entry_t=bars[t].t,
+            entry_idx=t,
+            entry_price=bars[t].close,
+            line_slope=abs_slope,
+            line_intercept=abs_intercept,
+            line_anchor_b_idx=chosen_line.anchor_b_idx + win_start,
+            line_touches=chosen_line.touches,
+        )
+        if chosen_side == 'LONG':
+            hwm = bars[t].close
+        else:
+            lwm = bars[t].close
 
     if open_trade is not None:
         open_trade.exit_t = bars[-1].t
