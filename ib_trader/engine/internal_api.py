@@ -518,8 +518,16 @@ async def get_history(
     cache_key = (int(con_id), int(hours), bar_size)
     now = time.monotonic()
     cached = _HISTORY_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _HISTORY_TTL_SECONDS:
+    # Defensive: an earlier build briefly wrote ``cached[0]`` as a
+    # datetime (variable shadowing), so an in-memory cache from
+    # before the fix can still trip the subtraction here. Discard
+    # any non-float baseline so the request falls through to a
+    # fresh fetch.
+    if cached and isinstance(cached[0], (int, float)) \
+            and (now - cached[0]) < _HISTORY_TTL_SECONDS:
         return cached[1]
+    if cached and not isinstance(cached[0], (int, float)):
+        _HISTORY_CACHE.pop(cache_key, None)
 
     contract = _ctx.ib._contract_cache.get(int(con_id))
     if contract is None:
@@ -564,13 +572,16 @@ async def get_history(
                         "15 mins": 900, "30 mins": 1800, "1 hour": 3600}
     bar_seconds = bar_seconds_map.get(bar_size, 0)
     from datetime import datetime as _dt, timezone as _tz
-    now = _dt.now(_tz.utc)
+    # ``now`` above is ``time.monotonic()`` used by the TTL cache.
+    # Use a separate name here so the in-progress filter doesn't
+    # shadow it and break the cache check on the next call.
+    now_utc = _dt.now(_tz.utc).timestamp()
     out: list[dict] = []
     for bar in bars or []:
         ts = getattr(bar, "date", None)
         if bar_seconds > 0 and hasattr(ts, "timestamp"):
             slot_end = ts.timestamp() + bar_seconds
-            if slot_end > now.timestamp() + 0.5:
+            if slot_end > now_utc + 0.5:
                 continue
         ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
         out.append({
