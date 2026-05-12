@@ -268,12 +268,24 @@ class ChartSignalStrategy:
         # newer than ``fetched``'s last entry.
         fetched = await self._fetch_history()
         local_window = event.window or []
+        # ``/engine/history`` stores timestamps as ISO strings;
+        # ``event.window`` stores them as datetime objects. Normalize
+        # both to ISO strings before comparing so the append loop
+        # doesn't trip a ``TypeError: '>' not supported between
+        # datetime and str``.
+        def _ts_iso(b: dict) -> str:
+            ts = b.get("timestamp_utc")
+            if ts is None:
+                return ""
+            if hasattr(ts, "isoformat"):
+                return ts.isoformat()
+            return str(ts)
         if fetched:
             window = list(fetched)
             if local_window:
-                latest_ts_fetched = window[-1].get("timestamp_utc") or ""
+                latest_ts_fetched = _ts_iso(window[-1])
                 for bar in local_window:
-                    bar_ts = bar.get("timestamp_utc") or ""
+                    bar_ts = _ts_iso(bar)
                     if bar_ts and bar_ts > latest_ts_fetched:
                         window.append(bar)
                         latest_ts_fetched = bar_ts

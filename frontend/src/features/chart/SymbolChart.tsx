@@ -131,6 +131,14 @@ interface Props {
    *  across the multi-pane workstation. When ``null``/undefined,
    *  the chart falls back to the theme's panel background. */
   paneBackground?: string | null;
+  /** Bot-pane semantics: suppress auto-generated B/S badges from
+   *  the SR detector. In bot panes the only badge that should ever
+   *  appear is one tied to an actual order — the bot's active entry
+   *  (driven by ``activeEntryBarTime`` + ``entrySide``) — so the
+   *  operator can trust "if there's a B/S on the chart, the bot
+   *  placed an order at that bar". Defaults to false (view-only
+   *  panes continue to show auto-detected signals). */
+  suppressAutoSignals?: boolean;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -150,6 +158,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     activeEntryBarTime = null,
     entrySide = null,
     paneBackground = null,
+    suppressAutoSignals = false,
   }: Props,
   ref,
 ) {
@@ -220,6 +229,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const brokenMinutesRef = useRef(brokenMinutes);
   const showCounterSupportRef = useRef(showCounterSupport);
   const showCounterResistanceRef = useRef(showCounterResistance);
+  const suppressAutoSignalsRef = useRef(suppressAutoSignals);
   // Bot-mode prop mirrors. Read by the SVG badge painter and the
   // entry-line series effect.
   const entryLineRef = useRef(entryLine);
@@ -272,11 +282,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     brokenMinutesRef.current = brokenMinutes;
     showCounterSupportRef.current = showCounterSupport;
     showCounterResistanceRef.current = showCounterResistance;
+    suppressAutoSignalsRef.current = suppressAutoSignals;
     // Re-render lines on toggle. The viewport gate is gone (detection
     // now runs on a fixed recent-bars slice), so this is just a
     // straight re-detect to pick up the new filter state.
     scheduleSrRecomputeRef.current?.(true);
-  }, [showBrokenSr, brokenMinutes, showCounterSupport, showCounterResistance]);
+  }, [showBrokenSr, brokenMinutes, showCounterSupport, showCounterResistance,
+      suppressAutoSignals]);
 
   // Debounced SR recompute. Set inside the chart-create effect (since
   // it captures the chart instance); the visible-range subscription
@@ -309,15 +321,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // and the live-tick handler (in-place fold of high/low/close).
   const barsRef = useRef<Bar[]>([]);
   const userRangeRef = useRef<SavedRange | null>(null);
-  // Logical-range mirror of the user's current viewport. Captured
-  // alongside ``userRangeRef`` on every pan/zoom so we can restore
-  // pan position in *bar-index* space across periodic ``load()``
-  // refreshes. Time-domain restoration loses the user's "empty space
-  // past the last bar" because lightweight-charts re-clamps `to` to
-  // data bounds when ``setData`` runs; the logical-domain API
-  // survives this because it stores positions as bar indices that
-  // re-anchor on the new data set.
-  const userLogicalRangeRef = useRef<{ from: number; to: number } | null>(null);
+  // Viewport mirror in bar-relative terms. Captured on every pan/zoom
+  // so the periodic ``load()`` refresh can restore the same view past
+  // newly-arrived bars. Storing ``{ from, to }`` absolutely would
+  // strand the view behind the latest bar after setData expands the
+  // dataset — so we store:
+  //   ``rightSpaceBars`` = bars past the last-known bar that the user
+  //                         kept visible (right-edge gap; rightOffset
+  //                         normally puts this at ``rightOffset``).
+  //   ``widthBars``      = visible width in bars (zoom level).
+  // On restore: newTo = (barCount − 1) + rightSpaceBars; newFrom =
+  // newTo − widthBars. Net effect: new bars push the chart LEFT while
+  // the right-edge gap and zoom stay constant, which is the live-
+  // following behavior the operator wants.
+  const userLogicalRangeRef = useRef<
+    { rightSpaceBars: number; widthBars: number } | null
+  >(null);
   // Y-axis zoom persistence. lightweight-charts doesn't fire an event
   // for price-scale changes (only time-scale), so we sample the
   // current price range at refresh time and restore it after setData.
@@ -895,7 +914,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // Broken lines already filtered above. Price comes from the
         // line algebra (not the close at that bar) so the leader
         // line lands on the exact pivot the line is constructed on.
-        if (confirmed) {
+        //
+        // Bot panes set ``suppressAutoSignals=true`` so the only
+        // badge that ever appears is one tied to a real order
+        // (driven by ``activeEntryBarTime`` + ``entrySide``). The
+        // chart still draws the SR lines themselves; just no
+        // anchor-emitted Bs/Ss that the bot never acted on.
+        if (confirmed && !suppressAutoSignalsRef.current) {
           const isBuy = line.type === 'support' && line.slope > 0;
           const isSell = line.type === 'resistance' && line.slope < 0;
           if (isBuy || isSell) {
@@ -1116,30 +1141,69 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     //                   middle third (scaleMargins 0.25/0.25). The
     //                   prior persisted Y is cleared so the autofit
     //                   sticks across the next refresh.
+    // Wheel-zoom factor per notch. 3 % per tick — touchpad scrolls
+    // fire many small wheel events, so anything higher feels jumpy.
+    const Y_ZOOM_STEP = 0.03;
     const onWheel = (e: WheelEvent): void => {
       if (!containerEl) return;
       const rect = containerEl.getBoundingClientRect();
       const mouseX = e.clientX - rect.left;
       const mouseY = e.clientY - rect.top;
+      // ``.width()`` / ``.height()`` may report 0 before the chart's
+      // first paint or when the axis is collapsed. Floor each zone
+      // at a sensible default so wheel routing works from the first
+      // tick.
       let psW = 0;
       let tsH = 0;
       try { psW = chart.priceScale('right').width(); } catch { /* ignore */ }
       try { tsH = chart.timeScale().height(); } catch { /* ignore */ }
-      const overYAxis = psW > 0 && mouseX > rect.width - psW;
-      const overXAxis = !overYAxis && tsH > 0 && mouseY > rect.height - tsH;
+      const yZoneW = Math.max(psW, 56);
+      const xZoneH = Math.max(tsH, 24);
+      const overYAxis = mouseX > rect.width - yZoneW;
+      const overXAxis = !overYAxis && mouseY > rect.height - xZoneH;
       if (overYAxis) {
+        // lightweight-charts' wheel handler always zooms X regardless
+        // of mouse position — Y wheel-zoom is not built-in. Intercept
+        // here, stop the default X zoom, and resize the price scale's
+        // visible range around its current centre by ``Y_ZOOM_STEP``.
+        // captureYRange persists the new range for the next refresh.
+        e.preventDefault();
+        try {
+          const ps = chart.priceScale('right');
+          const pr = ps.getVisibleRange();
+          if (pr) {
+            // Anchor the zoom around the most-recent price so the
+            // end of the polyline stays at the vertical centre of
+            // the pane while the band around it widens/narrows.
+            // Falls back to the previous-range centre if no bars
+            // are loaded yet (e.g. cold chart).
+            const lastBar = barsRef.current[barsRef.current.length - 1];
+            const centre = lastBar
+              ? lastBar.close
+              : (pr.from + pr.to) / 2;
+            const halfRange = (pr.to - pr.from) / 2;
+            // Wheel-up (deltaY < 0) = zoom in (smaller range).
+            // Wheel-down (deltaY > 0) = zoom out (larger range).
+            const factor = e.deltaY > 0
+              ? 1 + Y_ZOOM_STEP
+              : 1 / (1 + Y_ZOOM_STEP);
+            const next = halfRange * factor;
+            ps.setVisibleRange({ from: centre - next, to: centre + next });
+          }
+        } catch { /* ignore */ }
         captureYRange();
         return;
       }
       if (overXAxis) {
-        // X-only: don't touch Y. Just keep signal badges aligned
-        // after the time scale settles.
+        // X-axis wheel: lightweight-charts already zooms X. Leave Y
+        // untouched — a prior manual zoom (if any) sticks.
         requestAnimationFrame(() => repositionSrSignalsRef.current?.());
         return;
       }
-      // Body wheel: re-fit Y to the polyline. Drop the persisted Y
-      // so a subsequent refresh respects the auto-fit instead of
-      // restoring an older manual zoom.
+      // Body wheel: lightweight-charts zoomed X. Re-fit Y to centre
+      // the polyline and drop the persisted Y so a subsequent
+      // refresh respects the auto-fit rather than restoring an
+      // older manual zoom.
       requestAnimationFrame(() => {
         try { chart.priceScale('right').setAutoScale(true); }
         catch { /* ignore */ }
@@ -1147,15 +1211,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const tgt = targetRef.current;
         const xr = userRangeRef.current;
         if (tgt && xr) {
-          // Persist X-only — strip any stored priceFrom/priceTo so
-          // a hard refresh doesn't re-apply the stale Y.
           saveRange(targetKey(tgt), { from: xr.from, to: xr.to });
         }
         repositionSrSignalsRef.current?.();
       });
     };
     if (containerEl) {
-      containerEl.addEventListener('wheel', onWheel, { passive: true });
+      // ``passive: false`` so we can preventDefault on Y-axis wheels;
+      // otherwise lightweight-charts also zooms X on the same event.
+      containerEl.addEventListener('wheel', onWheel, { passive: false });
       // Drag-to-zoom on the Y axis ends with a mouseup; touch
       // pinch ends with touchend. Both should persist whatever Y
       // the user landed on.
@@ -1186,7 +1250,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       userRangeRef.current = r;
       const lr = chart.timeScale().getVisibleLogicalRange();
       if (lr) {
-        userLogicalRangeRef.current = { from: lr.from, to: lr.to };
+        // Record viewport in bar-relative terms (gap from last bar +
+        // visible width). See ``userLogicalRangeRef`` for why.
+        const barCount = barsRef.current.length;
+        userLogicalRangeRef.current = {
+          rightSpaceBars: lr.to - (barCount - 1),
+          widthBars: lr.to - lr.from,
+        };
       }
       // Re-run SR detection over the new visible range (debounced —
       // zoom emits many events). Detection self-skips when width is
@@ -1408,12 +1478,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             to: nowSec,
           });
         } else if (userLogicalRangeRef.current) {
-          // Prefer logical range so any empty space the user kept past
-          // the last bar is preserved when new bars arrive — see ref
-          // declaration for the rationale.
+          // Re-anchor the saved bar-relative viewport to the freshly-
+          // loaded dataset. ``rightSpaceBars`` keeps the last-bar →
+          // y-axis gap constant; ``widthBars`` keeps the zoom level
+          // constant. New bars therefore push the chart left while
+          // the right edge stays a fixed distance from the y axis.
+          const barCount = fullBars.length;
+          const lr = userLogicalRangeRef.current;
+          const newTo = (barCount - 1) + lr.rightSpaceBars;
+          const newFrom = newTo - lr.widthBars;
           try {
             chart.timeScale().setVisibleLogicalRange(
-              userLogicalRangeRef.current,
+              { from: newFrom, to: newTo },
             );
           } catch { /* range invalid for current data — skip */ }
         } else if (prevRange) {

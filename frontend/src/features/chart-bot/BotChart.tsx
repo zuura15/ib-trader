@@ -438,6 +438,7 @@ export function BotChart({
           activeEntryBarTime={activeEntryBarTime}
           entrySide={entrySide}
           paneBackground={inPosition ? ACTIVE_TINT : null}
+          suppressAutoSignals
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
