@@ -507,7 +507,12 @@ export function BotChart({
         />
       </div>
       <div style={inactiveStyle}>
-        <PositionStrip state={state} fsmState={fsmState} botId={botId} />
+        <PositionStrip
+          state={state}
+          fsmState={fsmState}
+          botId={botId}
+          symbol={symbol}
+        />
       </div>
     </div>
   );

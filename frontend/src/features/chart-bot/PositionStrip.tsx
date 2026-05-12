@@ -9,6 +9,30 @@ interface Props {
    *  Optional so the strip stays usable in contexts without a bot
    *  bound (e.g. demo / placeholder panes). */
   botId?: string;
+  /** Symbol the bot trades. Used to look up the contract multiplier
+   *  for the PL-at-stop calc (stops are price-based; converting to
+   *  dollars needs the $/point multiplier). */
+  symbol?: string | null;
+}
+
+/** $-per-point multiplier for the futures contracts this app trades.
+ *  Stock and unknown symbols fall back to 1. Keep in lockstep with
+ *  ``config/bots/chart-bot-*.yaml:contract_multiplier``. */
+const SYMBOL_MULTIPLIERS: Record<string, number> = {
+  MGC: 10,   // micro gold,    10 oz/contract
+  MCL: 100,  // micro crude,  100 bbl/contract
+  MES: 5,    // micro S&P 500, $5/index point
+  MNQ: 2,    // micro Nasdaq,  $2/index point
+  GC: 100,   // full gold
+  CL: 1000,  // full crude
+  ES: 50,    // full S&P
+  NQ: 20,    // full Nasdaq
+};
+
+function contractMultiplier(symbol: string | undefined | null): number {
+  if (!symbol) return 1;
+  const root = symbol.toUpperCase().slice(0, 3);
+  return SYMBOL_MULTIPLIERS[root] ?? 1;
 }
 
 function fmt(n: string | number | undefined | null, digits = 2): string {
@@ -47,7 +71,7 @@ const PNL_WINDOW_MS = 24 * 60 * 60 * 1000;
  *  round-trip — re-checking every 30s is plenty. */
 const PNL_POLL_MS = 30_000;
 
-export function PositionStrip({ state, fsmState, botId }: Props) {
+export function PositionStrip({ state, fsmState, botId, symbol }: Props) {
   // Rolling 24h realized P/L (sum of bot's closed trades whose
   // exit_time is within the window). Null while the first fetch is
   // pending; number once we have data.
@@ -109,17 +133,23 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
   const lastNum = state.last_price != null && state.last_price !== ''
     ? Number(state.last_price) : NaN;
 
-  // PL-at-stop = pnl × (stop − entry) / (last − entry).
-  // multiplier × qty × sign cancels out, so the derivation works
-  // without knowing the contract multiplier. Falls back to '—' early
-  // in a trade when last == entry (denominator is zero / pnl is 0).
+  // PL-at-stop = (stop − entry) × sign × qty × multiplier.
+  // Direct calc: doesn't depend on the live ``pnl`` ratio, so a
+  // fixed stop price gives a fixed dollar outcome regardless of
+  // how far the last price has drifted toward (or away from) it.
+  // The earlier ratio-based derivation drifted with every tick.
+  const qtyNum = Number(state.qty ?? 1) || 1;
+  const dirSign =
+    String(state.position_direction || '').toUpperCase() === 'SHORT'
+      ? -1
+      : 1;
+  const mult = contractMultiplier(symbol);
   let pnlAtStop: number | null = null;
   if (
-    Number.isFinite(pnl) && Number.isFinite(entryNum)
-    && Number.isFinite(lastNum) && stopNum != null
-    && Number.isFinite(stopNum) && lastNum !== entryNum
+    Number.isFinite(entryNum) && stopNum != null
+    && Number.isFinite(stopNum) && Number.isFinite(pnl)
   ) {
-    pnlAtStop = pnl * (stopNum - entryNum) / (lastNum - entryNum);
+    pnlAtStop = (stopNum - entryNum) * dirSign * qtyNum * mult;
   }
 
   const pnlValue = Number.isFinite(pnl)
@@ -189,14 +219,15 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
     <div
       style={{
         flexShrink: 0,
-        // Two rows of cells. 84 px stays the same as the prior strip
-        // height; the rows sit stacked centred vertically.
-        height: 84,
+        // Just-enough height for two rows of 14 px text with a bit
+        // of padding — the strip stops eating into the chart canvas
+        // while still giving the operator a legible two-line panel.
+        height: 52,
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
-        gap: 6,
-        padding: '0 10px',
+        gap: 4,
+        padding: '4px 10px',
         // Slightly darker than the chart pane so the metrics strip
         // reads as a distinct shelf below the chart. Holds the same
         // hue when the bot is in position (blue) vs neutral (grey)
@@ -205,8 +236,10 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
           ? 'rgba(59,130,246,0.18)'
           : 'rgba(0,0,0,0.05)',
         borderTop: '1px solid var(--border-default)',
-        // +20 % from the prior 11 px.
-        fontSize: 13,
+        // 14 px — bigger than the rest of the UI's small chrome on
+        // purpose (operator wants the live metrics legible at a
+        // glance) but still proportional to the two-row strip.
+        fontSize: 14,
         fontVariantNumeric: 'tabular-nums',
         color: 'var(--text-secondary)',
       }}

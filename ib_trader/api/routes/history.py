@@ -32,12 +32,22 @@ async def get_history(
     sec_type: str = "STK",
     hours: int = 24,
     bar_size: str = "1 min",
+    include_partial: bool = True,
 ):
-    """Proxy to GET /engine/history. See engine endpoint for semantics."""
+    """Proxy to GET /engine/history. See engine endpoint for semantics.
+
+    The frontend chart wants the in-progress bar so the operator sees
+    live price action; the bot consumes ``/engine/history`` directly
+    (with ``include_partial=False``) to avoid transient-pivot leaks.
+    Default here is ``True`` because this proxy is the chart's path.
+    """
     if con_id is None and not symbol:
         raise HTTPException(status_code=400, detail="con_id or symbol is required")
 
-    params: dict[str, str | int] = {"hours": hours, "bar_size": bar_size}
+    params: dict[str, str | int | bool] = {
+        "hours": hours, "bar_size": bar_size,
+        "include_partial": include_partial,
+    }
     if con_id is not None:
         params["con_id"] = int(con_id)
     if symbol:

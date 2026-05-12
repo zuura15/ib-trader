@@ -28,6 +28,14 @@ export type SavedRange = {
    *  still load correctly — the chart auto-fits Y. */
   priceFrom?: number;
   priceTo?: number;
+  /** Bar-relative X persistence: right-edge gap in bar units and
+   *  visible width in bars at the moment of capture. Restored on
+   *  hard refresh so the chart re-anchors to where the operator
+   *  was looking, with new bars sliding old ones off the left
+   *  while the right-edge gap stays constant. Optional so older
+   *  saved entries (time-only) still load. */
+  rightSpaceBars?: number;
+  widthBars?: number;
 };
 export type Point = { time: UTCTimestamp; value: number };
 /** Full OHLC bar with the same local-as-UTC time shift as Point. Used
@@ -87,8 +95,14 @@ export function toBars(bars: HistoryBar[]): Bar[] {
     // lightweight-charts always formats UTCTimestamp as UTC. Shift each
     // bar's epoch by its own timezone offset so the axis reads as the
     // user's local wall time. Per-bar so DST flips stay correct.
+    // ALSO shift by ``+BAR_SECONDS`` so each bar is labelled by its
+    // slot-END (= the wall-clock moment it actually closed) instead
+    // of its slot-start. This matches operator intuition: the bar
+    // "at 15:27" is the bar that just closed at 15:27, not the one
+    // that started at 15:27. Pair with the same shift on badges and
+    // entry-line anchor times below so they stay co-located.
     const tzOffsetMs = date.getTimezoneOffset() * 60_000;
-    const t = Math.floor((ms - tzOffsetMs) / 1000);
+    const t = Math.floor((ms - tzOffsetMs) / 1000) + BAR_SECONDS;
     out.push({
       time: t as UTCTimestamp,
       open: b.open, high: b.high, low: b.low, close: b.close,

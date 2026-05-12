@@ -31,7 +31,7 @@ this out explicitly; a future PR can lift the short path.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -600,9 +600,23 @@ class ChartSignalStrategy:
             qty=Decimal(str(qty)),
             order_type=self.config.get("order_strategy", "mid"),
         ))
+        # ``entry_bar_time`` should mark the bar that triggered the
+        # entry — i.e. the just-confirmed PIVOT at last_idx-1, NOT the
+        # just-closed bar (last_idx) at which the bot evaluated. The
+        # chart anchors its B/S badge here; storing bar_time made the
+        # badge land one slot too late (visible in the 2026-05-12
+        # MGCM6 15:21 entry where the operator's chart drew B at the
+        # 15:18 bar but the actual pivot was the 15:15 bar).
+        pivot_t = (
+            _bar_ts(window[new_pivot_idx])
+            if 0 <= new_pivot_idx < len(window)
+            else None
+        )
+        if pivot_t is None:
+            pivot_t = bar_time - timedelta(seconds=self.bar_seconds)
         actions.append(UpdateState({
             "entry_line": entry_line_doc,
-            "entry_bar_time": bar_time.isoformat(),
+            "entry_bar_time": pivot_t.isoformat(),
         }))
         return actions
 

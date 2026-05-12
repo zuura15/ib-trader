@@ -255,13 +255,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const activeEntryBarTimeRef = useRef<number | null>(null);
   useEffect(() => { entryLineRef.current = entryLine; }, [entryLine]);
   useEffect(() => {
-    // Convert real-UTC ISO to chart-time (shifted UTC). null clears.
+    // Convert real-UTC ISO to chart-time (shifted UTC), then shift
+    // ``+BAR_SECONDS`` so the badge sits at the bar's slot-END
+    // label — co-located with the bar at that x in ``toBars``.
     if (!activeEntryBarTime) {
       activeEntryBarTimeRef.current = null;
     } else {
       const d = new Date(activeEntryBarTime);
       activeEntryBarTimeRef.current = Number.isFinite(d.getTime())
-        ? (localUtcSeconds(d) as number) : null;
+        ? (localUtcSeconds(d) as number) + BAR_SECONDS : null;
     }
 
     // Synthetic badge injection: if the bot tells us it acted on a
@@ -309,7 +311,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     for (const f of historicalFires) {
       const d = new Date(f.barTime);
       if (!Number.isFinite(d.getTime())) continue;
-      const t = localUtcSeconds(d) as UTCTimestamp;
+      // +BAR_SECONDS shifts to slot-end labelling (matches toBars).
+      const t = (localUtcSeconds(d) as number) + BAR_SECONDS as UTCTimestamp;
       out.push({
         time: t,
         price: f.price,
@@ -421,7 +424,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       try { ser.setData([]); } catch { /* ignore */ }
       return;
     }
-    const anchorChartSec = localUtcSeconds(anchorDate) as number;
+    // +BAR_SECONDS keeps the anchor + Q endpoints aligned with the
+    // slot-end-labelled bars produced by ``toBars``.
+    const anchorChartSec = (localUtcSeconds(anchorDate) as number) + BAR_SECONDS;
     // Clip the line's left endpoint at Q when the bot provides it.
     // Without ``fromTime``, the line is projected backward to
     // ``bars[0]``, which historically read as a long-running trend
@@ -431,7 +436,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (entryLine.fromTime) {
       const fromDate = new Date(entryLine.fromTime);
       if (Number.isFinite(fromDate.getTime())) {
-        const fromChartSec = localUtcSeconds(fromDate) as number;
+        const fromChartSec = (localUtcSeconds(fromDate) as number) + BAR_SECONDS;
         if (fromChartSec > (bars[0].time as number)) {
           startTime = fromChartSec as UTCTimestamp;
         }
@@ -829,9 +834,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // mismatch reported 2026-05-11 (MES 18:57). Strip the live bar
       // so the chart's detector uses the same closed-bars-only input
       // as the bot.
+      // Slot-end labelling: bars are now stamped at slot-end. The
+      // in-progress bar's stamp = floor(now/BAR_SECONDS)*BAR_SECONDS
+      // + BAR_SECONDS. Anything at or past that stamp is the live
+      // forming bar — strip it so SR detection runs on closed bars
+      // only, matching the bot's view.
       const _nowSec = localUtcSeconds(new Date()) as number;
-      const _liveBarStart = Math.floor(_nowSec / BAR_SECONDS) * BAR_SECONDS;
-      if (slice.length > 0 && (slice[slice.length - 1].time as number) >= _liveBarStart) {
+      const _liveBarStamp = Math.floor(_nowSec / BAR_SECONDS) * BAR_SECONDS
+        + BAR_SECONDS;
+      if (slice.length > 0 && (slice[slice.length - 1].time as number) >= _liveBarStamp) {
         slice = slice.slice(0, -1);
         if (slice.length < 3) return;
       }
@@ -1307,10 +1318,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // Record viewport in bar-relative terms (gap from last bar +
         // visible width). See ``userLogicalRangeRef`` for why.
         const barCount = barsRef.current.length;
-        userLogicalRangeRef.current = {
-          rightSpaceBars: lr.to - (barCount - 1),
-          widthBars: lr.to - lr.from,
-        };
+        const rightSpaceBars = lr.to - (barCount - 1);
+        const widthBars = lr.to - lr.from;
+        userLogicalRangeRef.current = { rightSpaceBars, widthBars };
+        // Also persist bar-relative values into ``SavedRange`` so a
+        // hard refresh restores the operator's viewport (without
+        // these, the firstLoad path re-anchored to ``now`` and the
+        // user's pan/zoom was lost on every page reload).
+        r.rightSpaceBars = rightSpaceBars;
+        r.widthBars = widthBars;
       }
       // Re-run SR detection over the new visible range (debounced —
       // zoom emits many events). Detection self-skips when width is
@@ -1525,19 +1541,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
         if (firstLoad) {
           firstLoad = false;
-          // First load anchors `to` to wall-clock "now" regardless of
-          // what's persisted. We retain the *width* of the saved zoom
-          // (so users keep their preferred lookback) but always show
-          // the live tail. Subsequent loads in the same session
-          // respect the user's panning/zooming via prevRange below.
-          const nowSec = localUtcSeconds(new Date());
-          const widthSec = prevRange
-            ? Math.max(60, prevRange.to - prevRange.from)
-            : visibleMinutes * 60;
-          chart.timeScale().setVisibleRange({
-            from: (nowSec - widthSec) as UTCTimestamp,
-            to: nowSec,
-          });
+          // Hard-refresh path. If the saved range carries bar-relative
+          // values, restore using those — the operator's prior pan
+          // and zoom both survive. Without them (older entries),
+          // fall back to the width-preserve-anchor-to-now behavior.
+          const sb = savedRange?.rightSpaceBars;
+          const sw = savedRange?.widthBars;
+          if (sb != null && sw != null && Number.isFinite(sb) && Number.isFinite(sw)) {
+            const barCount = fullBars.length;
+            const newTo = (barCount - 1) + sb;
+            const newFrom = newTo - sw;
+            // Hydrate the in-memory ref too so the in-session
+            // refresh path doesn't have to wait for a user gesture
+            // to repopulate.
+            userLogicalRangeRef.current = {
+              rightSpaceBars: sb, widthBars: sw,
+            };
+            try {
+              chart.timeScale().setVisibleLogicalRange(
+                { from: newFrom, to: newTo },
+              );
+            } catch { /* range invalid for current data — skip */ }
+          } else {
+            const nowSec = localUtcSeconds(new Date());
+            const widthSec = prevRange
+              ? Math.max(60, prevRange.to - prevRange.from)
+              : visibleMinutes * 60;
+            chart.timeScale().setVisibleRange({
+              from: (nowSec - widthSec) as UTCTimestamp,
+              to: nowSec,
+            });
+          }
         } else if (userLogicalRangeRef.current) {
           // Re-anchor the saved bar-relative viewport to the freshly-
           // loaded dataset. ``rightSpaceBars`` keeps the last-bar →
@@ -1681,9 +1715,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // place. The visible window then only shifts when a real
           // bar boundary crosses (every 3 min) — matching the user's
           // mental model "this is a 3-min chart, advance one bar at
-          // a time."
+          // a time."  +BAR_SECONDS for slot-END labelling so the
+          // in-progress bar lands at the next 3-min wallclock mark
+          // (e.g. ticks in [15:27, 15:30) plot at x=15:30, matching
+          // the bar that WILL close at that mark).
           const nowSec = localUtcSeconds(new Date());
-          const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS;
+          const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
+            + BAR_SECONDS;
           series.update({ time: barSec as UTCTimestamp, value: last });
           lastTickBarSecRef.current = barSec;
           // Mirror the update into the OHLC bars ref so SR pivot

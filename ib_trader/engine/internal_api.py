@@ -473,6 +473,7 @@ async def get_history(
     sec_type: str = "STK",
     hours: int = 24,
     bar_size: str = "1 min",
+    include_partial: bool = False,
 ):
     """Return historical close-price bars for charting.
 
@@ -515,7 +516,7 @@ async def get_history(
         if not con_id:
             raise HTTPException(status_code=502, detail="qualify_contract returned no con_id")
 
-    cache_key = (int(con_id), int(hours), bar_size)
+    cache_key = (int(con_id), int(hours), bar_size, bool(include_partial))
     now = time.monotonic()
     cached = _HISTORY_CACHE.get(cache_key)
     # Defensive: an earlier build briefly wrote ``cached[0]`` as a
@@ -579,7 +580,8 @@ async def get_history(
     out: list[dict] = []
     for bar in bars or []:
         ts = getattr(bar, "date", None)
-        if bar_seconds > 0 and hasattr(ts, "timestamp"):
+        if (not include_partial) and bar_seconds > 0 \
+                and hasattr(ts, "timestamp"):
             slot_end = ts.timestamp() + bar_seconds
             if slot_end > now_utc + 0.5:
                 continue
