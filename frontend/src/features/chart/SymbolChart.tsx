@@ -682,7 +682,27 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // pivots are intentionally excluded so the chart never paints a
       // line anchored to something the user can't see; zooming out is
       // the explicit gesture for longer-trend detection.
-      const slice = allBars.slice(fromIdx, toIdx + 1);
+      let slice = allBars.slice(fromIdx, toIdx + 1);
+      // Exclude the in-progress (live) 3-min bar from pivot detection.
+      // The live-tick handler appends/updates a bar whose ``time`` is
+      // the current 3-min boundary; its ``close`` is the latest tick,
+      // not a real close. Letting that bar participate as a pivot
+      // neighbor produces TRANSIENT pivot detections — e.g. while the
+      // live price stays below the prior bar's close, ``find_pivot_
+      // highs`` sees the prior bar as a pivot HIGH and the chart paints
+      // an S badge; when the live bar's actual close ends up higher,
+      // the pivot disappears. The bot (which uses /engine/history,
+      // closed bars only) never sees these phantom pivots and can't
+      // act on the S, producing the "S appeared, bot didn't fire"
+      // mismatch reported 2026-05-11 (MES 18:57). Strip the live bar
+      // so the chart's detector uses the same closed-bars-only input
+      // as the bot.
+      const _nowSec = localUtcSeconds(new Date()) as number;
+      const _liveBarStart = Math.floor(_nowSec / BAR_SECONDS) * BAR_SECONDS;
+      if (slice.length > 0 && (slice[slice.length - 1].time as number) >= _liveBarStart) {
+        slice = slice.slice(0, -1);
+        if (slice.length < 3) return;
+      }
       // Map "show broken for N minutes" to bar count. BAR_SECONDS=180
       // (3 min). When the broken toggle is off the value is irrelevant
       // — broken lines get filtered out at render anyway — but we
