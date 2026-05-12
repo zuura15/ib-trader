@@ -133,70 +133,90 @@ export function PositionStrip({ state, fsmState, botId }: Props) {
   const entryWithQty = qtyStr != null
     ? `${entryValue} (${qtyStr})`
     : entryValue;
-  const cells: { label: string; value: string; tone?: 'pos' | 'neg' }[] = [
+  type Cell = { label: string; value: string; tone?: 'pos' | 'neg' };
+  // Row 1: identity + price snapshot.
+  // Row 2: risk + P/L (carries the @stop and 24h brackets).
+  const row1: Cell[] = [
     { label: '@', value: fmtTime(state.entry_time) },
     { label: 'Entry', value: entryWithQty },
     { label: 'Last', value: fmt(state.last_price) },
+  ];
+  const row2: Cell[] = [
     { label: 'Stop', value: stopValue },
     { label: 'P/L', value: pnlValue, tone: pnlTone },
   ];
+
+  const renderCell = ({ label, value, tone }: Cell) => {
+    const isPnl = label === 'P/L';
+    return (
+      <span key={label} style={{ display: 'inline-flex', gap: 4 }}>
+        <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+        <span style={{
+          color: tone === 'pos' ? 'var(--accent-green)'
+               : tone === 'neg' ? 'var(--accent-red)'
+               : 'var(--text-primary)',
+          fontWeight: 600,
+        }}>{value}</span>
+        {isPnl && pnlAtStop != null && (
+          <span style={{ color: 'var(--text-muted)' }}>
+            (
+            <span style={{
+              color: pnlAtStop >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+              fontWeight: 600,
+            }}>
+              {pnlAtStop >= 0 ? '+$' : '-$'}{Math.abs(pnlAtStop).toFixed(2)}
+            </span>
+            <span>&nbsp;@stop</span>)
+          </span>
+        )}
+        {isPnl && botId && pnl24h != null && (
+          <span style={{ color: 'var(--text-muted)' }}>
+            (24h:&nbsp;
+            <span style={{
+              color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+              fontWeight: 600,
+            }}>
+              {pnl24h >= 0 ? '+$' : '-$'}{Math.abs(pnl24h).toFixed(2)}
+            </span>
+            <span>&nbsp;/ {pnl24hCount}</span>)
+          </span>
+        )}
+      </span>
+    );
+  };
 
   return (
     <div
       style={{
         flexShrink: 0,
-        height: 28,
+        // Two rows of cells. 84 px stays the same as the prior strip
+        // height; the rows sit stacked centred vertically.
+        height: 84,
         display: 'flex',
-        alignItems: 'center',
-        gap: 14,
+        flexDirection: 'column',
+        justifyContent: 'center',
+        gap: 6,
         padding: '0 10px',
+        // Slightly darker than the chart pane so the metrics strip
+        // reads as a distinct shelf below the chart. Holds the same
+        // hue when the bot is in position (blue) vs neutral (grey)
+        // so the active-bot signal still pops.
         background: inPosition
-          ? 'rgba(59,130,246,0.10)'
-          : 'var(--bg-primary)',
+          ? 'rgba(59,130,246,0.18)'
+          : 'rgba(0,0,0,0.05)',
         borderTop: '1px solid var(--border-default)',
-        fontSize: 11,
+        // +20 % from the prior 11 px.
+        fontSize: 13,
         fontVariantNumeric: 'tabular-nums',
         color: 'var(--text-secondary)',
       }}
     >
-      {cells.map(({ label, value, tone }) => {
-        const isPnl = label === 'P/L';
-        return (
-          <span key={label} style={{ display: 'inline-flex', gap: 4 }}>
-            <span style={{ color: 'var(--text-muted)' }}>{label}</span>
-            <span style={{
-              color: tone === 'pos' ? 'var(--accent-green)'
-                   : tone === 'neg' ? 'var(--accent-red)'
-                   : 'var(--text-primary)',
-              fontWeight: 600,
-            }}>{value}</span>
-            {isPnl && pnlAtStop != null && (
-              <span style={{ color: 'var(--text-muted)' }}>
-                (
-                <span style={{
-                  color: pnlAtStop >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
-                  fontWeight: 600,
-                }}>
-                  {pnlAtStop >= 0 ? '+$' : '-$'}{Math.abs(pnlAtStop).toFixed(2)}
-                </span>
-                <span>&nbsp;@stop</span>)
-              </span>
-            )}
-            {isPnl && botId && pnl24h != null && (
-              <span style={{ color: 'var(--text-muted)' }}>
-                (24h:&nbsp;
-                <span style={{
-                  color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
-                  fontWeight: 600,
-                }}>
-                  {pnl24h >= 0 ? '+$' : '-$'}{Math.abs(pnl24h).toFixed(2)}
-                </span>
-                <span>&nbsp;/ {pnl24hCount}</span>)
-              </span>
-            )}
-          </span>
-        );
-      })}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        {row1.map(renderCell)}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        {row2.map(renderCell)}
+      </div>
     </div>
   );
 }

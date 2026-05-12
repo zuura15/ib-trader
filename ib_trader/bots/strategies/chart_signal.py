@@ -274,7 +274,14 @@ class ChartSignalStrategy:
         # doesn't trip a ``TypeError: '>' not supported between
         # datetime and str``.
         def _ts_iso(b: dict) -> str:
-            ts = b.get("timestamp_utc")
+            # ``/engine/history`` returns bars with the timestamp under
+            # the ``ts`` key (ISO string) while ``event.window`` bars
+            # use ``timestamp_utc`` (datetime). Read both so the
+            # dedup/append comparison works regardless of source.
+            # Earlier oversight: with only ``timestamp_utc`` the fetched
+            # latest ts came back as "" → the loop appended every
+            # event.window bar (a duplicate of the fetched data).
+            ts = b.get("timestamp_utc") or b.get("ts")
             if ts is None:
                 return ""
             if hasattr(ts, "isoformat"):
@@ -509,9 +516,18 @@ class ChartSignalStrategy:
 
         # Freeze the line in (time, price) space so future evaluations
         # survive the window sliding forward.
-        anchor_b_time = _parse_ts(
-            window[chosen.anchor_b_idx].get("timestamp_utc")
-        ) if 0 <= chosen.anchor_b_idx < len(window) else bar_time
+        # ``/engine/history`` bars expose timestamps as ``ts`` whereas
+        # the in-process aggregator's bars use ``timestamp_utc``.
+        # Falling back keeps anchor / Q resolution correct regardless
+        # of which feed populated the window (otherwise we silently
+        # recorded ``anchor_time = bar_time`` for every entry).
+        def _bar_ts(b: dict):
+            return _parse_ts(b.get("timestamp_utc") or b.get("ts"))
+        anchor_b_time = (
+            _bar_ts(window[chosen.anchor_b_idx])
+            if 0 <= chosen.anchor_b_idx < len(window)
+            else bar_time
+        )
         anchor_b_price = float(window[chosen.anchor_b_idx].get(
             "close", closes[chosen.anchor_b_idx]
         )) if 0 <= chosen.anchor_b_idx < len(window) else closes[chosen.anchor_b_idx]
@@ -520,9 +536,11 @@ class ChartSignalStrategy:
         # the section the bot actually validated. Without ``from_time``
         # the chart extrapolates the line all the way back to ``bars[0]``
         # which looks like a long-running trend the bot never claimed.
-        anchor_q_time = _parse_ts(
-            window[chosen.from_idx].get("timestamp_utc")
-        ) if 0 <= chosen.from_idx < len(window) else None
+        anchor_q_time = (
+            _bar_ts(window[chosen.from_idx])
+            if 0 <= chosen.from_idx < len(window)
+            else None
+        )
         slope_per_sec = chosen.slope / self.bar_seconds
 
         entry_line_doc = {

@@ -552,9 +552,26 @@ async def get_history(
         logger.exception('{"event": "HISTORY_FETCH_FAILED", "con_id": %d}', con_id)
         raise HTTPException(status_code=502, detail=f"historical data failed: {e}") from e
 
+    # Drop the in-progress bar (the bar whose slot end is still in
+    # the future). IB returns the currently-forming bar at the tail
+    # of historical data with whatever the latest tick is as its
+    # close — bots that consume this feed for pivot detection then
+    # see "bar - 1" as a strict pivot every few ticks even when it
+    # isn't, because the in-progress close moves above/below it as
+    # the tape ticks. Trimming the in-progress bar makes the feed a
+    # pure record of *closed* bars.
+    bar_seconds_map = {"1 min": 60, "3 mins": 180, "5 mins": 300,
+                        "15 mins": 900, "30 mins": 1800, "1 hour": 3600}
+    bar_seconds = bar_seconds_map.get(bar_size, 0)
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
     out: list[dict] = []
     for bar in bars or []:
         ts = getattr(bar, "date", None)
+        if bar_seconds > 0 and hasattr(ts, "timestamp"):
+            slot_end = ts.timestamp() + bar_seconds
+            if slot_end > now.timestamp() + 0.5:
+                continue
         ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
         out.append({
             "ts": ts_str,

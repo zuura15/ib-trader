@@ -230,6 +230,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const showCounterSupportRef = useRef(showCounterSupport);
   const showCounterResistanceRef = useRef(showCounterResistance);
   const suppressAutoSignalsRef = useRef(suppressAutoSignals);
+  // Set true by ``withFrozenViewport`` for the duration of an async
+  // callback (e.g. html2canvas capture). The custom ResizeObserver
+  // checks this and skips its setAutoScale(true) re-fit so a layout
+  // reflow during capture can't undo the explicit setVisibleRange
+  // we pinned at freeze-start.
+  const viewportFrozenRef = useRef(false);
   // Bot-mode prop mirrors. Read by the SVG badge painter and the
   // entry-line series effect.
   const entryLineRef = useRef(entryLine);
@@ -977,7 +983,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // pan/zoom/refresh). Keeping the most recent ``MAX_SIGNALS``
       // bounds memory, repaint cost, and visual clutter.
       const MAX_SIGNALS = 50;
-      const merged = [...srSignalsRef.current, ...newSignals];
+      // Bot panes opt out of the auto-emit cache entirely. Stale
+      // badges from earlier recomputes (or older sessions before
+      // suppression was enabled) would otherwise stick around even
+      // after the gate flips off — defeating the "B/S = real order"
+      // invariant. Clear the cache every recompute when suppressed.
+      const merged = suppressAutoSignalsRef.current
+        ? []
+        : [...srSignalsRef.current, ...newSignals];
       if (merged.length > MAX_SIGNALS) {
         merged.sort((a, b) => (a.time as number) - (b.time as number));
         merged.splice(0, merged.length - MAX_SIGNALS);
@@ -1277,7 +1290,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     let resizeObserver: ResizeObserver | null = null;
     if (containerEl && typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver(() => {
-        try { chart.priceScale('right').setAutoScale(true); } catch { /* ignore */ }
+        // Honour an in-flight ``withFrozenViewport`` freeze — the
+        // capture path pinned the price range explicitly and the
+        // ResizeObserver firing here is an html2canvas layout side
+        // effect, not a real user resize.
+        if (!viewportFrozenRef.current) {
+          try { chart.priceScale('right').setAutoScale(true); }
+          catch { /* ignore */ }
+        }
         repositionSrSignalsRef.current?.();
       });
       resizeObserver.observe(containerEl);
@@ -1774,6 +1794,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const priceScale = chart.priceScale('right');
       const lr = (() => { try { return ts.getVisibleLogicalRange(); } catch { return null; } })();
       const pr = (() => { try { return priceScale.getVisibleRange(); } catch { return null; } })();
+      // Tell the custom ResizeObserver to skip its setAutoScale
+      // re-fit — html2canvas's DOM clone trips that observer mid-
+      // capture and that's what was popping Y back to autoscale.
+      viewportFrozenRef.current = true;
       // Lock every input + auto-shift path. handleScroll covers
       // wheel-pan + drag; handleScale covers wheel-zoom + pinch.
       // shiftVisibleRangeOnNewBar=false freezes the right-edge for
@@ -1786,6 +1810,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
       } catch { /* ignore */ }
       try { priceScale.setAutoScale(false); } catch { /* ignore */ }
+      // Pin Y BEFORE the capture too — setAutoScale(false) alone
+      // doesn't anchor the range; an explicit setVisibleRange does.
+      try { if (pr) priceScale.setVisibleRange(pr); } catch { /* ignore */ }
       try {
         return await fn();
       } finally {
@@ -1802,6 +1829,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             timeScale: { shiftVisibleRangeOnNewBar: true },
           });
         } catch { /* ignore */ }
+        // Defer clearing the freeze flag one frame so the trailing
+        // ResizeObserver callback from html2canvas's iframe teardown
+        // (fires AFTER finally on some browsers) still no-ops.
+        requestAnimationFrame(() => {
+          viewportFrozenRef.current = false;
+        });
       }
     },
   }), [visibleMinutes, srHiddenTick]);

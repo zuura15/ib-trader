@@ -514,6 +514,140 @@ def run_backtest_live(
     return trades
 
 
+def run_backtest_momentum(
+    bars: list[Bar],
+    *,
+    breakout_bars: int = 10,
+    trail_width_pct: float = 0.0003,
+    cooldown_bars: int = 1,
+    utc_hour_range: tuple[int, int] | None = None,
+    atr_mult: float | None = None,
+    atr_period: int = ATR_PERIOD,
+) -> list[Trade]:
+    """Donchian-channel breakout strategy. Single position at a time.
+
+    Entry:
+      * LONG  when close[t] > max(close[t - breakout_bars : t]).
+      * SHORT when close[t] < min(close[t - breakout_bars : t]).
+      First breakout wins; opposite-side breakouts during a position
+      are ignored (no reversals).
+
+    Exit:
+      * Trailing-stop at HWM × (1 − trail_width_pct) for longs and
+        LWM × (1 + trail_width_pct) for shorts. ``atr_mult`` overrides
+        the % trail with ``k × ATR`` when set.
+      * EOD on the final bar; open trades flagged EOD in the
+        summary.
+
+    Fill model mirrors ``run_backtest_live``: entry and exit at the
+    trigger bar's close (no phantom +1-bar slippage). Cooldown bars
+    apply after each round-trip just like chart_signal."""
+    if len(bars) < breakout_bars + 3:
+        return []
+    closes = [b.close for b in bars]
+    atr_series = (
+        compute_atr(bars, atr_period) if atr_mult is not None else None
+    )
+
+    trades: list[Trade] = []
+    open_trade: Trade | None = None
+    cooldown_until_idx = -1
+    hwm = -float('inf')
+    lwm = float('inf')
+
+    for t in range(breakout_bars, len(bars)):
+        # Exit gate on the open position.
+        if open_trade is not None:
+            if atr_series is not None:
+                atr_t = atr_series[t]
+                trail_delta = (atr_mult * atr_t) if atr_t is not None else None
+            else:
+                trail_delta = None
+            if open_trade.side == 'LONG':
+                hwm = max(hwm, closes[t])
+                if trail_delta is not None:
+                    trail_stop = hwm - trail_delta
+                else:
+                    trail_stop = (hwm * (1 - trail_width_pct)
+                                  if trail_width_pct > 0 else -float('inf'))
+                breach = closes[t] < trail_stop
+            else:
+                lwm = min(lwm, closes[t])
+                if trail_delta is not None:
+                    trail_stop = lwm + trail_delta
+                else:
+                    trail_stop = (lwm * (1 + trail_width_pct)
+                                  if trail_width_pct > 0 else float('inf'))
+                breach = closes[t] > trail_stop
+            if breach:
+                open_trade.exit_t = bars[t].t
+                open_trade.exit_idx = t
+                open_trade.exit_price = bars[t].close
+                open_trade.exit_reason = "TRAIL"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+            continue
+
+        if t <= cooldown_until_idx:
+            continue
+
+        if utc_hour_range is not None:
+            ts = bars[t].t
+            try:
+                hour = int(ts[11:13])
+            except (ValueError, IndexError):
+                hour = -1
+            lo, hi = utc_hour_range
+            if not (lo <= hour < hi):
+                continue
+
+        # Donchian-channel triggers — prior-bar lookback so close[t]
+        # vs the highs/lows that existed BEFORE this bar formed.
+        window_lo = t - breakout_bars
+        window_hi = t  # exclusive: closes[window_lo : window_hi]
+        prior = closes[window_lo:window_hi]
+        if not prior:
+            continue
+        prior_high = max(prior)
+        prior_low = min(prior)
+        side: str | None = None
+        if closes[t] > prior_high:
+            side = 'LONG'
+        elif closes[t] < prior_low:
+            side = 'SHORT'
+        if side is None:
+            continue
+
+        # Entry at the trigger bar's close — matches live-style fill
+        # near bar boundary; no +1-bar phantom slippage.
+        open_trade = Trade(
+            side=side,
+            entry_t=bars[t].t,
+            entry_idx=t,
+            entry_price=bars[t].close,
+            line_slope=0.0,
+            line_intercept=0.0,
+            line_anchor_b_idx=t,
+            line_touches=breakout_bars,
+        )
+        if side == 'LONG':
+            hwm = bars[t].close
+        else:
+            lwm = bars[t].close
+
+    if open_trade is not None:
+        open_trade.exit_t = bars[-1].t
+        open_trade.exit_idx = len(bars) - 1
+        open_trade.exit_price = bars[-1].close
+        open_trade.exit_reason = "EOD"
+        trades.append(open_trade)
+
+    return trades
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bars", default="/tmp/mgc7d.json",

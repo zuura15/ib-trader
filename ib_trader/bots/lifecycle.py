@@ -122,6 +122,15 @@ def clear_position_fields() -> dict:
         "entry_line": None,
         "entry_bar_time": None,
         "position_direction": None,
+        # 2026-05-12: a prior SHORT's ``low_water_mark`` +
+        # ``active_stop`` leaked into the next LONG until the first
+        # EXIT_CHECK overwrote them — the chart-bot strip showed a
+        # stop ~$285 below the new entry (the previous short's stale
+        # stop). Clearing both here keeps the position strip honest
+        # in the gap between entry fill and the first exit eval.
+        "low_water_mark": None,
+        "active_stop": None,
+        "exit_reason": None,
     }
 
 

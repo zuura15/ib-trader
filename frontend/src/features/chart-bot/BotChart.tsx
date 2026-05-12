@@ -423,13 +423,24 @@ export function BotChart({
     </div>
   );
 
+  // OFF / unknown bot — desaturate the chart + strip so the operator
+  // can tell at a glance which bots are dormant. Toolbar header stays
+  // crisp so Start / Force-quit remain prominent. Live live-tick
+  // ingestion continues underneath; the grey-out is purely visual.
+  const isInactive = !fsmState
+    || fsmState === 'OFF'
+    || fsmState === 'UNKNOWN';
+  const inactiveStyle: React.CSSProperties = isInactive
+    ? { filter: 'grayscale(0.85) opacity(0.55)' }
+    : {};
   const chartBody = (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
-      <div className="flex-1" style={{ minHeight: 0 }}>
+      <div className="flex-1" style={{ minHeight: 0, ...inactiveStyle }}>
         <SymbolChart
           ref={chartRef}
           target={target}
           enableSr
+          showRsi={false}
           showBrokenSr={showBrokenSr}
           brokenMinutes={brokenMinutes}
           showCounterSupport={showCounterSupport}
@@ -442,7 +453,9 @@ export function BotChart({
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
-      <PositionStrip state={state} fsmState={fsmState} botId={botId} />
+      <div style={inactiveStyle}>
+        <PositionStrip state={state} fsmState={fsmState} botId={botId} />
+      </div>
     </div>
   );
 
