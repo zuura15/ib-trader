@@ -207,6 +207,52 @@ async def test_ib_order_id_captured_on_successful_submission():
 
 
 @pytest.mark.asyncio
+async def test_cmd_id_patch_skipped_when_fill_already_processed():
+    """If a fast fill races the engine HTTP return — bot transitions
+    PAST *_ORDER_PLACED before ``_run_pipeline`` patches the cmd_id —
+    the patch must SKIP writing ``ib_order_id`` /
+    ``awaiting_ib_order_id``. Otherwise the now-stale cmd_id
+    resurrects ``awaiting_ib_order_id`` on a doc that
+    ``on_exit_filled``'s ``clear_position_fields()`` just zeroed,
+    and the next ``/start`` clean-check refuses to launch the bot.
+    Caught 2026-05-12 on chart-bot-3 MESM6 force-quit (cmd_id
+    2668).
+    """
+    runner = _make_runner(initial_state=BotState.AWAITING_EXIT_TRIGGER)
+
+    class _FillRacingPipeline:
+        last_cmd_id: str | None = None
+
+        def __init__(self, runner_):
+            self._runner = runner_
+
+        async def process(self, actions, ctx):
+            # Simulate: during pipeline.process, ``on_exit_filled`` fires,
+            # clears position fields, transitions to OFF.
+            import json
+            key = f"bot:{self._runner.bot_id}"
+            doc = json.loads(self._runner.config["_redis"]._store[key])
+            doc["state"] = BotState.OFF.value
+            doc["awaiting_ib_order_id"] = None
+            doc["ib_order_id"] = None
+            self._runner.config["_redis"]._store[key] = json.dumps(doc)
+            # Engine then returns with cmd_id.
+            self.last_cmd_id = "ib-fast-fill-2668"
+            return actions
+
+    pipeline = _FillRacingPipeline(runner)
+    runner.pipeline = pipeline
+
+    await runner._run_pipeline([_sell_order()], ctx=object())
+
+    doc = await runner._load_doc()
+    # Doc must reflect the post-fill state, NOT the cmd_id patch.
+    assert doc["state"] == BotState.OFF.value
+    assert doc.get("awaiting_ib_order_id") in (None, "")
+    assert doc.get("ib_order_id") in (None, "")
+
+
+@pytest.mark.asyncio
 async def test_buy_order_from_awaiting_entry_transitions_correctly():
     """BUY entry flips the state to ENTRY_ORDER_PLACED (not
     EXIT_ORDER_PLACED). The state machine dispatches on state, not

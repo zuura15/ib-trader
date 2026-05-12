@@ -1460,19 +1460,44 @@ class StrategyBotRunner(BotBase):
             # Patch the real ib_order_id into the doc now that the engine
             # returned it. The stream handler needs this to match the
             # terminal event to our order.
+            #
+            # Skip the patch when the FSM has already advanced PAST the
+            # *_ORDER_PLACED state — i.e., when a fast fill arrived on
+            # ``order:updates`` during the engine HTTP wait and
+            # ``on_entry_filled`` / ``on_exit_filled`` already ran +
+            # cleared the doc via ``clear_position_fields()``. Writing
+            # the cmd_id here would resurrect ``awaiting_ib_order_id``
+            # on a doc that's supposed to be back to OFF /
+            # AWAITING_ENTRY_TRIGGER, breaking the next ``/start``'s
+            # clean check. Caught 2026-05-12 on chart-bot-3 MESM6
+            # force-quit round trip — bot exited cleanly but operator
+            # couldn't restart without /reset.
             if place_orders and cmd_id is not None:
                 async with self._state_lock:
                     doc = await self._load_doc()
-                    doc["ib_order_id"] = str(cmd_id)
-                    doc["awaiting_ib_order_id"] = str(cmd_id)
-                    doc["updated_at"] = now_iso()
-                    await self._save_doc(doc)
-                logger.info(
-                    '{"event": "BOT_ORDER_ID_CAPTURED", "bot_id": "%s", '
-                    '"cmd_id": "%s", "side": "%s"}',
-                    self.bot_id, cmd_id,
-                    place_orders[0].side if place_orders else "?",
-                )
+                    try:
+                        cur_state = BotState(doc.get("state", BotState.OFF.value))
+                    except ValueError:
+                        cur_state = BotState.OFF
+                    if cur_state in (BotState.ENTRY_ORDER_PLACED,
+                                     BotState.EXIT_ORDER_PLACED):
+                        doc["ib_order_id"] = str(cmd_id)
+                        doc["awaiting_ib_order_id"] = str(cmd_id)
+                        doc["updated_at"] = now_iso()
+                        await self._save_doc(doc)
+                        logger.info(
+                            '{"event": "BOT_ORDER_ID_CAPTURED", "bot_id": "%s", '
+                            '"cmd_id": "%s", "side": "%s"}',
+                            self.bot_id, cmd_id,
+                            place_orders[0].side if place_orders else "?",
+                        )
+                    else:
+                        logger.info(
+                            '{"event": "BOT_ORDER_ID_PATCH_SKIPPED", '
+                            '"bot_id": "%s", "cmd_id": "%s", '
+                            '"state": "%s", "reason": "fill processed before cmd_id return"}',
+                            self.bot_id, cmd_id, cur_state.value,
+                        )
         except Exception:
             # Pipeline failed — revert every pre-flight state transition
             # we made so the bot can retry.
