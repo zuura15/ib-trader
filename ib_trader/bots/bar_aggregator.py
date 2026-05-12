@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -34,8 +34,35 @@ class BarAggregator:
         self._last_seen_ts: datetime | None = None
         self._total_bar_count: int = 0
 
+    def _slot_start(self, ts: datetime) -> datetime:
+        """Aligned 3-min slot start for a 5s-bar timestamp.
+
+        Bins each incoming 5s bar by ``floor(epoch_seconds /
+        target_seconds) * target_seconds``. Result: bars always
+        finalize at epoch-aligned boundaries (``:00, :03, :06, ...``
+        UTC for 3-min), same grid the chart renders. Before this,
+        bar boundaries were tick-count driven and started wherever
+        IB's first RT 5s bar landed (e.g. ``:25`` past each 3-min
+        boundary), producing a 25-second offset between the bot's
+        bar grid and the operator's chart bar grid. Bot would then
+        act on a "bar close" the chart never showed.
+        """
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        epoch_sec = int(ts.timestamp())
+        slot_sec = (epoch_sec // self.target_seconds) * self.target_seconds
+        return datetime.fromtimestamp(slot_sec, tz=timezone.utc)
+
     def add_bars(self, raw_bars: list[dict]) -> list[dict]:
         """Ingest new 5-second bars and return any newly completed target bars.
+
+        Bars are binned by aligned slot — when an incoming 5s bar's
+        slot differs from the in-progress bar's slot, the in-progress
+        bar is finalized at its aligned ``timestamp_utc`` and a fresh
+        bar starts at the new slot. The first bar after subscription
+        may be partial (fewer than ``target_seconds/5`` ticks if
+        subscription started mid-slot); it still emits at the aligned
+        slot start when the next slot arrives.
 
         Args:
             raw_bars: List of dicts with keys: timestamp_utc, open, high, low,
@@ -60,9 +87,23 @@ class BarAggregator:
                 continue  # dedup on restart
             self._last_seen_ts = ts
 
+            slot_start = self._slot_start(ts)
+
+            # Slot rolled → finalize the current bar at its aligned
+            # timestamp before starting the new one. Bars finalize on
+            # slot change, not on a tick count, so missing/dropped 5s
+            # bars don't shift subsequent slot boundaries.
+            if (self._current is not None
+                    and self._current["timestamp_utc"] != slot_start):
+                self._completed.append(self._current)
+                self._total_bar_count += 1
+                completed.append(self._current)
+                self._current = None
+                self._ticks_in_current = 0
+
             if self._current is None:
                 self._current = {
-                    "timestamp_utc": ts,
+                    "timestamp_utc": slot_start,
                     "open": bar["open"],
                     "high": bar["high"],
                     "low": bar["low"],
@@ -76,14 +117,6 @@ class BarAggregator:
                 self._current["close"] = bar["close"]
                 self._current["volume"] += bar["volume"]
                 self._ticks_in_current += 1
-
-            # Check if we've accumulated enough 5-sec ticks for a full bar
-            if self._ticks_in_current * 5 >= self.target_seconds:
-                self._completed.append(self._current)
-                self._total_bar_count += 1
-                completed.append(self._current)
-                self._current = None
-                self._ticks_in_current = 0
 
         return completed
 
