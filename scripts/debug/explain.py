@@ -118,49 +118,50 @@ def _query_bot_events(bot_id: str, lo: datetime, hi: datetime) -> list[tuple]:
 
 
 def _grep_logs(symbol: str, lo: datetime, hi: datetime) -> list[str]:
-    """Tail-grep ``logs/ib_trader.log`` for symbol + window. Returns
-    full JSON lines whose timestamp falls in the range and that mention
-    the symbol OR the bot's id OR an IB error. Skips the noisy
-    ``IB_THROTTLED``/HTTP-noise lines by default."""
+    """Look up log events from the ``log_events`` SQLite index instead
+    of grepping the raw ``ib_trader.log``. The index is refreshed
+    on every invocation (tails new lines since the last call —
+    typically a few ms after the first warm-up build). Falls back to
+    raw grep if the index can't be built."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import log_index  # type: ignore
+        log_index.refresh()
+        lo_iso = lo.astimezone(PT).isoformat()
+        hi_iso = hi.astimezone(PT).isoformat()
+        rows = log_index.query(lo_iso, hi_iso, symbol=symbol)
+        # Re-emit as JSON strings so the existing print loop below
+        # can keep using ``json.loads``. Cheap — these are already-
+        # parsed payloads we're re-stringifying.
+        return [payload for (_ts, _ev, _sym, _bot, payload) in rows]
+    except Exception as e:  # noqa: BLE001
+        print(f"[log_index] fallback to raw grep ({e})", file=sys.stderr)
     if not LOG_PATH.exists():
         return []
     lo_iso = lo.astimezone(PT).strftime("%Y-%m-%dT%H:%M")
     hi_iso = hi.astimezone(PT).strftime("%Y-%m-%dT%H:%M")
-    # rg for speed when available; fall back to grep.
     pattern = "|".join((
         re.escape(symbol),
         r"IB_ERROR",
         r"BOT_STARTUP_FORCED_OFF",
         r"FSM_TRANSITION",
-        r"SUBSCRIBE_BARS_FAILED",
-        r"UNSUBSCRIBE_BARS_FAILED",
-        r"WARMUP_BARS_PUBLISHED",
-        r"BOT_AUTOSTARTED",
-        r"BOT_TASK_STARTED",
-        r"STRATEGY_BOT_STARTED",
     ))
-    grep_cmd = ["grep", "-E", pattern, str(LOG_PATH)]
     try:
-        out = subprocess.check_output(grep_cmd, text=True, errors="replace")
+        out = subprocess.check_output(
+            ["grep", "-E", pattern, str(LOG_PATH)],
+            text=True, errors="replace",
+        )
     except subprocess.CalledProcessError:
         return []
     keep: list[str] = []
     for line in out.splitlines():
-        # Tight time filter — line starts with `{"timestamp": "ISO".
         m = re.search(r'"timestamp":\s*"([0-9T:.\-+]+)"', line)
         if not m:
             continue
         ts = m.group(1)
-        # ISO comparisons string-wise work because of fixed-width
-        # ISO 8601 with the same offset.
         if ts[: len(lo_iso)] < lo_iso or ts[: len(hi_iso)] > hi_iso:
             continue
-        # Drop a couple of common noise events we never want.
-        if '"event": "IB_THROTTLED"' in line:
-            continue
-        if '"HTTP Request' in line:
-            continue
-        if '"DEBUG"' in line:
+        if '"event": "IB_THROTTLED"' in line or '"HTTP Request' in line:
             continue
         keep.append(line)
     return keep

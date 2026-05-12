@@ -130,9 +130,18 @@ def _detect_one_side(closes: list[float], pivots: list[int],
                      type_: str, *,
                      tolerance_fraction: float,
                      touch_tolerance_fraction: float,
-                     break_stale_bars: int) -> list[TrendLine]:
+                     break_stale_bars: int,
+                     near_touch_tolerance_fraction: float | None = None,
+                     ) -> list[TrendLine]:
     """Per-side fan detection. ``type_`` is "support" or "resistance".
-    Direct port of the frontend's ``detectOneSide``."""
+    Direct port of the frontend's ``detectOneSide``.
+
+    ``near_touch_tolerance_fraction`` (optional): when set and > the
+    base ``touch_tolerance_fraction``, additional pivots within this
+    looser band count as further touches — but only after a line has
+    already accumulated ``MIN_TOUCHES`` strict touches. Used by the
+    backtest harness to evaluate the 4th-and-later "near touch on an
+    established trendline" rule without altering live behavior."""
     out: list[TrendLine] = []
     last_bar_idx = len(closes) - 1
     if last_bar_idx < 2 or len(pivots) < 2:
@@ -140,6 +149,11 @@ def _detect_one_side(closes: list[float], pivots: list[int],
     avg_close = sum(closes) / max(1, len(closes))
     tol = max(EPS, avg_close * tolerance_fraction)
     touch_tol = max(tol, avg_close * touch_tolerance_fraction)
+    near_touch_tol: float | None = None
+    if (near_touch_tolerance_fraction is not None
+            and near_touch_tolerance_fraction > touch_tolerance_fraction):
+        near_touch_tol = max(touch_tol,
+                              avg_close * near_touch_tolerance_fraction)
 
     def violates(close_v: float, line_v: float) -> bool:
         return (close_v < line_v - tol) if type_ == "support" \
@@ -213,13 +227,30 @@ def _detect_one_side(closes: list[float], pivots: list[int],
             # Mirrors the frontend: count ALL pivots within touch_tol
             # of the line, then min-cap at 2 (Q and P always count by
             # construction).
-            touches = 0
+            #
+            # Optional 4th+ near-touch rule (``near_touch_tol``):
+            # once the line accumulates ``MIN_TOUCHES`` strict
+            # touches, further pivots within the wider ``near_touch_tol``
+            # band also count. The first three touches stay strict —
+            # so line construction quality is unchanged; only the
+            # confirmation count widens. ``None`` leaves the legacy
+            # single-tolerance behavior in place.
+            strict_touches = 0
+            loose_touches = 0
             for piv_idx in pivots:
                 if piv_idx < q or piv_idx > last_bar_idx:
                     continue
                 line_at = slope * piv_idx + intercept
-                if abs(closes[piv_idx] - line_at) <= touch_tol:
-                    touches += 1
+                delta = abs(closes[piv_idx] - line_at)
+                if delta <= touch_tol:
+                    strict_touches += 1
+                    loose_touches += 1
+                elif near_touch_tol is not None and delta <= near_touch_tol:
+                    loose_touches += 1
+            if near_touch_tol is not None and strict_touches >= MIN_TOUCHES:
+                touches = loose_touches
+            else:
+                touches = strict_touches
             if touches < 2:
                 touches = 2
 
@@ -243,6 +274,7 @@ def detect_support_resistance(
     tolerance_fraction: float = TOLERANCE_FRACTION,
     touch_tolerance_fraction: float = TOUCH_TOLERANCE_FRACTION,
     break_stale_bars: int = BREAK_STALE_BARS,
+    near_touch_tolerance_fraction: float | None = None,
 ) -> list[TrendLine]:
     """Top-level: run support and resistance fan detection on the
     same close series and return all surviving lines from both sides.
@@ -258,12 +290,14 @@ def detect_support_resistance(
         tolerance_fraction=tolerance_fraction,
         touch_tolerance_fraction=touch_tolerance_fraction,
         break_stale_bars=break_stale_bars,
+        near_touch_tolerance_fraction=near_touch_tolerance_fraction,
     )
     out.extend(_detect_one_side(
         closes, highs, "resistance",
         tolerance_fraction=tolerance_fraction,
         touch_tolerance_fraction=touch_tolerance_fraction,
         break_stale_bars=break_stale_bars,
+        near_touch_tolerance_fraction=near_touch_tolerance_fraction,
     ))
     return out
 
@@ -272,7 +306,9 @@ def detect_lines(closes: list[float], up_to: int, type_: str,
                  *,
                  tolerance_fraction: float = TOLERANCE_FRACTION,
                  touch_tolerance_fraction: float = TOUCH_TOLERANCE_FRACTION,
-                 break_stale_bars: int = BREAK_STALE_BARS) -> list[TrendLine]:
+                 break_stale_bars: int = BREAK_STALE_BARS,
+                 near_touch_tolerance_fraction: float | None = None,
+                 ) -> list[TrendLine]:
     """Compatibility shim used by ``chart_signal`` and the backtest.
     Returns only lines of one side (matches the old single-side
     function), slicing the input to ``closes[:up_to+1]`` first to
@@ -287,6 +323,7 @@ def detect_lines(closes: list[float], up_to: int, type_: str,
         tolerance_fraction=tolerance_fraction,
         touch_tolerance_fraction=touch_tolerance_fraction,
         break_stale_bars=break_stale_bars,
+        near_touch_tolerance_fraction=near_touch_tolerance_fraction,
     )
 
 

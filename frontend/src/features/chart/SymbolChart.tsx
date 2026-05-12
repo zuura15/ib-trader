@@ -30,6 +30,25 @@ export interface SymbolChartHandle {
   /** Whether SR is currently hidden via clearSupportResistance. Bot
    *  panes need this to render the right toggle label. */
   isSupportResistanceHidden: () => boolean;
+  /** Snapshot the chart's current X (logical) and Y (price) zoom so
+   *  it can be reapplied after a flow that's known to disturb the
+   *  visible range — e.g. html2canvas cloning the pane DOM, which
+   *  trips lightweight-charts' autoSize observer and re-fits the
+   *  chart. Pair with ``restoreZoomSnapshot``. */
+  snapshotZoom: () => ZoomSnapshot | null;
+  restoreZoomSnapshot: (snap: ZoomSnapshot | null) => void;
+  /** Freeze every input + auto-fit on the chart for the duration of
+   *  an async callback. Disables wheel/pan/pinch, locks Y autoscale,
+   *  and forces the time scale to keep its current visible range
+   *  even when new bars arrive. Used by the screenshot path so
+   *  html2canvas's DOM clone + ResizeObserver firings can't move
+   *  the viewport. */
+  withFrozenViewport: <T>(fn: () => Promise<T>) => Promise<T>;
+}
+
+export interface ZoomSnapshot {
+  logical?: { from: number; to: number };
+  price?: { from: number; to: number };
 }
 
 interface Props {
@@ -392,13 +411,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         timeVisible: true,
         secondsVisible: false,
         borderColor: colors.grid,
-        // Don't auto-shift the viewport when a new bar arrives. The
-        // user's current pan/zoom is sticky — only the "Reset Zoom"
-        // button (or a fresh symbol load) snaps back to the live
-        // edge. This is the right tradeoff for analysis: examining
-        // an older window shouldn't get yanked forward every 3 min
-        // just because a new bar formed.
-        shiftVisibleRangeOnNewBar: false,
+        // Push the timeline left when a new bar lands so the right-edge
+        // gap (last bar → price axis) stays constant. lightweight-charts
+        // only applies the shift when the most-recent bar is already on
+        // screen — if the user has panned back to examine an older
+        // window, the view stays put. So this gives the live-following
+        // behavior the operator wants without yanking them around when
+        // they've explicitly scrolled away.
+        shiftVisibleRangeOnNewBar: true,
         // Always reserve a few bars of empty space on the right edge.
         // Without this the most-recent bar (which is up to 3 min behind
         // wall-clock with our 3-min bar rounding) sits flush against
@@ -776,23 +796,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const color = isBroken
           ? colors.archived
           : line.type === 'support' ? colors.bullish : colors.bearish;
-        const ds = ch.addSeries(LineSeries, {
-          color,
-          lineWidth: 1,
-          // lightweight-charts LineStyle: 0=solid, 1=dotted, 2=dashed.
-          // Visual hierarchy: confirmed = solid (most prominent),
-          // tentative 2-touch = dotted (forming, less committed),
-          // broken/archived = dashed (gave way; kept on screen briefly).
-          lineStyle: isBroken ? 2 : confirmed ? 0 : 1,
-          priceLineVisible: false,
-          lastValueVisible: false,
-          crosshairMarkerVisible: false,
-          // Exclude SR lines from the right price scale's auto-fit.
-          // Otherwise a deeply-anchored support that extends below
-          // the visible price range pulls the auto-scaled Y window
-          // wide, squashing the actual price polyline to a sliver.
-          autoscaleInfoProvider: () => null,
-        });
         // line.fromIdx / toIdx are local to the slice; map back via
         // ``slice[i].time`` for the actual chart time. Price comes
         // from the line algebra so it draws straight regardless of
@@ -801,11 +804,63 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const endTime = slice[line.toIdx].time;
         const startPrice = line.slope * line.fromIdx + line.intercept;
         const endPrice = line.slope * line.toIdx + line.intercept;
-        ds.setData([
-          { time: startTime, value: startPrice },
-          { time: endTime, value: endPrice },
-        ]);
-        srSeriesRef.current.push(ds);
+        const lineStyleVal = isBroken ? 2 : confirmed ? 0 : 1;
+        const baseOpts = {
+          color,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          // Exclude SR lines from the right price scale's auto-fit.
+          // Otherwise a deeply-anchored support that extends below
+          // the visible price range pulls the auto-scaled Y window
+          // wide, squashing the actual price polyline to a sliver.
+          autoscaleInfoProvider: () => null,
+          // lightweight-charts LineStyle: 0=solid, 1=dotted, 2=dashed.
+          // Visual hierarchy: confirmed = solid (most prominent),
+          // tentative 2-touch = dotted (forming, less committed),
+          // broken/archived = dashed (gave way; kept on screen briefly).
+          lineStyle: lineStyleVal,
+        };
+        // 5× thicker segment past the 3rd strict touch ONCE the line
+        // has accumulated a 4th-or-later (loose-band) touch. Operator
+        // cue: thick = the near-touch rule is now in play on this
+        // line. ``thirdTouchIdx`` < toIdx means there's daylight
+        // between the 3rd strict touch and the line's right edge —
+        // otherwise we just draw one series.
+        const hasLooseFourth = line.touches >= 4
+          && line.thirdTouchIdx !== null
+          && line.thirdTouchIdx < line.toIdx
+          && !isBroken;
+        if (hasLooseFourth) {
+          const splitIdx = line.thirdTouchIdx as number;
+          const splitTime = slice[splitIdx].time;
+          const splitPrice = line.slope * splitIdx + line.intercept;
+          const dsBefore = ch.addSeries(LineSeries, {
+            ...baseOpts, lineWidth: 1 as any,
+          });
+          dsBefore.setData([
+            { time: startTime, value: startPrice },
+            { time: splitTime, value: splitPrice },
+          ]);
+          srSeriesRef.current.push(dsBefore);
+          const dsAfter = ch.addSeries(LineSeries, {
+            ...baseOpts, lineWidth: 4 as any,
+          });
+          dsAfter.setData([
+            { time: splitTime, value: splitPrice },
+            { time: endTime, value: endPrice },
+          ]);
+          srSeriesRef.current.push(dsAfter);
+        } else {
+          const ds = ch.addSeries(LineSeries, {
+            ...baseOpts, lineWidth: 1 as any,
+          });
+          ds.setData([
+            { time: startTime, value: startPrice },
+            { time: endTime, value: endPrice },
+          ]);
+          srSeriesRef.current.push(ds);
+        }
 
         // Signal: uptrending support or downtrending resistance with
         // 3+ confirming pivot touches → buy/sell indicator. Anchored
@@ -1287,13 +1342,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             to: prevRange.to as UTCTimestamp,
           });
         }
-        // Periodic refresh re-fits Y to the polyline's current
-        // amplitude (rule: amp = 1/3 of chart, centered, via
-        // scaleMargins). Drops any manual Y the user had — by
-        // design: refresh, reset, and resize all snap Y back; only
-        // X-only pan/zoom respects an in-progress manual Y.
-        try { priceScale.setAutoScale(true); } catch { /* ignore */ }
-        userPriceRangeRef.current = null;
+        // Respect the user's Y zoom across refreshes. If a saved
+        // (or in-session captured) price range exists, restore it
+        // directly via the price-scale API; otherwise let auto-scale
+        // re-fit the polyline into the middle third (scaleMargins).
+        // Only Reset-Zoom now clears userPriceRangeRef.
+        const yToRestore = userPriceRangeRef.current;
+        if (yToRestore) {
+          try { priceScale.setVisibleRange(yToRestore); }
+          catch { /* range invalid for current data — fall back to auto */
+            try { priceScale.setAutoScale(true); } catch { /* ignore */ }
+          }
+        } else {
+          try { priceScale.setAutoScale(true); } catch { /* ignore */ }
+        }
         onError?.(null);
       } catch (e: any) {
         if (cancelled) return;
@@ -1521,6 +1583,71 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       scheduleSrRecomputeRef.current?.(true);
     },
     isSupportResistanceHidden: () => srHiddenRef.current,
+    snapshotZoom: () => {
+      const chart = chartRef.current;
+      if (!chart) return null;
+      const snap: ZoomSnapshot = {};
+      try {
+        const lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr) snap.logical = { from: lr.from, to: lr.to };
+      } catch { /* ignore */ }
+      try {
+        const pr = chart.priceScale('right').getVisibleRange();
+        if (pr) snap.price = { from: pr.from, to: pr.to };
+      } catch { /* ignore */ }
+      return snap;
+    },
+    restoreZoomSnapshot: (snap) => {
+      const chart = chartRef.current;
+      if (!chart || !snap) return;
+      // Defer one frame so we run after any layout reflow caused by
+      // the caller (e.g. html2canvas cloning + resize observers).
+      requestAnimationFrame(() => {
+        try {
+          if (snap.logical) chart.timeScale().setVisibleLogicalRange(snap.logical);
+        } catch { /* ignore */ }
+        try {
+          if (snap.price) chart.priceScale('right').setVisibleRange(snap.price);
+        } catch { /* ignore */ }
+      });
+    },
+    withFrozenViewport: async <T,>(fn: () => Promise<T>): Promise<T> => {
+      const chart = chartRef.current;
+      if (!chart) return fn();
+      const ts = chart.timeScale();
+      const priceScale = chart.priceScale('right');
+      const lr = (() => { try { return ts.getVisibleLogicalRange(); } catch { return null; } })();
+      const pr = (() => { try { return priceScale.getVisibleRange(); } catch { return null; } })();
+      // Lock every input + auto-shift path. handleScroll covers
+      // wheel-pan + drag; handleScale covers wheel-zoom + pinch.
+      // shiftVisibleRangeOnNewBar=false freezes the right-edge for
+      // the duration. setAutoScale(false) on the price axis pins Y.
+      try {
+        chart.applyOptions({
+          handleScroll: false,
+          handleScale: false,
+          timeScale: { shiftVisibleRangeOnNewBar: false },
+        });
+      } catch { /* ignore */ }
+      try { priceScale.setAutoScale(false); } catch { /* ignore */ }
+      try {
+        return await fn();
+      } finally {
+        // Re-pin the snapshot ranges before re-enabling inputs.
+        // Without this, html2canvas may have triggered a re-fit
+        // mid-capture; restoring the snapshot here closes the gap
+        // before the user sees anything.
+        try { if (lr) ts.setVisibleLogicalRange(lr); } catch { /* ignore */ }
+        try { if (pr) priceScale.setVisibleRange(pr); } catch { /* ignore */ }
+        try {
+          chart.applyOptions({
+            handleScroll: true,
+            handleScale: true,
+            timeScale: { shiftVisibleRangeOnNewBar: true },
+          });
+        } catch { /* ignore */ }
+      }
+    },
   }), [visibleMinutes, srHiddenTick]);
 
   return (

@@ -32,6 +32,7 @@ if str(_REPO_ROOT) not in sys.path:
 from ib_trader.signals.sr_fan import (  # noqa: E402
     EPS,
     TOLERANCE_FRACTION,
+    TOUCH_TOLERANCE_FRACTION,
     BREAK_STALE_BARS,
     MIN_TOUCHES,
     TrendLine as Line,
@@ -273,6 +274,7 @@ def run_backtest_live(
     utc_hour_range: tuple[int, int] | None = None,
     atr_mult: float | None = None,
     atr_period: int = ATR_PERIOD,
+    near_touch_tolerance_fraction: float | None = None,
 ) -> list[Trade]:
     """Mirrors current chart_signal live rules:
     - Single position at a time, EITHER side.
@@ -392,6 +394,50 @@ def run_backtest_live(
         window_last = len(slice_closes) - 1
         window_new_pivot = window_last - 1
 
+        # Window-local tolerances for the strict-then-loose entry gate.
+        # ``touch_tol_w`` mirrors ``_has_new_touch``'s strict band in
+        # the live bot; ``loose_tol_w`` (when set) widens the new
+        # pivot's accept band — but ONLY when the line already holds
+        # MIN_TOUCHES strict touches from older pivots.
+        avg_slice = sum(slice_closes) / max(1, len(slice_closes))
+        touch_tol_w = max(EPS, avg_slice * TOUCH_TOLERANCE_FRACTION)
+        loose_tol_w: float | None = None
+        if (near_touch_tolerance_fraction is not None
+                and near_touch_tolerance_fraction > TOUCH_TOLERANCE_FRACTION):
+            loose_tol_w = max(touch_tol_w,
+                              avg_slice * near_touch_tolerance_fraction)
+
+        side_supports = find_pivot_lows(slice_closes)
+        side_resists = find_pivot_highs(slice_closes)
+
+        def _accept(line, side_pivots) -> bool:
+            """Entry gate: did the just-confirmed pivot land on this
+            line? Strict tol always; loose tol only when the line
+            already has MIN_TOUCHES strict touches from OLDER pivots
+            (so the loose acceptance is a 4th+ near touch on an
+            already-established trendline, not a relaxed first
+            confirmation)."""
+            if window_new_pivot not in side_pivots:
+                return False
+            line_at_new = line.intercept + line.slope * window_new_pivot
+            delta_new = abs(slice_closes[window_new_pivot] - line_at_new)
+            # Count strict touches from older pivots only — Q and P
+            # are pivots and always on the line within EPS, so they
+            # contribute when they're not the new pivot.
+            strict_old = 0
+            for piv in side_pivots:
+                if piv == window_new_pivot or piv < line.from_idx \
+                        or piv > window_last:
+                    continue
+                if abs(slice_closes[piv]
+                       - (line.intercept + line.slope * piv)) <= touch_tol_w:
+                    strict_old += 1
+            if delta_new <= touch_tol_w:
+                return (strict_old + 1) >= MIN_TOUCHES
+            if loose_tol_w is not None and delta_new <= loose_tol_w:
+                return strict_old >= MIN_TOUCHES
+            return False
+
         long_line = None
         if new_low:
             if rsi_long_max is None or (
@@ -399,10 +445,9 @@ def run_backtest_live(
             ):
                 for line in detect_lines(
                     slice_closes, up_to=window_last, type_='support',
+                    near_touch_tolerance_fraction=near_touch_tolerance_fraction,
                 ):
-                    if (line.anchor_b_idx == window_new_pivot
-                            and line.slope > 0
-                            and line.touches >= MIN_TOUCHES):
+                    if line.slope > 0 and _accept(line, side_supports):
                         long_line = line
                         break
 
@@ -413,10 +458,9 @@ def run_backtest_live(
             ):
                 for line in detect_lines(
                     slice_closes, up_to=window_last, type_='resistance',
+                    near_touch_tolerance_fraction=near_touch_tolerance_fraction,
                 ):
-                    if (line.anchor_b_idx == window_new_pivot
-                            and line.slope < 0
-                            and line.touches >= MIN_TOUCHES):
+                    if line.slope < 0 and _accept(line, side_resists):
                         short_line = line
                         break
 

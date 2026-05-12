@@ -31,6 +31,13 @@ export interface SRLine {
   intercept: number;
   touches: number;
   breakIdx: number | null;
+  /** Bar index of the 3rd strict touch on this line (Q + P + one
+   *  intermediate or post-P strict touch). ``null`` when the line
+   *  has fewer than 3 strict touches. The renderer thickens the
+   *  segment past this index when a 4th-or-later loose touch
+   *  promotes the line into "established" territory — see
+   *  ``nearTouchToleranceFraction``. */
+  thirdTouchIdx: number | null;
 }
 
 export interface SROptions {
@@ -49,13 +56,23 @@ export interface SROptions {
    *  it's just slightly off-anchor on that pivot. 0.0002 ≈ $0.95 on
    *  gold at $4700, ≈ $0.10 on a $500 stock. */
   touchToleranceFraction: number;
+  /** Optional looser band for *4th-and-later* touches. Once a line
+   *  has accumulated MIN_TOUCHES strict touches, further pivots
+   *  within this wider band also count as touches. Lets a line that
+   *  is visually-established collect extra near-touches that fall
+   *  outside the strict band. Default 5× of ``touchToleranceFraction``
+   *  (≈ $4.72 on gold at $4700). Set to ``null`` to disable. */
+  nearTouchToleranceFraction: number | null;
 }
 
 export const SR_DEFAULTS: SROptions = {
   breakStaleBars: 20,
   toleranceFraction: 0.00005,
   touchToleranceFraction: 0.0002,
+  nearTouchToleranceFraction: 0.001,
 };
+
+const MIN_TOUCHES = 3;
 
 const EPS = 1e-6;
 
@@ -139,6 +156,11 @@ function detectOneSide(
     closes.reduce((s, v) => s + v, 0) / Math.max(1, closes.length);
   const tol = Math.max(EPS, avgClose * opts.toleranceFraction);
   const touchTol = Math.max(tol, avgClose * opts.touchToleranceFraction);
+  const nearFrac = opts.nearTouchToleranceFraction;
+  const nearTol: number | null =
+    nearFrac !== null && nearFrac > opts.touchToleranceFraction
+      ? Math.max(touchTol, avgClose * nearFrac)
+      : null;
 
   // Process pivots most-recent → oldest. Newer pivots' lines are
   // emitted first and constrain older candidates, not the other way
@@ -219,18 +241,36 @@ function detectOneSide(
       );
       if (isCoincident) continue;
 
-      // Count pivots that sit on the line within ``touchTol`` (looser
-      // than the channel/break tolerance — see ``touchToleranceFraction``
-      // doc). Q and P contribute by construction; additional collinear
-      // pivots upgrade a "tentative" 2-touch fan member into a
-      // "confirmed" 3+-touch line. Range covers any pivot of the same
-      // type from the line's start (q) through the post-anchor
-      // extension (lastBarIdx) so post-P retests count too.
-      let touches = 0;
+      // Two-pass touch count. The first MIN_TOUCHES touches must be
+      // strict (within ``touchTol``); once that bar is cleared, the
+      // 4th-and-later pivots within ``nearTol`` also count. This
+      // mirrors ``ib_trader/signals/sr_fan.py`` so the bot and the
+      // chart agree on which pivots "confirm" a line.
+      // ``thirdTouchIdx`` records the bar index of the third strict
+      // touch (Q-side scan), enabling the renderer to thicken the
+      // line past that point when loose 4th+ touches exist.
+      let strictTouches = 0;
+      let looseTouches = 0;
+      let thirdTouchIdx: number | null = null;
       for (const pivIdx of pivots) {
         if (pivIdx < q || pivIdx > lastBarIdx) continue;
         const lineAt = slope * pivIdx + intercept;
-        if (Math.abs(closes[pivIdx] - lineAt) <= touchTol) touches++;
+        const delta = Math.abs(closes[pivIdx] - lineAt);
+        if (delta <= touchTol) {
+          strictTouches += 1;
+          looseTouches += 1;
+          if (thirdTouchIdx === null && strictTouches === MIN_TOUCHES) {
+            thirdTouchIdx = pivIdx;
+          }
+        } else if (nearTol !== null && delta <= nearTol) {
+          looseTouches += 1;
+        }
+      }
+      let touches: number;
+      if (nearTol !== null && strictTouches >= MIN_TOUCHES) {
+        touches = looseTouches;
+      } else {
+        touches = strictTouches;
       }
       if (touches < 2) touches = 2; // safety: q & P should always count
 
@@ -242,6 +282,7 @@ function detectOneSide(
         slope, intercept,
         touches,
         breakIdx,
+        thirdTouchIdx,
       });
     }
   }

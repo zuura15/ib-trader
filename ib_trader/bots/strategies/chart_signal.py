@@ -273,8 +273,24 @@ class ChartSignalStrategy:
         # Scan both sides. Long candidates from uptrending support
         # (slope > 0); short candidates from downtrending resistance
         # (slope < 0). Both filtered to 3-touch, not broken.
-        supports = detect_lines(closes, up_to=last_idx, type_="support")
-        resistances = detect_lines(closes, up_to=last_idx, type_="resistance")
+        #
+        # ``near_touch_tolerance_fraction`` (optional, default 5× of
+        # the strict 0.0002 = 0.001): once a line accumulates the
+        # first three strict touches, further pivots within this
+        # wider band count as 4th/5th/… touches. This recovers entries
+        # on lines that are visually-established but where the new
+        # pivot's strict tol misses by a hair — the kind of pivot the
+        # operator's eye reads as "on the line" but the math doesn't.
+        # Set to ``None`` to disable (= legacy strict behavior).
+        near_frac = self.config.get(
+            "near_touch_tolerance_fraction", 5 * TOUCH_TOLERANCE_FRACTION,
+        )
+        if near_frac is not None:
+            near_frac = float(near_frac)
+        supports = detect_lines(closes, up_to=last_idx, type_="support",
+                                 near_touch_tolerance_fraction=near_frac)
+        resistances = detect_lines(closes, up_to=last_idx, type_="resistance",
+                                    near_touch_tolerance_fraction=near_frac)
         longs = [ln for ln in supports
                  if ln.touches >= MIN_TOUCHES and ln.slope > 0
                  and ln.break_idx is None]
@@ -368,6 +384,13 @@ class ChartSignalStrategy:
         ))
         avg_close = sum(closes) / max(1, len(closes))
         touch_tol = max(1e-6, avg_close * TOUCH_FRAC)
+        # Loose band for 4th+ touches — only applied when the line
+        # already has MIN_TOUCHES strict touches from OLDER pivots
+        # (i.e. the just-confirmed pivot is a follow-up confirmation
+        # on a line the prior bars already established).
+        near_tol: float | None = None
+        if near_frac is not None and near_frac > TOUCH_FRAC:
+            near_tol = max(touch_tol, avg_close * near_frac)
         support_pivots = find_pivot_lows(closes)
         resistance_pivots = find_pivot_highs(closes)
         new_pivot_idx = last_idx - 1   # the just-confirmed pivot
@@ -376,7 +399,27 @@ class ChartSignalStrategy:
             if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
                 return False
             line_at = line.intercept + line.slope * new_pivot_idx
-            return abs(closes[new_pivot_idx] - line_at) <= touch_tol
+            delta = abs(closes[new_pivot_idx] - line_at)
+            if delta <= touch_tol:
+                return True
+            if near_tol is None or delta > near_tol:
+                return False
+            # 4th+ near touch — accept only if the line already holds
+            # MIN_TOUCHES strict touches from pivots OTHER than the
+            # new one. ``line.touches`` already includes loose-counted
+            # pivots when ``near_touch_tolerance_fraction`` is in
+            # effect, so we recount strict-old here to enforce the
+            # "first three must be strict" rule.
+            strict_old = 0
+            for piv in side_pivots:
+                if piv == new_pivot_idx or piv < line.from_idx:
+                    continue
+                if piv > last_idx:
+                    continue
+                if abs(closes[piv]
+                       - (line.intercept + line.slope * piv)) <= touch_tol:
+                    strict_old += 1
+            return strict_old >= MIN_TOUCHES
 
         long_has_new = (long_line is not None
                         and _has_new_touch(long_line, support_pivots))

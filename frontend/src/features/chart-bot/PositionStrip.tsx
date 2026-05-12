@@ -1,8 +1,14 @@
+import { useEffect, useState } from 'react';
 import type { BotPositionState } from '../../data/useBotState';
+import { getBotTrades } from '../../api/client';
 
 interface Props {
   state: BotPositionState;
   fsmState: string | undefined;
+  /** Bot id used to fetch the 24h closed-trade P/L on P/L hover.
+   *  Optional so the strip stays usable in contexts without a bot
+   *  bound (e.g. demo / placeholder panes). */
+  botId?: string;
 }
 
 function fmt(n: string | number | undefined | null, digits = 2): string {
@@ -35,7 +41,49 @@ function computeLineNow(line: BotPositionState['entry_line']): number | null {
  * qty, last price, unrealized P/L. Uses ``"—"`` placeholders per
  * CLAUDE.md when a field is absent.
  */
-export function PositionStrip({ state, fsmState }: Props) {
+/** Window for the 24h P/L badge next to the live P/L cell. */
+const PNL_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Poll cadence for the 24h roll-up. Closed trades only land on
+ *  round-trip — re-checking every 30s is plenty. */
+const PNL_POLL_MS = 30_000;
+
+export function PositionStrip({ state, fsmState, botId }: Props) {
+  // Rolling 24h realized P/L (sum of bot's closed trades whose
+  // exit_time is within the window). Null while the first fetch is
+  // pending; number once we have data.
+  const [pnl24h, setPnl24h] = useState<number | null>(null);
+  const [pnl24hCount, setPnl24hCount] = useState<number>(0);
+
+  useEffect(() => {
+    if (!botId) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const trades = await getBotTrades(botId, 500);
+        if (cancelled) return;
+        const cutoff = Date.now() - PNL_WINDOW_MS;
+        let sum = 0;
+        let n = 0;
+        for (const t of trades) {
+          if (!t.exit_time || t.realized_pnl == null) continue;
+          const exitMs = new Date(t.exit_time).getTime();
+          if (!Number.isFinite(exitMs) || exitMs < cutoff) continue;
+          const v = Number(t.realized_pnl);
+          if (!Number.isFinite(v)) continue;
+          sum += v;
+          n += 1;
+        }
+        setPnl24h(sum);
+        setPnl24hCount(n);
+      } catch {
+        // Keep the last good value visible on a transient error.
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, PNL_POLL_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [botId]);
+
   const lineNow = computeLineNow(state.entry_line ?? null);
   const inPosition = fsmState === 'AWAITING_EXIT_TRIGGER'
     || fsmState === 'EXIT_ORDER_PLACED';
@@ -95,17 +143,32 @@ export function PositionStrip({ state, fsmState }: Props) {
         color: 'var(--text-secondary)',
       }}
     >
-      {cells.map(({ label, value, tone }) => (
-        <span key={label} style={{ display: 'inline-flex', gap: 4 }}>
-          <span style={{ color: 'var(--text-muted)' }}>{label}</span>
-          <span style={{
-            color: tone === 'pos' ? 'var(--accent-green)'
-                 : tone === 'neg' ? 'var(--accent-red)'
-                 : 'var(--text-primary)',
-            fontWeight: 600,
-          }}>{value}</span>
-        </span>
-      ))}
+      {cells.map(({ label, value, tone }) => {
+        const isPnl = label === 'P/L';
+        return (
+          <span key={label} style={{ display: 'inline-flex', gap: 4 }}>
+            <span style={{ color: 'var(--text-muted)' }}>{label}</span>
+            <span style={{
+              color: tone === 'pos' ? 'var(--accent-green)'
+                   : tone === 'neg' ? 'var(--accent-red)'
+                   : 'var(--text-primary)',
+              fontWeight: 600,
+            }}>{value}</span>
+            {isPnl && botId && pnl24h != null && (
+              <span style={{ color: 'var(--text-muted)' }}>
+                (24h:&nbsp;
+                <span style={{
+                  color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+                  fontWeight: 600,
+                }}>
+                  {pnl24h >= 0 ? '+$' : '-$'}{Math.abs(pnl24h).toFixed(2)}
+                </span>
+                <span>&nbsp;/ {pnl24hCount}</span>)
+              </span>
+            )}
+          </span>
+        );
+      })}
     </div>
   );
 }

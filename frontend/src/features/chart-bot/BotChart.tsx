@@ -76,7 +76,15 @@ export function BotChart({
     if (!node) return;
     setShotBusy(true);
     setShotMsg('Capturing…');
-    try {
+    // html2canvas clones the pane DOM and reads computed styles,
+    // which trips lightweight-charts' autoSize ResizeObserver and
+    // our custom resize observer (the latter setAutoScale(true)s
+    // the price axis). ``withFrozenViewport`` locks every input +
+    // auto-fit path AND re-pins the snapshot ranges immediately
+    // after the capture so the chart can't drift before the user
+    // sees the next frame.
+    const handle = chartRef.current;
+    const runCapture = async () => {
       // ``backgroundColor: null`` preserves the theme-aware panel bg.
       // ``useCORS`` and ``logging: false`` keep the console quiet.
       // ``scale`` matches the device pixel ratio so the screenshot
@@ -99,6 +107,13 @@ export function BotChart({
         new ClipboardItem({ 'image/png': blob }),
       ]);
       setShotMsg('Copied');
+    };
+    try {
+      if (handle) {
+        await handle.withFrozenViewport(runCapture);
+      } else {
+        await runCapture();
+      }
     } catch (e) {
       setShotMsg(`Capture failed: ${
         e instanceof Error ? e.message : String(e)
@@ -419,7 +434,7 @@ export function BotChart({
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
-      <PositionStrip state={state} fsmState={fsmState} />
+      <PositionStrip state={state} fsmState={fsmState} botId={botId} />
     </div>
   );
 
