@@ -117,6 +117,12 @@ class ChartSignalStrategy:
                 "low_water_mark": "decimal|null",
                 "active_stop": "decimal|null",
                 "exit_reason": "str|null",
+                # ``cooldown_until`` is a wallclock ISO set by the
+                # runtime on exit when ``stop_on_exit=False``. The
+                # entry gate in _on_bar skips firing while now <
+                # cooldown_until — gives one bar of breathing room
+                # after a round-trip before the bot enters again.
+                "cooldown_until": "str|null",
                 "last_deadzone_alert_date": "str|null",
             },
             version="1.0",
@@ -212,11 +218,31 @@ class ChartSignalStrategy:
         if pos == BotState.AWAITING_EXIT_TRIGGER:
             return actions + self._evaluate_exit(event, ctx, bar_time)
 
-        # Entry check: gated on armed + deadzone + FSM state.
+        # Entry check: gated on armed + deadzone + cooldown + FSM state.
         if pos != BotState.AWAITING_ENTRY_TRIGGER:
             return actions
         if not ctx.state.get("armed", False):
             return actions
+        # Cooldown gate: when ``stop_on_exit=false``, the runtime
+        # writes a ``cooldown_until`` wallclock ISO on the bot doc
+        # after each round-trip. Skip entries while that's in the
+        # future. Default cooldown = 180s (one 3-min bar) so the
+        # bot doesn't immediately re-fire on the bar right after
+        # exit.
+        cooldown_until = ctx.state.get("cooldown_until")
+        if cooldown_until:
+            cu = _parse_ts(cooldown_until)
+            if cu is not None and cu > bar_time:
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"in cooldown until {cu.isoformat()} "
+                        f"(bar_time={bar_time.isoformat()})"
+                    ),
+                    payload={"cooldown_until": cu.isoformat(),
+                             "bar_time": bar_time.isoformat()},
+                ))
+                return actions
         # Futures deadzone only applies to FUT/FOP — the docstring and
         # the holding-alert path scope to those sec types, but the
         # entry gate was unconditional and silently blocked STK bots
@@ -757,7 +783,12 @@ class ChartSignalStrategy:
                 ),
                 UpdateState({
                     "trade_serial": None,
-                    "armed": False,
+                    # ``armed`` stays True so the bot continues firing
+                    # on future qualifying bars. The runtime's exit
+                    # patch writes ``cooldown_until`` (when
+                    # stop_on_exit=False) which gates re-entry for
+                    # one bar; that replaces the old one-and-done
+                    # disarm semantic.
                     "entry_line": None,
                     "entry_price": None,
                     "entry_time": None,

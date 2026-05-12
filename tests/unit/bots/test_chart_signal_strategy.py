@@ -154,6 +154,42 @@ class TestEntry:
         assert place and place[0].qty == Decimal("3")
 
     @pytest.mark.asyncio
+    async def test_cooldown_until_blocks_entry(self):
+        """After exit (with stop_on_exit=False), the runtime writes
+        ``cooldown_until``. While the bar's wallclock is before that
+        timestamp, the entry gate skips even if a fresh 3-touch
+        signal otherwise qualifies."""
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        # Bar evaluation is at idx 8 of ZIGZAG — wallclock
+        # ``START_UTC + 8 × BAR_SECONDS``. Set cooldown_until to one
+        # bar after that, so the gate fires.
+        bar_time = START_UTC + timedelta(seconds=BAR_SECONDS * 8)
+        cooldown_until = (bar_time + timedelta(seconds=BAR_SECONDS)).isoformat()
+        ctx = _make_ctx(state={"armed": True, "cooldown_until": cooldown_until})
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        assert not any(isinstance(a, PlaceOrder) for a in actions), \
+            "expected no entry during cooldown"
+        from ib_trader.bots.strategy import LogSignal, LogEventType
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and "cooldown" in a.message]
+        assert skips, "expected a SKIP log for the cooldown gate"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_passed_allows_entry(self):
+        """Once the bar's wallclock is past ``cooldown_until``, entry
+        fires normally."""
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        bar_time = START_UTC + timedelta(seconds=BAR_SECONDS * 8)
+        cooldown_until = (bar_time - timedelta(seconds=1)).isoformat()
+        ctx = _make_ctx(state={"armed": True, "cooldown_until": cooldown_until})
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place, f"expected entry after cooldown, got {actions}"
+
+    @pytest.mark.asyncio
     async def test_no_3touch_no_entry(self):
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx()
@@ -417,7 +453,11 @@ class TestShortEntry:
         for a in actions:
             if isinstance(a, UpdateState):
                 merged.update(a.state)
-        assert merged["armed"] is False
+        # armed stays True — the bot continues running after a
+        # round-trip (post-2026-05-12: ``stop_on_exit=False`` for
+        # chart_signal). The runtime writes ``cooldown_until`` to
+        # gate re-entry for one bar.
+        assert "armed" not in merged
         assert merged["entry_line"] is None
         assert merged["entry_price"] is None
 
@@ -769,7 +809,7 @@ class TestFills:
         assert merged["trade_serial"] == 42
 
     @pytest.mark.asyncio
-    async def test_full_close_sell_clears_state_and_locks_armed(self):
+    async def test_full_close_sell_clears_state_keeps_armed(self):
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx(
             state={"armed": True, "qty": "0", "entry_price": "12.0",
@@ -786,7 +826,10 @@ class TestFills:
         for a in actions:
             if isinstance(a, UpdateState):
                 merged.update(a.state)
-        assert merged["armed"] is False
+        # armed stays True (post-2026-05-12 semantic — chart_signal's
+        # ``stop_on_exit=False`` keeps the bot running through
+        # round-trips with a cooldown gate instead of one-and-done).
+        assert "armed" not in merged
         assert merged["entry_line"] is None
         assert merged["entry_price"] is None
 

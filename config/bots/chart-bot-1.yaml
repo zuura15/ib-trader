@@ -22,5 +22,10 @@ config:
   contract_multiplier: 10
   # Trailing dip: 0.02% × $4,741 × 10 ≈ $9.48 per contract per move.
   trail_width_pct: 0.0002
+  # After a round-trip, transition back to AWAITING_ENTRY_TRIGGER
+  # (not OFF) and respect a one-bar cool-off before re-entering.
+  # Operator turns the bot on once and it lives through round-trips.
+  stop_on_exit: false
+  cooldown_seconds: 180
 symbols:
 - MGCM6

@@ -16,5 +16,7 @@ config:
   contract_multiplier: 2
   # Trailing dip: 0.02% × 29,395 pts × $2 ≈ $11.76 per contract per move.
   trail_width_pct: 0.0002
+  stop_on_exit: false
+  cooldown_seconds: 180
 symbols:
 - MNQM6

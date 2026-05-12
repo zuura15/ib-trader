@@ -114,6 +114,49 @@ async def test_full_close_transitions_to_off_and_signals_stop():
 
 
 @pytest.mark.asyncio
+async def test_continue_on_exit_when_flag_false():
+    """When ``stop_on_exit=False`` in strategy_config, a full close
+    transitions to AWAITING_ENTRY_TRIGGER (not OFF), the loop is NOT
+    signalled to stop, and ``cooldown_until`` is set so the strategy
+    skips entries for the configured cooldown window.
+    """
+    store = _FakeStore({
+        "state": BotState.EXIT_ORDER_PLACED.value,
+        "qty": "1",
+        "order_qty": "1",
+        "entry_price": "4741.20",
+        "entry_time": "2026-05-12T02:54:25+00:00",
+        "exit_retries": 0,
+        "trail_reset_count": 0,
+        "symbol": "MGCM6",
+        "serial": 10,
+        "ib_order_id": "ib-1",
+        "entry_serial": 9,
+        "entry_ib_order_id": "ib-0",
+        "position_direction": "LONG",
+    })
+    runner = _make_runner(store)
+    runner.strategy_config = {
+        "symbol": "MGCM6",
+        "stop_on_exit": False,
+        "cooldown_seconds": 180,
+    }
+
+    await runner.on_exit_filled(
+        qty=Decimal("1"),
+        price=Decimal("4742.20"),
+        terminal=True,
+        commission=Decimal("0"),
+        serial=10,
+    )
+
+    assert store._doc["state"] == BotState.AWAITING_ENTRY_TRIGGER.value
+    assert runner._stop_requested is False
+    assert store._doc.get("cooldown_until"), \
+        "expected cooldown_until to be set when stop_on_exit=False"
+
+
+@pytest.mark.asyncio
 async def test_partial_close_with_residual_does_not_stop():
     """A partial exit (residual remains) must NOT stop the bot — it
     needs to retry the residual. State stays in EXIT_ORDER_PLACED with

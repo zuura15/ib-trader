@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from redis.exceptions import ConnectionError as _RedisConnectionError
@@ -121,7 +121,8 @@ class StrategyBotRunner(BotBase):
         # ~$10/contract regardless of symbol). Mirror from the bot YAML
         # so a single strategy yaml can back differently-multiplied
         # contracts without forking.
-        for k in ("contract_multiplier", "trail_width_pct"):
+        for k in ("contract_multiplier", "trail_width_pct",
+                  "stop_on_exit", "cooldown_seconds"):
             if k in config:
                 self.strategy_config[k] = config[k]
 
@@ -1143,22 +1144,25 @@ class StrategyBotRunner(BotBase):
             new_position_qty = max(position_qty - qty, Decimal("0"))
             residual_on_order = max(order_qty - qty, Decimal("0"))
 
-            # Fully flat — record the closed trade and stop the bot.
+            # Fully flat — record the closed trade and either stop the
+            # bot or transition to AWAITING_ENTRY_TRIGGER with a
+            # cooldown window before next entry, depending on the
+            # strategy_config's ``stop_on_exit`` flag.
             #
-            # Stop-on-exit policy (GH #85): after a successful round-
-            # trip we transition to OFF and signal the loop to exit. The
-            # operator manually restarts the bot via the UI before the
-            # next entry. This avoids the "bot fires another 140
+            # Stop-on-exit policy (GH #85, default True): after a
+            # successful round-trip transition to OFF + request_stop.
+            # The operator manually restarts the bot via the UI before
+            # the next entry. This avoids the "bot fires another 140
             # immediately after a 100-share stop-out" pattern observed
-            # when a positionEvent race corrupts qty mid-cycle, and
-            # gives an unattended operator a safe pause to review.
+            # when a positionEvent race corrupts qty mid-cycle.
             #
-            # FUTURE — see GH #86: replace the stop with a 2-minute
-            # cooldown timer. The bot will transition to a new
-            # COOLDOWN state on exit, set a wakeup timestamp, and auto-
-            # re-arm to AWAITING_ENTRY_TRIGGER after ``cooldown_seconds``
-            # (default 120). That removes the manual-restart friction
-            # once we have confidence in the drift fix.
+            # Continue-on-exit (``stop_on_exit=False``): transition to
+            # AWAITING_ENTRY_TRIGGER and write a ``cooldown_until``
+            # wallclock so the strategy can skip entry evaluation for
+            # ``cooldown_seconds`` after exit (default 180 = one
+            # 3-min bar). chart_signal bots use this — operator turns
+            # the bot on once, it keeps running through round-trips
+            # with a one-bar cool-off between.
             if new_position_qty == 0:
                 entry_price = Decimal(str(doc.get("entry_price") or "0"))
                 # Contract multiplier — futures use a notional
@@ -1197,19 +1201,44 @@ class StrategyBotRunner(BotBase):
                     "entry_ib_order_id": doc.get("entry_ib_order_id"),
                     "exit_ib_order_id": doc.get("ib_order_id"),
                 }
+                stop_on_exit = bool(
+                    self.strategy_config.get("stop_on_exit", True),
+                )
+                cooldown_seconds = int(
+                    self.strategy_config.get("cooldown_seconds", 180),
+                )
+                extra_patch: dict = {}
+                if not stop_on_exit:
+                    # Bot keeps running after the round-trip — give it
+                    # a cooldown so it doesn't re-fire on the very next
+                    # bar. ``cooldown_until`` is a wallclock ISO read
+                    # by chart_signal._on_bar's entry gate.
+                    cooldown_until = (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=cooldown_seconds)
+                    ).isoformat()
+                    extra_patch["cooldown_until"] = cooldown_until
                 patch = {
                     **clear_position_fields(),
                     "last_realized_pnl": str(realized_pnl),
                     "exit_retries": 0,
                     "trail_reset_count": 0,  # Reset for next trade
+                    **extra_patch,
                 }
+                target_state = (BotState.OFF if stop_on_exit
+                                else BotState.AWAITING_ENTRY_TRIGGER)
+                transition_label = ("on_exit_filled_stop_on_exit"
+                                    if stop_on_exit
+                                    else "on_exit_filled_continue")
                 await self._apply_transition(
-                    doc, BotState.OFF, patch, "on_exit_filled_stop_on_exit",
+                    doc, target_state, patch, transition_label,
                 )
-                # Signal run_event_loop to exit on its next iteration so
-                # the runner task supervisor clears bot_instances; the
-                # operator's next /start spawns a fresh task cleanly.
-                self.request_stop()
+                if stop_on_exit:
+                    # Signal run_event_loop to exit on its next
+                    # iteration so the runner task supervisor clears
+                    # bot_instances; the operator's next /start spawns
+                    # a fresh task cleanly.
+                    self.request_stop()
                 notify_kind = "filled"
                 retry_args = None
                 escalated = False
