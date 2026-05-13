@@ -29,28 +29,69 @@ def get_session_factory() -> scoped_session:
     return _session_factory
 
 
-def get_trades() -> TradeRepository:
-    return TradeRepository(get_session_factory())
+def _release_thread_session() -> None:
+    """Call ``scoped_session.remove()`` on the module-level factory.
+
+    Repositories use ``scoped_session`` which is thread-local. FastAPI
+    runs sync endpoint handlers in a threadpool — each request lands
+    on a different worker thread and the factory hands back a fresh
+    Session bound to that thread's pool connection. Without an explicit
+    remove() the Session stays parked in the thread-local registry and
+    the connection it holds is never returned to the pool, so the pool
+    exhausts after ~50 requests. ``remove()`` clears the thread-local
+    so the connection is checked back in.
+    """
+    sf = _session_factory
+    if sf is not None:
+        try:
+            sf.remove()
+        except Exception:
+            # remove() can fail if no session was opened on this thread
+            # (e.g. dependency injected but endpoint short-circuited);
+            # safe to ignore.
+            pass
 
 
-def get_heartbeats() -> HeartbeatRepository:
-    return HeartbeatRepository(get_session_factory())
+def get_trades():
+    try:
+        yield TradeRepository(get_session_factory())
+    finally:
+        _release_thread_session()
 
 
-def get_alerts() -> AlertRepository:
-    return AlertRepository(get_session_factory())
+def get_heartbeats():
+    try:
+        yield HeartbeatRepository(get_session_factory())
+    finally:
+        _release_thread_session()
 
 
-def get_pending_commands() -> PendingCommandRepository:
-    return PendingCommandRepository(get_session_factory())
+def get_alerts():
+    try:
+        yield AlertRepository(get_session_factory())
+    finally:
+        _release_thread_session()
 
 
-def get_transactions() -> TransactionRepository:
-    return TransactionRepository(get_session_factory())
+def get_pending_commands():
+    try:
+        yield PendingCommandRepository(get_session_factory())
+    finally:
+        _release_thread_session()
 
 
-def get_bot_trades() -> BotTradeRepository:
-    return BotTradeRepository(get_session_factory())
+def get_transactions():
+    try:
+        yield TransactionRepository(get_session_factory())
+    finally:
+        _release_thread_session()
+
+
+def get_bot_trades():
+    try:
+        yield BotTradeRepository(get_session_factory())
+    finally:
+        _release_thread_session()
 
 
 # --- Redis dependency ---
