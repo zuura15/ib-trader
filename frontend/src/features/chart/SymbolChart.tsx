@@ -2,7 +2,7 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries,
+  createChart, ColorType, LineSeries, HistogramSeries,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
@@ -208,6 +208,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // chart; data updated by an effect when the ``entryLine`` prop or
   // the bar history changes.
   const entryLineSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  // Volume overlay: faint histogram pinned to the bottom 15% of the
+  // price pane via its own price scale (``priceScaleId: 'volume'``)
+  // with ``scaleMargins: { top: 0.85, bottom: 0 }``. Sits underneath
+  // the price line without affecting the auto-fit of the middle
+  // third where the candle polyline lives.
+  const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   // Buy/Sell letters drawn on an SVG overlay positioned over the
   // chart canvas. Each signal is { time, price, side } — the letter
   // floats above (S) or below (B) the bar with a black leader line
@@ -227,6 +233,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // per chart and is rendered in the same paint loop alongside the
   // organic badges.
   const botPinnedBadgeRef = useRef<Signal | null>(null);
+  // Arrowhead overlay — pairs of (support, resistance) lines converging
+  // ahead of the right edge. Each entry holds three (time, price)
+  // vertices that the repaint loop projects into pixel coordinates
+  // for an SVG <polygon>. Refilled on every SR recompute; positioned
+  // alongside the B/S badges on every visible-range change.
+  type Arrow = {
+    aTime: UTCTimestamp; aPrice: number;   // support side, left
+    bTime: UTCTimestamp; bPrice: number;   // apex
+    cTime: UTCTimestamp; cPrice: number;   // resistance side, left
+  };
+  const srArrowsRef = useRef<Arrow[]>([]);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
   // Bumps on Clear/Show toggle so callers (BotChart) can re-render
@@ -686,9 +703,31 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       } catch { /* older lightweight-charts builds — silently skip */ }
     }
 
+    // Volume histogram — overlay in the bottom 15% of the price pane.
+    // Own price scale id (``'volume'``) so it auto-fits independently
+    // of the price polyline; ``scaleMargins`` keeps it pinned to the
+    // bottom strip. Faint per-bar colors so it reads as ambient
+    // context, not a foreground feature.
+    const volume = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'volume',
+      color: 'rgba(120, 144, 156, 0.45)',
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    chart.priceScale('volume').applyOptions({
+      scaleMargins: { top: 0.85, bottom: 0 },
+      // Hide the volume axis labels — lightweight-charts renders one
+      // axis per priceScaleId, and the extra column was crowding the
+      // chart area and making the price axis labels look oversized.
+      // The histogram itself still draws at the bottom of the pane.
+      visible: false,
+    });
+
     chartRef.current = chart;
     seriesRef.current = series;
     rsiSeriesRef.current = rsi;
+    volumeSeriesRef.current = volume;
     divergenceSeriesRef.current = [];
 
     // Bot-mode: dedicated series for the chart_signal entry line. Kept
@@ -735,6 +774,39 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Empty + repaint. Cheap (handful of children); keeps the
       // logic linear instead of diffing.
       while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+      // Arrowhead polygons — painted FIRST so they sit under badges /
+      // leader lines. Faint fill, no stroke. Skipped when there are
+      // no detected pairs (most bars).
+      const arrowList = srArrowsRef.current;
+      if (arrowList.length > 0) {
+        const tsArrow = ch.timeScale();
+        for (const a of arrowList) {
+          const xA = tsArrow.timeToCoordinate(a.aTime);
+          const xB = tsArrow.timeToCoordinate(a.bTime);
+          const xC = tsArrow.timeToCoordinate(a.cTime);
+          const yA = ser.priceToCoordinate(a.aPrice);
+          const yB = ser.priceToCoordinate(a.bPrice);
+          const yC = ser.priceToCoordinate(a.cPrice);
+          if (xA == null || xB == null || xC == null
+              || yA == null || yB == null || yC == null) continue;
+          const poly = document.createElementNS(
+            'http://www.w3.org/2000/svg', 'polygon',
+          );
+          poly.setAttribute(
+            'points',
+            `${xA},${yA} ${xB},${yB} ${xC},${yC}`,
+          );
+          // Faint warm tone so the operator's eye catches the wedge
+          // without it competing with the SR lines or candles.
+          poly.setAttribute('fill', 'rgba(255, 196, 96, 0.10)');
+          poly.setAttribute('stroke', 'rgba(255, 196, 96, 0.40)');
+          poly.setAttribute('stroke-width', '0.8');
+          poly.setAttribute('stroke-dasharray', '2,3');
+          poly.setAttribute('pointer-events', 'none');
+          svg.appendChild(poly);
+        }
+      }
       // Skip on tiny chart panes — the stacked-charts sparklines are
       // ~46px tall, so a letter 28px above the bar lands outside the
       // pane and looks broken. Buy/sell signals are an analyst tool;
@@ -1023,6 +1095,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // dims regardless of whether the underlying line is still
       // detected. Computed in the painter, not here.
       const newSignals: Signal[] = [];
+      // Lines that actually get rendered on the chart (post-filter).
+      // Arrow/wedge detection runs against this list so the triangle
+      // only highlights structures the user can see.
+      const renderedLines: typeof lines = [];
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
         // Broken lines are noisy at zoom-out and clutter the active
@@ -1040,6 +1116,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const counterResistance = line.type === 'resistance' && line.slope > 0;
         if (counterSupport && !showCounterSupportRef.current) continue;
         if (counterResistance && !showCounterResistanceRef.current) continue;
+        renderedLines.push(line);
         labelCounter += 1;
         const label = `L${labelCounter}`;
         // Color is type-driven so support and resistance are always
@@ -1201,6 +1278,62 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         merged.splice(0, merged.length - MAX_SIGNALS);
       }
       srSignalsRef.current = merged;
+
+      // ── Arrowhead detection: converging support + resistance ─────────
+      // Pairs of lines with opposite slopes whose apex lies ahead of
+      // the latest data within ~50 bars. Stashed as triangle vertices
+      // for the repaint loop. Faint overlay only — does NOT affect
+      // bot firing. Operator uses these to spot wedges where price
+      // action is compressing.
+      const arrows: Arrow[] = [];
+      // Converging condition: support catches up to resistance from
+      // below. Holds for symmetric (s>0, r<0), ascending (s>0, r≈0),
+      // and descending (s≈0, r<0) triangles. The per-line slope-sign
+      // requirement was too strict — an ascending triangle has flat
+      // resistance, which trips ``r.slope < 0``.
+      const supports = renderedLines.filter(
+        (l) => l.type === 'support',
+      );
+      const resistances = renderedLines.filter(
+        (l) => l.type === 'resistance',
+      );
+      const sliceLast = slice.length - 1;
+      const APEX_MAX_AHEAD = 50;       // bars past last visible bar
+      const MIN_OVERLAP_BARS = 5;
+      for (const s of supports) {
+        for (const r of resistances) {
+          // Lines must converge (support gaining on resistance).
+          const dSlope = s.slope - r.slope;
+          if (dSlope <= 1e-9) continue;     // parallel or diverging
+          const apexIdxFloat = (r.intercept - s.intercept) / dSlope;
+          if (!Number.isFinite(apexIdxFloat)) continue;
+          if (apexIdxFloat <= sliceLast) continue;
+          if (apexIdxFloat > sliceLast + APEX_MAX_AHEAD) continue;
+          const overlapStart = Math.max(s.fromIdx, r.fromIdx);
+          const overlapEnd = Math.min(s.toIdx, r.toIdx);
+          if (overlapEnd - overlapStart < MIN_OVERLAP_BARS) continue;
+          // Sanity: resistance must sit ABOVE support at overlapStart
+          // (real wedge shape, not crossed lines).
+          if (r.slope * overlapStart + r.intercept
+              <= s.slope * overlapStart + s.intercept) continue;
+          // Triangle: left vertices on each line at overlapStart,
+          // apex projected ahead. Apex time = slice[sliceLast].time
+          // + extra bars at BAR_SECONDS granularity.
+          const apexExtraBars = Math.ceil(apexIdxFloat - sliceLast);
+          const lastTimeSec = slice[sliceLast].time as number;
+          const apexTimeSec = lastTimeSec + apexExtraBars * BAR_SECONDS;
+          const supportAtLeft = s.slope * overlapStart + s.intercept;
+          const resistAtLeft = r.slope * overlapStart + r.intercept;
+          const apexPrice = s.slope * apexIdxFloat + s.intercept;
+          arrows.push({
+            aTime: slice[overlapStart].time, aPrice: supportAtLeft,
+            bTime: apexTimeSec as UTCTimestamp, bPrice: apexPrice,
+            cTime: slice[overlapStart].time, cPrice: resistAtLeft,
+          });
+        }
+      }
+      srArrowsRef.current = arrows;
+
       repositionSrSignalsRef.current?.();
 
       // Always stash diagnostic snapshot on window — even when 0
@@ -1219,6 +1352,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         sliceTo: string;
         slice: SliceBar[];
         priceAt: (timeSubstr: string) => SliceBar | undefined;
+        arrows: Arrow[];   // detected wedges (apex within 50 bars)
+        rawLines: typeof lines;   // pre-filter detector output
       };
       // Recompute pivot indices on the same slice the detector saw,
       // for the diagnostic. Cheap: O(N).
@@ -1252,6 +1387,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         slice: sliceBars,
         priceAt: (substr: string) =>
           sliceBars.find((b) => b.t.includes(substr)),
+        arrows: srArrowsRef.current,
+        rawLines: lines,
       };
       (window as unknown as { __sr: SrGlobal }).__sr = stash;
       // Stash silently — auto-printing on every recompute drowns out
@@ -1268,6 +1405,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         pivotHighsAt: stash.pivotHighsAt,
         lines: stash.lines,
         slice: stash.slice,
+        // Wedge/arrowhead diagnostics — server-side tail tells us
+        // which side of the converging-pair check is failing
+        // without needing the operator to paste from the console.
+        rawLineSummary: lines.map((l) => ({
+          type: l.type, slope: l.slope, touches: l.touches,
+          fromIdx: l.fromIdx, toIdx: l.toIdx,
+          isBroken: l.breakIdx != null,
+        })),
+        rawLineCounts: {
+          supports: lines.filter((l) => l.type === 'support').length,
+          resistances: lines.filter((l) => l.type === 'resistance').length,
+          supportsUnbroken: lines.filter(
+            (l) => l.type === 'support' && l.breakIdx == null,
+          ).length,
+          resistancesUnbroken: lines.filter(
+            (l) => l.type === 'resistance' && l.breakIdx == null,
+          ).length,
+        },
+        arrows: srArrowsRef.current,
+        sliceLast,
       };
       void fetch('/api/debug/log/sr-debug', {
         method: 'POST',
@@ -1528,6 +1685,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       srOverlayRef.current = null;
       srSignalsRef.current = [];
+      srArrowsRef.current = [];
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -1535,6 +1693,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       divergenceSeriesRef.current = [];
       srSeriesRef.current = [];
       entryLineSeriesRef.current = null;
+      volumeSeriesRef.current = null;
       barsRef.current = [];
     };
   }, [theme, showRsi]);
@@ -1650,6 +1809,24 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // ticks update past this point without auto-fit-to-one-point
         // pathology.
         historicalLoadedRef.current = true;
+
+        // Volume overlay — green when close >= open, red when down,
+        // both at low alpha so the histogram reads as ambient context
+        // under the price line. Updates only here (every 30s refresh);
+        // the live-tick WS pushes price-only frames, so the most-recent
+        // bar's volume stays whatever IB returned at the last fetch.
+        const volSeries = volumeSeriesRef.current;
+        if (volSeries) {
+          try {
+            volSeries.setData(fullBars.map((b) => ({
+              time: b.time,
+              value: b.volume ?? 0,
+              color: (b.close >= b.open)
+                ? 'rgba(22, 163, 74, 0.35)'
+                : 'rgba(220, 38, 38, 0.35)',
+            })));
+          } catch { /* series torn down mid-refresh — ignore */ }
+        }
 
         if (rsiSeries && points.length >= RSI_DEFAULTS.period + 1) {
           const closes = points.map((p) => p.value);

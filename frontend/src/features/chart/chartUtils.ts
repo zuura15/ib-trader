@@ -48,6 +48,10 @@ export type Bar = {
   high: number;
   low: number;
   close: number;
+  /** TRADES-feed volume for the bar. Optional because the live-tick
+   *  WebSocket pushes price-only updates — the most-recent bar's
+   *  volume only refreshes on the 30s history refetch. */
+  volume?: number;
 };
 
 export function targetKey(t: { symbol: string; secType: string; conId: number | null }): string {
@@ -106,6 +110,7 @@ export function toBars(bars: HistoryBar[]): Bar[] {
     out.push({
       time: t as UTCTimestamp,
       open: b.open, high: b.high, low: b.low, close: b.close,
+      volume: typeof b.volume === 'number' ? b.volume : 0,
     });
   }
   out.sort((a, b) => a.time - b.time);
