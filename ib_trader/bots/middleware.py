@@ -161,7 +161,6 @@ class RiskMiddleware:
             return False, "kill_switch_active"
 
         stats = await self._state.get_stats(self.bot_id)
-        trades_today = int(stats.get("trades_today") or 0)
         pnl_today = Decimal(str(stats.get("pnl_today") or "0"))
 
         # Daily loss cap
@@ -169,11 +168,6 @@ class RiskMiddleware:
         account_value = Decimal(str(self.config.get("account_value", "10000")))
         if pnl_today < -(max_loss * account_value):
             return False, f"daily_loss_cap ({pnl_today})"
-
-        # Max trades per day
-        max_trades = self.config.get("max_trades_per_day", 10)
-        if trades_today >= max_trades:
-            return False, f"max_trades_per_day ({trades_today}/{max_trades})"
 
         # Max concurrent positions
         max_positions = self.config.get("max_concurrent_positions", 1)
