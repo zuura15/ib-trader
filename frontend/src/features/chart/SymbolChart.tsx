@@ -242,8 +242,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     aTime: UTCTimestamp; aPrice: number;   // support side, left
     bTime: UTCTimestamp; bPrice: number;   // apex
     cTime: UTCTimestamp; cPrice: number;   // resistance side, left
+    apexBarsAhead: number;                  // bars from sliceLast to apex
   };
   const srArrowsRef = useRef<Arrow[]>([]);
+  const srApexBadgeRef = useRef<HTMLDivElement | null>(null);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
   // Bumps on Clear/Show toggle so callers (BotChart) can re-render
@@ -781,6 +783,38 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const arrowList = srArrowsRef.current;
       if (arrowList.length > 0) {
         const tsArrow = ch.timeScale();
+        let painted = 0;
+        let skippedNull = 0;
+        // Diagonal-stripe pattern. ID must be UNIQUE PER CHART —
+        // four chart-bot panes each create their own SVG and clear
+        // it on every paint, so a fixed id="wedge-stripes" gives 4
+        // elements with the same id; SVG url(#…) refs resolve to
+        // whichever is first in the document, leaving the others
+        // with a broken (invisible) fill. Random suffix per paint.
+        const patternId = `wedge-stripes-${
+          Math.random().toString(36).slice(2, 9)
+        }`;
+        const defs = document.createElementNS(
+          'http://www.w3.org/2000/svg', 'defs',
+        );
+        const pat = document.createElementNS(
+          'http://www.w3.org/2000/svg', 'pattern',
+        );
+        pat.setAttribute('id', patternId);
+        pat.setAttribute('patternUnits', 'userSpaceOnUse');
+        pat.setAttribute('width', '6');
+        pat.setAttribute('height', '6');
+        pat.setAttribute('patternTransform', 'rotate(45)');
+        const stripe = document.createElementNS(
+          'http://www.w3.org/2000/svg', 'line',
+        );
+        stripe.setAttribute('x1', '0'); stripe.setAttribute('y1', '0');
+        stripe.setAttribute('x2', '0'); stripe.setAttribute('y2', '6');
+        stripe.setAttribute('stroke', 'rgba(255, 160, 60, 0.65)');
+        stripe.setAttribute('stroke-width', '2');
+        pat.appendChild(stripe);
+        defs.appendChild(pat);
+        svg.appendChild(defs);
         for (const a of arrowList) {
           const xA = tsArrow.timeToCoordinate(a.aTime);
           const xB = tsArrow.timeToCoordinate(a.bTime);
@@ -789,7 +823,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const yB = ser.priceToCoordinate(a.bPrice);
           const yC = ser.priceToCoordinate(a.cPrice);
           if (xA == null || xB == null || xC == null
-              || yA == null || yB == null || yC == null) continue;
+              || yA == null || yB == null || yC == null) {
+            skippedNull += 1;
+            continue;
+          }
           const poly = document.createElementNS(
             'http://www.w3.org/2000/svg', 'polygon',
           );
@@ -797,15 +834,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             'points',
             `${xA},${yA} ${xB},${yB} ${xC},${yC}`,
           );
-          // Faint warm tone so the operator's eye catches the wedge
-          // without it competing with the SR lines or candles.
-          poly.setAttribute('fill', 'rgba(255, 196, 96, 0.10)');
-          poly.setAttribute('stroke', 'rgba(255, 196, 96, 0.40)');
-          poly.setAttribute('stroke-width', '0.8');
-          poly.setAttribute('stroke-dasharray', '2,3');
+          poly.setAttribute('fill', `url(#${patternId})`);
+          poly.setAttribute('stroke', 'rgba(255, 160, 60, 0.55)');
+          poly.setAttribute('stroke-width', '1');
+          poly.setAttribute('stroke-dasharray', '3,3');
           poly.setAttribute('pointer-events', 'none');
           svg.appendChild(poly);
+          painted += 1;
         }
+        (svg as unknown as { dataset: Record<string, string> })
+          .dataset.arrows =
+          `n=${arrowList.length} painted=${painted} skipped=${skippedNull}`;
+      } else {
+        (svg as unknown as { dataset: Record<string, string> })
+          .dataset.arrows = 'n=0';
       }
       // Skip on tiny chart panes — the stacked-charts sparklines are
       // ~46px tall, so a letter 28px above the bar lands outside the
@@ -1286,6 +1328,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // bot firing. Operator uses these to spot wedges where price
       // action is compressing.
       const arrows: Arrow[] = [];
+      const arrowReject: Array<Record<string, unknown>> = [];
       // Converging condition: support catches up to resistance from
       // below. Holds for symmetric (s>0, r<0), ascending (s>0, r≈0),
       // and descending (s≈0, r<0) triangles. The per-line slope-sign
@@ -1298,24 +1341,39 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         (l) => l.type === 'resistance',
       );
       const sliceLast = slice.length - 1;
-      const APEX_MAX_AHEAD = 50;       // bars past last visible bar
+      // Loose wedges (small slope diff) have far-future apexes — the
+      // earlier 50-bar cap rejected visually-obvious converging
+      // structures. 200 bars is ~10 h at 3-min granularity which
+      // covers anything operator-visible.
+      const APEX_MAX_AHEAD = 200;
       const MIN_OVERLAP_BARS = 5;
       for (const s of supports) {
         for (const r of resistances) {
           // Lines must converge (support gaining on resistance).
           const dSlope = s.slope - r.slope;
-          if (dSlope <= 1e-9) continue;     // parallel or diverging
-          const apexIdxFloat = (r.intercept - s.intercept) / dSlope;
-          if (!Number.isFinite(apexIdxFloat)) continue;
-          if (apexIdxFloat <= sliceLast) continue;
-          if (apexIdxFloat > sliceLast + APEX_MAX_AHEAD) continue;
+          const apexIdxFloat = dSlope > 1e-9
+            ? (r.intercept - s.intercept) / dSlope
+            : NaN;
           const overlapStart = Math.max(s.fromIdx, r.fromIdx);
           const overlapEnd = Math.min(s.toIdx, r.toIdx);
-          if (overlapEnd - overlapStart < MIN_OVERLAP_BARS) continue;
-          // Sanity: resistance must sit ABOVE support at overlapStart
-          // (real wedge shape, not crossed lines).
-          if (r.slope * overlapStart + r.intercept
-              <= s.slope * overlapStart + s.intercept) continue;
+          const rAtStart = r.slope * overlapStart + r.intercept;
+          const sAtStart = s.slope * overlapStart + s.intercept;
+          let reason: string | null = null;
+          if (dSlope <= 1e-9) reason = 'parallel-or-diverging';
+          else if (!Number.isFinite(apexIdxFloat)) reason = 'apex-nan';
+          else if (apexIdxFloat <= sliceLast) reason = 'apex-past';
+          else if (apexIdxFloat > sliceLast + APEX_MAX_AHEAD) reason = 'apex-too-far';
+          else if (overlapEnd - overlapStart < MIN_OVERLAP_BARS) reason = 'overlap-short';
+          else if (rAtStart <= sAtStart) reason = 'r-not-above-s';
+          if (reason) {
+            arrowReject.push({
+              s_slope: s.slope, r_slope: r.slope, dSlope,
+              apex: apexIdxFloat, sliceLast,
+              overlap: overlapEnd - overlapStart,
+              rAtStart, sAtStart, reason,
+            });
+            continue;
+          }
           // Triangle: left vertices on each line at overlapStart,
           // apex projected ahead. Apex time = slice[sliceLast].time
           // + extra bars at BAR_SECONDS granularity.
@@ -1329,10 +1387,38 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             aTime: slice[overlapStart].time, aPrice: supportAtLeft,
             bTime: apexTimeSec as UTCTimestamp, bPrice: apexPrice,
             cTime: slice[overlapStart].time, cPrice: resistAtLeft,
+            apexBarsAhead: apexExtraBars,
           });
         }
       }
       srArrowsRef.current = arrows;
+
+      // Top-left apex-distance indicator. "△ <n>" where n is the
+      // smallest apex-bars-ahead across detected wedges, or "△ ∞"
+      // when no triangle context exists. Lets the operator visually
+      // verify triangle detection even if the polygon shading has
+      // a render issue.
+      const minApex = arrows.length === 0
+        ? Infinity
+        : Math.min(...arrows.map((a) => a.apexBarsAhead));
+      let badge = srApexBadgeRef.current;
+      if (!badge && el) {
+        badge = document.createElement('div');
+        badge.setAttribute(
+          'style',
+          'position:absolute;top:6px;left:8px;z-index:11;'
+          + 'font-family:ui-monospace,Menlo,monospace;font-size:11px;'
+          + 'padding:1px 6px;border-radius:3px;'
+          + 'background:rgba(255,160,60,0.12);color:rgba(180,90,0,0.85);'
+          + 'pointer-events:none;user-select:none;letter-spacing:0.5px;',
+        );
+        el.appendChild(badge);
+        srApexBadgeRef.current = badge;
+      }
+      if (badge) {
+        badge.textContent =
+          minApex === Infinity ? '△ ∞' : `△ ${minApex}`;
+      }
 
       repositionSrSignalsRef.current?.();
 
@@ -1424,6 +1510,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           ).length,
         },
         arrows: srArrowsRef.current,
+        arrowReject,
+        renderedCounts: {
+          supports: renderedLines.filter((l) => l.type === 'support').length,
+          resistances: renderedLines.filter((l) => l.type === 'resistance').length,
+        },
         sliceLast,
       };
       void fetch('/api/debug/log/sr-debug', {
@@ -1630,13 +1721,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const barCount = barsRef.current.length;
         const rightSpaceBars = lr.to - (barCount - 1);
         const widthBars = lr.to - lr.from;
-        userLogicalRangeRef.current = { rightSpaceBars, widthBars };
-        // Also persist bar-relative values into ``SavedRange`` so a
-        // hard refresh restores the operator's viewport (without
-        // these, the firstLoad path re-anchored to ``now`` and the
-        // user's pan/zoom was lost on every page reload).
-        r.rightSpaceBars = rightSpaceBars;
-        r.widthBars = widthBars;
+        // Don't persist suspiciously narrow logical ranges. When
+        // ``volume.setData()`` lands during a refresh, lightweight-
+        // charts briefly re-emits the visible-range-change event
+        // with a transient narrow window before settling — those
+        // ranges were getting persisted and stranded the chart at
+        // a ~10-min view on subsequent loads. Anything below 10
+        // bars (= 30 min on 3-min bars) is below any reasonable
+        // operator zoom and almost certainly transient.
+        if (widthBars >= 10) {
+          userLogicalRangeRef.current = { rightSpaceBars, widthBars };
+          r.rightSpaceBars = rightSpaceBars;
+          r.widthBars = widthBars;
+        }
       }
       // Re-run SR detection over the new visible range (debounced —
       // zoom emits many events). Detection self-skips when width is
@@ -1686,6 +1783,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       srOverlayRef.current = null;
       srSignalsRef.current = [];
       srArrowsRef.current = [];
+      if (srApexBadgeRef.current && srApexBadgeRef.current.parentNode) {
+        srApexBadgeRef.current.parentNode.removeChild(srApexBadgeRef.current);
+      }
+      srApexBadgeRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -1877,7 +1978,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // fall back to the width-preserve-anchor-to-now behavior.
           const sb = savedRange?.rightSpaceBars;
           const sw = savedRange?.widthBars;
-          if (sb != null && sw != null && Number.isFinite(sb) && Number.isFinite(sw)) {
+          if (
+            sb != null && sw != null
+            && Number.isFinite(sb) && Number.isFinite(sw)
+            && sw >= 10   // reject corrupted saves < 30 min wide
+          ) {
             const barCount = fullBars.length;
             const newTo = (barCount - 1) + sb;
             const newFrom = newTo - sw;
