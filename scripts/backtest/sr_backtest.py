@@ -277,6 +277,14 @@ def run_backtest_live(
     near_touch_tolerance_fraction: float | None = None,
     hard_stop_mult: float | None = None,
     min_pivot_strength: float = 0.0,
+    entry_min_pivot_height: float = 0.0,
+    shallow_right_leg_threshold: float | None = None,
+    shoulder_filter: bool = False,
+    exit_on_counter_trend: bool = False,
+    counter_trend_buffer_pct: float = 0.0001,
+    exit_on_triangle_rejection: bool = False,
+    triangle_min_touches: int = 2,
+    triangle_reentry_watch_bars: int = 4,
 ) -> list[Trade]:
     """Mirrors current chart_signal live rules:
     - Single position at a time, EITHER side.
@@ -307,6 +315,18 @@ def run_backtest_live(
     cooldown_until_idx = -1
     hwm = -float('inf')
     lwm = float('inf')
+    # Re-entry watch state — populated when a triangle-rejection exit
+    # fires so the next few bars can re-enter if price actually breaks
+    # the rejected line. Cleared when the watch window expires or a
+    # re-entry triggers.
+    watch_until_idx = -1
+    watch_line_slope: float = 0.0
+    watch_line_intercept: float = 0.0
+    watch_side: str = ""              # "LONG" / "SHORT" — original direction
+    watch_entry_line_slope: float = 0.0
+    watch_entry_line_intercept: float = 0.0
+    watch_entry_anchor_b_idx: int = 0
+    watch_entry_touches: int = 0
 
     for t in range(2, len(bars) - 1):
         if open_trade is not None:
@@ -372,6 +392,204 @@ def run_backtest_live(
                 hwm = -float('inf')
                 lwm = float('inf')
                 continue
+
+            # Counter-trend rejection exit. For LONG: any resistance
+            # line (incl. 2-touch tentative) detected in the trailing
+            # window; if bar.high reached the line within ``touch_tol``
+            # AND bar.close came back from that high by more than the
+            # ``counter_trend_buffer_pct``, exit at bar.close. Mirrors
+            # an intra-bar tick rejection without needing tick data —
+            # the bar's range captures the "approached and rejected"
+            # pattern. SHORT side: same logic on support lines.
+            ct_fired = False
+            if exit_on_counter_trend:
+                win_start_ct = max(0, t - history_bars + 1)
+                slice_ct = closes[win_start_ct:t]   # exclude bar t
+                if len(slice_ct) >= 4:
+                    avg_ct = sum(slice_ct) / len(slice_ct)
+                    touch_tol_ct = max(EPS, avg_ct * TOUCH_TOLERANCE_FRACTION)
+                    if open_trade.side == 'LONG':
+                        ct_lines = detect_lines(
+                            slice_ct,
+                            up_to=len(slice_ct) - 1,
+                            type_='resistance',
+                        )
+                        bar_high = bars[t].high
+                        bar_close = bars[t].close
+                        for cl in ct_lines:
+                            line_val = (cl.intercept
+                                        + cl.slope * (len(slice_ct) - 1
+                                                      + 1))  # project to t
+                            buf_amt = max(EPS, line_val * counter_trend_buffer_pct)
+                            if bar_high >= line_val - touch_tol_ct \
+                                    and bar_close < bar_high - buf_amt:
+                                ct_fired = True
+                                break
+                    else:   # SHORT
+                        ct_lines = detect_lines(
+                            slice_ct,
+                            up_to=len(slice_ct) - 1,
+                            type_='support',
+                        )
+                        bar_low = bars[t].low
+                        bar_close = bars[t].close
+                        for cl in ct_lines:
+                            line_val = (cl.intercept
+                                        + cl.slope * (len(slice_ct) - 1 + 1))
+                            buf_amt = max(EPS, line_val * counter_trend_buffer_pct)
+                            if bar_low <= line_val + touch_tol_ct \
+                                    and bar_close > bar_low + buf_amt:
+                                ct_fired = True
+                                break
+            if ct_fired:
+                open_trade.exit_t = bars[t].t
+                open_trade.exit_idx = t
+                open_trade.exit_price = bars[t].close
+                open_trade.exit_reason = "COUNTER_TREND"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+                continue
+
+            # Triangle-rejection exit. Fires when:
+            #   1. We're inside a converging triangle: an opposing-side
+            #      line exists AND the entry-side line + opposing
+            #      line converge (s.slope > r.slope).
+            #   2. The bar's wick reached the adjacent side within
+            #      ``touch_tol``.
+            #   3. The bar closed on the wrong side of the line
+            #      (failed to clear — close < resistance for LONG,
+            #      close > support for SHORT).
+            # Uses ``triangle_min_touches`` to gate the opposing line
+            # quality (2 = any 2-touch tentative; 3 = confirmed).
+            tri_fired = False
+            if exit_on_triangle_rejection:
+                win_start_tr = max(0, t - history_bars + 1)
+                slice_tr = closes[win_start_tr:t]
+                if len(slice_tr) >= 4:
+                    avg_tr = sum(slice_tr) / len(slice_tr)
+                    touch_tol_tr = max(EPS, avg_tr * TOUCH_TOLERANCE_FRACTION)
+                    if open_trade.side == 'LONG':
+                        adj_lines = [
+                            l for l in detect_lines(
+                                slice_tr,
+                                up_to=len(slice_tr) - 1,
+                                type_='resistance',
+                            ) if l.touches >= triangle_min_touches
+                        ]
+                        sup_lines = detect_lines(
+                            slice_tr,
+                            up_to=len(slice_tr) - 1,
+                            type_='support',
+                        )
+                        has_converging_pair = False
+                        for sl in sup_lines:
+                            for rl in adj_lines:
+                                if sl.slope - rl.slope > 1e-9:
+                                    has_converging_pair = True
+                                    break
+                            if has_converging_pair:
+                                break
+                        if has_converging_pair:
+                            bar_high = bars[t].high
+                            bar_close = bars[t].close
+                            t_in_slice = len(slice_tr) - 1 + 1
+                            for rl in adj_lines:
+                                line_val = rl.intercept + rl.slope * t_in_slice
+                                if bar_high >= line_val - touch_tol_tr \
+                                        and bar_close < line_val:
+                                    tri_fired = True
+                                    break
+                    else:  # SHORT
+                        adj_lines = [
+                            l for l in detect_lines(
+                                slice_tr,
+                                up_to=len(slice_tr) - 1,
+                                type_='support',
+                            ) if l.touches >= triangle_min_touches
+                        ]
+                        res_lines = detect_lines(
+                            slice_tr,
+                            up_to=len(slice_tr) - 1,
+                            type_='resistance',
+                        )
+                        has_converging_pair = False
+                        for sl in adj_lines:
+                            for rl in res_lines:
+                                if sl.slope - rl.slope > 1e-9:
+                                    has_converging_pair = True
+                                    break
+                            if has_converging_pair:
+                                break
+                        if has_converging_pair:
+                            bar_low = bars[t].low
+                            bar_close = bars[t].close
+                            t_in_slice = len(slice_tr) - 1 + 1
+                            for sl in adj_lines:
+                                line_val = sl.intercept + sl.slope * t_in_slice
+                                if bar_low <= line_val + touch_tol_tr \
+                                        and bar_close > line_val:
+                                    tri_fired = True
+                                    break
+            if tri_fired:
+                # Capture the entry-line params + the rejected line
+                # BEFORE we clear open_trade, so the re-entry watch
+                # can rebuild a continuation trade if price breaks.
+                if triangle_reentry_watch_bars > 0:
+                    watch_until_idx = t + triangle_reentry_watch_bars
+                    watch_side = open_trade.side
+                    watch_entry_line_slope = open_trade.line_slope
+                    watch_entry_line_intercept = open_trade.line_intercept
+                    watch_entry_anchor_b_idx = open_trade.line_anchor_b_idx
+                    watch_entry_touches = open_trade.line_touches
+                    # The line we got rejected at — find the one that
+                    # actually triggered the exit and stash its slope/
+                    # intercept (window-absolute).
+                    if open_trade.side == 'LONG':
+                        rej_lines = adj_lines
+                    else:
+                        rej_lines = adj_lines
+                    bar_high = bars[t].high
+                    bar_low = bars[t].low
+                    bar_close = bars[t].close
+                    win_start_local = max(0, t - history_bars + 1)
+                    slice_len = t - win_start_local
+                    for cl in rej_lines:
+                        line_val = (cl.intercept
+                                    + cl.slope * (slice_len - 1 + 1))
+                        if open_trade.side == 'LONG':
+                            if bar_high >= line_val - touch_tol_tr \
+                                    and bar_close < line_val:
+                                watch_line_slope = cl.slope
+                                # Convert slice-local intercept to
+                                # absolute (t-frame) so future bar
+                                # idx t' projects correctly:
+                                # line_at_t' = slope*(t' - win_start) + intercept
+                                #            = slope*t' + (intercept - slope*win_start)
+                                watch_line_intercept = (
+                                    cl.intercept - cl.slope * win_start_local
+                                )
+                                break
+                        else:
+                            if bar_low <= line_val + touch_tol_tr \
+                                    and bar_close > line_val:
+                                watch_line_slope = cl.slope
+                                watch_line_intercept = (
+                                    cl.intercept - cl.slope * win_start_local
+                                )
+                                break
+                open_trade.exit_t = bars[t].t
+                open_trade.exit_idx = t
+                open_trade.exit_price = bars[t].close
+                open_trade.exit_reason = "TRIANGLE_REJECT"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+                continue
             if breach_line or breach_trail:
                 # Live fills happen within ~1-5s of bar close, not a
                 # full bar later. Approximate as the trigger bar's
@@ -396,6 +614,39 @@ def run_backtest_live(
                 lwm = float('inf')
             continue
 
+        # Re-entry watch — if a triangle-rejection exit just fired
+        # within the last ``triangle_reentry_watch_bars`` bars, check
+        # whether THIS bar broke through the rejected line. If yes,
+        # rebuild the continuation trade using the original entry-line
+        # params (so existing breach/trail logic applies unchanged).
+        if watch_side and watch_until_idx >= t:
+            line_val = watch_line_slope * t + watch_line_intercept
+            broke_through = (
+                (watch_side == 'LONG' and bars[t].close > line_val)
+                or (watch_side == 'SHORT' and bars[t].close < line_val)
+            )
+            if broke_through:
+                open_trade = Trade(
+                    side=watch_side,
+                    entry_t=bars[t].t,
+                    entry_idx=t,
+                    entry_price=bars[t].close,
+                    line_slope=watch_entry_line_slope,
+                    line_intercept=watch_entry_line_intercept,
+                    line_anchor_b_idx=watch_entry_anchor_b_idx,
+                    line_touches=watch_entry_touches,
+                )
+                hwm = bars[t].close if watch_side == 'LONG' else -float('inf')
+                lwm = bars[t].close if watch_side == 'SHORT' else float('inf')
+                watch_until_idx = -1
+                watch_side = ""
+                cooldown_until_idx = -1  # break-out bypasses cooldown
+                continue
+        elif watch_side and watch_until_idx < t:
+            # Watch expired without a break — reset.
+            watch_until_idx = -1
+            watch_side = ""
+
         # Cooldown after a recent exit.
         if t <= cooldown_until_idx:
             continue
@@ -415,6 +666,31 @@ def run_backtest_live(
         # the chosen line.
         new_low = closes[t - 1] < closes[t - 2] and closes[t - 1] < closes[t]
         new_high = closes[t - 1] > closes[t - 2] and closes[t - 1] > closes[t]
+
+        # Asymmetric entry-only filter: reject the new-pivot entry
+        # trigger when the pivot's height vs its immediate neighbors
+        # is below ``entry_min_pivot_height`` (absolute price units).
+        # Height = smaller of the two adjacent legs. Tiny-blip pivots
+        # both visually clutter the chart AND tend to be followed by
+        # a big counter-move that smacks the trail. Crucially this
+        # gate does NOT propagate into line construction — SR lines
+        # still form on every strict 1/1 pivot, so the *exit* side
+        # (line-breach + trail) is unaffected. Only the new-bar
+        # ``new_low / new_high`` entry latch is suppressed.
+        if entry_min_pivot_height > 0.0 and (new_low or new_high):
+            if new_low:
+                height = min(
+                    closes[t - 2] - closes[t - 1],
+                    closes[t] - closes[t - 1],
+                )
+            else:
+                height = min(
+                    closes[t - 1] - closes[t - 2],
+                    closes[t - 1] - closes[t],
+                )
+            if height < entry_min_pivot_height:
+                new_low = False
+                new_high = False
 
         # Sliding history window: matches live chart_signal's 2h
         # ``/engine/history`` fetch (history_bars = 40 × 3min). Each
@@ -504,6 +780,44 @@ def run_backtest_live(
                     if line.slope < 0 and _accept(line, side_resists):
                         short_line = line
                         break
+
+        # Bad-shoulder filter — mirrors chart_signal.py's live filter.
+        # LONG  rejects when right_shoulder ≤ left_shoulder.
+        # SHORT rejects when right_shoulder ≥ left_shoulder.
+        if shoulder_filter and window_new_pivot >= 1:
+            left_shoulder = slice_closes[window_new_pivot - 1]
+            right_shoulder = slice_closes[window_last]
+            if long_line is not None and right_shoulder <= left_shoulder:
+                long_line = None
+            if short_line is not None and right_shoulder >= left_shoulder:
+                short_line = None
+
+        # Shallow-right-leg filter — mirrors chart_signal.py's live
+        # entry gate. Drops the entry when the bar AFTER the pivot
+        # bar (rise-out for LONG / drop-out for SHORT) is less than
+        # ``shallow_right_leg_threshold`` × the bar immediately
+        # before the pivot bar. Done in window-relative coords:
+        # pivot is at window_new_pivot, the bar after = window_last,
+        # the bar before the pivot bar = window_new_pivot - 1, and
+        # the bar BEFORE THAT = window_new_pivot - 2 (we need both
+        # to compute prior-bar net height).
+        if (shallow_right_leg_threshold is not None
+                and window_new_pivot >= 2):
+            prior_change = abs(
+                slice_closes[window_new_pivot - 1]
+                - slice_closes[window_new_pivot - 2]
+            )
+            if prior_change > 0:
+                if long_line is not None:
+                    rl = (slice_closes[window_last]
+                          - slice_closes[window_new_pivot])
+                    if rl / prior_change < shallow_right_leg_threshold:
+                        long_line = None
+                if short_line is not None:
+                    rl = (slice_closes[window_new_pivot]
+                          - slice_closes[window_last])
+                    if rl / prior_change < shallow_right_leg_threshold:
+                        short_line = None
 
         chosen_line = None
         chosen_side = None
