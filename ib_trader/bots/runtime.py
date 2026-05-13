@@ -163,6 +163,10 @@ class StrategyBotRunner(BotBase):
         self._last_bar_ts: datetime | None = None
         self._last_quote_time: float = time.monotonic()  # init to now, not 0
         self._quote_stale_logged: bool = False
+        # Latched while an engine-wide IB_GATEWAY_RECONNECTING /
+        # IB_GATEWAY_DISCONNECTED alert is suppressing the per-bot halt.
+        # Cleared the moment the watchdog sees the alert gone.
+        self._reconnect_pause_logged: bool = False
 
         # Repos for middleware
         self._bot_events_repo = BotEventRepository(session_factory)
@@ -2744,6 +2748,40 @@ class StrategyBotRunner(BotBase):
             info["heartbeat_last_symbol"] = hb_raw["symbol"]
         return info
 
+    async def _ib_reconnect_alert_active(self) -> bool:
+        """True if the engine has an active IB Gateway reconnect alert.
+
+        When the engine's ib_async ``disconnectedEvent`` fires, it
+        publishes ``IB_GATEWAY_RECONNECTING`` to ``alerts_active``
+        immediately (and escalates to ``IB_GATEWAY_DISCONNECTED`` after
+        5 min). Both alerts are cleared on a successful reconnect.
+
+        The stale-quote watchdog consults this signal so a Gateway
+        outage does not crash every bot in lockstep — the engine owns
+        the reconnect loop, and bots should pause until it succeeds.
+        """
+        redis = self.config.get("_redis") if self.config else None
+        if redis is None:
+            return False
+        try:
+            from ib_trader.redis.state import StateKeys
+            active = await redis.hgetall(StateKeys.alerts_active())
+        except Exception:
+            logger.exception(
+                '{"event": "IB_RECONNECT_ALERT_PROBE_FAILED", "bot_id": "%s"}',
+                self.bot_id,
+            )
+            return False
+        for raw in (active or {}).values():
+            try:
+                trigger = json.loads(raw).get("trigger")
+            except (TypeError, ValueError):
+                continue
+            if trigger in ("IB_GATEWAY_RECONNECTING",
+                           "IB_GATEWAY_DISCONNECTED"):
+                return True
+        return False
+
     async def check_stale_quote(self) -> None:
         """Supervisory check: warn on a quiet symbol, halt only when the
         engine-wide market-data heartbeat goes stale.
@@ -2784,6 +2822,38 @@ class StrategyBotRunner(BotBase):
         heartbeat_stale = (
             not hb_present or hb_age is None or hb_age > halt_threshold
         )
+
+        # Engine-wide IB reconnect in progress → suppress the per-bot
+        # halt. Every bot's heartbeat goes stale together during an IB
+        # Gateway outage; crashing them all is the wrong response when
+        # the engine is already driving a backoff reconnect. Pause
+        # silently; the watchdog's per-symbol timer is refreshed below
+        # so ticks resuming after reconnect don't immediately re-fire.
+        if heartbeat_stale and await self._ib_reconnect_alert_active():
+            if not self._reconnect_pause_logged:
+                self._reconnect_pause_logged = True
+                logger.warning(
+                    '{"event": "STALE_QUOTES_PAUSED_PENDING_IB_RECONNECT", '
+                    '"bot_id": "%s", "symbol": "%s", "heartbeat_age_s": %s}',
+                    self.bot_id, symbol,
+                    f"{hb_age:.1f}" if hb_age is not None else "null",
+                )
+            # Hold the watchdog clock at "now" while paused. When the
+            # Gateway returns and quote ticks resume, _last_quote_time
+            # is updated on each tick (line 2305 path), so this just
+            # prevents the watchdog from accumulating gap time during
+            # the outage.
+            self._last_quote_time = time.monotonic()
+            return
+        # Reconnect alert is no longer active — clear the latch so a
+        # later genuine outage logs the pause again.
+        if self._reconnect_pause_logged:
+            self._reconnect_pause_logged = False
+            logger.info(
+                '{"event": "STALE_QUOTES_RESUMED_AFTER_IB_RECONNECT", '
+                '"bot_id": "%s", "symbol": "%s"}',
+                self.bot_id, symbol,
+            )
 
         if heartbeat_stale and not self._quote_stale_logged:
             self._quote_stale_logged = True

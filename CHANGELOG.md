@@ -3,6 +3,23 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-05-12
+
+### Fixed
+- **Gateway-restart no longer crashes every bot.** The bot's stale-
+  quote watchdog used to fire `on_crash → ERRORED` on any 120s
+  heartbeat gap, including the universal gap that happens when IB
+  Gateway disconnects. With two-plus bots running, a Gateway restart
+  put them all into ERRORED simultaneously. The watchdog now checks
+  Redis `alerts_active` for `IB_GATEWAY_RECONNECTING` /
+  `IB_GATEWAY_DISCONNECTED` (the engine raises these immediately on
+  disconnect, clears on reconnect): when one is active the bot logs
+  `STALE_QUOTES_PAUSED_PENDING_IB_RECONNECT` once, holds its watchdog
+  clock at "now", and stays in its current state until ticks resume.
+  Engine's reconnect-with-backoff loop remains authoritative for
+  recovery, and a genuine per-bot stream outage (Gateway up, one
+  symbol silent past threshold) still escalates to halt as before.
+
 ## 2026-04-24
 
 ### Added
