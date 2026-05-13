@@ -41,7 +41,8 @@ from ib_trader.config import environment  # noqa: E402
 from ib_trader.ib.insync_client import InsyncClient  # noqa: E402
 
 
-async def fetch(symbol: str, sec_type: str, hours: int, bar_size: str) -> list[dict]:
+async def fetch(symbol: str, sec_type: str, hours: int, bar_size: str,
+                what_to_show: str = "TRADES") -> list[dict]:
     host = os.environ.get("IB_HOST", "192.168.4.66")
     port = int(os.environ.get("IB_PORT", "4001"))
     account_id = os.environ.get("IB_ACCOUNT_ID", "")
@@ -82,7 +83,7 @@ async def fetch(symbol: str, sec_type: str, hours: int, bar_size: str) -> list[d
             end_date_time=end_str,
             duration_str=f"{chunk_seconds} S",
             bar_size=bar_size,
-            what_to_show="BID_ASK",
+            what_to_show=what_to_show,
             use_rth=False,
             format_date=2,
         )

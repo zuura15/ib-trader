@@ -232,6 +232,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Bumps on Clear/Show toggle so callers (BotChart) can re-render
   // the toolbar label without polling.
   const [srHiddenTick, setSrHiddenTick] = useState(0);
+  // ``chartVersion`` is bumped by the chart-create effect once the
+  // chart instance + entry-line series exist. Multiple effects key
+  // off it so they re-fire when the chart is re-built (theme /
+  // showRsi toggle). Declared up here so effects defined below the
+  // refs (e.g. ``historicalFires`` at line ~410) can reference it
+  // in their deps without tripping the JS temporal-dead-zone.
+  const [chartVersion, setChartVersion] = useState(0);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -296,15 +303,34 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (chartT != null && side != null) {
       // Store the bot's entry badge in its own pinned slot —
       // separate from the bounded ``srSignalsRef`` queue so a busy
-      // session can't evict it. ``priceToCoordinate`` needs a price
-      // for the leader line; use the bar's close at the entry time
-      // as a stand-in (the badge floats above/below either way).
-      const bar = barsRef.current.find(
-        (b) => Math.abs((b.time as number) - chartT) < 1,
-      );
-      if (bar) {
+      // session can't evict it. Anchor the badge at the TRENDLINE's
+      // value at the pivot bar's x (computed from entryLine's
+      // anchor + slope) so the S/B sits on the line that triggered
+      // the entry. With the loose 4th+ touch rule the pivot bar's
+      // close can be up to ``near_tol`` away from the line, which
+      // made the badge appear to hang in the air relative to the
+      // trendline. Falls back to bar.close when entryLine isn't
+      // available yet.
+      let anchorPrice: number | null = null;
+      if (entryLine && entryLine.anchorTime
+          && typeof entryLine.anchorPrice === 'number'
+          && typeof entryLine.slopePerSec === 'number') {
+        const aDate = new Date(entryLine.anchorTime);
+        if (Number.isFinite(aDate.getTime())) {
+          const aChartSec = (localUtcSeconds(aDate) as number) + BAR_SECONDS;
+          anchorPrice = entryLine.anchorPrice
+            + entryLine.slopePerSec * (chartT - aChartSec);
+        }
+      }
+      if (anchorPrice == null) {
+        const bar = barsRef.current.find(
+          (b) => Math.abs((b.time as number) - chartT) < 1,
+        );
+        if (bar) anchorPrice = bar.close;
+      }
+      if (anchorPrice != null && Number.isFinite(anchorPrice)) {
         botPinnedBadgeRef.current = {
-          time: bar.time, price: bar.close, side,
+          time: chartT as UTCTimestamp, price: anchorPrice, side,
         };
       }
     } else {
@@ -313,86 +339,100 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
     // Re-paint badges so the ring appears/disappears immediately.
     repositionSrSignalsRef.current?.();
-  }, [activeEntryBarTime, entrySide]);
+  }, [activeEntryBarTime, entrySide, entryLine]);
   // Convert prop fires (real-UTC ISO + price) into chart-time
   // Signal entries on every change. The painter reads from
   // ``historicalFiresRef`` which the SR recompute splices in.
   useEffect(() => {
-    const chart = chartRef.current;
-    // Clean up any prior fill-segment LineSeries before rebuilding.
-    if (chart) {
-      for (const ds of fillSegmentSeriesRef.current) {
-        try { chart.removeSeries(ds); } catch { /* already gone */ }
+    try {
+      const chart = chartRef.current;
+      // Clean up any prior fill-segment LineSeries before rebuilding.
+      if (chart) {
+        for (const ds of fillSegmentSeriesRef.current) {
+          try { chart.removeSeries(ds); } catch { /* already gone */ }
+        }
       }
-    }
-    fillSegmentSeriesRef.current = [];
+      fillSegmentSeriesRef.current = [];
 
-    if (!historicalFires || historicalFires.length === 0) {
+      if (!historicalFires || historicalFires.length === 0) {
+        historicalFiresRef.current = [];
+        fillRenderRef.current = [];
+        srSignalsRef.current = [];
+        repositionSrSignalsRef.current?.();
+        return;
+      }
+      const out: Signal[] = [];
+      const fillOut: FillRender[] = [];
+      for (const f of historicalFires) {
+        const d = new Date(f.barTime);
+        if (!Number.isFinite(d.getTime())) continue;
+        // +BAR_SECONDS shifts to slot-end labelling (matches toBars).
+        const pivotT = (localUtcSeconds(d) as number) + BAR_SECONDS;
+        // Anchor the B/S badge at the pivot bar's CLOSE so the badge
+        // sits on the price polyline at the trigger pivot. Fill
+        // price is recorded separately for the ±-marker endpoint.
+        // Falls back to the fill price when bars haven't loaded yet.
+        const pivotBar = barsRef.current.find(
+          (b) => (b.time as number) === pivotT,
+        );
+        const pivotClose = pivotBar ? pivotBar.close : f.price;
+        const fillT = (pivotT + BAR_SECONDS) as UTCTimestamp;
+        out.push({
+          time: pivotT as UTCTimestamp,
+          price: pivotClose,
+          side: f.side === 'short' ? 'S' : 'B',
+        });
+        fillOut.push({
+          side: f.side,
+          pivotTime: pivotT as UTCTimestamp,
+          pivotPrice: pivotClose,
+          fillTime: fillT,
+          fillPrice: f.price,
+        });
+      }
+      historicalFiresRef.current = out;
+      fillRenderRef.current = fillOut;
+      // Build a lightweight-charts LineSeries per pivot→fill segment.
+      // Each addSeries / setData is wrapped because the chart can
+      // be mid-teardown when chartVersion just bumped — an addSeries
+      // on a disposed chart instance throws, and an uncaught throw
+      // bubbles up to flexlayout's "Error rendering component"
+      // overlay.
+      if (chart) {
+        const colors = themeColors();
+        for (const fr of fillOut) {
+          const colour = fr.side === 'long' ? colors.bullish : colors.bearish;
+          try {
+            const ds = chart.addSeries(LineSeries, {
+              color: colour,
+              lineWidth: 2,
+              lineStyle: 0,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              crosshairMarkerVisible: false,
+              autoscaleInfoProvider: () => null,
+            });
+            ds.setData([
+              { time: fr.pivotTime, value: fr.pivotPrice },
+              { time: fr.fillTime, value: fr.fillPrice },
+            ]);
+            fillSegmentSeriesRef.current.push(ds);
+          } catch { /* chart disposed / range invalid — skip */ }
+        }
+      }
+      // Force the painter to repaint so newly-fetched fires show up
+      // immediately rather than waiting for the next SR recompute.
+      srSignalsRef.current = out;
+      repositionSrSignalsRef.current?.();
+    } catch (err) {
+      // Last-resort guard: never let a fill-render hiccup take the
+      // whole pane down. Log and clear so subsequent recomputes can
+      // re-attempt cleanly.
+      try { console.warn('historical fires effect failed', err); }
+      catch { /* console missing — ignore */ }
       historicalFiresRef.current = [];
       fillRenderRef.current = [];
-      repositionSrSignalsRef.current?.();
-      return;
     }
-    const out: Signal[] = [];
-    const fillOut: FillRender[] = [];
-    for (const f of historicalFires) {
-      const d = new Date(f.barTime);
-      if (!Number.isFinite(d.getTime())) continue;
-      // +BAR_SECONDS shifts to slot-end labelling (matches toBars).
-      const pivotT = (localUtcSeconds(d) as number) + BAR_SECONDS;
-      // Anchor the B/S badge at the pivot bar's CLOSE so the badge
-      // sits on the price polyline at the trigger pivot. Fill price
-      // is recorded separately for the ±-marker endpoint. Falls
-      // back to the fill price when bars haven't loaded yet.
-      const pivotBar = barsRef.current.find(
-        (b) => (b.time as number) === pivotT,
-      );
-      const pivotClose = pivotBar ? pivotBar.close : f.price;
-      const fillT = (pivotT + BAR_SECONDS) as UTCTimestamp;
-      out.push({
-        time: pivotT as UTCTimestamp,
-        price: pivotClose,
-        side: f.side === 'short' ? 'S' : 'B',
-      });
-      fillOut.push({
-        side: f.side,
-        pivotTime: pivotT as UTCTimestamp,
-        pivotPrice: pivotClose,
-        fillTime: fillT,
-        fillPrice: f.price,
-      });
-    }
-    historicalFiresRef.current = out;
-    fillRenderRef.current = fillOut;
-    // Build a lightweight-charts LineSeries per pivot→fill segment.
-    // Green/red carries the direction; ``autoscaleInfoProvider: null``
-    // keeps the segment out of the price-axis auto-fit.
-    if (chart) {
-      const colors = themeColors();
-      for (const fr of fillOut) {
-        const colour = fr.side === 'long' ? colors.bullish : colors.bearish;
-        const ds = chart.addSeries(LineSeries, {
-          color: colour,
-          lineWidth: 2,
-          lineStyle: 0,
-          priceLineVisible: false,
-          lastValueVisible: false,
-          crosshairMarkerVisible: false,
-          autoscaleInfoProvider: () => null,
-        });
-        try {
-          ds.setData([
-            { time: fr.pivotTime, value: fr.pivotPrice },
-            { time: fr.fillTime, value: fr.fillPrice },
-          ]);
-        } catch { /* range invalid — skip */ }
-        fillSegmentSeriesRef.current.push(ds);
-      }
-    }
-    // Force the painter to repaint so newly-fetched fires show up
-    // immediately rather than waiting for the next SR recompute.
-    srSignalsRef.current = out;
-    repositionSrSignalsRef.current?.();
   }, [historicalFires, chartVersion]);
 
   useEffect(() => {
@@ -473,7 +513,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const [theme, setTheme] = useState<string>(
     () => document.documentElement.getAttribute('data-theme') || 'light',
   );
-  const [chartVersion, setChartVersion] = useState(0);
+  // ``chartVersion`` declared near the top with the other state refs
+  // so it's accessible to effects defined above this point.
 
   // Bot-mode: project the frozen entry line across the bar history.
   // Recomputes whenever the line prop or chart version changes; the
@@ -823,38 +864,45 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // ± markers at the fill endpoint of each historical pivot→
       // fill segment. + for longs, − for shorts. Painted small so
       // they don't compete visually with the B/S badge at the
-      // pivot bar.
-      for (const fr of fillRenderRef.current) {
-        const fx = ts.timeToCoordinate(fr.fillTime);
-        const fy = ser.priceToCoordinate(fr.fillPrice);
-        if (fx == null || fy == null) continue;
-        const dirCol = fr.side === 'long'
-          ? themeColors().bullish
-          : themeColors().bearish;
-        // Small filled circle anchor + ± glyph centred on it.
-        const cir = document.createElementNS(
-          'http://www.w3.org/2000/svg', 'circle',
-        );
-        cir.setAttribute('cx', String(fx));
-        cir.setAttribute('cy', String(fy));
-        cir.setAttribute('r', '6');
-        cir.setAttribute('fill', dirCol);
-        cir.setAttribute('opacity', '0.85');
-        svg.appendChild(cir);
-        const glyph = document.createElementNS(
-          'http://www.w3.org/2000/svg', 'text',
-        );
-        glyph.setAttribute('x', String(fx));
-        glyph.setAttribute('y', String(fy));
-        glyph.setAttribute('text-anchor', 'middle');
-        glyph.setAttribute('dominant-baseline', 'central');
-        glyph.setAttribute('font-size', '11');
-        glyph.setAttribute('font-weight', '800');
-        glyph.setAttribute('font-family', 'system-ui, sans-serif');
-        glyph.setAttribute('fill', themeColors().background);
-        glyph.textContent = fr.side === 'long' ? '+' : '−';
-        svg.appendChild(glyph);
-      }
+      // pivot bar. Wrapped in try/catch — a transient lookup
+      // failure here must not blow up the badge painter (which
+      // runs inside the render path; an uncaught throw shows the
+      // flexlayout "Error rendering component" overlay).
+      try {
+        // Re-derive themeColors here — the one inside the badge loop
+        // is scoped to that loop and would be undefined outside.
+        const themePaint = themeColors();
+        for (const fr of fillRenderRef.current) {
+          const fx = ts.timeToCoordinate(fr.fillTime);
+          const fy = ser.priceToCoordinate(fr.fillPrice);
+          if (fx == null || fy == null) continue;
+          const dirCol = fr.side === 'long'
+            ? themePaint.bullish
+            : themePaint.bearish;
+          const cir = document.createElementNS(
+            'http://www.w3.org/2000/svg', 'circle',
+          );
+          cir.setAttribute('cx', String(fx));
+          cir.setAttribute('cy', String(fy));
+          cir.setAttribute('r', '6');
+          cir.setAttribute('fill', dirCol);
+          cir.setAttribute('opacity', '0.85');
+          svg.appendChild(cir);
+          const glyph = document.createElementNS(
+            'http://www.w3.org/2000/svg', 'text',
+          );
+          glyph.setAttribute('x', String(fx));
+          glyph.setAttribute('y', String(fy));
+          glyph.setAttribute('text-anchor', 'middle');
+          glyph.setAttribute('dominant-baseline', 'central');
+          glyph.setAttribute('font-size', '11');
+          glyph.setAttribute('font-weight', '800');
+          glyph.setAttribute('font-family', 'system-ui, sans-serif');
+          glyph.setAttribute('fill', themePaint.background);
+          glyph.textContent = fr.side === 'long' ? '+' : '−';
+          svg.appendChild(glyph);
+        }
+      } catch { /* never fail the whole paint over a marker */ }
     };
 
     // rAF-coalesced wrapper. Multiple back-to-back ``reposition`` calls

@@ -35,3 +35,14 @@ exit_order_strategy: mid
 # Risk knobs — kept minimal. The exit is the SR line itself.
 max_position_value: 100000
 max_shares: 100
+
+# Acceleration-continuation entry. When ``acceleration_entry_enabled``
+# is true and the just-confirmed pivot lies strictly outside the
+# Q→P line in the favourable direction (above for support / below
+# for resistance) beyond ``near_touch_tolerance_fraction``, AND the
+# implied slope (P → new_pivot) is ≥ ``min_slope_ratio`` × the
+# line's slope, the bot fires an acceleration entry. The exit
+# evaluator skips the line-breach gate on these trades (price is
+# well away from the line; trail alone manages the exit).
+acceleration_entry_enabled: true
+min_slope_ratio: 1.5

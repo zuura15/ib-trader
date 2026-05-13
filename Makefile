@@ -96,6 +96,14 @@ dev:
 		sleep 0.5; \
 	fi
 	@trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' INT TERM; \
+	if command -v systemd-inhibit >/dev/null 2>&1; then \
+		echo "[DEV] systemd-inhibit: blocking sleep/idle for this session."; \
+		systemd-inhibit --what=sleep:idle --mode=block \
+			--who="ib-trader make dev" --why="trading session active" \
+			sleep infinity & \
+	else \
+		echo "[DEV] systemd-inhibit unavailable — system may auto-suspend mid-session."; \
+	fi; \
 	uv run ib-engine $(IB_MODE_FLAG) & \
 	uv run ib-api & \
 	uv run ib-bots & \
