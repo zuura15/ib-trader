@@ -604,6 +604,123 @@ async def get_history(
     return out
 
 
+@app.get("/engine/sr")
+async def get_sr(
+    con_id: int | None = None,
+    symbol: str | None = None,
+    sec_type: str = "STK",
+    hours: int = 2,
+    bar_size: str = "3 mins",
+):
+    """Canonical SR detection: lines + wedges + pivot timestamps.
+
+    Single source of truth shared by the bot and the chart. Internally:
+      1. Re-uses ``get_history`` (with ``include_partial=False`` to
+         match the bot's view — chart frontend that wants live-tick
+         pivots can still keep its own incremental detector).
+      2. Runs ``detect_lines`` + ``find_wedges`` from
+         ``ib_trader.signals.sr_fan``.
+      3. Returns lines with their key indices remapped to bar
+         TIMESTAMPS so the frontend doesn't have to share an index
+         coordinate system with the backend.
+
+    Bars used = closed-bar slice (no in-progress). Frontend chart
+    can pass the result through unchanged.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    bars_raw = await get_history(
+        con_id=con_id, symbol=symbol, sec_type=sec_type,
+        hours=hours, bar_size=bar_size, include_partial=False,
+    )
+    if not bars_raw or len(bars_raw) < 4:
+        return {"bars_count": len(bars_raw or []),
+                "lines": [], "wedges": [],
+                "pivot_lows": [], "pivot_highs": []}
+
+    from ib_trader.signals.sr_fan import (
+        detect_lines, find_pivot_highs, find_pivot_lows,
+        find_wedges, TOUCH_TOLERANCE_FRACTION,
+    )
+
+    closes = [float(b["close"]) for b in bars_raw]
+    last_idx = len(closes) - 1
+    timestamps = [b["ts"] for b in bars_raw]
+
+    # Use the same near-touch tolerance the live strategy defaults to
+    # (5 × TOUCH_TOLERANCE_FRACTION = 0.001) so wedge / line detection
+    # is byte-for-byte what chart_signal sees.
+    near_frac = 5 * TOUCH_TOLERANCE_FRACTION
+
+    supports = detect_lines(
+        closes, up_to=last_idx, type_="support",
+        near_touch_tolerance_fraction=near_frac,
+    )
+    resistances = detect_lines(
+        closes, up_to=last_idx, type_="resistance",
+        near_touch_tolerance_fraction=near_frac,
+    )
+    wedges = find_wedges(supports, resistances, last_idx)
+
+    def _line_payload(ln) -> dict:
+        return {
+            "type": ln.type,
+            "slope": ln.slope,
+            "intercept": ln.intercept,
+            "from_idx": ln.from_idx,
+            "from_ts": timestamps[ln.from_idx]
+                if 0 <= ln.from_idx < len(timestamps) else None,
+            "anchor_b_idx": ln.anchor_b_idx,
+            "anchor_b_ts": timestamps[ln.anchor_b_idx]
+                if 0 <= ln.anchor_b_idx < len(timestamps) else None,
+            "to_idx": ln.to_idx,
+            "to_ts": timestamps[ln.to_idx]
+                if 0 <= ln.to_idx < len(timestamps) else None,
+            "touches": ln.touches,
+            "break_idx": ln.break_idx,
+            "break_ts": timestamps[ln.break_idx]
+                if ln.break_idx is not None and 0 <= ln.break_idx < len(timestamps)
+                else None,
+        }
+
+    def _wedge_payload(w) -> dict:
+        s_left_price = w.support.value_at(w.overlap_start_idx)
+        s_right_price = w.support.value_at(last_idx)
+        r_left_price = w.resistance.value_at(w.overlap_start_idx)
+        r_right_price = w.resistance.value_at(last_idx)
+        return {
+            "apex_bars_ahead": w.apex_bars_ahead,
+            "apex_idx_float": w.apex_idx_float,
+            "overlap_start_idx": w.overlap_start_idx,
+            "overlap_start_ts": timestamps[w.overlap_start_idx]
+                if 0 <= w.overlap_start_idx < len(timestamps) else None,
+            "right_ts": timestamps[last_idx],
+            "support_slope": w.support.slope,
+            "resistance_slope": w.resistance.slope,
+            "vertices": {
+                "support_left":  {"ts": timestamps[w.overlap_start_idx],
+                                  "price": s_left_price},
+                "support_right": {"ts": timestamps[last_idx],
+                                  "price": s_right_price},
+                "resistance_right": {"ts": timestamps[last_idx],
+                                     "price": r_right_price},
+                "resistance_left":  {"ts": timestamps[w.overlap_start_idx],
+                                     "price": r_left_price},
+            },
+        }
+
+    pivot_lows = find_pivot_lows(closes)
+    pivot_highs = find_pivot_highs(closes)
+    return {
+        "bars_count": len(closes),
+        "last_ts": timestamps[last_idx],
+        "lines": [_line_payload(ln) for ln in (supports + resistances)],
+        "wedges": [_wedge_payload(w) for w in wedges],
+        "pivot_lows": [timestamps[i] for i in pivot_lows],
+        "pivot_highs": [timestamps[i] for i in pivot_highs],
+    }
+
+
 @app.get("/engine/health", response_model=HealthResponse)
 async def health():
     """Engine health check."""

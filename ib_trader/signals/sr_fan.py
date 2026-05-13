@@ -356,6 +356,100 @@ def detect_lines(closes: list[float], up_to: int, type_: str,
     )
 
 
+@dataclass
+class Wedge:
+    """A converging support/resistance pair forming a triangle/wedge.
+
+    ``apex_bars_ahead`` is the integer number of bars from ``last_idx``
+    to the apex (the point where the two lines intersect). Computed
+    via ``floor(apex_idx_float - last_idx)`` so an apex landing
+    half-way through the current bar reports as ``0``.
+
+    ``overlap_start_idx`` is the leftmost bar where both lines were
+    defined — used as the left edge of the wedge trapezoid the
+    frontend renders.
+    """
+    support: TrendLine
+    resistance: TrendLine
+    apex_idx_float: float    # exact intersection point in bar-index space
+    apex_bars_ahead: int     # floor(apex_idx_float - last_idx)
+    overlap_start_idx: int   # max(support.from_idx, resistance.from_idx)
+
+
+def find_wedges(
+    supports: list[TrendLine],
+    resistances: list[TrendLine],
+    last_idx: int,
+    *,
+    max_apex_bars_ahead: int = 200,
+    min_overlap_bars: int = 5,
+    include_broken: bool = False,
+) -> list[Wedge]:
+    """Find converging (support, resistance) pairs forming a wedge.
+
+    Canonical wedge detection — used by:
+      - the bot's tight-triangle entry filter (see chart_signal.py)
+      - the chart frontend's wedge-shading overlay (via API)
+      - the backtest harness (so simulation matches live)
+
+    Rules (mirror the operator's visual intuition):
+      - Pair must be converging: ``support.slope > resistance.slope``
+        (the support line catches up to the resistance from below).
+      - Apex must lie in the future: ``apex_idx_float > last_idx``.
+      - Apex must be within ``max_apex_bars_ahead`` (the wedge is
+        "imminent enough to matter" — far-future apexes are usually
+        artefacts of nearly-parallel lines).
+      - The two lines must overlap on the x-axis by at least
+        ``min_overlap_bars`` so the wedge has actual width.
+      - At ``overlap_start_idx`` resistance must sit above support
+        (real wedge shape, not crossed lines).
+
+    By default broken lines are excluded — once a line is breached
+    its "active" wedge interpretation is gone. Set ``include_broken``
+    if you want to include them anyway (the chart sometimes does
+    when the operator has "show broken" toggled on).
+
+    Returns a list of ``Wedge``, sorted by ``apex_bars_ahead`` ascending
+    (innermost wedge first), so ``[0]`` is the nearest apex.
+    """
+    out: list[Wedge] = []
+    s_pool = [
+        s for s in supports
+        if include_broken or s.break_idx is None
+    ]
+    r_pool = [
+        r for r in resistances
+        if include_broken or r.break_idx is None
+    ]
+    for s in s_pool:
+        for r in r_pool:
+            d_slope = s.slope - r.slope
+            if d_slope <= 1e-9:           # parallel or diverging
+                continue
+            apex_idx_float = (r.intercept - s.intercept) / d_slope
+            if apex_idx_float <= last_idx:
+                continue
+            if apex_idx_float - last_idx > max_apex_bars_ahead:
+                continue
+            overlap_start = max(s.from_idx, r.from_idx)
+            overlap_end = min(s.to_idx, r.to_idx)
+            if overlap_end - overlap_start < min_overlap_bars:
+                continue
+            r_at_start = r.slope * overlap_start + r.intercept
+            s_at_start = s.slope * overlap_start + s.intercept
+            if r_at_start <= s_at_start:  # crossed, not a wedge
+                continue
+            apex_bars_ahead = int(apex_idx_float - last_idx)
+            out.append(Wedge(
+                support=s, resistance=r,
+                apex_idx_float=apex_idx_float,
+                apex_bars_ahead=apex_bars_ahead,
+                overlap_start_idx=overlap_start,
+            ))
+    out.sort(key=lambda w: w.apex_bars_ahead)
+    return out
+
+
 def in_futures_deadzone(now: datetime) -> bool:
     """``True`` when ``now`` falls inside the futures maintenance window
     (14:00-15:00 Pacific). Naive datetimes are treated as server-local

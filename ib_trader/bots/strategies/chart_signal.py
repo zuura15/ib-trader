@@ -59,6 +59,7 @@ from ib_trader.signals.sr_fan import (
     detect_lines,
     find_pivot_highs,
     find_pivot_lows,
+    find_wedges,
     in_futures_deadzone,
 )
 
@@ -634,6 +635,35 @@ class ChartSignalStrategy:
                         payload={**rejected_payload,
                                  "entry_decision": decision_diag},
                     ))
+
+        # Tight-triangle entry block. If we're inside a converging
+        # triangle whose apex is within ``entry_triangle_block_distance``
+        # bars of the current bar, suppress the entry — the wedge is
+        # about to resolve in EITHER direction and a fresh position
+        # is exposed to the breakout going the wrong way. Set to 0 to
+        # disable. Mirrors the on-chart wedge overlay's apex math.
+        tri_block_dist = int(self.config.get(
+            "entry_triangle_block_distance", 3,
+        ))
+        if tri_block_dist > 0 and (
+            long_line is not None or short_line is not None
+        ):
+            wedges = find_wedges(supports, resistances, last_idx)
+            apex_min = wedges[0].apex_bars_ahead if wedges else None
+            if apex_min is not None and apex_min <= tri_block_dist:
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"tight-triangle filter — apex {apex_min} bars "
+                        f"ahead (≤ {tri_block_dist}); waiting for "
+                        f"resolution"
+                    ),
+                    payload={"apex_bars_ahead": apex_min,
+                             "threshold": tri_block_dist,
+                             "entry_decision": decision_diag},
+                ))
+                long_line = None
+                short_line = None
 
         if long_line is None and short_line is None:
             actions.append(LogSignal(
