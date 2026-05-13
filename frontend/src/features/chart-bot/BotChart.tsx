@@ -66,6 +66,11 @@ export function BotChart({
   // inverse toggle label. The chart's ref holds the source of truth;
   // we bump on click.
   const [srHidden, setSrHidden] = useState(false);
+  // SR data source: backend (canonical, default) vs frontend (legacy
+  // local detector). Diagnostic toggle while we verify the
+  // canonicalization holds — flip to FE to confirm the rendering
+  // pipeline works independently of the backend fetch.
+  const [srSourceMode, setSrSourceMode] = useState<'be' | 'fe'>('be');
   // Transient screenshot feedback ("Copied!" / "Capture failed").
   // Surfaces in the toolbar next to the camera button for ~2s.
   const [shotMsg, setShotMsg] = useState<string | null>(null);
@@ -337,6 +342,26 @@ export function BotChart({
         }}
       >
         {srHidden ? 'Show S/R' : 'Clear S/R'}
+      </button>
+      <button
+        onClick={() => {
+          const m = chartRef.current?.toggleSrSourceMode();
+          if (m) setSrSourceMode(m);
+        }}
+        title={
+          srSourceMode === 'be'
+            ? 'SR data from backend (canonical) — click to switch to local'
+            : 'SR data from local detector — click to switch to backend'
+        }
+        style={{
+          background: srSourceMode === 'fe'
+            ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
+          border: '1px solid var(--border-default)',
+          color: srSourceMode === 'fe' ? '#000' : 'var(--text-secondary)',
+          padding: '1px 6px', borderRadius: 3, cursor: 'pointer',
+        }}
+      >
+        SR: {srSourceMode}
       </button>
       <div ref={filtersWrapRef} style={{ position: 'relative' }}>
         <button

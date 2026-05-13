@@ -34,6 +34,13 @@ export interface SymbolChartHandle {
   /** Whether SR is currently hidden via clearSupportResistance. Bot
    *  panes need this to render the right toggle label. */
   isSupportResistanceHidden: () => boolean;
+  /** Toggle between canonical backend SR (default, "BE") and the
+   *  legacy local frontend detector ("FE"). Diagnostic only — once
+   *  parity is verified the FE path can be deleted. */
+  toggleSrSourceMode: () => 'be' | 'fe';
+  /** Current SR source: ``'be'`` = backend (canonical), ``'fe'`` =
+   *  local detection. */
+  getSrSourceMode: () => 'be' | 'fe';
   /** Snapshot the chart's current X (logical) and Y (price) zoom so
    *  it can be reapplied after a flow that's known to disturb the
    *  visible range — e.g. html2canvas cloning the pane DOM, which
@@ -262,6 +269,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // SR locally; this ref is the single source of truth for what
   // gets drawn. Updated by the periodic fetch effect below.
   const srBackendDataRef = useRef<BackendSrPayload | null>(null);
+  // SR source toggle: 'be' = backend canonical (default), 'fe' =
+  // legacy frontend ``detectSupportResistance`` (diagnostic — lets
+  // the operator confirm whether a missing line is a backend issue
+  // vs a rendering issue). Stored as a ref so the SR recompute
+  // closure reads the latest value without a chart rebuild.
+  const srSourceModeRef = useRef<'be' | 'fe'>('be');
+  const [srSourceModeTick, setSrSourceModeTick] = useState(0);
   // Apex distances surfaced in the top-left badge — derived from the
   // canonical backend payload's wedges. ``null`` until first fetch
   // settles, then either an empty array (no wedges) or a list of
@@ -1188,26 +1202,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const breakStaleBars = Math.max(
         1, Math.ceil((brokenMinutesRef.current ?? 30) * 60 / BAR_SECONDS),
       );
-      // Canonical SR data comes from the backend (/api/sr → /engine/sr
-      // → find_wedges + detect_lines, the same code the bot uses).
-      // Map backend's timestamp-based line payload into the index-
-      // based SRLine shape the renderer expects. Lines whose anchors
-      // fall outside ``allBars`` (e.g. older than the chart's
-      // history) are dropped. Drops the local detectSupportResistance
-      // entirely — single source of truth.
+      // Canonical SR data source. Backend mode = single source of
+      // truth (/api/sr → /engine/sr → find_wedges + detect_lines,
+      // same code path the bot uses). FE mode = legacy local
+      // detector kept around as a diagnostic so the operator can
+      // verify rendering vs detection independently.
       const backendData = srBackendDataRef.current;
-      const lines = backendData
-        ? backendData.lines
-            .map((bl) => backendLineToSRLine(bl, allBars))
-            .filter((ln): ln is NonNullable<typeof ln> => ln !== null)
-        : [];
-      // ``breakStaleBars`` retained only because the existing render
-      // path references it for log/diagnostic shape; backend already
-      // applied its own staleness rule.
-      void breakStaleBars;
-      // local-detector fallback retained but never called now — keep
-      // the import live so HMR + dev tools can still introspect.
-      void detectSupportResistance;
+      const useBackend = srSourceModeRef.current === 'be';
+      let lines: ReturnType<typeof detectSupportResistance>;
+      if (useBackend) {
+        lines = backendData
+          ? backendData.lines
+              .map((bl) => backendLineToSRLine(bl, allBars))
+              .filter((ln): ln is NonNullable<typeof ln> => ln !== null)
+          : [];
+      } else {
+        // Local detector returns indices in ``slice`` coords. Re-base
+        // them to ``allBars`` so the renderer (which reads
+        // ``allBars[idx].time``) lines up either way.
+        const local = detectSupportResistance(slice, { breakStaleBars });
+        lines = local.map((ln) => ({
+          ...ln,
+          fromIdx: ln.fromIdx + fromIdx,
+          anchorBIdx: ln.anchorBIdx + fromIdx,
+          toIdx: ln.toIdx + fromIdx,
+          breakIdx: ln.breakIdx != null ? ln.breakIdx + fromIdx : null,
+          thirdTouchIdx: ln.thirdTouchIdx != null
+            ? ln.thirdTouchIdx + fromIdx
+            : null,
+          intercept: ln.intercept - ln.slope * fromIdx,
+        }));
+      }
       const colors = themeColors();
       // Counter for human-readable line labels rendered on the right
       // axis. Numbered in detection order; lets the user point at a
@@ -2172,10 +2197,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         target, PRELOAD_HOURS, BAR_SIZE,
       );
       if (cancelled) return;
-      srBackendDataRef.current = payload;
-      // Trigger the recompute path so the renderer re-runs with the
-      // new data. ``force=true`` bypasses the throttle so the first
-      // fetch lands visibly within ~one frame.
+      // Preserve last-good data on a transient fetch failure (engine
+      // restart, network blip). Wiping to null would blank every SR
+      // line until the next 15s tick — annoying for the operator.
+      if (payload !== null) {
+        srBackendDataRef.current = payload;
+      }
       scheduleSrRecomputeRef.current?.(true);
     };
     doFetch();
@@ -2356,6 +2383,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       scheduleSrRecomputeRef.current?.(true);
     },
     isSupportResistanceHidden: () => srHiddenRef.current,
+    toggleSrSourceMode: () => {
+      srSourceModeRef.current =
+        srSourceModeRef.current === 'be' ? 'fe' : 'be';
+      // Drop the cached backend lines when leaving BE so a stale
+      // snapshot doesn't bleed through; the next BE toggle will
+      // refetch on the 15s interval.
+      scheduleSrRecomputeRef.current?.(true);
+      setSrSourceModeTick((n) => n + 1);
+      return srSourceModeRef.current;
+    },
+    getSrSourceMode: () => srSourceModeRef.current,
     snapshotZoom: () => {
       const chart = chartRef.current;
       if (!chart) return null;
