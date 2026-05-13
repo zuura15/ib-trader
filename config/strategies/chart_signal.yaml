@@ -44,5 +44,5 @@ max_shares: 100
 # line's slope, the bot fires an acceleration entry. The exit
 # evaluator skips the line-breach gate on these trades (price is
 # well away from the line; trail alone manages the exit).
-acceleration_entry_enabled: true
+acceleration_entry_enabled: false
 min_slope_ratio: 1.5

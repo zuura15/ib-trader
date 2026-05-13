@@ -542,6 +542,99 @@ class ChartSignalStrategy:
         if short_path is None:
             short_line = None
 
+        # Entry-decision diagnostic — one structured block captured on
+        # EVERY eval (including when no entry fires). Lets us answer
+        # "why didn't this bar fire?" without restarting with a more
+        # verbose log level. Kept compact so payload stays cheap.
+        def _line_diag(line, side: str) -> dict | None:
+            if line is None:
+                return None
+            line_at = line.intercept + line.slope * new_pivot_idx
+            delta = closes[new_pivot_idx] - line_at if new_pivot_idx >= 0 else None
+            return {
+                "touches": line.touches,
+                "slope": round(line.slope, 4),
+                "from_idx": line.from_idx,
+                "anchor_b_idx": line.anchor_b_idx,
+                "q_close": round(closes[line.from_idx], 4)
+                    if 0 <= line.from_idx < len(closes) else None,
+                "p_close": round(closes[line.anchor_b_idx], 4)
+                    if 0 <= line.anchor_b_idx < len(closes) else None,
+                "line_at_new_pivot": round(line_at, 4),
+                "delta_from_line": round(delta, 4) if delta is not None else None,
+            }
+        decision_diag = {
+            "new_pivot_idx": new_pivot_idx,
+            "new_pivot_close": (
+                round(closes[new_pivot_idx], 4)
+                if 0 <= new_pivot_idx < len(closes) else None
+            ),
+            "new_is_pivot_low": new_pivot_idx in support_pivots,
+            "new_is_pivot_high": new_pivot_idx in resistance_pivots,
+            "left_shoulder_close": (
+                round(closes[new_pivot_idx - 1], 4)
+                if 1 <= new_pivot_idx < len(closes) else None
+            ),
+            "right_shoulder_close": (
+                round(closes[last_idx], 4)
+                if 0 <= last_idx < len(closes) else None
+            ),
+            "touch_tol": round(touch_tol, 4),
+            "near_tol": round(near_tol, 4) if near_tol is not None else None,
+            "long_path_pre_filter": long_path,
+            "short_path_pre_filter": short_path,
+            "candidate_long": _line_diag(long_line, "LONG"),
+            "candidate_short": _line_diag(short_line, "SHORT"),
+        }
+
+        # Bad-shoulder entry filter. Operator's visual rule:
+        #   B (LONG)  — the bar AFTER the pivot must close HIGHER than
+        #               the bar BEFORE the pivot (right shoulder > left).
+        #   S (SHORT) — the bar AFTER the pivot must close LOWER than
+        #               the bar BEFORE the pivot (right shoulder < left).
+        # Pivot at p = new_pivot_idx; left shoulder = bar p−1; right
+        # shoulder = bar p+1 = the entry bar (last_idx). Inclusive
+        # comparison so flat right-shoulders (=) are also rejected.
+        # 30d TRADES sweep showed this filter saves $14.6k on MGC
+        # (clear edge) but INVERTS on MNQ — opt MNQ out via per-bot
+        # YAML (``entry_shoulder_filter_enabled: false``).
+        filt_enabled = bool(self.config.get(
+            "entry_shoulder_filter_enabled", True,
+        ))
+        if filt_enabled and (long_line is not None or short_line is not None):
+            if new_pivot_idx >= 1 and last_idx <= len(closes) - 1:
+                left_shoulder = closes[new_pivot_idx - 1]
+                right_shoulder = closes[last_idx]
+                rejected_by_filter = False
+                rejected_payload: dict = {}
+                if long_line is not None and right_shoulder <= left_shoulder:
+                    rejected_payload = {
+                        "side": "LONG",
+                        "left_shoulder": round(left_shoulder, 4),
+                        "right_shoulder": round(right_shoulder, 4),
+                    }
+                    long_line = None
+                    rejected_by_filter = True
+                if short_line is not None and right_shoulder >= left_shoulder:
+                    rejected_payload = {
+                        "side": "SHORT",
+                        "left_shoulder": round(left_shoulder, 4),
+                        "right_shoulder": round(right_shoulder, 4),
+                    }
+                    short_line = None
+                    rejected_by_filter = True
+                if rejected_by_filter:
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"bad-shoulder filter — right shoulder "
+                            f"{rejected_payload['right_shoulder']:.4f} "
+                            f"vs left {rejected_payload['left_shoulder']:.4f}"
+                        ),
+                        payload={**rejected_payload,
+                                 "entry_decision": decision_diag},
+                    ))
+
         if long_line is None and short_line is None:
             actions.append(LogSignal(
                 event_type=LogEventType.SKIP,
@@ -552,7 +645,8 @@ class ChartSignalStrategy:
                 payload={"new_pivot_idx": new_pivot_idx,
                          "last_idx": last_idx,
                          "new_is_pivot_low": new_pivot_idx in support_pivots,
-                         "new_is_pivot_high": new_pivot_idx in resistance_pivots},
+                         "new_is_pivot_high": new_pivot_idx in resistance_pivots,
+                         "entry_decision": decision_diag},
             ))
             return actions
 
@@ -575,7 +669,8 @@ class ChartSignalStrategy:
                 ),
                 payload={"elapsed_seconds": round(elapsed_s, 2),
                          "max_signal_age_seconds": max_signal_age_s,
-                         "bar_close": bar_close_dt.isoformat()},
+                         "bar_close": bar_close_dt.isoformat(),
+                         "entry_decision": decision_diag},
             ))
             return actions
 
@@ -678,7 +773,8 @@ class ChartSignalStrategy:
                              new_pivot_idx in support_pivots,
                          "new_is_pivot_high":
                              new_pivot_idx in resistance_pivots,
-                     }},
+                     },
+                     "entry_decision": decision_diag},
         ))
         actions.append(PlaceOrder(
             symbol=self.config["symbol"],
@@ -932,6 +1028,24 @@ class ChartSignalStrategy:
             or (direction == "short" and event.side == "BUY")
         )
         if is_entry_leg:
+            # Seed the trail-only stop at entry time so the position
+            # strip has a real number from the first tick. Without
+            # this, ``active_stop`` stays None until the next 3-min
+            # bar's EXIT_CHECK fills it in. The bot's exit eval will
+            # overwrite this with ``max(line, trail)`` (LONG) or
+            # ``min(line, trail)`` (SHORT) at first close — but in
+            # the interim the trail-only band is the conservative
+            # initial stop and matches what the operator expects.
+            trail_pct_d = Decimal(str(
+                self.config.get("trail_width_pct", 0.0002)
+            ))
+            fill_price_d = Decimal(str(event.fill_price))
+            if direction == "long":
+                initial_stop = fill_price_d * (Decimal("1") - trail_pct_d)
+                wm_field = "high_water_mark"
+            else:
+                initial_stop = fill_price_d * (Decimal("1") + trail_pct_d)
+                wm_field = "low_water_mark"
             actions.extend([
                 LogSignal(
                     event_type=LogEventType.FILL,
@@ -951,6 +1065,8 @@ class ChartSignalStrategy:
                     # parses with ``new Date(iso)`` which respects the offset.
                     "entry_time": datetime.now().astimezone().isoformat(),
                     "qty": str(event.qty),
+                    "active_stop": str(initial_stop),
+                    wm_field: str(fill_price_d),
                 }),
             ])
         elif is_exit_leg:

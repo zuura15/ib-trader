@@ -114,11 +114,18 @@ export function PositionStrip({ state, fsmState, botId, symbol }: Props) {
 
   // Stop value the bot would actually act on. ``active_stop`` is
   // bot-authoritative = max/min of line and trail per direction.
-  // Falls back to the projected line for legacy state docs.
+  // We deliberately do NOT fall back to ``lineNow`` here — that's
+  // a live projection of the entry line at the current wallclock,
+  // which drifts up/down on every tick. Between entry fill and the
+  // first EXIT_CHECK (next bar close, up to ~3 min away) the bot
+  // has not yet locked an ``active_stop``; showing the moving
+  // projection caused pnl_at_stop to drift in the first bar before
+  // settling. ``—`` here is honest: the bot's stop is genuinely
+  // pending the first exit eval.
   const stopNum: number | null =
     state.active_stop != null && state.active_stop !== ''
       ? Number(state.active_stop)
-      : (lineNow ?? null);
+      : null;
   const stopValue: string = stopNum == null || !Number.isFinite(stopNum)
     ? '—' : stopNum.toFixed(2);
 
