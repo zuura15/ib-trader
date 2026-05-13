@@ -14,6 +14,10 @@ import {
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
 import { detectSupportResistance } from './supportResistance';
+import {
+  fetchBackendSr, backendLineToSRLine, backendTsToChartTime,
+  type BackendSrPayload,
+} from './srBackend';
 import type { ChartTarget } from '../../data/store';
 import { useUserSetting } from '../../data/userSettings';
 
@@ -253,6 +257,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   };
   const srArrowsRef = useRef<Arrow[]>([]);
   const srApexBadgeRef = useRef<HTMLDivElement | null>(null);
+  // Canonical SR data: full /api/sr payload (lines + wedges +
+  // pivots, with timestamps + prices). The chart NO LONGER computes
+  // SR locally; this ref is the single source of truth for what
+  // gets drawn. Updated by the periodic fetch effect below.
+  const srBackendDataRef = useRef<BackendSrPayload | null>(null);
+  // Apex distances surfaced in the top-left badge — derived from the
+  // canonical backend payload's wedges. ``null`` until first fetch
+  // settles, then either an empty array (no wedges) or a list of
+  // up to three nearest apex distances.
+  const srBackendApexRef = useRef<number[] | null>(null);
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
   // Bumps on Clear/Show toggle so callers (BotChart) can re-render
@@ -483,6 +497,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Set inside the chart-create effect (captures chart + container).
   // Called from the SR recompute and from pan/zoom/resize events.
   const repositionSrSignalsRef = useRef<(() => void) | null>(null);
+  const paintApexBadgeRef = useRef<(() => void) | null>(null);
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
   // The old ``SR_MIN_BARS`` viewport gate was removed (2026-05-10): it
@@ -1054,6 +1069,38 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       });
     };
 
+    // Two-line apex badge: top row = backend (/api/sr) wedges, bottom
+    // row = frontend's local computation. Both surfaced so visual
+    // drift is immediately obvious; either side returning ``∞`` while
+    // the other shows a number means the two implementations have
+    // diverged on this dataset.
+    paintApexBadgeRef.current = () => {
+      let badge = srApexBadgeRef.current;
+      if (!badge && el) {
+        badge = document.createElement('div');
+        badge.setAttribute(
+          'style',
+          'position:absolute;top:6px;left:8px;z-index:11;'
+          + 'font-family:ui-monospace,Menlo,monospace;font-size:14px;'
+          + 'padding:2px 8px;border-radius:4px;line-height:1.25;'
+          + 'background:rgba(255,160,60,0.15);color:rgba(180,90,0,0.9);'
+          + 'pointer-events:none;user-select:none;letter-spacing:0.3px;'
+          + 'font-weight:600;white-space:pre;',
+        );
+        el.appendChild(badge);
+        srApexBadgeRef.current = badge;
+      }
+      if (!badge) return;
+      const list = srBackendApexRef.current;
+      if (list === null) {
+        badge.textContent = '△ …';
+      } else if (list.length === 0) {
+        badge.textContent = '△ ∞';
+      } else {
+        badge.textContent = `△ ${list.join(',')}`;
+      }
+    };
+
     setChartVersion((v) => v + 1);
 
     // SR detection helper, scoped to this chart instance. Runs over
@@ -1141,7 +1188,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const breakStaleBars = Math.max(
         1, Math.ceil((brokenMinutesRef.current ?? 30) * 60 / BAR_SECONDS),
       );
-      const lines = detectSupportResistance(slice, { breakStaleBars });
+      // Canonical SR data comes from the backend (/api/sr → /engine/sr
+      // → find_wedges + detect_lines, the same code the bot uses).
+      // Map backend's timestamp-based line payload into the index-
+      // based SRLine shape the renderer expects. Lines whose anchors
+      // fall outside ``allBars`` (e.g. older than the chart's
+      // history) are dropped. Drops the local detectSupportResistance
+      // entirely — single source of truth.
+      const backendData = srBackendDataRef.current;
+      const lines = backendData
+        ? backendData.lines
+            .map((bl) => backendLineToSRLine(bl, allBars))
+            .filter((ln): ln is NonNullable<typeof ln> => ln !== null)
+        : [];
+      // ``breakStaleBars`` retained only because the existing render
+      // path references it for log/diagnostic shape; backend already
+      // applied its own staleness rule.
+      void breakStaleBars;
+      // local-detector fallback retained but never called now — keep
+      // the import live so HMR + dev tools can still introspect.
+      void detectSupportResistance;
       const colors = themeColors();
       // Counter for human-readable line labels rendered on the right
       // axis. Numbered in detection order; lets the user point at a
@@ -1191,12 +1257,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const color = isBroken
           ? colors.archived
           : line.type === 'support' ? colors.bullish : colors.bearish;
-        // line.fromIdx / toIdx are local to the slice; map back via
-        // ``slice[i].time`` for the actual chart time. Price comes
-        // from the line algebra so it draws straight regardless of
-        // the close at the endpoint bar.
-        const startTime = slice[line.fromIdx].time;
-        const endTime = slice[line.toIdx].time;
+        // Backend-resolved indices are against ``allBars`` (full
+        // history), not the visible slice. Read from allBars so a
+        // line anchored to a bar outside the current zoom still
+        // renders correctly when the operator pans back.
+        const startTime = allBars[line.fromIdx].time;
+        const endTime = allBars[line.toIdx].time;
         const startPrice = line.slope * line.fromIdx + line.intercept;
         const endPrice = line.slope * line.toIdx + line.intercept;
         const lineStyleVal = isBroken ? 2 : confirmed ? 0 : 1;
@@ -1298,7 +1364,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const startBarTime = new Date((startTime as number) * 1000).toISOString();
         const endBarTime = new Date((endTime as number) * 1000).toISOString();
         const anchorBTime = new Date(
-          (slice[line.anchorBIdx].time as number) * 1000,
+          (allBars[line.anchorBIdx].time as number) * 1000,
         ).toISOString();
         lineLog.push({
           label, type: line.type, touches: line.touches,
@@ -1313,7 +1379,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           slope: Number(line.slope.toFixed(4)),
           breakIdx: line.breakIdx,
           breakTime: line.breakIdx != null
-            ? new Date((slice[line.breakIdx].time as number) * 1000).toISOString()
+            ? new Date((allBars[line.breakIdx].time as number) * 1000).toISOString()
             : null,
           isBroken, confirmed,
         });
@@ -1347,111 +1413,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // for the repaint loop. Faint overlay only — does NOT affect
       // bot firing. Operator uses these to spot wedges where price
       // action is compressing.
+      // Wedges come from the backend payload's ``wedges`` array,
+      // already sorted by apex_bars_ahead ascending (innermost
+      // first). We just convert the timestamp-based vertices into
+      // the four-vertex trapezoid the painter expects. The local
+      // wedge math is gone.
       const arrows: Arrow[] = [];
       const arrowReject: Array<Record<string, unknown>> = [];
-      // Converging condition: support catches up to resistance from
-      // below. Holds for symmetric (s>0, r<0), ascending (s>0, r≈0),
-      // and descending (s≈0, r<0) triangles. The per-line slope-sign
-      // requirement was too strict — an ascending triangle has flat
-      // resistance, which trips ``r.slope < 0``.
-      const supports = renderedLines.filter(
-        (l) => l.type === 'support',
-      );
-      const resistances = renderedLines.filter(
-        (l) => l.type === 'resistance',
-      );
-      const sliceLast = slice.length - 1;
-      // Loose wedges (small slope diff) have far-future apexes — the
-      // earlier 50-bar cap rejected visually-obvious converging
-      // structures. 200 bars is ~10 h at 3-min granularity which
-      // covers anything operator-visible.
-      const APEX_MAX_AHEAD = 200;
-      const MIN_OVERLAP_BARS = 5;
-      for (const s of supports) {
-        for (const r of resistances) {
-          // Lines must converge (support gaining on resistance).
-          const dSlope = s.slope - r.slope;
-          const apexIdxFloat = dSlope > 1e-9
-            ? (r.intercept - s.intercept) / dSlope
-            : NaN;
-          const overlapStart = Math.max(s.fromIdx, r.fromIdx);
-          const overlapEnd = Math.min(s.toIdx, r.toIdx);
-          const rAtStart = r.slope * overlapStart + r.intercept;
-          const sAtStart = s.slope * overlapStart + s.intercept;
-          let reason: string | null = null;
-          if (dSlope <= 1e-9) reason = 'parallel-or-diverging';
-          else if (!Number.isFinite(apexIdxFloat)) reason = 'apex-nan';
-          else if (apexIdxFloat <= sliceLast) reason = 'apex-past';
-          else if (apexIdxFloat > sliceLast + APEX_MAX_AHEAD) reason = 'apex-too-far';
-          else if (overlapEnd - overlapStart < MIN_OVERLAP_BARS) reason = 'overlap-short';
-          else if (rAtStart <= sAtStart) reason = 'r-not-above-s';
-          if (reason) {
-            arrowReject.push({
-              s_slope: s.slope, r_slope: r.slope, dSlope,
-              apex: apexIdxFloat, sliceLast,
-              overlap: overlapEnd - overlapStart,
-              rAtStart, sAtStart, reason,
-            });
-            continue;
-          }
-          // Triangle: left vertices on each line at overlapStart,
-          // apex projected ahead. Apex time = slice[sliceLast].time
-          // + extra bars at BAR_SECONDS granularity.
-          // Floor (not ceil): an apex landing 0.5 bars past sliceLast
-          // should report as ``0`` ("apex inside the current bar"),
-          // not ``1``. ``ceil`` over-counted by one for any non-integer
-          // apex distance.
-          const apexExtraBars = Math.floor(apexIdxFloat - sliceLast);
-          const supportAtLeft = s.slope * overlapStart + s.intercept;
-          const resistAtLeft = r.slope * overlapStart + r.intercept;
-          // Right edge clipped to sliceLast — guarantees both right
-          // vertices land in the visible time range.
-          const supportAtRight = s.slope * sliceLast + s.intercept;
-          const resistAtRight = r.slope * sliceLast + r.intercept;
-          const leftTime = slice[overlapStart].time;
-          const rightTime = slice[sliceLast].time;
+      if (backendData) {
+        for (const w of backendData.wedges) {
+          const v = w.vertices;
           arrows.push({
-            aTime: leftTime,  aPrice: supportAtLeft,
-            bTime: rightTime, bPrice: supportAtRight,
-            cTime: rightTime, cPrice: resistAtRight,
-            dTime: leftTime,  dPrice: resistAtLeft,
-            apexBarsAhead: apexExtraBars,
+            aTime: backendTsToChartTime(v.support_left.ts) as UTCTimestamp,
+            aPrice: v.support_left.price,
+            bTime: backendTsToChartTime(v.support_right.ts) as UTCTimestamp,
+            bPrice: v.support_right.price,
+            cTime: backendTsToChartTime(v.resistance_right.ts) as UTCTimestamp,
+            cPrice: v.resistance_right.price,
+            dTime: backendTsToChartTime(v.resistance_left.ts) as UTCTimestamp,
+            dPrice: v.resistance_left.price,
+            apexBarsAhead: w.apex_bars_ahead,
           });
         }
       }
-      // Sort by apex distance, nearest first. The painter shades
-      // ONLY the innermost (arrows[0]); the badge enumerates every
-      // distinct apex distance so the operator can spot when two
-      // (or more) triangles share the wedge.
-      arrows.sort((a, b) => a.apexBarsAhead - b.apexBarsAhead);
       srArrowsRef.current = arrows;
 
-      // Top-left badge: "△ 5,18,40" when triangles converge at 5,
-      // 18, and 40 bars ahead; "△ ∞" when none. Limited to the
-      // three nearest — anything further out isn't actionable.
+      // Badge: up to 3 nearest apex distances from backend wedges.
       const apexList = Array.from(
         new Set(arrows.map((a) => a.apexBarsAhead)),
       ).sort((a, b) => a - b).slice(0, 3);
-      let badge = srApexBadgeRef.current;
-      if (!badge && el) {
-        badge = document.createElement('div');
-        badge.setAttribute(
-          'style',
-          'position:absolute;top:6px;left:8px;z-index:11;'
-          + 'font-family:ui-monospace,Menlo,monospace;font-size:16px;'
-          + 'padding:2px 8px;border-radius:4px;'
-          + 'background:rgba(255,160,60,0.15);color:rgba(180,90,0,0.9);'
-          + 'pointer-events:none;user-select:none;letter-spacing:0.5px;'
-          + 'font-weight:600;',
-        );
-        el.appendChild(badge);
-        srApexBadgeRef.current = badge;
-      }
-      if (badge) {
-        badge.textContent = apexList.length === 0
-          ? '△ ∞'
-          : `△ ${apexList.join(',')}`;
-      }
+      srBackendApexRef.current = backendData ? apexList : null;
+      paintApexBadgeRef.current?.();
 
       repositionSrSignalsRef.current?.();
 
@@ -2164,6 +2156,35 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes]);
+
+  // Canonical SR fetch — populates the SINGLE source of truth that
+  // drives line drawing, wedge shading, and the apex badge. Fetched
+  // over PRELOAD_HOURS (24h by default) so the chart sees every
+  // structure the operator might zoom out to inspect, not just the
+  // bot's 2h window. Refreshed every 15s + whenever the target
+  // changes; chart pan/zoom does NOT trigger a re-fetch (renderer
+  // uses cached data + ``allBars`` to clip to visible).
+  useEffect(() => {
+    if (!target) return;
+    let cancelled = false;
+    const doFetch = async () => {
+      const payload = await fetchBackendSr(
+        target, PRELOAD_HOURS, BAR_SIZE,
+      );
+      if (cancelled) return;
+      srBackendDataRef.current = payload;
+      // Trigger the recompute path so the renderer re-runs with the
+      // new data. ``force=true`` bypasses the throttle so the first
+      // fetch lands visibly within ~one frame.
+      scheduleSrRecomputeRef.current?.(true);
+    };
+    doFetch();
+    const id = window.setInterval(doFetch, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [target?.conId, target?.symbol, target?.secType]);
 
   // Live tick subscription. Engine publishes STK ticks keyed on
   // ``symbol`` and FUT ticks keyed on ``localSymbol`` (= the IB-paste

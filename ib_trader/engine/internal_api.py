@@ -663,24 +663,45 @@ async def get_sr(
     wedges = find_wedges(supports, resistances, last_idx)
 
     def _line_payload(ln) -> dict:
+        from_price = (
+            ln.value_at(ln.from_idx)
+            if 0 <= ln.from_idx < len(closes) else None
+        )
+        to_price = (
+            ln.value_at(ln.to_idx)
+            if 0 <= ln.to_idx < len(closes) else None
+        )
+        anchor_b_price = (
+            ln.value_at(ln.anchor_b_idx)
+            if 0 <= ln.anchor_b_idx < len(closes) else None
+        )
+        break_price = (
+            ln.value_at(ln.break_idx)
+            if ln.break_idx is not None and 0 <= ln.break_idx < len(closes)
+            else None
+        )
         return {
             "type": ln.type,
-            "slope": ln.slope,
-            "intercept": ln.intercept,
-            "from_idx": ln.from_idx,
             "from_ts": timestamps[ln.from_idx]
                 if 0 <= ln.from_idx < len(timestamps) else None,
-            "anchor_b_idx": ln.anchor_b_idx,
+            "from_price": from_price,
             "anchor_b_ts": timestamps[ln.anchor_b_idx]
                 if 0 <= ln.anchor_b_idx < len(timestamps) else None,
-            "to_idx": ln.to_idx,
+            "anchor_b_price": anchor_b_price,
             "to_ts": timestamps[ln.to_idx]
                 if 0 <= ln.to_idx < len(timestamps) else None,
+            "to_price": to_price,
             "touches": ln.touches,
-            "break_idx": ln.break_idx,
+            "is_broken": ln.break_idx is not None,
             "break_ts": timestamps[ln.break_idx]
                 if ln.break_idx is not None and 0 <= ln.break_idx < len(timestamps)
                 else None,
+            "break_price": break_price,
+            # Numeric line params still exposed for the bot / backtest
+            # consumers; the chart renders from the (ts, price) pairs
+            # above and doesn't need them.
+            "slope_per_bar": ln.slope,
+            "intercept": ln.intercept,
         }
 
     def _wedge_payload(w) -> dict:
