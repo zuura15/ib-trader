@@ -24,16 +24,34 @@ type SortKey = 'symbol' | 'direction' | 'duration_seconds' | 'realized_pnl' | 'e
 type SortDir = 'asc' | 'desc';
 
 function formatDuration(seconds: number | null): string {
+  // Tight compact form so the column doesn't need extra padding:
+  // ``5m12s`` not ``5m 12s``. Operator scans the value at a glance;
+  // the omitted space saves ~4-6 px per row × hundreds of rows.
   if (seconds === null || seconds === undefined) return '—';
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
-    return `${m}m ${s}s`;
+    return `${m}m${s}s`;
   }
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  return `${h}h${m}m`;
+}
+
+/** Format an ISO timestamp as ``HH:MM M/D`` (24h time first, then
+ *  date) for the Closed column. Slot-end style — most-recent first
+ *  reads top-to-bottom. Falls back to ``—`` on bad input. */
+function fmtClosedTime(s: string | null): string {
+  if (!s) return '—';
+  // /api/bot-trades may return naive ISO (no tz); append Z so a UTC
+  // exit isn't reinterpreted as local-time-in-the-future.
+  const tsIso = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z';
+  const d = new Date(tsIso);
+  if (!Number.isFinite(d.getTime())) return '—';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm} ${d.getMonth() + 1}/${d.getDate()}`;
 }
 
 function formatPnl(pnl: string | null): { text: string; color: string } {
@@ -177,13 +195,13 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
       <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{trades.length} trades</span>
     }>
       <div className="h-full overflow-auto">
-        <table className="data-table">
+        <table className="data-table bot-trades">
           <thead>
             <tr>
-              <th style={{ width: 28 }}></th>
+              <th style={{ width: 22 }}></th>
               <SortHeader label="Symbol" myKey="symbol" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               <SortHeader label="Dir" myKey="direction" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              <SortHeader label="Duration" myKey="duration_seconds" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              <SortHeader label="Dur" myKey="duration_seconds" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               <SortHeader label="P&L (net)" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               {!compact && (
                 <SortHeader label="Closed" myKey="exit_time" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
@@ -224,13 +242,17 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                     <td style={{ color: t.direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                       {t.direction === 'LONG' ? 'L' : 'S'}
                     </td>
-                    <td className="font-mono" style={{ color: 'var(--text-primary)' }}>{dur}</td>
+                    <td className="font-mono"
+                        style={{ color: 'var(--text-primary)', width: 70 }}>
+                      {dur}
+                    </td>
                     <td className="font-mono" style={{ color: pnl.color, fontWeight: 600 }}>
                       {pnl.text}
                     </td>
                     {!compact && (
-                      <td style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-                        {fmtTime(t.exit_time)}
+                      <td className="font-mono"
+                          style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                        {fmtClosedTime(t.exit_time)}
                       </td>
                     )}
                   </tr>,

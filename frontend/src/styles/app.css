@@ -435,6 +435,14 @@ html, body, #root {
   white-space: nowrap;
 }
 
+/* Bot Trades — slightly tighter column gap so the Closed time fits
+ * comfortably without truncation. Only the Bot Trades panel uses
+ * this; other ``.data-table`` instances keep the default padding. */
+.data-table.bot-trades th,
+.data-table.bot-trades td {
+  padding: 3px 6px;
+}
+
 .data-table tr:hover td {
   background: var(--row-hover);
 }

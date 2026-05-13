@@ -345,11 +345,18 @@ async def start_bot(bot_id: str, sf=Depends(get_session_factory), redis=Depends(
 
     The runner is the sole FSM writer — it transitions state AFTER the
     task actually spawns. API doesn't write FSM state itself.
+
+    Timeout is 60 s because the runner's start handler is synchronous
+    over the bot's warmup (``_warmup_from_history`` → /engine/history
+    → IB ``reqHistoricalData``), which on a cold contract is routinely
+    10-25 s and can spike higher when IB is busy. 5 s was tripping
+    ``httpx.ReadTimeout`` even though the runner went on to start
+    the bot successfully in the background.
     """
     _get_defn_or_404(bot_id)
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
+        async with httpx.AsyncClient(timeout=60) as c:
             resp = await c.post(f"{_runner_url()}/bots/{bot_id}/start")
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
