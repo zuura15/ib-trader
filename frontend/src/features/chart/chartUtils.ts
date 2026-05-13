@@ -67,11 +67,15 @@ export function loadSavedRange(key: string): SavedRange | null {
     const map = JSON.parse(raw) as Record<string, SavedRange>;
     const r = map[key];
     if (!r || typeof r.from !== 'number' || typeof r.to !== 'number') return null;
-    // Reject stale ranges narrower than 5 min — these were polluted by
-    // an earlier bug where transient auto-fit states got persisted.
-    // Falls back to the default 90m window which is what the user
-    // expects for a fresh chart.
-    if (r.to - r.from < 5 * 60) return null;
+    // Reject any save under 30 minutes wide. Time-based and bar-
+    // relative widths get cross-checked: if EITHER signals a tiny
+    // viewport, treat the whole entry as corrupt. This catches saves
+    // polluted by lightweight-charts' transient narrow-window events
+    // during ``setData`` (the volume histogram aggravated this) — any
+    // such entry on reload would otherwise strand the chart at a few
+    // minutes of width.
+    if (r.to - r.from < 30 * 60) return null;
+    if (r.widthBars != null && r.widthBars < 10) return null;
     return r;
   } catch { return null; }
 }

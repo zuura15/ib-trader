@@ -239,10 +239,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // for an SVG <polygon>. Refilled on every SR recompute; positioned
   // alongside the B/S badges on every visible-range change.
   type Arrow = {
-    aTime: UTCTimestamp; aPrice: number;   // support side, left
-    bTime: UTCTimestamp; bPrice: number;   // apex
-    cTime: UTCTimestamp; cPrice: number;   // resistance side, left
-    apexBarsAhead: number;                  // bars from sliceLast to apex
+    // Four-vertex trapezoid (bottom-left, bottom-right, top-right,
+    // top-left). The right edge is clipped to ``sliceLast`` (the
+    // last fully-closed bar) because lightweight-charts'
+    // ``timeToCoordinate`` returns null for times past the visible
+    // range — using the off-screen apex as a vertex silently
+    // dropped the polygon on every paint.
+    aTime: UTCTimestamp; aPrice: number;   // support, left
+    bTime: UTCTimestamp; bPrice: number;   // support, right (at sliceLast)
+    cTime: UTCTimestamp; cPrice: number;   // resistance, right (at sliceLast)
+    dTime: UTCTimestamp; dPrice: number;   // resistance, left
+    apexBarsAhead: number;
   };
   const srArrowsRef = useRef<Arrow[]>([]);
   const srApexBadgeRef = useRef<HTMLDivElement | null>(null);
@@ -663,7 +670,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // still overrides this by switching auto-scale off.
       rightPriceScale: {
         borderColor: colors.grid,
-        scaleMargins: { top: 0.25, bottom: 0.25 },
+        // Price polyline fills 80% of the pane (top 5% padding,
+        // bottom 15% for the volume histogram). Matches TradingView
+        // proportions where price dominates and volume sits as a
+        // thin band underneath. Earlier 0.25/0.25 squashed price
+        // into the middle 50% with empty space top and bottom.
+        scaleMargins: { top: 0.05, bottom: 0.15 },
       },
       crosshair: { mode: 1 },
     });
@@ -780,7 +792,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Arrowhead polygons — painted FIRST so they sit under badges /
       // leader lines. Faint fill, no stroke. Skipped when there are
       // no detected pairs (most bars).
-      const arrowList = srArrowsRef.current;
+      // Render ONLY the innermost wedge (smallest apex distance).
+      // The detector sorts ``srArrowsRef`` ascending by apexBarsAhead
+      // so arrowList[0] is the most-imminent triangle. Showing every
+      // overlapping wedge buries the relevant one in stripes; the
+      // ``△`` badge already enumerates all apex distances for the
+      // operator's situational awareness.
+      const arrowList = srArrowsRef.current.slice(0, 1);
       if (arrowList.length > 0) {
         const tsArrow = ch.timeScale();
         let painted = 0;
@@ -819,11 +837,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const xA = tsArrow.timeToCoordinate(a.aTime);
           const xB = tsArrow.timeToCoordinate(a.bTime);
           const xC = tsArrow.timeToCoordinate(a.cTime);
+          const xD = tsArrow.timeToCoordinate(a.dTime);
           const yA = ser.priceToCoordinate(a.aPrice);
           const yB = ser.priceToCoordinate(a.bPrice);
           const yC = ser.priceToCoordinate(a.cPrice);
-          if (xA == null || xB == null || xC == null
-              || yA == null || yB == null || yC == null) {
+          const yD = ser.priceToCoordinate(a.dPrice);
+          if (xA == null || xB == null || xC == null || xD == null
+              || yA == null || yB == null || yC == null || yD == null) {
             skippedNull += 1;
             continue;
           }
@@ -832,7 +852,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           );
           poly.setAttribute(
             'points',
-            `${xA},${yA} ${xB},${yB} ${xC},${yC}`,
+            `${xA},${yA} ${xB},${yB} ${xC},${yC} ${xD},${yD}`,
           );
           poly.setAttribute('fill', `url(#${patternId})`);
           poly.setAttribute('stroke', 'rgba(255, 160, 60, 0.55)');
@@ -1377,47 +1397,60 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // Triangle: left vertices on each line at overlapStart,
           // apex projected ahead. Apex time = slice[sliceLast].time
           // + extra bars at BAR_SECONDS granularity.
-          const apexExtraBars = Math.ceil(apexIdxFloat - sliceLast);
-          const lastTimeSec = slice[sliceLast].time as number;
-          const apexTimeSec = lastTimeSec + apexExtraBars * BAR_SECONDS;
+          // Floor (not ceil): an apex landing 0.5 bars past sliceLast
+          // should report as ``0`` ("apex inside the current bar"),
+          // not ``1``. ``ceil`` over-counted by one for any non-integer
+          // apex distance.
+          const apexExtraBars = Math.floor(apexIdxFloat - sliceLast);
           const supportAtLeft = s.slope * overlapStart + s.intercept;
           const resistAtLeft = r.slope * overlapStart + r.intercept;
-          const apexPrice = s.slope * apexIdxFloat + s.intercept;
+          // Right edge clipped to sliceLast — guarantees both right
+          // vertices land in the visible time range.
+          const supportAtRight = s.slope * sliceLast + s.intercept;
+          const resistAtRight = r.slope * sliceLast + r.intercept;
+          const leftTime = slice[overlapStart].time;
+          const rightTime = slice[sliceLast].time;
           arrows.push({
-            aTime: slice[overlapStart].time, aPrice: supportAtLeft,
-            bTime: apexTimeSec as UTCTimestamp, bPrice: apexPrice,
-            cTime: slice[overlapStart].time, cPrice: resistAtLeft,
+            aTime: leftTime,  aPrice: supportAtLeft,
+            bTime: rightTime, bPrice: supportAtRight,
+            cTime: rightTime, cPrice: resistAtRight,
+            dTime: leftTime,  dPrice: resistAtLeft,
             apexBarsAhead: apexExtraBars,
           });
         }
       }
+      // Sort by apex distance, nearest first. The painter shades
+      // ONLY the innermost (arrows[0]); the badge enumerates every
+      // distinct apex distance so the operator can spot when two
+      // (or more) triangles share the wedge.
+      arrows.sort((a, b) => a.apexBarsAhead - b.apexBarsAhead);
       srArrowsRef.current = arrows;
 
-      // Top-left apex-distance indicator. "△ <n>" where n is the
-      // smallest apex-bars-ahead across detected wedges, or "△ ∞"
-      // when no triangle context exists. Lets the operator visually
-      // verify triangle detection even if the polygon shading has
-      // a render issue.
-      const minApex = arrows.length === 0
-        ? Infinity
-        : Math.min(...arrows.map((a) => a.apexBarsAhead));
+      // Top-left badge: "△ 5,18,40" when triangles converge at 5,
+      // 18, and 40 bars ahead; "△ ∞" when none. Limited to the
+      // three nearest — anything further out isn't actionable.
+      const apexList = Array.from(
+        new Set(arrows.map((a) => a.apexBarsAhead)),
+      ).sort((a, b) => a - b).slice(0, 3);
       let badge = srApexBadgeRef.current;
       if (!badge && el) {
         badge = document.createElement('div');
         badge.setAttribute(
           'style',
           'position:absolute;top:6px;left:8px;z-index:11;'
-          + 'font-family:ui-monospace,Menlo,monospace;font-size:11px;'
-          + 'padding:1px 6px;border-radius:3px;'
-          + 'background:rgba(255,160,60,0.12);color:rgba(180,90,0,0.85);'
-          + 'pointer-events:none;user-select:none;letter-spacing:0.5px;',
+          + 'font-family:ui-monospace,Menlo,monospace;font-size:16px;'
+          + 'padding:2px 8px;border-radius:4px;'
+          + 'background:rgba(255,160,60,0.15);color:rgba(180,90,0,0.9);'
+          + 'pointer-events:none;user-select:none;letter-spacing:0.5px;'
+          + 'font-weight:600;',
         );
         el.appendChild(badge);
         srApexBadgeRef.current = badge;
       }
       if (badge) {
-        badge.textContent =
-          minApex === Infinity ? '△ ∞' : `△ ${minApex}`;
+        badge.textContent = apexList.length === 0
+          ? '△ ∞'
+          : `△ ${apexList.join(',')}`;
       }
 
       repositionSrSignalsRef.current?.();
@@ -1576,13 +1609,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       yCaptureScheduled = true;
       requestAnimationFrame(() => {
         yCaptureScheduled = false;
-        const pr = chart.priceScale('right').getVisibleRange();
+        const ps = chart.priceScale('right');
+        const pr = ps.getVisibleRange();
         // Repaint signals on any Y change (wheel/pinch/axis drag).
         repositionSrSignalsRef.current?.();
         if (!pr) return;
         const cur = userPriceRangeRef.current;
         if (cur && cur.from === pr.from && cur.to === pr.to) return;
         userPriceRangeRef.current = { from: pr.from, to: pr.to };
+        // Lock autoScale OFF the moment the operator moves Y. Without
+        // this, lightweight-charts re-fits the polyline on every data
+        // update (30 s refresh + every live tick), instantly undoing
+        // an axis drag. Explicit Reset Zoom re-enables it.
+        try { ps.applyOptions({ autoScale: false }); }
+        catch { /* older builds — ignore */ }
         const tgt = targetRef.current;
         const xRange = userRangeRef.current;
         if (tgt && xRange) {
@@ -1686,9 +1726,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // ``passive: false`` so we can preventDefault on Y-axis wheels;
       // otherwise lightweight-charts also zooms X on the same event.
       containerEl.addEventListener('wheel', onWheel, { passive: false });
-      // Drag-to-zoom on the Y axis ends with a mouseup; touch
-      // pinch ends with touchend. Both should persist whatever Y
-      // the user landed on.
+      // Drag-to-zoom / drag-to-pan on the Y axis ends with a
+      // pointerup (lightweight-charts uses pointer events; mouseup
+      // may not bubble through). ``pointerup`` covers mouse + touch
+      // + pen; the explicit ``mouseup``/``touchend`` are kept as
+      // belt-and-braces for older browsers.
+      containerEl.addEventListener('pointerup', captureYRange);
       containerEl.addEventListener('mouseup', captureYRange);
       containerEl.addEventListener('touchend', captureYRange);
     }
@@ -1774,6 +1817,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (resizeObserver) resizeObserver.disconnect();
       if (containerEl) {
         containerEl.removeEventListener('wheel', onWheel);
+        containerEl.removeEventListener('pointerup', captureYRange);
         containerEl.removeEventListener('mouseup', captureYRange);
         containerEl.removeEventListener('touchend', captureYRange);
       }
@@ -1878,14 +1922,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // time-range event) and persist that updated value.
         const priceScale = chart.priceScale('right');
         if (firstLoad) {
-          if (
-            savedRange?.priceFrom != null && savedRange?.priceTo != null
-          ) {
-            userPriceRangeRef.current = {
-              from: savedRange.priceFrom,
-              to: savedRange.priceTo,
-            };
-          }
+          // Y range is NOT restored on hard refresh. The saved value
+          // is in absolute price units, while the scale margins +
+          // visible-bar set determine where on the pane those prices
+          // get drawn — a stale Y range applied under different
+          // margins squishes the polyline and gives an unexpected
+          // "weird zoom" on reload. Auto-fit handles the first paint;
+          // in-session pan/zoom is captured in ``userPriceRangeRef``
+          // immediately afterwards so subsequent refreshes preserve
+          // it.
+          userPriceRangeRef.current = null;
         } else {
           const currentPriceRange = priceScale.getVisibleRange();
           if (currentPriceRange) {
@@ -1972,6 +2018,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
         if (firstLoad) {
           firstLoad = false;
+          // Guard against a thin first-fetch (only the in-progress
+          // bar landed, history endpoint hadn't returned). Skip any
+          // viewport override — the next 30s refresh will populate
+          // the dataset and the standard path takes over. Without
+          // this, ``setVisibleRange(now-90m..now)`` over a 1-bar
+          // dataset can leave lightweight-charts showing a single
+          // bar at the right edge with a flat Y range.
+          if (fullBars.length < 5) {
+            // intentionally no-op — let lightweight-charts auto-fit
+            // to whatever sliver of data it has; refresh will fix it.
+          } else {
           // Hard-refresh path. If the saved range carries bar-relative
           // values, restore using those — the operator's prior pan
           // and zoom both survive. Without them (older entries),
@@ -1998,15 +2055,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
               );
             } catch { /* range invalid for current data — skip */ }
           } else {
+            // No usable saved range. Always land on the deterministic
+            // default-width view anchored to now. Earlier the fallback
+            // honored ``prevRange.to - prevRange.from`` which could
+            // reproduce a corrupted narrow width on reload — make it
+            // a fixed ``visibleMinutes`` instead so hard-refresh is
+            // predictable.
             const nowSec = localUtcSeconds(new Date());
-            const widthSec = prevRange
-              ? Math.max(60, prevRange.to - prevRange.from)
-              : visibleMinutes * 60;
+            const widthSec = visibleMinutes * 60;
             chart.timeScale().setVisibleRange({
               from: (nowSec - widthSec) as UTCTimestamp,
               to: nowSec,
             });
           }
+          } // end fullBars.length >= 5 branch
         } else if (userLogicalRangeRef.current) {
           // Re-anchor the saved bar-relative viewport to the freshly-
           // loaded dataset. ``rightSpaceBars`` keeps the last-bar →
@@ -2235,7 +2297,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const priceScale = chart.priceScale('right');
       try {
         priceScale.applyOptions({
-          scaleMargins: { top: 0.25, bottom: 0.25 },
+          scaleMargins: { top: 0.05, bottom: 0.15 },
         });
       } catch { /* ignore */ }
       try { priceScale.setAutoScale(true); } catch { /* ignore */ }
