@@ -55,22 +55,43 @@ class TrendLine:
         return self.slope * idx + self.intercept
 
 
-def find_pivot_lows(closes: list[float]) -> list[int]:
-    """Strict 1/1 local minima on the close polyline."""
+def find_pivot_lows(
+    closes: list[float],
+    min_pivot_strength: float = 0.0,
+) -> list[int]:
+    """Strict 1/1 local minima on the close polyline.
+
+    ``min_pivot_strength`` (optional, price units): require BOTH
+    neighbour-deltas to clear this threshold. With ``0`` it stays
+    the bare 1/1 rule; with a positive value it rejects
+    micro-blips where the central close is only fractionally below
+    its neighbours."""
     out: list[int] = []
     for i in range(1, len(closes) - 1):
         v, l, r = closes[i], closes[i - 1], closes[i + 1]
         if v < l and v < r:
+            if min_pivot_strength > 0:
+                if (l - v) < min_pivot_strength or (r - v) < min_pivot_strength:
+                    continue
             out.append(i)
     return out
 
 
-def find_pivot_highs(closes: list[float]) -> list[int]:
-    """Strict 1/1 local maxima on the close polyline."""
+def find_pivot_highs(
+    closes: list[float],
+    min_pivot_strength: float = 0.0,
+) -> list[int]:
+    """Strict 1/1 local maxima on the close polyline.
+
+    ``min_pivot_strength`` (optional, price units): same semantics as
+    ``find_pivot_lows`` — both neighbour-deltas must clear it."""
     out: list[int] = []
     for i in range(1, len(closes) - 1):
         v, l, r = closes[i], closes[i - 1], closes[i + 1]
         if v > l and v > r:
+            if min_pivot_strength > 0:
+                if (v - l) < min_pivot_strength or (v - r) < min_pivot_strength:
+                    continue
             out.append(i)
     return out
 
@@ -308,16 +329,24 @@ def detect_lines(closes: list[float], up_to: int, type_: str,
                  touch_tolerance_fraction: float = TOUCH_TOLERANCE_FRACTION,
                  break_stale_bars: int = BREAK_STALE_BARS,
                  near_touch_tolerance_fraction: float | None = None,
+                 min_pivot_strength: float = 0.0,
                  ) -> list[TrendLine]:
     """Compatibility shim used by ``chart_signal`` and the backtest.
     Returns only lines of one side (matches the old single-side
     function), slicing the input to ``closes[:up_to+1]`` first to
-    preserve the "no look-ahead" guarantee the backtest relies on."""
+    preserve the "no look-ahead" guarantee the backtest relies on.
+
+    ``min_pivot_strength`` (optional, price units) filters out
+    micro-pivots whose smaller-side delta is below the threshold.
+    See ``find_pivot_lows`` / ``find_pivot_highs``."""
     if up_to < 2:
         return []
     sub = closes[: up_to + 1]
-    pivots = find_pivot_lows(sub) if type_ == "support" \
-        else find_pivot_highs(sub)
+    pivots = (
+        find_pivot_lows(sub, min_pivot_strength=min_pivot_strength)
+        if type_ == "support"
+        else find_pivot_highs(sub, min_pivot_strength=min_pivot_strength)
+    )
     return _detect_one_side(
         sub, pivots, type_,
         tolerance_fraction=tolerance_fraction,

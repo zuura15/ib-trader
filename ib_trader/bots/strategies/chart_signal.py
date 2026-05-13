@@ -430,6 +430,19 @@ class ChartSignalStrategy:
         resistance_pivots = find_pivot_highs(closes)
         new_pivot_idx = last_idx - 1   # the just-confirmed pivot
 
+        # Acceleration-continuation entry: opt-in, off by default.
+        # Fires when the new pivot lies STRICTLY OUTSIDE the line in
+        # the favorable direction (above for support, below for
+        # resistance) by more than near_touch_tol AND the implied
+        # slope new_pivot→P is at least ``min_slope_ratio`` × the
+        # line's slope. Trail-only exit when this path fires (line
+        # is no longer a useful breach-stop because price is well
+        # away from it).
+        accel_enabled = bool(self.config.get(
+            "acceleration_entry_enabled", False,
+        ))
+        min_slope_ratio = float(self.config.get("min_slope_ratio", 1.5))
+
         def _has_new_touch(line, side_pivots) -> bool:
             if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
                 return False
@@ -456,13 +469,77 @@ class ChartSignalStrategy:
                     strict_old += 1
             return strict_old >= MIN_TOUCHES
 
-        long_has_new = (long_line is not None
-                        and _has_new_touch(long_line, support_pivots))
-        short_has_new = (short_line is not None
-                          and _has_new_touch(short_line, resistance_pivots))
-        if not long_has_new:
+        def _has_acceleration_entry(line) -> bool:
+            """Steeper-3rd-point momentum entry.
+
+            Conditions:
+              1. new_pivot_idx is a strict 1/1 pivot of the matching
+                 side (find_pivot_lows for support, highs for
+                 resistance).
+              2. closes[new_pivot] is strictly outside the line in
+                 the favorable direction beyond ``near_tol`` — i.e.
+                 above the support / below the resistance.
+              3. The implied slope from line.anchor_b_idx (P) to
+                 new_pivot has the same sign as line.slope and is
+                 at least ``min_slope_ratio`` × steeper. Price is
+                 accelerating in the trend's direction.
+            """
+            if near_tol is None:
+                return False
+            side_pivots = (
+                support_pivots if line.type == "support"
+                else resistance_pivots
+            )
+            if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
+                return False
+            line_at = line.intercept + line.slope * new_pivot_idx
+            delta = closes[new_pivot_idx] - line_at
+            if line.type == "support":
+                # New pivot must be ABOVE the support line.
+                if delta <= near_tol:
+                    return False
+            else:
+                # New pivot must be BELOW the resistance line.
+                if delta >= -near_tol:
+                    return False
+            P_idx = line.anchor_b_idx
+            if P_idx <= 0 or P_idx >= new_pivot_idx:
+                return False
+            span = new_pivot_idx - P_idx
+            if span <= 0:
+                return False
+            implied_slope = (closes[new_pivot_idx] - closes[P_idx]) / span
+            if line.type == "support":
+                # Long: line.slope > 0; need implied steeper (more +).
+                if line.slope <= 0:
+                    return False
+                return implied_slope >= line.slope * min_slope_ratio
+            else:
+                # Short: line.slope < 0; need implied steeper (more -).
+                if line.slope >= 0:
+                    return False
+                return implied_slope <= line.slope * min_slope_ratio
+
+        # Track which path each line passed: ``"touch"`` (strict /
+        # 4th+ loose, the original 3rd-touch entry) or ``"accel"``
+        # (acceleration continuation). The chosen line's path
+        # propagates into the entry_line state so exit eval can
+        # skip the line-breach check on accel entries.
+        long_path: str | None = None
+        short_path: str | None = None
+        if long_line is not None:
+            if _has_new_touch(long_line, support_pivots):
+                long_path = "touch"
+            elif accel_enabled and _has_acceleration_entry(long_line):
+                long_path = "accel"
+        if short_line is not None:
+            if _has_new_touch(short_line, resistance_pivots):
+                short_path = "touch"
+            elif accel_enabled and _has_acceleration_entry(short_line):
+                short_path = "accel"
+        if long_path is None:
             long_line = None
-        if not short_has_new:
+        if short_path is None:
             short_line = None
 
         if long_line is None and short_line is None:
@@ -505,14 +582,19 @@ class ChartSignalStrategy:
         if long_line and short_line:
             if short_line.touches > long_line.touches:
                 chosen, direction, kind = short_line, "short", "resistance"
+                chosen_path = short_path
             else:
                 chosen, direction, kind = long_line, "long", "support"
+                chosen_path = long_path
         elif long_line:
             chosen, direction, kind = long_line, "long", "support"
+            chosen_path = long_path
         elif short_line:
             chosen, direction, kind = short_line, "short", "resistance"
+            chosen_path = short_path
         else:
             return actions
+        is_acceleration_entry = chosen_path == "accel"
 
         # Freeze the line in (time, price) space so future evaluations
         # survive the window sliding forward.
@@ -555,6 +637,10 @@ class ChartSignalStrategy:
             "from_idx": chosen.from_idx,
             "from_time": (anchor_q_time or anchor_b_time or bar_time).isoformat(),
             "touches": chosen.touches,
+            # Flag the exit path: ``acceleration`` entries skip the
+            # line-breach gate (price is far from the line and the
+            # line is no longer a useful stop reference).
+            "entry_path": "accel" if is_acceleration_entry else "touch",
         }
 
         qty = int(self.config.get("qty_default", 1))
@@ -745,8 +831,16 @@ class ChartSignalStrategy:
             }
             breach_trail = bar_close_d > trail_stop_d
 
-        breach_line = (bar_close < line_value) if direction == "long" \
-            else (bar_close > line_value)
+        # Acceleration entries skip the line-breach gate — they were
+        # entered ABOVE/BELOW the line by design, so a "breach" of
+        # the original line carries no information. Trail does all
+        # the exit work.
+        entry_path = str(entry_line.get("entry_path", "touch"))
+        if entry_path == "accel":
+            breach_line = False
+        else:
+            breach_line = (bar_close < line_value) if direction == "long" \
+                else (bar_close > line_value)
 
         actions.append(LogSignal(
             event_type=LogEventType.EXIT_CHECK,

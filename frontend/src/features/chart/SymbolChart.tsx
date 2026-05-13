@@ -243,6 +243,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // the SR recompute loop can splice them directly into srSignalsRef
   // without converting on every iteration.
   const historicalFiresRef = useRef<Signal[]>([]);
+  // Companion render data: one entry per historical fire describing
+  // the pivot→fill segment and the ``+``/``−`` marker at the fill
+  // endpoint. Painted alongside the B/S badges so every order has a
+  // visible "this is where we acted, this is where we filled" cue.
+  type FillRender = {
+    side: 'long' | 'short';
+    pivotTime: UTCTimestamp;
+    pivotPrice: number;
+    fillTime: UTCTimestamp;
+    fillPrice: number;
+  };
+  const fillRenderRef = useRef<FillRender[]>([]);
+  // lightweight-charts LineSeries handles for the pivot→fill segments.
+  // Recreated whenever historicalFires changes; cleaned up here so a
+  // stale segment never lingers after a trade exits the 24 h window.
+  const fillSegmentSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
   // Set true by ``withFrozenViewport`` for the duration of an async
   // callback (e.g. html2canvas capture). The custom ResizeObserver
   // checks this and skips its setAutoScale(true) re-fit so a layout
@@ -302,29 +318,82 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Signal entries on every change. The painter reads from
   // ``historicalFiresRef`` which the SR recompute splices in.
   useEffect(() => {
+    const chart = chartRef.current;
+    // Clean up any prior fill-segment LineSeries before rebuilding.
+    if (chart) {
+      for (const ds of fillSegmentSeriesRef.current) {
+        try { chart.removeSeries(ds); } catch { /* already gone */ }
+      }
+    }
+    fillSegmentSeriesRef.current = [];
+
     if (!historicalFires || historicalFires.length === 0) {
       historicalFiresRef.current = [];
+      fillRenderRef.current = [];
       repositionSrSignalsRef.current?.();
       return;
     }
     const out: Signal[] = [];
+    const fillOut: FillRender[] = [];
     for (const f of historicalFires) {
       const d = new Date(f.barTime);
       if (!Number.isFinite(d.getTime())) continue;
       // +BAR_SECONDS shifts to slot-end labelling (matches toBars).
-      const t = (localUtcSeconds(d) as number) + BAR_SECONDS as UTCTimestamp;
+      const pivotT = (localUtcSeconds(d) as number) + BAR_SECONDS;
+      // Anchor the B/S badge at the pivot bar's CLOSE so the badge
+      // sits on the price polyline at the trigger pivot. Fill price
+      // is recorded separately for the ±-marker endpoint. Falls
+      // back to the fill price when bars haven't loaded yet.
+      const pivotBar = barsRef.current.find(
+        (b) => (b.time as number) === pivotT,
+      );
+      const pivotClose = pivotBar ? pivotBar.close : f.price;
+      const fillT = (pivotT + BAR_SECONDS) as UTCTimestamp;
       out.push({
-        time: t,
-        price: f.price,
+        time: pivotT as UTCTimestamp,
+        price: pivotClose,
         side: f.side === 'short' ? 'S' : 'B',
+      });
+      fillOut.push({
+        side: f.side,
+        pivotTime: pivotT as UTCTimestamp,
+        pivotPrice: pivotClose,
+        fillTime: fillT,
+        fillPrice: f.price,
       });
     }
     historicalFiresRef.current = out;
+    fillRenderRef.current = fillOut;
+    // Build a lightweight-charts LineSeries per pivot→fill segment.
+    // Green/red carries the direction; ``autoscaleInfoProvider: null``
+    // keeps the segment out of the price-axis auto-fit.
+    if (chart) {
+      const colors = themeColors();
+      for (const fr of fillOut) {
+        const colour = fr.side === 'long' ? colors.bullish : colors.bearish;
+        const ds = chart.addSeries(LineSeries, {
+          color: colour,
+          lineWidth: 2,
+          lineStyle: 0,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          autoscaleInfoProvider: () => null,
+        });
+        try {
+          ds.setData([
+            { time: fr.pivotTime, value: fr.pivotPrice },
+            { time: fr.fillTime, value: fr.fillPrice },
+          ]);
+        } catch { /* range invalid — skip */ }
+        fillSegmentSeriesRef.current.push(ds);
+      }
+    }
     // Force the painter to repaint so newly-fetched fires show up
     // immediately rather than waiting for the next SR recompute.
     srSignalsRef.current = out;
     repositionSrSignalsRef.current?.();
-  }, [historicalFires]);
+  }, [historicalFires, chartVersion]);
 
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
@@ -749,6 +818,42 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         txt.setAttribute('opacity', opacity);
         txt.textContent = sig.side;
         svg.appendChild(txt);
+      }
+
+      // ± markers at the fill endpoint of each historical pivot→
+      // fill segment. + for longs, − for shorts. Painted small so
+      // they don't compete visually with the B/S badge at the
+      // pivot bar.
+      for (const fr of fillRenderRef.current) {
+        const fx = ts.timeToCoordinate(fr.fillTime);
+        const fy = ser.priceToCoordinate(fr.fillPrice);
+        if (fx == null || fy == null) continue;
+        const dirCol = fr.side === 'long'
+          ? themeColors().bullish
+          : themeColors().bearish;
+        // Small filled circle anchor + ± glyph centred on it.
+        const cir = document.createElementNS(
+          'http://www.w3.org/2000/svg', 'circle',
+        );
+        cir.setAttribute('cx', String(fx));
+        cir.setAttribute('cy', String(fy));
+        cir.setAttribute('r', '6');
+        cir.setAttribute('fill', dirCol);
+        cir.setAttribute('opacity', '0.85');
+        svg.appendChild(cir);
+        const glyph = document.createElementNS(
+          'http://www.w3.org/2000/svg', 'text',
+        );
+        glyph.setAttribute('x', String(fx));
+        glyph.setAttribute('y', String(fy));
+        glyph.setAttribute('text-anchor', 'middle');
+        glyph.setAttribute('dominant-baseline', 'central');
+        glyph.setAttribute('font-size', '11');
+        glyph.setAttribute('font-weight', '800');
+        glyph.setAttribute('font-family', 'system-ui, sans-serif');
+        glyph.setAttribute('fill', themeColors().background);
+        glyph.textContent = fr.side === 'long' ? '+' : '−';
+        svg.appendChild(glyph);
       }
     };
 

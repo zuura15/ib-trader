@@ -275,6 +275,8 @@ def run_backtest_live(
     atr_mult: float | None = None,
     atr_period: int = ATR_PERIOD,
     near_touch_tolerance_fraction: float | None = None,
+    hard_stop_mult: float | None = None,
+    min_pivot_strength: float = 0.0,
 ) -> list[Trade]:
     """Mirrors current chart_signal live rules:
     - Single position at a time, EITHER side.
@@ -319,8 +321,22 @@ def run_backtest_live(
                 trail_delta = (atr_mult * atr_t) if atr_t is not None else None
             else:
                 trail_delta = None
+            # Optional intra-bar hard stop. Fires when bar.low (long)
+            # or bar.high (short) breaches HWM/LWM ×
+            # (1 ± hard_stop_mult × trail_width_pct) — i.e. a wider
+            # tick-by-tick band than the close-only trail. Catches
+            # rapid mid-bar reversals that the bar-close trail
+            # waits 1-3 min to confirm.
+            hard_stop_fired = False
+            hard_stop_price = 0.0
             if open_trade.side == 'LONG':
                 hwm = max(hwm, closes[t])
+                if hard_stop_mult is not None and hard_stop_mult > 0 \
+                        and trail_width_pct > 0:
+                    hard_pct = trail_width_pct * hard_stop_mult
+                    hard_stop_price = hwm * (1 - hard_pct)
+                    if bars[t].low < hard_stop_price:
+                        hard_stop_fired = True
                 if trail_delta is not None:
                     trail_stop = hwm - trail_delta
                 else:
@@ -330,6 +346,12 @@ def run_backtest_live(
                 breach_trail = closes[t] < trail_stop
             else:
                 lwm = min(lwm, closes[t])
+                if hard_stop_mult is not None and hard_stop_mult > 0 \
+                        and trail_width_pct > 0:
+                    hard_pct = trail_width_pct * hard_stop_mult
+                    hard_stop_price = lwm * (1 + hard_pct)
+                    if bars[t].high > hard_stop_price:
+                        hard_stop_fired = True
                 if trail_delta is not None:
                     trail_stop = lwm + trail_delta
                 else:
@@ -337,6 +359,19 @@ def run_backtest_live(
                                   if trail_width_pct > 0 else float('inf'))
                 breach_line = closes[t] > line_at_t + tol
                 breach_trail = closes[t] > trail_stop
+            if hard_stop_fired:
+                # Exit at the hard-stop price — assumes a stop-loss
+                # order would have filled there (no slippage modeled).
+                open_trade.exit_t = bars[t].t
+                open_trade.exit_idx = t
+                open_trade.exit_price = hard_stop_price
+                open_trade.exit_reason = "HARDSTOP"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+                continue
             if breach_line or breach_trail:
                 # Live fills happen within ~1-5s of bar close, not a
                 # full bar later. Approximate as the trigger bar's
@@ -407,8 +442,12 @@ def run_backtest_live(
             loose_tol_w = max(touch_tol_w,
                               avg_slice * near_touch_tolerance_fraction)
 
-        side_supports = find_pivot_lows(slice_closes)
-        side_resists = find_pivot_highs(slice_closes)
+        side_supports = find_pivot_lows(
+            slice_closes, min_pivot_strength=min_pivot_strength,
+        )
+        side_resists = find_pivot_highs(
+            slice_closes, min_pivot_strength=min_pivot_strength,
+        )
 
         def _accept(line, side_pivots) -> bool:
             """Entry gate: did the just-confirmed pivot land on this
@@ -446,6 +485,7 @@ def run_backtest_live(
                 for line in detect_lines(
                     slice_closes, up_to=window_last, type_='support',
                     near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                    min_pivot_strength=min_pivot_strength,
                 ):
                     if line.slope > 0 and _accept(line, side_supports):
                         long_line = line
@@ -459,6 +499,7 @@ def run_backtest_live(
                 for line in detect_lines(
                     slice_closes, up_to=window_last, type_='resistance',
                     near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                    min_pivot_strength=min_pivot_strength,
                 ):
                     if line.slope < 0 and _accept(line, side_resists):
                         short_line = line

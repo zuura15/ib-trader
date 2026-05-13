@@ -164,15 +164,27 @@ export function PositionStrip({ state, fsmState, botId, symbol }: Props) {
     ? `${entryValue} (${qtyStr})`
     : entryValue;
   type Cell = { label: string; value: string; tone?: 'pos' | 'neg' };
-  // Row 1: identity + price snapshot.
-  // Row 2: risk + P/L (carries the @stop and 24h brackets).
+  // Direction-aware water-mark label: HWM for longs, LWM for shorts.
+  // ``state.high_water_mark`` is set on long, ``low_water_mark`` on
+  // short — the previous round-trip's stale values are wiped via
+  // ``clear_position_fields`` so this reads cleanly between trades.
+  const dirUpper = String(state.position_direction || '').toUpperCase();
+  const wmLabel = dirUpper === 'SHORT' ? 'LWM' : 'HWM';
+  const wmRaw = dirUpper === 'SHORT'
+    ? state.low_water_mark
+    : state.high_water_mark;
+  const wmValue = wmRaw == null || wmRaw === '' ? '—' : fmt(wmRaw);
+
+  // Row 1: identity + price snapshot + risk levels (Stop, HWM).
+  // Row 2: P/L only — carries the @stop and 24 h brackets.
   const row1: Cell[] = [
     { label: '@', value: fmtTime(state.entry_time) },
     { label: 'Entry', value: entryWithQty },
     { label: 'Last', value: fmt(state.last_price) },
+    { label: 'Stop', value: stopValue },
+    { label: wmLabel, value: wmValue },
   ];
   const row2: Cell[] = [
-    { label: 'Stop', value: stopValue },
     { label: 'P/L', value: pnlValue, tone: pnlTone },
   ];
 

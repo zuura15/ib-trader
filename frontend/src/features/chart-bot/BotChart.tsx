@@ -203,16 +203,37 @@ export function BotChart({
         const out: { barTime: string; side: 'long' | 'short'; price: number }[] = [];
         for (const t of trades) {
           if (!t.entry_time) continue;
-          const entryMs = new Date(t.entry_time).getTime();
+          // /api/bot-trades serialises entry_time as a naive ISO
+          // string (no ``Z``/offset). JS would parse that as local
+          // time, putting a UTC entry 7-8 hours in the future —
+          // and the slot-start derivation below lands on a bar
+          // that doesn't exist, so badges render off-screen.
+          // Force UTC interpretation by appending ``Z`` when no
+          // timezone is present.
+          const tsRaw: string = t.entry_time;
+          const tsIso = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(tsRaw)
+            ? tsRaw
+            : tsRaw + 'Z';
+          const entryMs = new Date(tsIso).getTime();
           if (!Number.isFinite(entryMs) || entryMs < cutoff) continue;
           const price = Number(t.entry_price);
           if (!Number.isFinite(price)) continue;
-          // Round entry_time DOWN to the 3-min slot start. The bot
-          // fires at bar close (~5 s into the next slot), so the
-          // trigger bar's slot-start = floor(entry_time - 3 min)
-          // aligned to 3-min boundaries. /api/bot-trades doesn't
-          // currently surface entry_bar_time directly.
-          const slotStart = Math.floor((entryMs - 180_000) / 180_000) * 180_000;
+          // Bot fires at bar close (~5 s into the slot AFTER the
+          // bar that triggered). The trigger PIVOT bar is two
+          // slots earlier than ``entry_time``:
+          //   * boundary = the 3-min mark at or before entry_time
+          //                = the moment the bar that closed at
+          //                  bot-evaluation time ended.
+          //   * just-closed bar's slot_start = boundary − 3 min.
+          //   * pivot bar's slot_start         = boundary − 6 min.
+          // /api/bot-trades doesn't surface entry_bar_time yet, so
+          // we reverse-engineer here. Earlier version subtracted
+          // only one slot — anchoring the badge on the just-closed
+          // bar instead of the pivot bar (visible in the 2026-05-12
+          // 18:36 MGCM6 short where the S landed on a local low
+          // instead of the pivot high).
+          const boundary = Math.floor(entryMs / 180_000) * 180_000;
+          const slotStart = boundary - 2 * 180_000;
           const dir = (t.direction || '').toUpperCase();
           const side: 'long' | 'short' =
             dir === 'SHORT' || dir === 'SELL' ? 'short' : 'long';
