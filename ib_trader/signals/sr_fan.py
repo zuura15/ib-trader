@@ -31,6 +31,11 @@ EPS = 1e-6
 #     gold price.
 TOLERANCE_FRACTION = 0.00005
 TOUCH_TOLERANCE_FRACTION = 0.0002
+# Default looser band for 4th-and-later touches once a line has
+# accumulated MIN_TOUCHES strict touches. Centralized here so the bot
+# (via ``chart_signal.yaml``) and the chart (via ``/engine/sr``) read
+# the same default. Override per-bot or per-request as needed.
+NEAR_TOUCH_TOLERANCE_FRACTION = 5 * TOUCH_TOLERANCE_FRACTION
 BREAK_STALE_BARS = 20
 MIN_TOUCHES = 3   # 3rd-touch entry trigger
 
@@ -50,6 +55,13 @@ class TrendLine:
     intercept: float
     touches: int
     break_idx: int | None
+    # Bar index of the 3rd strict touch on this line. ``None`` when
+    # the line has fewer than 3 strict touches in the slice it was
+    # detected on. Renderer uses this to draw a thicker segment past
+    # the 3rd touch when a 4th-or-later loose touch upgrades the line
+    # into "established" territory. Mirrors the frontend SRLine's
+    # ``thirdTouchIdx`` field.
+    third_touch_idx: int | None = None
 
     def value_at(self, idx: int) -> float:
         return self.slope * idx + self.intercept
@@ -258,6 +270,11 @@ def _detect_one_side(closes: list[float], pivots: list[int],
             # single-tolerance behavior in place.
             strict_touches = 0
             loose_touches = 0
+            # Bar index of the 3rd strict touch — the moment the line
+            # becomes "confirmed." Renderer uses this to thicken the
+            # post-3rd-touch segment when a 4th near-touch upgrades
+            # the line into "established" territory.
+            third_touch_idx: int | None = None
             for piv_idx in pivots:
                 if piv_idx < q or piv_idx > last_bar_idx:
                     continue
@@ -266,6 +283,8 @@ def _detect_one_side(closes: list[float], pivots: list[int],
                 if delta <= touch_tol:
                     strict_touches += 1
                     loose_touches += 1
+                    if strict_touches == MIN_TOUCHES and third_touch_idx is None:
+                        third_touch_idx = piv_idx
                 elif near_touch_tol is not None and delta <= near_touch_tol:
                     loose_touches += 1
             if near_touch_tol is not None and strict_touches >= MIN_TOUCHES:
@@ -284,6 +303,7 @@ def _detect_one_side(closes: list[float], pivots: list[int],
                 intercept=intercept,
                 touches=touches,
                 break_idx=break_idx,
+                third_touch_idx=third_touch_idx,
             ))
 
     return out

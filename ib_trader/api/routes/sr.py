@@ -29,17 +29,27 @@ async def get_sr(
     sec_type: str = "STK",
     hours: int = 2,
     bar_size: str = "3 mins",
+    near_touch_tolerance_fraction: float | None = None,
+    break_stale_bars: int | None = None,
+    include_broken_wedges: bool = False,
 ):
     """Proxy to GET /engine/sr. See engine endpoint for semantics."""
     if con_id is None and not symbol:
         raise HTTPException(status_code=400, detail="con_id or symbol is required")
 
-    params: dict[str, str | int] = {"hours": hours, "bar_size": bar_size}
+    params: dict[str, str | int | float | bool] = {
+        "hours": hours, "bar_size": bar_size,
+        "include_broken_wedges": include_broken_wedges,
+    }
     if con_id is not None:
         params["con_id"] = int(con_id)
     if symbol:
         params["symbol"] = symbol
         params["sec_type"] = sec_type
+    if near_touch_tolerance_fraction is not None:
+        params["near_touch_tolerance_fraction"] = near_touch_tolerance_fraction
+    if break_stale_bars is not None:
+        params["break_stale_bars"] = int(break_stale_bars)
 
     try:
         async with httpx.AsyncClient(timeout=45) as client:

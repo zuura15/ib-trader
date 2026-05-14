@@ -185,12 +185,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
 
-  // Wipe sticky buy/sell signals when the user switches to a different
-  // symbol. Without this, MGCM6's historical badges would render on
-  // ESM6's chart at the same wallclock pivot times — confusing.
+  // Wipe sticky buy/sell signals + cached backend SR payload when
+  // the user switches to a different symbol. Without this, MGCM6's
+  // historical badges would render on ESM6's chart at the same
+  // wallclock pivot times, AND the cached /api/sr payload from the
+  // previous symbol would map its timestamps onto the new symbol's
+  // ``allBars`` for the ~15s gap before the next fetch arrives,
+  // painting wrong-symbol SR lines briefly.
   useEffect(() => {
     srSignalsRef.current = [];
     botPinnedBadgeRef.current = null;
+    srBackendDataRef.current = null;
+    srBackendApexRef.current = null;
+    srArrowsRef.current = [];
     repositionSrSignalsRef.current?.();
   }, [target?.conId, target?.symbol, target?.secType]);
 
@@ -1319,7 +1326,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           && !isBroken;
         if (hasLooseFourth) {
           const splitIdx = line.thirdTouchIdx as number;
-          const splitTime = slice[splitIdx].time;
+          // ``splitIdx`` is now in allBars space (post-rebase / backend
+          // resolution), so read time from allBars rather than slice.
+          const splitTime = allBars[splitIdx].time;
           const splitPrice = line.slope * splitIdx + line.intercept;
           const dsBefore = ch.addSeries(LineSeries, {
             ...baseOpts, lineWidth: 1 as any,
@@ -1365,11 +1374,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const isSell = line.type === 'resistance' && line.slope < 0;
           if (isBuy || isSell) {
             const anchorIdx = line.anchorBIdx;
-            // Dedup against existing fired signals AND new ones in
-            // this recompute. Bar-time is the canonical axis (idx is
-            // slice-local and shifts as the visible window slides;
-            // bar-time is stable).
-            const anchorTime = slice[anchorIdx].time as number;
+            // ``anchorIdx`` is in allBars space (post-rebase for fe
+            // mode, backend-resolved for be mode). Read from allBars,
+            // not slice.
+            const anchorTime = allBars[anchorIdx].time as number;
             const dedupKey = (anchorTime << 1) | (isBuy ? 1 : 0);
             // Skip if any existing signal already covers this key.
             const alreadyKnown = srSignalsRef.current.some((s) =>
@@ -1377,7 +1385,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             );
             if (!alreadyKnown) {
               newSignals.push({
-                time: slice[anchorIdx].time as UTCTimestamp,
+                time: allBars[anchorIdx].time as UTCTimestamp,
                 price: line.slope * anchorIdx + line.intercept,
                 side: isBuy ? 'B' : 'S',
               });
@@ -2193,8 +2201,20 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!target) return;
     let cancelled = false;
     const doFetch = async () => {
+      // Pass the operator's broken-minutes setting + show-broken
+      // wedges toggle so the backend's line detection and wedge set
+      // align with what the chart will actually render (otherwise
+      // the broken-minutes slider was capped at the Python default).
+      const minBroken = brokenMinutesRef.current ?? 30;
+      const breakStaleBars = Math.max(
+        1, Math.ceil(minBroken * 60 / BAR_SECONDS),
+      );
       const payload = await fetchBackendSr(
         target, PRELOAD_HOURS, BAR_SIZE,
+        {
+          breakStaleBars,
+          includeBrokenWedges: showBrokenSrRef.current,
+        },
       );
       if (cancelled) return;
       // Preserve last-good data on a transient fetch failure (engine
@@ -2386,9 +2406,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     toggleSrSourceMode: () => {
       srSourceModeRef.current =
         srSourceModeRef.current === 'be' ? 'fe' : 'be';
-      // Drop the cached backend lines when leaving BE so a stale
-      // snapshot doesn't bleed through; the next BE toggle will
-      // refetch on the 15s interval.
+      // Drop the cached backend payload + apex so a stale snapshot
+      // doesn't bleed through after the toggle. The next BE turn
+      // refetches on the 15s interval (or sooner if anything else
+      // triggers the effect).
+      srBackendDataRef.current = null;
+      srBackendApexRef.current = null;
+      srArrowsRef.current = [];
       scheduleSrRecomputeRef.current?.(true);
       setSrSourceModeTick((n) => n + 1);
       return srSourceModeRef.current;

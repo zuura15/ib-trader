@@ -648,7 +648,17 @@ class ChartSignalStrategy:
         if tri_block_dist > 0 and (
             long_line is not None or short_line is not None
         ):
-            wedges = find_wedges(supports, resistances, last_idx)
+            wedge_max_apex = int(self.config.get(
+                "wedge_max_apex_bars_ahead", 200,
+            ))
+            wedge_min_overlap = int(self.config.get(
+                "wedge_min_overlap_bars", 5,
+            ))
+            wedges = find_wedges(
+                supports, resistances, last_idx,
+                max_apex_bars_ahead=wedge_max_apex,
+                min_overlap_bars=wedge_min_overlap,
+            )
             apex_min = wedges[0].apex_bars_ahead if wedges else None
             if apex_min is not None and apex_min <= tri_block_dist:
                 actions.append(LogSignal(

@@ -25,6 +25,7 @@ export interface BackendSrLine {
   is_broken: boolean;
   break_ts: string | null;
   break_price: number | null;
+  third_touch_ts: string | null;
   slope_per_bar: number;
   intercept: number;
 }
@@ -96,17 +97,22 @@ export function backendLineToSRLine(
   const anchorBIdx = _idxForTs(allBars, bl.anchor_b_ts);
   const toIdx = _idxForTs(allBars, bl.to_ts);
   if (fromIdx < 0 || anchorBIdx < 0 || toIdx < 0) return null;
+  // ``from_price`` is the trusted price-axis anchor; without it we
+  // can't safely rebase the intercept into frontend index space.
+  // Drop the line rather than fall back to backend's raw intercept
+  // (which is in backend-bar-index space and would skew the line).
+  if (bl.from_price == null) return null;
   const breakIdx = bl.is_broken && bl.break_ts
     ? _idxForTs(allBars, bl.break_ts)
     : null;
+  const thirdTouchIdx = bl.third_touch_ts
+    ? _idxForTs(allBars, bl.third_touch_ts)
+    : null;
   // Recompute index-space intercept so the renderer's
-  // ``slope * idx + intercept`` math (currently unused for line
-  // drawing — it uses endpoint times directly — but used for
-  // wedge / triangle math elsewhere) stays consistent with the
-  // resolved indices.
-  const intercept = bl.from_price != null
-    ? bl.from_price - bl.slope_per_bar * fromIdx
-    : bl.intercept;
+  // ``slope * idx + intercept`` math stays consistent with the
+  // frontend-resolved indices regardless of any drift between the
+  // backend's and frontend's first-bar timestamp.
+  const intercept = bl.from_price - bl.slope_per_bar * fromIdx;
   return {
     type: bl.type,
     fromIdx,
@@ -116,8 +122,21 @@ export function backendLineToSRLine(
     intercept,
     touches: bl.touches,
     breakIdx: breakIdx != null && breakIdx >= 0 ? breakIdx : null,
-    thirdTouchIdx: null,   // backend doesn't expose this yet
+    thirdTouchIdx: thirdTouchIdx != null && thirdTouchIdx >= 0
+      ? thirdTouchIdx : null,
   };
+}
+
+export interface FetchSrOptions {
+  /** Bot's ``near_touch_tolerance_fraction`` if a per-bot YAML value
+   *  exists; ``null``/undefined → backend uses the shared default. */
+  nearTouchToleranceFraction?: number | null;
+  /** Operator's "broken visible for N min" toolbar value, converted
+   *  to bars (3-min granularity). ``undefined`` → backend default. */
+  breakStaleBars?: number | null;
+  /** Match the chart toolbar's "show broken" toggle so wedges that
+   *  depend on a broken leg appear / hide consistently. */
+  includeBrokenWedges?: boolean;
 }
 
 /** Fetch ``/api/sr`` for the given target over a configurable
@@ -126,6 +145,7 @@ export async function fetchBackendSr(
   target: { conId: number | null; symbol: string; secType: string },
   hours: number,
   barSize: string,
+  opts: FetchSrOptions = {},
 ): Promise<BackendSrPayload | null> {
   const params = new URLSearchParams({
     hours: String(Math.max(1, Math.min(72, Math.ceil(hours)))),
@@ -136,6 +156,20 @@ export async function fetchBackendSr(
   } else {
     params.set('symbol', target.symbol);
     params.set('sec_type', target.secType);
+  }
+  if (opts.nearTouchToleranceFraction != null
+      && Number.isFinite(opts.nearTouchToleranceFraction)) {
+    params.set(
+      'near_touch_tolerance_fraction',
+      String(opts.nearTouchToleranceFraction),
+    );
+  }
+  if (opts.breakStaleBars != null
+      && Number.isFinite(opts.breakStaleBars)) {
+    params.set('break_stale_bars', String(Math.max(1, opts.breakStaleBars)));
+  }
+  if (opts.includeBrokenWedges) {
+    params.set('include_broken_wedges', 'true');
   }
   try {
     const r = await fetch(`/api/sr?${params.toString()}`);

@@ -611,6 +611,9 @@ async def get_sr(
     sec_type: str = "STK",
     hours: int = 2,
     bar_size: str = "3 mins",
+    near_touch_tolerance_fraction: float | None = None,
+    break_stale_bars: int | None = None,
+    include_broken_wedges: bool = False,
 ):
     """Canonical SR detection: lines + wedges + pivot timestamps.
 
@@ -640,27 +643,41 @@ async def get_sr(
 
     from ib_trader.signals.sr_fan import (
         detect_lines, find_pivot_highs, find_pivot_lows,
-        find_wedges, TOUCH_TOLERANCE_FRACTION,
+        find_wedges, NEAR_TOUCH_TOLERANCE_FRACTION, BREAK_STALE_BARS,
     )
 
     closes = [float(b["close"]) for b in bars_raw]
     last_idx = len(closes) - 1
     timestamps = [b["ts"] for b in bars_raw]
 
-    # Use the same near-touch tolerance the live strategy defaults to
-    # (5 × TOUCH_TOLERANCE_FRACTION = 0.001) so wedge / line detection
-    # is byte-for-byte what chart_signal sees.
-    near_frac = 5 * TOUCH_TOLERANCE_FRACTION
+    # Defaults are the shared sr_fan constants so per-bot YAML
+    # overrides can be passed through via query params and the chart
+    # paints exactly what the bot reasons on.
+    near_frac = (
+        near_touch_tolerance_fraction
+        if near_touch_tolerance_fraction is not None
+        else NEAR_TOUCH_TOLERANCE_FRACTION
+    )
+    bsb = (
+        break_stale_bars
+        if break_stale_bars is not None
+        else BREAK_STALE_BARS
+    )
 
     supports = detect_lines(
         closes, up_to=last_idx, type_="support",
         near_touch_tolerance_fraction=near_frac,
+        break_stale_bars=bsb,
     )
     resistances = detect_lines(
         closes, up_to=last_idx, type_="resistance",
         near_touch_tolerance_fraction=near_frac,
+        break_stale_bars=bsb,
     )
-    wedges = find_wedges(supports, resistances, last_idx)
+    wedges = find_wedges(
+        supports, resistances, last_idx,
+        include_broken=include_broken_wedges,
+    )
 
     def _line_payload(ln) -> dict:
         from_price = (
@@ -697,6 +714,13 @@ async def get_sr(
                 if ln.break_idx is not None and 0 <= ln.break_idx < len(timestamps)
                 else None,
             "break_price": break_price,
+            # 3rd strict-touch anchor — used by the chart to thicken
+            # the post-3rd segment when a 4th near-touch upgrades the
+            # line. ``None`` when the line has only 2 strict touches.
+            "third_touch_ts": timestamps[ln.third_touch_idx]
+                if ln.third_touch_idx is not None
+                and 0 <= ln.third_touch_idx < len(timestamps)
+                else None,
             # Numeric line params still exposed for the bot / backtest
             # consumers; the chart renders from the (ts, price) pairs
             # above and doesn't need them.
