@@ -49,13 +49,12 @@ def _default_config(sec_type: str = "FUT") -> dict:
         # filter would reject most semantic tests. Disabled here;
         # dedicated tests in TestEntryDistanceFilter cover the rule.
         "far_from_pivot_filter_enabled": False,
-        # The q_session filter rejects lines whose Q anchor is in a
-        # different PT session than the fire bar. Real-time tests
-        # build wallclock-now bars; if the fixture's older bars
-        # happen to span a session boundary (06:30 / 15:00 / 17:00
-        # / 00:00 PT), the filter kicks in unpredictably. Disabled
-        # here; dedicated tests in TestQSessionFilter cover the rule.
-        "entry_q_session_filter_enabled": False,
+        # The stale_line filter rejects lines whose Q anchor is older
+        # than max_q_age_hours (default 24h). Real-time tests build
+        # wallclock-now bars; if a fixture happens to span more than
+        # 24h of synthetic time the filter kicks in unpredictably.
+        # Disabled here; TestStaleLineFilter covers the rule.
+        "entry_stale_line_filter_enabled": False,
     }
 
 
@@ -443,11 +442,11 @@ class TestMarginalEntryMode:
         assert (el.get("marginal_filters") or []) == []
 
 
-class TestQSessionFilter:
-    """FILTER_Q_SESSION: reject if chosen line's Q anchor is in a
-    different PT session from the fire bar. Defends against the
-    MES LONG @ 18:36 PT on 2026-05-14 where Q was 12h back in a
-    prior session."""
+class TestStaleLineFilter:
+    """FILTER_STALE_LINE: reject if the chosen line's Q anchor is
+    older than the configured max age (default 24h). Defends against
+    pivots anchored on stale lines whose level is no longer
+    representative of current price structure."""
 
     def _make_bar_event(self, bars):
         return BarCompleted(
@@ -455,28 +454,20 @@ class TestQSessionFilter:
         )
 
     @pytest.mark.asyncio
-    async def test_rejects_q_in_prior_session(self):
-        # Build 100 bars: Q anchored at 09:00 PT (session 1), fire
-        # at 18:30 PT (session 3) — different sessions, must reject.
-        # Use one bar at 09:00 PT and a run from 18:00 PT onwards
-        # so a 3-touch line can form within the recent run.
+    async def test_rejects_q_older_than_cap(self):
+        # Build 200 bars at 3-min spacing (10h coverage); with the
+        # max-age tightened to 4h the Q anchor at idx 0 is older
+        # than the cap, so the filter must fire.
         cfg = _default_config()
-        cfg["entry_q_session_filter_enabled"] = True
+        cfg["entry_stale_line_filter_enabled"] = True
+        cfg["entry_max_q_age_hours"] = 4.0
         # Disable other filters that might preempt.
         cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
-        # 09:00 AM PT 2026-05-10 = 16:00 UTC
         morning = datetime(2026, 5, 10, 16, 0, tzinfo=timezone.utc)
-        # 18:00 PT same day = 01:00 UTC next day. Use a window that
-        # makes the older pivot the only viable Q.
-        # Construct: pivot-low at morning, then run upward into evening,
-        # creating a support line from morning → evening pivot.
-        # Simplest: morning low, mid-day high, evening low (= P), then
-        # rising right shoulder triggering 3rd touch fire.
         bars = []
-        # 200 bars starting morning, 3-min spaced (=10h coverage)
         for i in range(200):
             t = morning + timedelta(seconds=BAR_SECONDS * i)
             # V-shape: dip at idx 0 (4660), peak at idx 100 (4680),
@@ -492,41 +483,11 @@ class TestQSessionFilter:
             bars.append(_bar(t, close))
         actions = await s.on_event(self._make_bar_event(bars), ctx)
         skips = [a for a in actions if isinstance(a, LogSignal)
-                 and (a.payload or {}).get("filter") == "q_session"]
+                 and (a.payload or {}).get("filter") == "stale_line"]
         if skips:
             p = skips[0].payload
-            assert p["q_session"] != p["current_session"]
-
-    def test_session_id_boundaries(self):
-        # Direct boundary verification on futures_session_id.
-        from ib_trader.signals.sr_fan import futures_session_id, _PT
-        # 06:30 PT exact → session 1 boundary
-        dt = datetime(2026, 5, 14, 6, 30, tzinfo=_PT)
-        assert futures_session_id(dt) == ("2026-05-14", 1)
-        # 14:59 PT → still session 1
-        assert futures_session_id(
-            datetime(2026, 5, 14, 14, 59, tzinfo=_PT)
-        ) == ("2026-05-14", 1)
-        # 15:00 PT → session 2
-        assert futures_session_id(
-            datetime(2026, 5, 14, 15, 0, tzinfo=_PT)
-        ) == ("2026-05-14", 2)
-        # 17:00 PT → session 3
-        assert futures_session_id(
-            datetime(2026, 5, 14, 17, 0, tzinfo=_PT)
-        ) == ("2026-05-14", 3)
-        # 23:59 PT → still session 3
-        assert futures_session_id(
-            datetime(2026, 5, 14, 23, 59, tzinfo=_PT)
-        ) == ("2026-05-14", 3)
-        # 00:00 PT next day → session 4 of next day
-        assert futures_session_id(
-            datetime(2026, 5, 15, 0, 0, tzinfo=_PT)
-        ) == ("2026-05-15", 4)
-        # 06:29 PT → still session 4
-        assert futures_session_id(
-            datetime(2026, 5, 15, 6, 29, tzinfo=_PT)
-        ) == ("2026-05-15", 4)
+            assert p["q_age_hours"] > p["max_q_age_hours"]
+            assert p["max_q_age_hours"] == 4.0
 
 
 class TestOpposingDominanceFilter:
@@ -548,7 +509,7 @@ class TestOpposingDominanceFilter:
         # trigger opposing_dominance.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = False
-        cfg["entry_q_session_filter_enabled"] = False
+        cfg["entry_stale_line_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
@@ -566,7 +527,7 @@ class TestOpposingDominanceFilter:
         # fires the filter.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = False
-        cfg["entry_q_session_filter_enabled"] = False
+        cfg["entry_stale_line_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = True
         cfg["entry_opposing_dominance_ratio"] = 0.5
         s = ChartSignalStrategy(cfg)

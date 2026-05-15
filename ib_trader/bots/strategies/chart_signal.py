@@ -61,7 +61,6 @@ from ib_trader.signals.sr_fan import (
     find_pivot_highs,
     find_pivot_lows,
     find_wedges,
-    futures_session_id,
     in_futures_deadzone,
 )
 
@@ -87,7 +86,7 @@ FILTER_SHOULDER = "shoulder"
 FILTER_TIGHT_TRIANGLE = "tight_triangle"
 FILTER_MIN_TARGET = "min_target"
 FILTER_FAR_FROM_PIVOT = "far_from_pivot"
-FILTER_Q_SESSION = "q_session"
+FILTER_STALE_LINE = "stale_line"
 FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
 
 # Named exit triggers (alongside the bar-close line_breach / trail_stop).
@@ -785,14 +784,13 @@ class ChartSignalStrategy:
         # pivot's matching side) that the just-confirmed pivot lies
         # on within touch_tol. This is what the audit feed's
         # TOUCH·N chip counts: "N = number of trendlines this
-        # pivot landed on". Current-session = same PT futures
-        # session as the fire bar (Q anchor in the same session).
+        # pivot landed on". Stale-line cap: Q anchor must be within
+        # ``entry_max_q_age_hours`` (default 24h) of the fire bar —
+        # same threshold the bot's stale_line entry filter uses.
         pivot_touching_lines: list[dict] = []
         if np_idx >= 0:
-            from ib_trader.signals.sr_fan import futures_session_id
+            from datetime import timedelta as _td_audit
             # Bar timestamps come from /engine/history into ``window``.
-            # The bar at index i has timestamp window[i]["ts"] or
-            # ["timestamp_utc"]. Use that to look up its session.
             def _bar_dt(i):
                 if 0 <= i < len(window):
                     ts = (window[i].get("timestamp_utc")
@@ -801,7 +799,9 @@ class ChartSignalStrategy:
                 return None
 
             fire_dt = _bar_dt(last_idx)
-            cur_sess = futures_session_id(fire_dt) if fire_dt else None
+            max_q_age_hours_audit = float(self.config.get(
+                "entry_max_q_age_hours", 24.0,
+            ))
 
             def _enumerate_touching(lines, side_pivots, pivot_kind):
                 out: list[dict] = []
@@ -838,12 +838,13 @@ class ChartSignalStrategy:
                                 strict_old += 1
                         if strict_old < MIN_TOUCHES:
                             continue
-                    # Current-session gate on Q anchor.
-                    if cur_sess is not None:
+                    # Stale-line gate: Q anchor must be within
+                    # max_q_age_hours of the fire bar.
+                    if fire_dt is not None:
                         q_dt = _bar_dt(ln.from_idx)
                         if q_dt is not None:
-                            q_sess = futures_session_id(q_dt)
-                            if q_sess != cur_sess:
+                            q_age_h = (fire_dt - q_dt).total_seconds() / 3600.0
+                            if q_age_h > max_q_age_hours_audit:
                                 continue
                     out.append({
                         "kind": ln.type,
@@ -1540,19 +1541,24 @@ class ChartSignalStrategy:
                 else:
                     return actions
 
-        # Q-session filter (FILTER_Q_SESSION).
-        # The chosen line's earlier construction anchor (Q = from_idx)
-        # must share a PT session with the fire bar. Lines built in a
-        # prior session — e.g. a 4-touch support anchored 12h back at
-        # the morning's RTH session, fired against during evening
-        # Asia — represent stale structure that the new session's
-        # participants may not honor.
-        # Sessions (PT, futures): 06:30-15:00, 15:00-17:00,
-        # 17:00-24:00, 00:00-06:30. See ``futures_session_id``.
-        qs_enabled = bool(self.config.get(
-            "entry_q_session_filter_enabled", True,
+        # Stale-line filter (FILTER_STALE_LINE).
+        # Caps the age of the chosen line's Q anchor. Lines whose Q
+        # anchor is more than ``entry_max_q_age_hours`` old represent
+        # stale structure that the current bar's participants may not
+        # honor.
+        # Replaces the older PT-session-bucket approach (operator's
+        # call 2026-05-15) — flat 24h is simpler to reason about than
+        # 4 boundary breakpoints, and inter-session lines have proven
+        # legitimate often enough to not warrant a hard reject.
+        sl_enabled = bool(self.config.get(
+            "entry_stale_line_filter_enabled",
+            # Back-compat with old key name.
+            self.config.get("entry_q_session_filter_enabled", True),
         ))
-        if qs_enabled:
+        max_q_age_hours = float(self.config.get(
+            "entry_max_q_age_hours", 24.0,
+        ))
+        if sl_enabled:
             q_time = None
             if 0 <= chosen.from_idx < len(window):
                 wq = window[chosen.from_idx]
@@ -1560,23 +1566,26 @@ class ChartSignalStrategy:
                     wq.get("timestamp_utc") or wq.get("ts"),
                 )
             if q_time is not None:
-                q_sess = futures_session_id(q_time)
-                cur_sess = futures_session_id(bar_time)
-                if q_sess != cur_sess:
+                from datetime import timedelta as _td
+                q_age_seconds = (
+                    bar_time - q_time
+                ).total_seconds()
+                q_age_hours = q_age_seconds / 3600.0
+                if q_age_hours > max_q_age_hours:
                     actions.append(LogSignal(
                         event_type=LogEventType.SKIP,
                         message=(
-                            f"{FILTER_Q_SESSION} filter ({direction.upper()})"
-                            f" — Q anchor in session {q_sess[1]} ({q_sess[0]})"
-                            f", fire bar in session {cur_sess[1]} "
-                            f"({cur_sess[0]}); line spans sessions"
+                            f"{FILTER_STALE_LINE} filter ({direction.upper()})"
+                            f" — Q anchor {q_age_hours:.1f}h old "
+                            f"(cap {max_q_age_hours:.1f}h); line is "
+                            f"stale relative to current price action"
                         ),
                         payload={
-                            "filter": FILTER_Q_SESSION,
+                            "filter": FILTER_STALE_LINE,
                             "direction": direction,
                             "q_anchor_time": q_time.isoformat(),
-                            "q_session": list(q_sess),
-                            "current_session": list(cur_sess),
+                            "q_age_hours": round(q_age_hours, 2),
+                            "max_q_age_hours": max_q_age_hours,
                             "entry_decision": decision_diag,
                         },
                     ))
@@ -1971,7 +1980,7 @@ class ChartSignalStrategy:
         entry_line = ctx.state.get("entry_line") or {}
         is_marginal = bool(entry_line.get("marginal", False))
         from ib_trader.signals.sr_fan import (
-            detect_lines, futures_session_id,
+            detect_lines,
         )
         if is_marginal:
             supports = detect_lines(
@@ -1993,11 +2002,13 @@ class ChartSignalStrategy:
         trigger_from_idx = entry_line.get("from_idx")
         trigger_anchor_b_idx = entry_line.get("anchor_b_idx")
 
-        # Current-session gate (marginal mode only). Reuses the same
-        # futures_session_id helper the q_session entry filter uses.
-        # Looks up the bar's timestamp via fetched[i]["ts"] (the
-        # /engine/history field).
-        cur_sess = None
+        # Stale-line gate (marginal mode only). Same threshold the
+        # bot's stale_line entry filter uses — Q anchor must be
+        # within entry_max_q_age_hours of the current bar.
+        last_dt = None
+        max_q_age_hours_cache = float(self.config.get(
+            "entry_max_q_age_hours", 24.0,
+        ))
         if is_marginal:
             from datetime import datetime as _dt
             def _bar_dt(i):
@@ -2012,7 +2023,6 @@ class ChartSignalStrategy:
                             return None
                 return None
             last_dt = _bar_dt(last_idx)
-            cur_sess = futures_session_id(last_dt) if last_dt else None
 
         min_touches = int(self.config.get("counter_exit_min_touches", 2))
         cache: list[dict] = []
@@ -2021,16 +2031,17 @@ class ChartSignalStrategy:
                 continue
             if ln.touches < min_touches:
                 continue
-            # Marginal mode: exclude trigger line + current-session-only.
+            # Marginal mode: exclude trigger line + stale-line gate
+            # (Q anchor within max_q_age_hours of current bar).
             if is_marginal:
                 if (ln.from_idx == trigger_from_idx
                         and ln.anchor_b_idx == trigger_anchor_b_idx):
                     continue
-                if cur_sess is not None:
+                if last_dt is not None:
                     q_dt = _bar_dt(ln.from_idx)
                     if q_dt is not None:
-                        q_sess = futures_session_id(q_dt)
-                        if q_sess != cur_sess:
+                        q_age_h = (last_dt - q_dt).total_seconds() / 3600.0
+                        if q_age_h > max_q_age_hours_cache:
                             continue
             value = ln.intercept + ln.slope * last_idx
             if not is_marginal:
