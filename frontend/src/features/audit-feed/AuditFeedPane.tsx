@@ -133,33 +133,37 @@ function BarEvalRow({ r }: { r: AuditRow }) {
             title={`pivot lies on ${lineCount} current-session trendline(s)`} />
     : <Chip text="NO_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
-  // Filter chip — three states:
-  //   FILTER·<name>  amber, a filter rejected the entry
-  //   PASSED         green, this bar had an order-trigger candidate
-  //                  (pivot landed on at least one 3+touch line) and
+  // Filter chip — three states, with N/A taking precedence over
+  // FILTER·<name> when there's no real order-trigger candidate.
+  //
+  //   N/A            muted, no current-session 3+touch line at this
+  //                  pivot — filters that happen to "fire" on a
+  //                  stale-session 3+touch line aren't meaningful
+  //                  for entry, so we hide them. The bot's
+  //                  ``q_session`` filter would have rejected them
+  //                  anyway; surfacing min_target / shoulder /
+  //                  far_from_pivot on those bars just confuses
+  //                  the operator's read.
+  //   FILTER·<name>  amber, a filter rejected an entry that DID
+  //                  have a current-session 3+touch candidate.
+  //   PASSED         green, current-session 3+touch candidate AND
   //                  every filter let it through.
-  //   N/A            muted, no order-trigger candidate existed —
-  //                  no pivot, no lines touched, OR every touched
-  //                  line was a tentative 2-touch (3 is the minimum
-  //                  the bot accepts for entry, so 2-touch lines
-  //                  never trigger filter evaluation).
   const filt = a.filter_name;
-  // An order-trigger candidate requires at least one line with >= 3
-  // touches at this pivot. The strategy emits only 3+touch lines into
-  // ``pivot_touching_lines``, but check defensively in case older
-  // rows (or future code paths) carry weaker lines.
-  const has3TouchLine = (a.touch?.lines ?? []).some(
+  // Only consider this a real order-trigger candidate if at least one
+  // entry in ``pivot_touching_lines`` has >= 3 touches. The strategy
+  // already gates that list on (a) 3+ touches and (b) current PT
+  // session, so an empty/2-touch-only list = no candidate.
+  const hasOrderCandidate = (a.touch?.lines ?? []).some(
     (ln) => (ln.touches ?? 0) >= 3,
   );
-  const hasOrderCandidate = has3TouchLine;
-  const filterChip = filt
+  const filterChip = !hasOrderCandidate
+    ? <Chip text="N/A" fg="#94a3b8" bg="rgba(148,163,184,0.08)"
+            title="no current-session 3+touch candidate; filters not relevant" />
+    : filt
     ? <Chip text={`FILTER·${filt}`} fg="#b45309" bg="rgba(245,158,11,0.18)"
             title={a.filter_detail || filt} />
-    : hasOrderCandidate
-    ? <Chip text="PASSED" fg="#16a34a" bg="rgba(34,197,94,0.12)"
-            title="all filters passed; entry triggered (or would have)" />
-    : <Chip text="N/A" fg="#94a3b8" bg="rgba(148,163,184,0.08)"
-            title="no order-trigger candidate this bar; filters didn't run" />;
+    : <Chip text="PASSED" fg="#16a34a" bg="rgba(34,197,94,0.12)"
+            title="all filters passed; entry triggered (or would have)" />;
 
   // Outcome chip — B/S/exit/— with strong color.
   const outcome = a.outcome ?? '—';
@@ -329,11 +333,13 @@ function ExpandedBarEval({ row, onShowRaw }: {
       {lineEntries}
       <DetailLine
         label="filter"
-        value={a.filter_name
-          ? `${a.filter_name} — ${a.filter_detail ?? ''}`
-          : ((a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
-              ? '— (passed all filters)'
-              : 'N/A — no 3+touch order-trigger candidate this bar')}
+        value={
+          !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
+            ? 'N/A — no current-session 3+touch candidate'
+            : a.filter_name
+            ? `${a.filter_name} — ${a.filter_detail ?? ''}`
+            : '— (passed all filters)'
+        }
       />
       <DetailLine label="outcome" value={
         a.outcome === 'B' ? 'BUY · entry order placed'
