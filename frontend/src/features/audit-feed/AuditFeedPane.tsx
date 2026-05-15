@@ -46,6 +46,22 @@ function _fmtMoney(s: string | null): string {
   return `${sign}$${n.toFixed(2)}`;
 }
 
+// Reformat a filter SKIP message for the detail pane. The backend
+// emits ``"<name> filter (<DIR>) — <description>"``; combined with
+// the filter_name prefix the original render read
+// ``"<name> — <name> filter (<DIR>) — <description>"`` which buries
+// the meaningful part. Lead with the description, then suffix the
+// direction (filter_name is already on the chip above).
+function _fmtFilter(name: string, detail: string): string {
+  if (!detail) return name;
+  const parts = detail.split(' — ');
+  if (parts.length < 2) return detail;
+  const description = parts.slice(1).join(' — ');
+  const dirMatch = parts[0].match(/\(([^)]+)\)/);
+  const dir = dirMatch ? ` — ${name} (${dirMatch[1]})` : ` — ${name}`;
+  return `${description}${dir}`;
+}
+
 function _fmtDuration(seconds: number | null | undefined): string {
   if (!seconds || !Number.isFinite(seconds)) return '';
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -334,17 +350,17 @@ function ExpandedBarEval({ row, onShowRaw }: {
           : nextClose === null ? '— (bar not closed yet)'
           : _fmtPrice(nextClose)}
       />
-      {lineEntries}
       <DetailLine
         label="filter"
         value={
           !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
             ? 'N/A — no current-session 3+touch candidate'
             : a.filter_name
-            ? `${a.filter_name} — ${a.filter_detail ?? ''}`
+            ? _fmtFilter(a.filter_name, a.filter_detail ?? '')
             : '— (passed all filters)'
         }
       />
+      {lineEntries}
       <DetailLine label="outcome" value={
         a.outcome === 'B' ? 'BUY · entry order placed'
         : a.outcome === 'S' ? 'SELL · entry order placed'
