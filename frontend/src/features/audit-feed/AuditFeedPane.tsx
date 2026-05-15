@@ -136,14 +136,22 @@ function BarEvalRow({ r }: { r: AuditRow }) {
   // Filter chip — three states:
   //   FILTER·<name>  amber, a filter rejected the entry
   //   PASSED         green, this bar had an order-trigger candidate
-  //                  (pivot landed on a 3-touch line) and every filter
-  //                  let it through (→ usually paired with FIRED outcome)
-  //   N/A            muted, no order-trigger candidate existed
-  //                  (no pivot, or pivot didn't land on any line) — filters
-  //                  never had a chance to evaluate, so reporting them
-  //                  as "PASSED" would be misleading.
+  //                  (pivot landed on at least one 3+touch line) and
+  //                  every filter let it through.
+  //   N/A            muted, no order-trigger candidate existed —
+  //                  no pivot, no lines touched, OR every touched
+  //                  line was a tentative 2-touch (3 is the minimum
+  //                  the bot accepts for entry, so 2-touch lines
+  //                  never trigger filter evaluation).
   const filt = a.filter_name;
-  const hasOrderCandidate = (a.touch?.count ?? 0) > 0;
+  // An order-trigger candidate requires at least one line with >= 3
+  // touches at this pivot. The strategy emits only 3+touch lines into
+  // ``pivot_touching_lines``, but check defensively in case older
+  // rows (or future code paths) carry weaker lines.
+  const has3TouchLine = (a.touch?.lines ?? []).some(
+    (ln) => (ln.touches ?? 0) >= 3,
+  );
+  const hasOrderCandidate = has3TouchLine;
   const filterChip = filt
     ? <Chip text={`FILTER·${filt}`} fg="#b45309" bg="rgba(245,158,11,0.18)"
             title={a.filter_detail || filt} />
@@ -323,9 +331,9 @@ function ExpandedBarEval({ row, onShowRaw }: {
         label="filter"
         value={a.filter_name
           ? `${a.filter_name} — ${a.filter_detail ?? ''}`
-          : ((a.touch?.count ?? 0) > 0
+          : ((a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
               ? '— (passed all filters)'
-              : 'N/A — no order-trigger candidate this bar')}
+              : 'N/A — no 3+touch order-trigger candidate this bar')}
       />
       <DetailLine label="outcome" value={
         a.outcome === 'B' ? 'BUY · entry order placed'
