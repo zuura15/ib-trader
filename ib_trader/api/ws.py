@@ -286,7 +286,21 @@ async def _fetch_channel_data_async(
     if channel == "status" and redis:
         try:
             from ib_trader.api.routes.system import get_status as _get_status_async
-            payload = await _get_status_async(redis=redis)
+            from ib_trader.api.deps import get_bot_trades
+            # Direct call bypasses FastAPI's dependency injection, so
+            # ``bot_trades`` would otherwise stay as a Depends marker
+            # and AttributeError inside the rolling-24h P&L query.
+            _bt_gen = get_bot_trades()
+            _bt = next(_bt_gen)
+            try:
+                payload = await _get_status_async(
+                    redis=redis, bot_trades=_bt,
+                )
+            finally:
+                try:
+                    next(_bt_gen)
+                except StopIteration:
+                    pass
             data = [{"id": "__status__", **payload}]
         except Exception:
             logger.exception(json.dumps({"event": "STATUS_REDIS_FETCH_FAILED"}))
