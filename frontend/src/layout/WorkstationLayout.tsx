@@ -15,9 +15,10 @@ const TABS_PREFIX = 'ib-layout-tabs-';
 // stored version differs from this and falls back to the default.
 const LAYOUT_VERSION: Partial<Record<LayoutVariant, number>> = {
   // T v3: Slot 2 (Micro Oil chart) replaced by the Audit Feed pane.
-  // Stale v2 layouts cached in localStorage get discarded and reseeded
-  // from variantT so the MCL chart no longer renders on reload.
-  T: 3,
+  // T v4: Help bottom-border removed from every variant; chart-bot
+  //       PanelShell header removed (gives chart panes their full
+  //       vertical space back). Stale v3 layouts get discarded.
+  T: 4,
 };
 const VERSION_PREFIX = 'ib-layout-ver-';
 

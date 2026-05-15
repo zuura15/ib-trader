@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { PanelShell } from '../../components/PanelShell';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import type { BotPositionState } from '../../data/useBotState';
@@ -127,7 +126,7 @@ export function ChartBotPane({ slot }: Props) {
   const onStop = () =>
     runAction('stop', 'Stopping…', 'Stopped.', 'Stop failed');
 
-  const header = `${symbol ?? '—'} · Slot ${slot}`;
+  // (was a PanelShell title — now redundant with the flexlayout tab label)
 
   const renderRight = (state: BotPositionState) => {
     const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
@@ -237,31 +236,33 @@ export function ChartBotPane({ slot }: Props) {
   };
 
   return (
-    <PanelShell title={header}>
-      <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
-        {botFetchError && (
-          <div
-            style={{
-              padding: '6px 10px', fontSize: 11,
-              color: 'var(--accent-red)',
-              background: 'var(--bg-secondary)',
-              borderBottom: '1px solid var(--border-default)',
-            }}
-          >
-            {botFetchError} — add <code>config/bots/{botId}.yaml</code>{' '}
-            with <code>strategy_name: chart_signal</code>.
-          </div>
-        )}
-        <div className="flex-1" style={{ minHeight: 0 }}>
-          <BotChart
-            botId={botId}
-            botRef={bot?.ref_id}
-            symbol={symbol}
-            secType={secType}
-            renderHeader={renderRight}
-          />
+    // PanelShell stripped: the chart-bot tab label already shows the
+    // slot/symbol via flexlayout's tab handle, and BotChart's own
+    // toolbar carries the state banner + action buttons. The extra
+    // header row was double-billing and stealing chart real estate.
+    <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
+      {botFetchError && (
+        <div
+          style={{
+            padding: '6px 10px', fontSize: 11,
+            color: 'var(--accent-red)',
+            background: 'var(--bg-secondary)',
+            borderBottom: '1px solid var(--border-default)',
+          }}
+        >
+          {botFetchError} — add <code>config/bots/{botId}.yaml</code>{' '}
+          with <code>strategy_name: chart_signal</code>.
         </div>
+      )}
+      <div className="flex-1" style={{ minHeight: 0 }}>
+        <BotChart
+          botId={botId}
+          botRef={bot?.ref_id}
+          symbol={symbol}
+          secType={secType}
+          renderHeader={renderRight}
+        />
       </div>
-    </PanelShell>
+    </div>
   );
 }

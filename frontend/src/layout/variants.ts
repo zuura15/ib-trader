@@ -251,16 +251,7 @@ export const variantC: IJsonModel = {
 // vertically. So a "column" here is a nested ``row``.
 export const variantT: IJsonModel = {
   global: globalConfig,
-  borders: [
-    {
-      type: 'border',
-      location: 'bottom',
-      size: 120,
-      children: [
-        { type: 'tab', name: 'Help', component: 'help' },
-      ],
-    },
-  ],
+  // borders removed — Help is accessible via Bots panel and CLAUDE.md.
   layout: {
     type: 'row',
     weight: 100,
