@@ -43,12 +43,19 @@ def _default_config(sec_type: str = "FUT") -> dict:
         # gate has its own dedicated tests that build wallclock-
         # recent bar events and use the production-default cap.
         "max_signal_age_seconds": 10 ** 9,
-        # The entry-distance filter (FILTER_ENTRY_DISTANCE) caps
+        # The entry-distance filter (FILTER_FAR_FROM_PIVOT) caps
         # entry-to-line gap at 2× trail_dist. Fixture closes drift
         # several units past the synthetic line by design, so the
         # filter would reject most semantic tests. Disabled here;
         # dedicated tests in TestEntryDistanceFilter cover the rule.
-        "entry_distance_filter_enabled": False,
+        "far_from_pivot_filter_enabled": False,
+        # The q_session filter rejects lines whose Q anchor is in a
+        # different PT session than the fire bar. Real-time tests
+        # build wallclock-now bars; if the fixture's older bars
+        # happen to span a session boundary (06:30 / 15:00 / 17:00
+        # / 00:00 PT), the filter kicks in unpredictably. Disabled
+        # here; dedicated tests in TestQSessionFilter cover the rule.
+        "entry_q_session_filter_enabled": False,
     }
 
 
@@ -316,7 +323,7 @@ class TestEntry:
 
 
 class TestEntryDistanceFilter:
-    """FILTER_ENTRY_DISTANCE: reject when entry-to-line gap > 2× trail_dist."""
+    """FILTER_FAR_FROM_PIVOT: reject when entry-to-line gap > 2× trail_dist."""
 
     def _bar_event_at(self, idx: int) -> BarCompleted:
         bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES[: idx + 1])
@@ -331,17 +338,17 @@ class TestEntryDistanceFilter:
         # With trail_pct = 0.0003 (default) and 2× mult: cap = 0.0084.
         # Gap 1.5 >> cap → reject.
         cfg = _default_config()
-        cfg["entry_distance_filter_enabled"] = True
+        cfg["far_from_pivot_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
         assert not [a for a in actions if isinstance(a, PlaceOrder)]
         skips = [a for a in actions if isinstance(a, LogSignal)
                  and a.event_type == LogEventType.SKIP
-                 and "entry_distance" in (a.message or "")]
+                 and "far_from_pivot" in (a.message or "")]
         assert skips, "expected entry_distance SKIP log"
         p = skips[0].payload
-        assert p["filter"] == "entry_distance"
+        assert p["filter"] == "far_from_pivot"
         assert p["direction"] == "long"
         assert p["gap"] > p["cap"]
 
@@ -350,7 +357,7 @@ class TestEntryDistanceFilter:
         # Same fixture, but bump trail_pct so 2× × 14 ≥ 1.5 → cap ≥ 1.5.
         # trail_pct = 0.06 → trail_dist 0.84 → cap 1.68 ≥ 1.5 → pass.
         cfg = _default_config()
-        cfg["entry_distance_filter_enabled"] = True
+        cfg["far_from_pivot_filter_enabled"] = True
         cfg["trail_width_pct"] = 0.06
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
@@ -361,7 +368,7 @@ class TestEntryDistanceFilter:
 
     @pytest.mark.asyncio
     async def test_disabled_by_config_lets_far_entry_through(self):
-        cfg = _default_config()  # entry_distance_filter_enabled: False
+        cfg = _default_config()  # far_from_pivot_filter_enabled: False
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
@@ -371,13 +378,13 @@ class TestEntryDistanceFilter:
     @pytest.mark.asyncio
     async def test_payload_has_cap_and_distance(self):
         cfg = _default_config()
-        cfg["entry_distance_filter_enabled"] = True
+        cfg["far_from_pivot_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
         skips = [a for a in actions if isinstance(a, LogSignal)
                  and a.event_type == LogEventType.SKIP
-                 and (a.payload or {}).get("filter") == "entry_distance"]
+                 and (a.payload or {}).get("filter") == "far_from_pivot"]
         p = skips[0].payload
         assert p["entry_price"] == pytest.approx(14.0)
         assert p["line_value"] == pytest.approx(12.5)
@@ -408,7 +415,7 @@ class TestQSessionFilter:
         cfg = _default_config()
         cfg["entry_q_session_filter_enabled"] = True
         # Disable other filters that might preempt.
-        cfg["entry_distance_filter_enabled"] = False
+        cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
@@ -492,7 +499,7 @@ class TestOpposingDominanceFilter:
         # (3-4 touches each); ratio well under 3.0 → should NOT
         # trigger opposing_dominance.
         cfg = _default_config()
-        cfg["entry_distance_filter_enabled"] = False
+        cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_q_session_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
@@ -510,7 +517,7 @@ class TestOpposingDominanceFilter:
         # 3 touches. Lower the cap to 0.5 so opposing(3) ≥ 4×0.5 = 2.0
         # fires the filter.
         cfg = _default_config()
-        cfg["entry_distance_filter_enabled"] = False
+        cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_q_session_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = True
         cfg["entry_opposing_dominance_ratio"] = 0.5

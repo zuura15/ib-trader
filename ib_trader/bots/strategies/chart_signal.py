@@ -86,7 +86,7 @@ logger = logging.getLogger(__name__)
 FILTER_SHOULDER = "shoulder"
 FILTER_TIGHT_TRIANGLE = "tight_triangle"
 FILTER_MIN_TARGET = "min_target"
-FILTER_ENTRY_DISTANCE = "entry_distance"
+FILTER_FAR_FROM_PIVOT = "far_from_pivot"
 FILTER_Q_SESSION = "q_session"
 FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
 
@@ -1370,39 +1370,49 @@ class ChartSignalStrategy:
             return actions
         is_acceleration_entry = chosen_path == "accel"
 
-        # Entry-distance filter (FILTER_ENTRY_DISTANCE).
-        # Rejects entries where the bar's close has drifted past the
-        # SR line by more than the configured stop band. The line IS
-        # the trigger; entering far away from it means the bar already
-        # ran past the touch zone and we're entering "into thin air"
+        # Far-from-pivot filter (FILTER_FAR_FROM_PIVOT). Rejects
+        # entries where the fire bar's close has overshot the pivot's
+        # rejection point on the trigger line by more than the
+        # configured stop band. The pivot landed on the line; if the
+        # next bar drifts too far past that line, the rejection has
+        # already played out and we'd be entering "into thin air"
         # with most of the trade's R:R consumed before fill.
         #
-        # Cap = trail_dist × ``entry_distance_max_trail_mult`` (default
+        # Cap = trail_dist × ``far_from_pivot_max_trail_mult`` (default
         # 2.0). MGC trail $0.93 → cap $1.86; MES $2.26 → $4.52;
         # MNQ $5.94 → $11.88. Acceleration-entry path is exempt by
         # design — accel ALREADY entered beyond the line.
-        ed_enabled = bool(self.config.get(
-            "entry_distance_filter_enabled", True,
+        ffp_enabled = bool(self.config.get(
+            "far_from_pivot_filter_enabled",
+            # Back-compat with the old config key name.
+            self.config.get("entry_distance_filter_enabled", True),
         ))
-        if ed_enabled and not is_acceleration_entry:
+        if ffp_enabled and not is_acceleration_entry:
             entry_price = closes[last_idx]
             trail_pct = float(self.config.get("trail_width_pct", 0.0003))
             trail_dist = abs(entry_price) * trail_pct
-            mult = float(self.config.get("entry_distance_max_trail_mult", 2.0))
+            mult = float(self.config.get(
+                "far_from_pivot_max_trail_mult",
+                self.config.get("entry_distance_max_trail_mult", 2.0),
+            ))
             cap = trail_dist * mult
             line_at = chosen.intercept + chosen.slope * last_idx
             gap = abs(entry_price - line_at)
             if gap > cap:
+                # Direction-aware wording: pivot HIGH (SHORT) → bar
+                # closed BELOW the resistance; pivot LOW (LONG) → bar
+                # closed ABOVE the support. Either way, the bar
+                # OVERSHOT the pivot's rejection point.
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
-                        f"{FILTER_ENTRY_DISTANCE} filter ({direction.upper()})"
-                        f" — entry {entry_price:.4f} is ${gap:.4f} from "
-                        f"{kind} line {line_at:.4f} (cap ${cap:.4f} = "
-                        f"{mult:.1f}× trail)"
+                        f"{FILTER_FAR_FROM_PIVOT} filter ({direction.upper()}) — "
+                        f"fire bar overshot pivot's {kind} line by "
+                        f"${gap:.4f} (cap ${cap:.4f} = {mult:.1f}× trail). "
+                        f"line @ {line_at:.4f}, entry @ {entry_price:.4f}"
                     ),
                     payload={
-                        "filter": FILTER_ENTRY_DISTANCE,
+                        "filter": FILTER_FAR_FROM_PIVOT,
                         "direction": direction,
                         "entry_price": round(entry_price, 4),
                         "line_value": round(line_at, 4),
