@@ -1988,12 +1988,29 @@ class ChartSignalStrategy:
         # entered ABOVE/BELOW the line by design, so a "breach" of
         # the original line carries no information. Trail does all
         # the exit work.
+        #
+        # ``breach_line`` only fires on bar close when bar_close is
+        # CLEARLY past the line on the unfavorable side — beyond a
+        # ``touch_tolerance_fraction`` band. A near-miss (bar close
+        # within tol of the line) is deferred to the 10 s tick-time
+        # touch+hold on ``tight_zones[trigger]`` so brief retests
+        # don't fire an immediate exit. Operator call 2026-05-15:
+        # "ensure the exit doesnt trigger when the price meets the
+        # original line from the entry side. even then it has to
+        # linger for 10s."
         entry_path = str(entry_line.get("entry_path", "touch"))
+        breach_tol_frac = float(self.config.get(
+            "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+        ))
+        breach_tol = abs(float(line_value)) * breach_tol_frac
         if entry_path == "accel":
             breach_line = False
         else:
-            breach_line = (bar_close < line_value) if direction == "long" \
-                else (bar_close > line_value)
+            breach_line = (
+                bar_close < (line_value - breach_tol)
+                if direction == "long"
+                else bar_close > (line_value + breach_tol)
+            )
 
         actions.append(LogSignal(
             event_type=LogEventType.EXIT_CHECK,
@@ -2041,17 +2058,21 @@ class ChartSignalStrategy:
                 await self._refresh_counter_lines_cache(direction, ctx)
             )
 
-        # Marginal trades — refresh the trigger-line snapshot for the
-        # tick-time touch+hold check. SL is NOT included: the
-        # ``_on_quote`` immediate-fire path reads ``active_stop``
-        # directly and exits the moment mid breaches it (no linger).
-        is_marginal_for_tight = bool(entry_line.get("marginal", False))
-        if is_marginal_for_tight:
-            actions.append(UpdateState({
-                "tight_zones": [
-                    {"value": float(line_value_d), "kind": "trigger"},
-                ],
-            }))
+        # Refresh the trigger-line snapshot for the tick-time
+        # touch+hold check. Populated for BOTH clean and marginal
+        # trades so a near-miss bar close (within touch_tol of the
+        # line) triggers the 10 s linger instead of an immediate
+        # bar-close line_breach — operator call 2026-05-15.
+        # The hard ``breach_line`` gate above still fires immediately
+        # when bar_close is CLEARLY past the line beyond tol.
+        # The SL is NOT included here: marginal trades exit on the
+        # immediate-tick SL path in ``_on_quote``; clean trades exit
+        # on the bar-close trail check above.
+        actions.append(UpdateState({
+            "tight_zones": [
+                {"value": float(line_value_d), "kind": "trigger"},
+            ],
+        }))
         return actions
 
     async def _refresh_counter_lines_cache(
@@ -2284,20 +2305,24 @@ class ChartSignalStrategy:
                 ))
                 return actions
 
-            # (2) Trigger-line touch+hold — keep only the trigger zone
-            # in the tight_zones cache. The SL is handled by the
-            # immediate-fire path above; including it in tight_zones
-            # would re-introduce the 10 s linger on the stop.
+            # Strip any stale "stop" entries; only "trigger" lingers.
             trigger_zones = [z for z in zones if z.get("kind") == "trigger"]
             state_patch["tight_zones"] = trigger_zones
             ctx.state["tight_zones"] = trigger_zones
-            tight_actions = self._check_tight_zones_exit(
-                ctx, float(last), direction, state_patch,
-            )
-            actions.extend(tight_actions)
-            for a in tight_actions:
-                if isinstance(a, PlaceOrder):
-                    return actions
+
+        # Trigger-line touch+hold runs for BOTH clean and marginal
+        # trades. The bar-close ``line_breach`` now only fires on a
+        # CLEAR overshoot (beyond touch_tol of the line); a
+        # near-miss bar close defers to this 10 s linger so a brief
+        # retest doesn't immediately knife a clean trade. Operator
+        # call 2026-05-15.
+        tight_actions = self._check_tight_zones_exit(
+            ctx, float(last), direction, state_patch,
+        )
+        actions.extend(tight_actions)
+        for a in tight_actions:
+            if isinstance(a, PlaceOrder):
+                return actions
 
         actions.append(UpdateState(state_patch))
         return actions
@@ -2696,22 +2721,18 @@ class ChartSignalStrategy:
                         )))
                     ),
                     "counter_touch": None,
-                    # Tight-exit zones — marginal trades only. Seed
-                    # with the trigger line value so the 10 s touch
-                    # check is armed from the first tick. The SL is
-                    # handled by the IMMEDIATE-fire tick path in
-                    # ``_on_quote`` (no linger), so it does NOT belong
-                    # in tight_zones.
-                    "tight_zones": (
-                        [
-                            {"value": float(
-                                entry_line.get("line_value_at_entry")
-                                or event.fill_price
-                            ), "kind": "trigger"},
-                        ]
-                        if bool(entry_line.get("marginal", False))
-                        else []
-                    ),
+                    # Tight-exit zones — seed for ALL trades with the
+                    # trigger line value so the 10 s touch+hold check
+                    # is armed from the first tick. The SL is handled
+                    # by the bar-close trail (clean) or the immediate
+                    # tick-time path (marginal), neither of which
+                    # belongs in tight_zones.
+                    "tight_zones": [
+                        {"value": float(
+                            entry_line.get("line_value_at_entry")
+                            or event.fill_price
+                        ), "kind": "trigger"},
+                    ],
                     "tight_touch": None,
                 }),
             ])
