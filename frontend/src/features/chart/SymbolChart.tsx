@@ -288,6 +288,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // settles, then either an empty array (no wedges) or a list of
   // up to three nearest apex distances.
   const srBackendApexRef = useRef<number[] | null>(null);
+  // Tooltip text for the apex badge — one line per wedge with the
+  // four vertex timestamps. Rebuilt on every SR recompute alongside
+  // ``srBackendApexRef``.
+  const srBackendTooltipRef = useRef<string>('');
   const srOverlayRef = useRef<SVGSVGElement | null>(null);
   const srHiddenRef = useRef(false);
   // Bumps on Clear/Show toggle so callers (BotChart) can re-render
@@ -1099,14 +1103,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       let badge = srApexBadgeRef.current;
       if (!badge && el) {
         badge = document.createElement('div');
+        // Keep ``pointer-events`` ON so the native ``title``
+        // tooltip pops on hover, but keep the cursor as the
+        // default arrow (cursor:help reads as "click for info"
+        // which this isn't — it's just a tooltip).
         badge.setAttribute(
           'style',
           'position:absolute;top:6px;left:8px;z-index:11;'
           + 'font-family:ui-monospace,Menlo,monospace;font-size:14px;'
           + 'padding:2px 8px;border-radius:4px;line-height:1.25;'
           + 'background:rgba(255,160,60,0.15);color:rgba(180,90,0,0.9);'
-          + 'pointer-events:none;user-select:none;letter-spacing:0.3px;'
-          + 'font-weight:600;white-space:pre;',
+          + 'user-select:none;letter-spacing:0.3px;'
+          + 'font-weight:600;white-space:pre;cursor:default;',
         );
         el.appendChild(badge);
         srApexBadgeRef.current = badge;
@@ -1120,6 +1128,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       } else {
         badge.textContent = `△ ${list.join(',')}`;
       }
+      // ``title`` is the native browser tooltip. Multi-line text
+      // works in Chrome/Safari/Firefox via embedded ``\n``.
+      badge.title = srBackendTooltipRef.current || '';
     };
 
     setChartVersion((v) => v + 1);
@@ -1453,8 +1464,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // wedge math is gone.
       const arrows: Arrow[] = [];
       const arrowReject: Array<Record<string, unknown>> = [];
+      const allApexes: number[] = [];
       if (backendData) {
         for (const w of backendData.wedges) {
+          allApexes.push(w.apex_bars_ahead);
           const v = w.vertices;
           arrows.push({
             aTime: backendTsToChartTime(v.support_left.ts) as UTCTimestamp,
@@ -1471,11 +1484,46 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       srArrowsRef.current = arrows;
 
-      // Badge: up to 3 nearest apex distances from backend wedges.
-      const apexList = Array.from(
-        new Set(arrows.map((a) => a.apexBarsAhead)),
-      ).sort((a, b) => a - b).slice(0, 3);
+      // Badge: three nearest apex distances across the entire
+      // detected set (uncapped). ``∞`` only when no wedges exist at
+      // all in the backend window.
+      const apexList = Array.from(new Set(allApexes))
+        .sort((a, b) => a - b).slice(0, 3);
       srBackendApexRef.current = backendData ? apexList : null;
+      // Tooltip: one line per wedge for the three nearest apexes
+      // (matches the badge readout). Format:
+      // ``△<n> SL <ts> | SR <ts> | RR <ts> | RL <ts>``.
+      if (backendData && backendData.wedges.length > 0) {
+        const sorted = [...backendData.wedges]
+          .sort((a, b) => a.apex_bars_ahead - b.apex_bars_ahead);
+        // Pick the first wedge for each distinct apex bars-ahead
+        // value, capped at the same 3-entry limit the badge uses.
+        const seen = new Set<number>();
+        const picked: typeof sorted = [];
+        for (const w of sorted) {
+          if (seen.has(w.apex_bars_ahead)) continue;
+          seen.add(w.apex_bars_ahead);
+          picked.push(w);
+          if (picked.length === 3) break;
+        }
+        const fmt = (ts: string) => ts.slice(5, 16).replace('T', ' ');
+        // The trapezoid's two right vertices share the same
+        // timestamp (both pinned at sliceLast), so listing both is
+        // redundant — drop ``RR`` and show three distinct anchor
+        // points: support-left, support-right (= shared right-edge
+        // ts), resistance-left.
+        srBackendTooltipRef.current = picked.map((w) => {
+          const v = w.vertices;
+          return `△${w.apex_bars_ahead}  `
+            + `SL ${fmt(v.support_left.ts)} `
+            + `· SR ${fmt(v.support_right.ts)} `
+            + `· RL ${fmt(v.resistance_left.ts)}`;
+        }).join('\n');
+      } else {
+        srBackendTooltipRef.current = backendData
+          ? 'no wedges detected in the backend window'
+          : 'awaiting backend SR fetch';
+      }
       paintApexBadgeRef.current?.();
 
       repositionSrSignalsRef.current?.();

@@ -94,6 +94,16 @@ def get_bot_trades():
         _release_thread_session()
 
 
+def get_audit_log():
+    from ib_trader.data.repositories.audit_log_repository import (
+        AuditLogRepository,
+    )
+    try:
+        yield AuditLogRepository(get_session_factory())
+    finally:
+        _release_thread_session()
+
+
 # --- Redis dependency ---
 
 _redis = None

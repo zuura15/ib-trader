@@ -2,7 +2,7 @@ import type { UTCTimestamp } from 'lightweight-charts';
 import type { HistoryBar } from '../../api/client';
 
 export const VISIBLE_MINUTES = 90;
-export const PRELOAD_HOURS = 24;
+export const PRELOAD_HOURS = 48;
 export const REFRESH_INTERVAL_MS = 30_000;
 // 3-min bars: enough resolution to see intraday structure without the
 // chart shifting per-minute on a quiet tape. With VISIBLE_MINUTES=90,

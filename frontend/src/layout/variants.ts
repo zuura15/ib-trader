@@ -243,7 +243,7 @@ export const variantC: IJsonModel = {
 // Variant T — Trader (chart-signal bots)
 // 3-column layout:
 //   Left column (~22%):  Console (top) · Stash tabset (bottom)
-//   Middle column (~39%): Slot 1 (top, MGC) · Slot 2 (bottom, MCL)
+//   Middle column (~39%): Slot 1 (top, MGC) · Audit Feed (bottom)
 //   Right column (~39%):  Slot 3 (top, MES) · Slot 4 (bottom, MNQ)
 //
 // flexlayout-react axis alternation: the root ``row`` lays out
@@ -308,7 +308,7 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 2 · Micro Oil', component: 'chart-bot', config: { slot: 2 } },
+              { type: 'tab', name: 'Audit Feed', component: 'audit-feed' },
             ],
           },
         ],

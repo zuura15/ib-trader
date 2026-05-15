@@ -280,11 +280,16 @@ def run_backtest_live(
     entry_min_pivot_height: float = 0.0,
     shallow_right_leg_threshold: float | None = None,
     shoulder_filter: bool = False,
+    tight_triangle_block_distance: int = 0,
     exit_on_counter_trend: bool = False,
     counter_trend_buffer_pct: float = 0.0001,
     exit_on_triangle_rejection: bool = False,
     triangle_min_touches: int = 2,
     triangle_reentry_watch_bars: int = 4,
+    min_target_filter: bool = False,
+    counter_line_exit: bool = False,
+    counter_line_bars1m: list["Bar"] | None = None,
+    counter_line_hold_seconds: float = 10.0,
 ) -> list[Trade]:
     """Mirrors current chart_signal live rules:
     - Single position at a time, EITHER side.
@@ -310,11 +315,37 @@ def run_backtest_live(
     # ``atr_period`` bars have elapsed.
     atr_series = compute_atr(bars, atr_period) if atr_mult is not None else None
 
+    # Pre-compute UTC-second timestamps for counter_line tick-approx.
+    # The opposing line is projected to each 1-min bar's elapsed time
+    # in 3-min-bar units, so the slope/intercept (in 3-min-bar coords)
+    # works directly.
+    from datetime import datetime as _dt
+    def _iso_to_sec(s: str) -> float:
+        s2 = s.replace("Z", "+00:00")
+        try:
+            return _dt.fromisoformat(s2).timestamp()
+        except ValueError:
+            return _dt.strptime(s2.split(".")[0],
+                                "%Y-%m-%dT%H:%M:%S").timestamp()
+    bar3m_secs: list[float] = []
+    bar1m_secs: list[float] = []
+    if counter_line_exit and counter_line_bars1m:
+        bar3m_secs = [_iso_to_sec(b.t) for b in bars]
+        bar1m_secs = [_iso_to_sec(b.t) for b in counter_line_bars1m]
+
     trades: list[Trade] = []
     open_trade: Trade | None = None
     cooldown_until_idx = -1
     hwm = -float('inf')
     lwm = float('inf')
+    # Monotonic pointer into 1-min bars — only used when counter_line
+    # tick-approx is active. Advances forward each 3-min iteration.
+    cl_1m_cursor = 0
+    # Armed-state for the touch state machine. ``None`` = no active
+    # touch; dict = { "line_val": float } captures the line being
+    # touched. Persists across 1-min bars within the same 3-min
+    # iteration so a touch on minute N can be confirmed on minute N+1.
+    cl_touch_armed: dict | None = None
     # Re-entry watch state — populated when a triangle-rejection exit
     # fires so the next few bars can re-enter if price actually breaks
     # the rejected line. Cleared when the watch window expires or a
@@ -446,6 +477,132 @@ def run_backtest_live(
                 open_trade.exit_idx = t
                 open_trade.exit_price = bars[t].close
                 open_trade.exit_reason = "COUNTER_TREND"
+                trades.append(open_trade)
+                cooldown_until_idx = t + cooldown_bars
+                open_trade = None
+                hwm = -float('inf')
+                lwm = float('inf')
+                continue
+
+            # Counter-line tick-approx (chart_signal.py EXIT_COUNTER_LINE).
+            # Refreshes opposing-side line set at every 3-min bar close;
+            # for 1-min sub-bars inside [bars[t-1].t, bars[t].t) checks
+            # touch + close-confirm = "rejection that didn't break through".
+            # Fires exit at the offending 1-min bar's close. Approximates
+            # the live rule (10s hold on tick stream) at 1-min granularity
+            # — 1-min > 10s so any "touched AND closed near the line"
+            # bar implies the touch persisted past the threshold.
+            cl_fired = False
+            cl_exit_price = 0.0
+            cl_exit_ts = ""
+            if (counter_line_exit and counter_line_bars1m
+                    and t >= 2 and len(bar1m_secs) > 0):
+                win_start_cl = max(0, t - history_bars + 1)
+                slice_cl_closes = closes[win_start_cl:t + 1]
+                if len(slice_cl_closes) >= 4:
+                    opp_type = ('resistance' if open_trade.side == 'LONG'
+                                else 'support')
+                    opp_lines = detect_lines(
+                        slice_cl_closes,
+                        up_to=len(slice_cl_closes) - 1,
+                        type_=opp_type,
+                        near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                    )
+                    # Live rule: 2+ touches, unbroken. detect_lines
+                    # excludes broken by default; touches >= 2 is the
+                    # minimum the live bot accepts (caches the best by
+                    # touch count).
+                    opp_lines = [l for l in opp_lines if l.touches >= 2]
+                    if opp_lines:
+                        # Highest-touch wins (matches live).
+                        opp = max(opp_lines, key=lambda l: l.touches)
+                        # Convert slope/intercept to absolute (full-bar
+                        # frame, t-relative). win_start_cl is the slice
+                        # origin in absolute bar coords.
+                        abs_slope = opp.slope
+                        abs_intercept = (opp.intercept
+                                         - opp.slope * win_start_cl)
+                        # 1-min bars in [bars[t-1].t_sec, bars[t].t_sec).
+                        # Advance cursor to the first 1-min bar with
+                        # t_sec >= bars[t-1].t_sec; iterate until t_sec
+                        # >= bars[t].t_sec.
+                        prev_3m_sec = bar3m_secs[t - 1]
+                        cur_3m_sec = bar3m_secs[t]
+                        # Skip-ahead the cursor.
+                        while (cl_1m_cursor < len(bar1m_secs)
+                               and bar1m_secs[cl_1m_cursor] < prev_3m_sec):
+                            cl_1m_cursor += 1
+                        i = cl_1m_cursor
+                        while (i < len(bar1m_secs)
+                               and bar1m_secs[i] < cur_3m_sec):
+                            sb = counter_line_bars1m[i]
+                            sec = bar1m_secs[i]
+                            # Elapsed 3-min-bar units from win_start.
+                            elapsed_3m = ((sec - bar3m_secs[win_start_cl])
+                                          / 180.0)
+                            line_val = abs_intercept + abs_slope * (
+                                win_start_cl + elapsed_3m
+                            )
+                            # Touch tolerance — counter_line uses the
+                            # TIGHT TOUCH_TOLERANCE_FRACTION (live default
+                            # 0.0002 = 0.02%) for the "is mid currently
+                            # touching the line" check, NOT the looser
+                            # near_touch_tolerance_fraction (0.001) which
+                            # is only for line DETECTION. The wider tol
+                            # would over-fire by ~5x at touch time.
+                            slice_avg = (sum(slice_cl_closes)
+                                         / len(slice_cl_closes))
+                            touch_tol = max(
+                                EPS, slice_avg * TOUCH_TOLERANCE_FRACTION,
+                            )
+                            # Armed-then-confirmed state machine — the
+                            # cleanest 1-min approximation of the live
+                            # "arm at first touch, confirm at +10s"
+                            # logic. On bar N, if price touched the line
+                            # without breaking through: arm. On bar
+                            # N+1 (~60s later, >> 10s), confirm if
+                            # still touching → exit; else disarm.
+                            if open_trade.side == 'LONG':
+                                # Opposing = resistance above.
+                                touched_now = (
+                                    sb.high >= line_val - touch_tol
+                                    and sb.close <= line_val + touch_tol
+                                )
+                                breakout_now = (
+                                    sb.close > line_val + touch_tol
+                                )
+                            else:
+                                # Opposing = support below.
+                                touched_now = (
+                                    sb.low <= line_val + touch_tol
+                                    and sb.close >= line_val - touch_tol
+                                )
+                                breakout_now = (
+                                    sb.close < line_val - touch_tol
+                                )
+                            if cl_touch_armed is not None:
+                                # Confirm-or-clear pass.
+                                if breakout_now:
+                                    cl_touch_armed = None
+                                elif touched_now:
+                                    cl_fired = True
+                                    cl_exit_price = sb.close
+                                    cl_exit_ts = sb.t
+                                    cl_touch_armed = None
+                                    break
+                                else:
+                                    cl_touch_armed = None
+                            elif touched_now and not breakout_now:
+                                cl_touch_armed = {"line": line_val}
+                            i += 1
+                        # Keep cursor advanced to cur_3m_sec for next iter
+                        # so we don't re-scan past sub-bars.
+                        cl_1m_cursor = i
+            if cl_fired:
+                open_trade.exit_t = cl_exit_ts
+                open_trade.exit_idx = t
+                open_trade.exit_price = cl_exit_price
+                open_trade.exit_reason = "COUNTER_LINE"
                 trades.append(open_trade)
                 cooldown_until_idx = t + cooldown_bars
                 open_trade = None
@@ -834,6 +991,76 @@ def run_backtest_live(
         if chosen_line is None:
             continue
 
+        # Tight-triangle entry block. Mirrors the live bot's
+        # ``entry_triangle_block_distance`` config (chart_signal.py).
+        # When set, detect all converging support/resistance pairs in
+        # the same window and skip the entry if the nearest apex is
+        # within ``tight_triangle_block_distance`` bars. Rationale:
+        # entering just before a wedge resolves exposes the position
+        # to a breakout going either way.
+        if tight_triangle_block_distance > 0:
+            from ib_trader.signals.sr_fan import find_wedges
+            # Both sides already detected for the entry path; reuse
+            # them. ``find_wedges`` defaults exclude broken lines —
+            # matches the live bot path.
+            tt_supports = detect_lines(
+                slice_closes, up_to=window_last, type_='support',
+                near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                min_pivot_strength=min_pivot_strength,
+            )
+            tt_resistances = detect_lines(
+                slice_closes, up_to=window_last, type_='resistance',
+                near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                min_pivot_strength=min_pivot_strength,
+            )
+            wedges = find_wedges(
+                tt_supports, tt_resistances, window_last,
+            )
+            if wedges and wedges[0].apex_bars_ahead \
+                    <= tight_triangle_block_distance:
+                continue
+
+        # Min-target entry filter (FILTER_MIN_TARGET). Mirrors the
+        # live bot's gate: if the opposing wedge edge is closer than
+        # the worst-case stop distance, the trade has bad R:R. Only
+        # applies when a wedge exists.
+        if min_target_filter:
+            from ib_trader.signals.sr_fan import find_wedges
+            mt_supports = detect_lines(
+                slice_closes, up_to=window_last, type_='support',
+                near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                min_pivot_strength=min_pivot_strength,
+            )
+            mt_resistances = detect_lines(
+                slice_closes, up_to=window_last, type_='resistance',
+                near_touch_tolerance_fraction=near_touch_tolerance_fraction,
+                min_pivot_strength=min_pivot_strength,
+            )
+            mt_wedges = find_wedges(
+                mt_supports, mt_resistances, window_last,
+            )
+            if mt_wedges:
+                nearest = mt_wedges[0]
+                entry_price = slice_closes[window_last]
+                trail_dist = abs(entry_price) * trail_width_pct
+                if chosen_side == 'LONG':
+                    opp = nearest.resistance
+                else:
+                    opp = nearest.support
+                opp_at = opp.intercept + opp.slope * window_last
+                target_dist = max(
+                    0.0,
+                    (opp_at - entry_price) if chosen_side == 'LONG'
+                    else (entry_price - opp_at),
+                )
+                line_at = (
+                    chosen_line.intercept + chosen_line.slope * window_last
+                )
+                line_breach_dist = abs(entry_price - line_at)
+                stop_dist = max(trail_dist, line_breach_dist)
+                if target_dist < stop_dist:
+                    continue
+
         # Live fires entry order immediately on bar close and fills
         # within ~1-5s at market mid — well inside the same bar.
         # Approximate as the trigger bar's close. Modeling entry at
@@ -858,6 +1085,9 @@ def run_backtest_live(
             hwm = bars[t].close
         else:
             lwm = bars[t].close
+        # Reset counter_line armed state at every entry — touches from
+        # a prior position must not bleed into the new one.
+        cl_touch_armed = None
 
     if open_trade is not None:
         open_trade.exit_t = bars[-1].t

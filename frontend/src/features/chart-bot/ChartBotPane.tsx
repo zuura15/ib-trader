@@ -155,7 +155,14 @@ export function ChartBotPane({ slot }: Props) {
           }}
           title={`fsm=${fsmState} armed=${armed}`}
         >
-          {fsmState.replace(/_/g, ' ')}{!isStopped && !armed ? ' · DISARMED' : ''}
+          {fsmState
+            .replace(/_/g, ' ')
+            // Drop the redundant "TRIGGER" suffix on the two watching
+            // states so the banner stays narrow enough to keep the
+            // toolbar buttons un-squished on small panes.
+            .replace(/\s+TRIGGER$/, '')}{
+            !isStopped && !armed ? ' · DISARMED' : ''
+          }
         </span>
         {isStopped && (
           <button

@@ -404,6 +404,7 @@ def find_wedges(
     max_apex_bars_ahead: int = 200,
     min_overlap_bars: int = 5,
     include_broken: bool = False,
+    flat_slope_threshold: float = 0.0,
 ) -> list[Wedge]:
     """Find converging (support, resistance) pairs forming a wedge.
 
@@ -446,6 +447,28 @@ def find_wedges(
             d_slope = s.slope - r.slope
             if d_slope <= 1e-9:           # parallel or diverging
                 continue
+            # Same-direction filter. When BOTH lines clearly point the
+            # same direction (both clearly up OR both clearly down)
+            # the structure isn't a "squeeze" — it's a channel or
+            # rising/falling wedge that generally supports the
+            # prevailing trend. Operator wants to act only on true
+            # squeezes (one line flat or opposite). ``flat_slope_
+            # threshold`` defines what counts as "flat": a slope with
+            # ``|slope| < threshold`` is treated as flat, so a flat
+            # ceiling + rising support still counts as a wedge.
+            if flat_slope_threshold > 0.0:
+                s_flat = abs(s.slope) < flat_slope_threshold
+                r_flat = abs(r.slope) < flat_slope_threshold
+                same_dir_up = (
+                    not s_flat and not r_flat
+                    and s.slope > 0 and r.slope > 0
+                )
+                same_dir_down = (
+                    not s_flat and not r_flat
+                    and s.slope < 0 and r.slope < 0
+                )
+                if same_dir_up or same_dir_down:
+                    continue
             apex_idx_float = (r.intercept - s.intercept) / d_slope
             if apex_idx_float <= last_idx:
                 continue
@@ -480,3 +503,33 @@ def in_futures_deadzone(now: datetime) -> bool:
     else:
         local = now.astimezone(_PT)
     return 14 <= local.hour < 15
+
+
+def futures_session_id(when: datetime) -> tuple[str, int]:
+    """Return (yyyy-mm-dd, session_num) for ``when`` in PT.
+
+    Sessions (PT) — boundaries align with futures market structure:
+      1) 06:30 → 15:00  US RTH + post-cash-close (covers 14-15 halt)
+      2) 15:00 → 17:00  post-maintenance reopen / pre-Asia
+      3) 17:00 → 24:00  Asia
+      4) 00:00 → 06:30  Europe
+
+    Used by the entry-time Q-anchor session gate: the chosen line's
+    earlier construction anchor must share a session with the fire
+    bar — i.e. the line was built within the current session, not
+    carried over from a prior one.
+    """
+    if when.tzinfo is None:
+        local = when
+    else:
+        local = when.astimezone(_PT)
+    minutes = local.hour * 60 + local.minute
+    if 6 * 60 + 30 <= minutes < 15 * 60:
+        sess = 1
+    elif 15 * 60 <= minutes < 17 * 60:
+        sess = 2
+    elif 17 * 60 <= minutes < 24 * 60:
+        sess = 3
+    else:
+        sess = 4
+    return (local.strftime("%Y-%m-%d"), sess)

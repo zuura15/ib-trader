@@ -23,7 +23,7 @@ lookback_bars: 1
 # How much history the bot fetches from ``/engine/history`` per
 # 3-min eval. Mirrors the view-only chart's default visible range
 # so both surfaces compute SR on the same slice.
-history_hours: 2
+history_hours: 24
 
 # Quantity — per-bot override possible via UI in a future iteration.
 qty_default: 1
@@ -44,5 +44,5 @@ max_shares: 100
 # line's slope, the bot fires an acceleration entry. The exit
 # evaluator skips the line-breach gate on these trades (price is
 # well away from the line; trail alone manages the exit).
-acceleration_entry_enabled: true
+acceleration_entry_enabled: false
 min_slope_ratio: 1.5

@@ -383,6 +383,64 @@ class BotTrade(Base):
     created_at         = Column(DateTime, nullable=False)
 
 
+class AuditLog(Base):
+    """Per-event audit feed for the operator's audit panel.
+
+    One row per:
+      - ``BAR_EVAL``      — 3-min bar close evaluation (entry decision OR
+                            in-position holding/exit check). One per bot
+                            per bar.
+      - ``ORDER_PLACED``  — bot submitted an order to IB. Entry orders
+                            follow a BAR_EVAL by 1-2s; exit orders can
+                            fire mid-bar (counter_line tick-time, trail).
+      - ``TRADE_CLOSED``  — round-trip summary on exit fill. Compact view
+                            of entry/exit/pnl/duration/reason.
+
+    Headline fields (``pivot_status``, ``line_status``, ``decision``)
+    drive the collapsed list view; ``payload_json`` carries the full
+    diagnostic for the expanded detail.
+
+    Append-only. Never updated after insert.
+    """
+
+    __tablename__ = "audit_log"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    bot_id          = Column(String(36), nullable=False, index=True)
+    symbol          = Column(String(20), nullable=False, index=True)
+    event_ts_utc    = Column(DateTime, nullable=False, index=True)
+    event_type      = Column(String(20), nullable=False)
+    # Headline fields — these drive the collapsed list view chips.
+    # BAR_EVAL: pivot_status ∈ {PIVOT_LOW, PIVOT_HIGH, NO_PIVOT, NONE}
+    #           line_status  ∈ {LINES_LONG, LINES_SHORT, LINES_BOTH,
+    #                           LINES_NONE, NONE}
+    #           decision    ∈ {FIRED·BUY, FIRED·SELL, FILTERED·<name>,
+    #                          SKIP·<reason>, GATED·<gate>, HOLDING,
+    #                          EXIT_FIRED·<reason>}
+    # ORDER_PLACED: pivot/line are NULL; decision = ORDER·<side>·<leg>
+    # TRADE_CLOSED: pivot/line are NULL; decision = CLOSED·<side>·<reason>
+    pivot_status    = Column(String(20), nullable=True)
+    line_status     = Column(String(20), nullable=True)
+    decision        = Column(String(60), nullable=False)
+    # bar_close for BAR_EVAL; entry/exit price for ORDER_PLACED/TRADE_CLOSED
+    bar_close       = Column(Numeric(18, 4), nullable=True)
+    # Realized P&L for TRADE_CLOSED only; net of commissions.
+    pnl_net         = Column(Numeric(18, 4), nullable=True)
+    # Full diagnostic — supports list, filter trace, wedge context,
+    # order details, exit context. Schema varies by event_type.
+    payload_json    = Column(Text, nullable=True)
+    created_at      = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        # "events for bot X newest first" — primary list query.
+        Index("ix_audit_bot_ts", "bot_id", "event_ts_utc"),
+        # "events across all bots newest first" — `All` dropdown filter.
+        Index("ix_audit_ts", "event_ts_utc"),
+        # "trade closures by bot" — used by the per-bot stats summary.
+        Index("ix_audit_bot_type_ts", "bot_id", "event_type", "event_ts_utc"),
+    )
+
+
 class OrderTemplate(Base):
     """Saved order template for quick-fire orders from the GUI."""
 

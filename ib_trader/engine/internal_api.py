@@ -537,9 +537,17 @@ async def get_history(
             detail=f"contract {con_id} not in cache; qualify it first",
         )
 
-    # IB's durationStr only accepts S/D/W/M/Y — no H. Convert to seconds
-    # (works for the 1–24 h range we care about; ~86400 S for 24 h).
-    duration_str = f"{int(hours) * 3600} S"
+    # IB's durationStr only accepts S/D/W/M/Y — no H. The "S" format
+    # is capped at 86400 (24h); anything longer must use "N D". Round
+    # up to whole days so a 48h chart preload (= "2 D") clears the
+    # cap. ``use_rth=False`` keeps the day-based request returning
+    # 24h calendar windows for futures.
+    hours_int = max(1, int(hours))
+    if hours_int <= 24:
+        duration_str = f"{hours_int * 3600} S"
+    else:
+        days = (hours_int + 23) // 24
+        duration_str = f"{days} D"
     # TRADES is what the bot reasons about and what the operator sees
     # on the chart. The prior BID_ASK feed put bot decisions on
     # avg_ask / mid while the operator's eye reads last-trade prints,
@@ -643,7 +651,8 @@ async def get_sr(
 
     from ib_trader.signals.sr_fan import (
         detect_lines, find_pivot_highs, find_pivot_lows,
-        find_wedges, NEAR_TOUCH_TOLERANCE_FRACTION, BREAK_STALE_BARS,
+        find_wedges, NEAR_TOUCH_TOLERANCE_FRACTION,
+        TOUCH_TOLERANCE_FRACTION, BREAK_STALE_BARS,
     )
 
     closes = [float(b["close"]) for b in bars_raw]
@@ -674,9 +683,22 @@ async def get_sr(
         near_touch_tolerance_fraction=near_frac,
         break_stale_bars=bsb,
     )
+    # Flat-slope threshold: a line whose ``|slope|`` is below this
+    # value is treated as "flat" for the same-direction filter in
+    # ``find_wedges``. Tied to the touch-tolerance so the threshold
+    # auto-scales across instruments: roughly "one tick per 20 bars"
+    # for a typical contract. Without this gate, a (rising support
+    # + barely-positive resistance) ascending-triangle pattern was
+    # being misclassified as "both up — keep" instead of "rising
+    # into a flat ceiling — squeeze."
+    avg_price = (
+        sum(closes) / len(closes) if closes else 0.0
+    )
+    flat_eps = (avg_price * TOUCH_TOLERANCE_FRACTION / 20.0)
     wedges = find_wedges(
         supports, resistances, last_idx,
         include_broken=include_broken_wedges,
+        flat_slope_threshold=flat_eps,
     )
 
     def _line_payload(ln) -> dict:

@@ -46,6 +46,7 @@ from ib_trader.bots.bar_aggregator import (
 )
 from ib_trader.bots.middleware import (
     MiddlewarePipeline, RiskMiddleware, LoggingMiddleware,
+    AuditMiddleware,
     PersistenceMiddleware, ExecutionMiddleware, ManualEntryMiddleware,
 )
 from ib_trader.data.repositories.bot_repository import BotEventRepository
@@ -171,6 +172,10 @@ class StrategyBotRunner(BotBase):
         # Repos for middleware
         self._bot_events_repo = BotEventRepository(session_factory)
         self._bot_trades_repo = BotTradeRepository(session_factory)
+        from ib_trader.data.repositories.audit_log_repository import (
+            AuditLogRepository,
+        )
+        self._audit_repo = AuditLogRepository(session_factory)
         self._session_factory = session_factory
 
     # ------------------------------------------------------------------
@@ -1985,6 +1990,10 @@ class StrategyBotRunner(BotBase):
             state_store=state_store,
         )
         logging_mw = LoggingMiddleware(self.bot_id, self._bot_events_repo, redis=redis)
+        audit_mw = AuditMiddleware(
+            self.bot_id, symbol_default=self.strategy_config["symbol"],
+            audit_repo=self._audit_repo, redis=redis,
+        )
         persistence_mw = PersistenceMiddleware(
             self.bot_id, write_fn=self._write_state,
         )
@@ -1996,8 +2005,11 @@ class StrategyBotRunner(BotBase):
 
         # ManualEntryMiddleware runs FIRST so blocked entries never
         # count against risk limits and the audit log sees the drop.
+        # AuditMiddleware sits AFTER LoggingMiddleware so both feeds
+        # see the same actions, but neither blocks the other.
         self.pipeline = MiddlewarePipeline(
-            [manual_entry_mw, risk_mw, logging_mw, persistence_mw, execution_mw],
+            [manual_entry_mw, risk_mw, logging_mw, audit_mw,
+             persistence_mw, execution_mw],
             rollback_fn=self._write_state,
         )
         self._risk_mw = risk_mw
@@ -3051,27 +3063,24 @@ class StrategyBotRunner(BotBase):
           operator clicked Force quit — they want the close NOW. The
           earlier version of this method silently no-op'd in this
           state, returning a 200 while leaving the stale limit waiting.
-        - In every state: flip ``armed=False`` immediately so a stale
-          trigger between this call and the cancel/fill can't re-enter.
-          Codex flagged the prior version, which left a working entry
-          un-cancelled — an operator clicking Force quit could still get
-          filled moments later, ending up in a position they meant to
-          abort.
+        - The bot stays ``armed=True`` across force-quit so the next
+          trigger after the close fires immediately. Two-state model:
+          a bot is either ON (running, armed) or OFF (stopped).
         """
         if not self.strategy or not self.ctx:
             raise RuntimeError("Bot not initialized")
         await self._refresh_state()
         symbol = self.strategy_config["symbol"]
         cur = await self.current_state()
-        await self._write_state({"armed": False})
+        await self._write_state({"armed": True})
         if cur == BotState.AWAITING_EXIT_TRIGGER:
             await self._execute_force_sell(symbol)
             return {"symbol": symbol, "action": "FORCE_QUIT",
-                    "exited": True, "cancelled": False, "armed": False}
+                    "exited": True, "cancelled": False, "armed": True}
         if cur == BotState.ENTRY_ORDER_PLACED:
             await self._handle_cancel_order({"symbol": symbol})
             return {"symbol": symbol, "action": "FORCE_QUIT",
-                    "exited": False, "cancelled": True, "armed": False,
+                    "exited": False, "cancelled": True, "armed": True,
                     "fsm_state": cur.value}
         if cur == BotState.EXIT_ORDER_PLACED:
             # Cancel the stale in-flight exit, synchronously revert to
@@ -3092,10 +3101,10 @@ class StrategyBotRunner(BotBase):
                     )
             await self._execute_force_sell(symbol)
             return {"symbol": symbol, "action": "FORCE_QUIT",
-                    "exited": True, "cancelled": True, "armed": False,
+                    "exited": True, "cancelled": True, "armed": True,
                     "fsm_state": BotState.AWAITING_EXIT_TRIGGER.value}
         return {"symbol": symbol, "action": "FORCE_QUIT",
-                "exited": False, "cancelled": False, "armed": False,
+                "exited": False, "cancelled": False, "armed": True,
                 "fsm_state": cur.value}
 
     async def rearm(self) -> dict:

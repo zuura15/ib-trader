@@ -7,6 +7,12 @@
 
 const BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
+/** Exposed for components that need to build raw URLs (e.g. EventSource
+ *  for SSE streams) — same base the ``request`` helper uses. */
+export function getApiBase(): string {
+  return BASE_URL;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const res = await fetch(url, {
@@ -111,6 +117,36 @@ export function getBotTrades(botId?: string, limit: number = 500) {
   if (botId) params.set("bot_id", botId);
   params.set("limit", String(limit));
   return request<BotTradeResponse[]>(`/bot-trades?${params}`);
+}
+
+// --- Audit Feed ---
+
+export interface AuditRow {
+  id: number;
+  bot_id: string;
+  symbol: string;
+  event_ts_utc: string | null;
+  event_type: 'BAR_EVAL' | 'ORDER_PLACED' | 'TRADE_CLOSED';
+  pivot_status: string | null;
+  line_status: string | null;
+  decision: string;
+  bar_close: string | null;
+  pnl_net: string | null;
+  payload: Record<string, unknown> | null;
+}
+
+export function getAuditFeed(opts: {
+  botId?: string;
+  since?: string;
+  before?: string;
+  limit?: number;
+}) {
+  const params = new URLSearchParams();
+  if (opts.botId) params.set('bot_id', opts.botId);
+  if (opts.since) params.set('since', opts.since);
+  if (opts.before) params.set('before', opts.before);
+  params.set('limit', String(opts.limit ?? 100));
+  return request<AuditRow[]>(`/audit?${params}`);
 }
 
 // --- Orders ---

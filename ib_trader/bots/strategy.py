@@ -267,8 +267,36 @@ class LogSignal:
     trade_serial: int | None = None
 
 
+@dataclass(frozen=True)
+class EmitAudit:
+    """Append a row to the operator-facing audit feed (``audit_log``).
+
+    Lives alongside ``LogSignal`` (which writes to ``bot_events``).
+    Both write to the same DB but serve different consumers:
+    LogSignal is the dev/debug trail; EmitAudit is the operator's
+    feed for the audit panel.
+
+    Three event flavors share the type, distinguished by ``event_type``:
+      - ``BAR_EVAL``: per-bar evaluation; populates pivot_status,
+        line_status, decision, bar_close, payload.
+      - ``ORDER_PLACED``: order submission; populates decision +
+        payload only.
+      - ``TRADE_CLOSED``: round-trip summary; populates decision,
+        pnl_net, payload.
+    """
+    event_type: str  # BAR_EVAL | ORDER_PLACED | TRADE_CLOSED
+    decision: str
+    symbol: str
+    event_ts_utc: "datetime | None" = None  # None = now
+    pivot_status: str | None = None
+    line_status: str | None = None
+    bar_close: "Decimal | None" = None
+    pnl_net: "Decimal | None" = None
+    payload: dict = field(default_factory=dict)
+
+
 # Union of all action types
-Action = PlaceOrder | CancelOrder | UpdateState | LogSignal
+Action = PlaceOrder | CancelOrder | UpdateState | LogSignal | EmitAudit
 
 
 # ---------------------------------------------------------------------------

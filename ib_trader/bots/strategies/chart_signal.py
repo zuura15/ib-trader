@@ -39,6 +39,7 @@ from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategy import (
     Action,
     BarCompleted,
+    EmitAudit,
     ExitType,
     LogEventType,
     LogSignal,
@@ -60,10 +61,41 @@ from ib_trader.signals.sr_fan import (
     find_pivot_highs,
     find_pivot_lows,
     find_wedges,
+    futures_session_id,
     in_futures_deadzone,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------
+# Named entry filters. Each constant is the canonical identifier for a
+# gate that can independently reject an otherwise-qualifying B/S
+# signal. Names appear in skip-log payloads under ``"filter"`` and are
+# referenced in operational docs.
+#
+#   shoulder        — right-shoulder close must beat the left in the
+#                     trend direction; rejects "bad shape" pivots.
+#   tight_triangle  — most-immediate wedge apex within N bars of the
+#                     current bar; wedge resolution imminent in either
+#                     direction.
+#   min_target      — distance from entry price to the most-immediate
+#                     wedge's opposing edge (resistance for LONG,
+#                     support for SHORT) must be ≥ stop distance.
+# --------------------------------------------------------------------
+FILTER_SHOULDER = "shoulder"
+FILTER_TIGHT_TRIANGLE = "tight_triangle"
+FILTER_MIN_TARGET = "min_target"
+FILTER_ENTRY_DISTANCE = "entry_distance"
+FILTER_Q_SESSION = "q_session"
+FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
+
+# Named exit triggers (alongside the bar-close line_breach / trail_stop).
+#   counter_line  — tick-time touch-and-hold: mid touches an opposing
+#                   trendline (2+ touches, unbroken) and price hasn't
+#                   broken through within ``counter_exit_hold_seconds``
+#                   (default 10) → immediate close.
+EXIT_COUNTER_LINE = "counter_line"
 
 
 def _parse_ts(ts: Any) -> datetime | None:
@@ -125,6 +157,13 @@ class ChartSignalStrategy:
                 # after a round-trip before the bot enters again.
                 "cooldown_until": "str|null",
                 "last_deadzone_alert_date": "str|null",
+                # Counter-line exit (EXIT_COUNTER_LINE). Cache is a
+                # snapshot of opposing trendlines written at every bar
+                # close in _evaluate_exit; tick-time _on_quote reads
+                # it and runs the touch-and-hold rule.
+                "counter_lines_cache": "list|null",
+                "counter_lines_tol": "decimal|null",
+                "counter_touch": "dict|null",
             },
             version="1.0",
             supported_sec_types=("STK", "ETF", "FUT", "FOP"),
@@ -160,7 +199,15 @@ class ChartSignalStrategy:
     async def on_event(self, event: MarketEvent,
                        ctx: StrategyContext) -> list[Action]:
         if isinstance(event, BarCompleted):
-            return await self._on_bar(event, ctx)
+            pos_before = ctx.fsm_state
+            actions = await self._on_bar(event, ctx)
+            # Append a BAR_EVAL audit row synthesized from the bar's
+            # action list. One row per 3-min bar evaluation regardless
+            # of outcome (entry side, exit side, gated, or holding).
+            audit = self._synthesize_bar_eval(event, actions, pos_before)
+            if audit is not None:
+                actions = list(actions) + [audit]
+            return actions
         if isinstance(event, QuoteUpdate):
             return self._on_quote(event, ctx)
         if isinstance(event, OrderFilled):
@@ -168,6 +215,267 @@ class ChartSignalStrategy:
         if isinstance(event, OrderRejected):
             return self._on_rejected(event, ctx)
         return []
+
+    def _synthesize_bar_eval(
+        self, event: BarCompleted, actions: list[Action],
+        pos_before: BotState,
+    ) -> EmitAudit | None:
+        """Derive the BAR_EVAL row from the bar's resulting action list.
+
+        Headline fields:
+          - pivot_status: from the BAR LogSignal payload (best touches
+            tell us if a pivot landed on a line; we resolve the side
+            from the chosen line if one was picked, else NO_PIVOT).
+          - line_status: from best_long_touches / best_short_touches.
+          - decision: tiered priority —
+              PlaceOrder           → FIRED·<BUY/SELL>
+              TRAILING_STOP signal → EXIT_FIRED·<reason>
+              SKIP w/ filter       → FILTERED·<filter_name>
+              SKIP w/o filter      → SKIP·<short reason>
+              else, in-position    → HOLDING
+              else                 → GATED·<gate>  (no BAR event = early gate)
+
+        Returns None if the bar produced literally no actions (e.g.,
+        the strategy bailed before emitting anything) — we skip the
+        audit row in that case to keep the feed clean.
+        """
+        bar_ts = _parse_ts(event.bar.get("timestamp_utc"))
+        try:
+            bar_close_d = Decimal(str(event.bar.get("close", "0")))
+        except Exception:  # noqa: BLE001
+            bar_close_d = None
+        symbol = self.config.get("symbol", "")
+
+        # BAR signal carries the line/pivot universe at evaluation time.
+        bar_sig: LogSignal | None = None
+        # PlaceOrder = the order that fired.
+        place_order: PlaceOrder | None = None
+        # Exit signal (in-position bar that triggered TRAILING_STOP).
+        exit_sig: LogSignal | None = None
+        # First SKIP wins for the decision (most specific reject).
+        skip_sig: LogSignal | None = None
+        for a in actions:
+            if isinstance(a, PlaceOrder):
+                if place_order is None:
+                    place_order = a
+            elif isinstance(a, LogSignal):
+                et = a.event_type.value if hasattr(a.event_type, "value") \
+                    else str(a.event_type)
+                if et == "BAR" and bar_sig is None:
+                    bar_sig = a
+                elif et == "EXIT_CHECK" and "TRAILING_STOP" in (a.message or ""):
+                    exit_sig = a
+                elif et == "SKIP" and skip_sig is None:
+                    skip_sig = a
+
+        # Pivot status — derive from chosen-line direction (when fired)
+        # or from skip diag (when filtered). Fall back to NO_PIVOT/NONE.
+        pivot_status = "NONE"
+        line_status = "LINES_NONE"
+        if bar_sig and bar_sig.payload:
+            blt = int(bar_sig.payload.get("best_long_touches") or 0)
+            bst = int(bar_sig.payload.get("best_short_touches") or 0)
+            if blt > 0 and bst > 0:
+                line_status = "LINES_BOTH"
+            elif blt > 0:
+                line_status = "LINES_LONG"
+            elif bst > 0:
+                line_status = "LINES_SHORT"
+
+        # Decision — tiered.
+        decision = ""
+        if place_order is not None:
+            decision = f"FIRED·{place_order.side}"
+            pivot_status = ("PIVOT_LOW" if place_order.side == "BUY"
+                            else "PIVOT_HIGH")
+        elif exit_sig is not None:
+            # TRAILING_STOP message starts with the exit reason; pull
+            # the short form (e.g., "counter-line held" → "counter_line").
+            payload = exit_sig.payload or {}
+            exit_type = str(payload.get("exit_type", "")).lower()
+            direction = str(payload.get("direction", "")).lower()
+            # The detail message carries the reason after the colon.
+            msg = exit_sig.message or ""
+            short = msg.split(":", 1)[-1].strip()[:30] if ":" in msg else exit_type
+            decision = f"EXIT_FIRED·{short}" if short else f"EXIT_FIRED·{exit_type}"
+            pivot_status = "PIVOT_LOW" if direction == "short" else "PIVOT_HIGH"
+        elif skip_sig is not None:
+            payload = skip_sig.payload or {}
+            filt = payload.get("filter")
+            if filt:
+                decision = f"FILTERED·{filt}"
+                side = str(payload.get("direction", "")).lower()
+                if side == "long":
+                    pivot_status = "PIVOT_LOW"
+                elif side == "short":
+                    pivot_status = "PIVOT_HIGH"
+            else:
+                # Cooldown / signal-too-old / no-new-pivot / etc.
+                msg = (skip_sig.message or "").lower()
+                if "cooldown" in msg:
+                    decision = "GATED·cooldown"
+                elif "deadzone" in msg:
+                    decision = "GATED·deadzone"
+                elif "too old" in msg:
+                    decision = "SKIP·stale_bar"
+                elif "no new pivot" in msg:
+                    decision = "SKIP·no_new_pivot"
+                    pivot_status = "NO_PIVOT"
+                else:
+                    decision = "SKIP·other"
+        else:
+            # No PlaceOrder, no exit signal, no SKIP — either the bar
+            # was processed silently (gated before any signal emit) or
+            # the bot is holding a position. We still emit a row so
+            # the audit feed has one entry per bot per bar — silent
+            # windows otherwise look like the system is broken.
+            if pos_before == BotState.AWAITING_EXIT_TRIGGER:
+                decision = "HOLDING"
+            elif pos_before == BotState.AWAITING_ENTRY_TRIGGER:
+                decision = "GATED·armed_false"
+            else:
+                # OFF / ERRORED / ENTRY_ORDER_PLACED / etc — the bot
+                # isn't actively evaluating but the bar still closed.
+                # Emit a row with the FSM state name so the operator
+                # can see what was happening at that bar.
+                state_name = getattr(pos_before, "name", "UNKNOWN") \
+                    if pos_before is not None else "UNKNOWN"
+                decision = f"GATED·{state_name.lower()}"
+
+        # Structured audit fields — what the frontend headline + detail
+        # actually consume. Keeping them as top-level dict entries so
+        # the renderer doesn't have to re-parse the BAR/SIGNAL payloads.
+        #
+        #   pivot         : "low" | "high" | None
+        #   touch         : { line_kind, touches, slope, intercept,
+        #                     q_anchor_time, p_anchor_time,
+        #                     line_value_at_now } | None
+        #   filter_name   : str | None    (e.g. "shoulder")
+        #   filter_detail : str | None    (one-line human form)
+        #   outcome       : "B" | "S" | "—"
+        #   prior_bar_close : decimal | None  (the bar BEFORE this one)
+        audit: dict = {
+            "pivot": None,
+            "touch": None,
+            "filter_name": None,
+            "filter_detail": None,
+            "outcome": "—",
+            "prior_bar_close": None,
+        }
+        # prior_bar_close — look back one bar in the window we received.
+        try:
+            wnd = event.window or []
+            if len(wnd) >= 2:
+                pc = wnd[-2].get("close")
+                if pc is not None:
+                    audit["prior_bar_close"] = float(pc)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Pivot bit — derived from the chosen direction.
+        if pivot_status == "PIVOT_LOW":
+            audit["pivot"] = "low"
+        elif pivot_status == "PIVOT_HIGH":
+            audit["pivot"] = "high"
+
+        # Touch info — primary source is the BAR payload (which is
+        # emitted on EVERY bar, regardless of whether SIGNAL fires or
+        # filters reject). The SIGNAL payload (if present) refines it
+        # with anchor timestamps the BAR payload doesn't carry.
+        signal_sig: LogSignal | None = next(
+            (a for a in actions if isinstance(a, LogSignal)
+             and (a.event_type.value if hasattr(a.event_type, "value")
+                  else str(a.event_type)) == "SIGNAL"),
+            None,
+        )
+        # Step 1: derive from BAR payload — works for every row where
+        # the bot detected a candidate (including FILTERED ones).
+        if bar_sig and bar_sig.payload:
+            bp = bar_sig.payload
+            blt = int(bp.get("best_long_touches") or 0)
+            bst = int(bp.get("best_short_touches") or 0)
+            # Prefer the side that's set; if both, the one with more
+            # touches (the bot's tie-break picks higher touches).
+            if blt >= bst and blt > 0:
+                audit["touch"] = {
+                    "line_kind": "support",
+                    "direction": "long",
+                    "touches": blt,
+                    "slope_per_bar": bp.get("best_long_slope"),
+                    "intercept": bp.get("best_long_intercept"),
+                    "anchor_b_idx": bp.get("best_long_anchor_b_idx"),
+                    "anchor_q_idx": bp.get("best_long_from_idx"),
+                    # Anchor times not in BAR payload — refined below
+                    # from SIGNAL when available.
+                    "anchor_b_time": None,
+                    "anchor_q_time": None,
+                    "anchor_b_price": None,
+                }
+            elif bst > 0:
+                audit["touch"] = {
+                    "line_kind": "resistance",
+                    "direction": "short",
+                    "touches": bst,
+                    "slope_per_bar": bp.get("best_short_slope"),
+                    "intercept": bp.get("best_short_intercept"),
+                    "anchor_b_idx": bp.get("best_short_anchor_b_idx"),
+                    "anchor_q_idx": bp.get("best_short_from_idx"),
+                    "anchor_b_time": None,
+                    "anchor_q_time": None,
+                    "anchor_b_price": None,
+                }
+        # Step 2: refine with SIGNAL payload anchor timestamps (only
+        # present when entry actually fired).
+        if signal_sig and signal_sig.payload and audit["touch"] is not None:
+            el = signal_sig.payload.get("entry_line") or {}
+            if el:
+                audit["touch"].update({
+                    "anchor_b_time": el.get("anchor_time"),
+                    "anchor_q_time": el.get("from_time"),
+                    "anchor_b_price": el.get("anchor_price"),
+                })
+        # Filter info — only set when a filter explicitly fired.
+        if skip_sig and skip_sig.payload:
+            sp = skip_sig.payload or {}
+            filt = sp.get("filter")
+            if filt:
+                audit["filter_name"] = str(filt)
+                audit["filter_detail"] = (skip_sig.message or "")[:200]
+        # Outcome.
+        if place_order is not None:
+            audit["outcome"] = "B" if place_order.side == "BUY" else "S"
+        elif exit_sig is not None:
+            audit["outcome"] = "exit"
+
+        # Payload: structured audit fields + the existing raw blocks so
+        # the operator can still drill into the full diag via the
+        # "raw JSON" modal in the UI.
+        payload: dict = {"audit": audit}
+        if bar_sig and bar_sig.payload:
+            payload["bar"] = bar_sig.payload
+        if skip_sig and skip_sig.payload:
+            payload["skip"] = skip_sig.payload
+        if signal_sig and signal_sig.payload:
+            payload["signal"] = signal_sig.payload
+        if exit_sig and exit_sig.payload:
+            payload["exit"] = exit_sig.payload
+        if place_order is not None:
+            payload["fired"] = {
+                "side": place_order.side,
+                "qty": str(place_order.qty),
+                "order_type": getattr(place_order, "order_type", None),
+            }
+
+        return EmitAudit(
+            event_type="BAR_EVAL",
+            decision=decision,
+            symbol=symbol,
+            event_ts_utc=bar_ts,
+            pivot_status=pivot_status,
+            line_status=line_status,
+            bar_close=bar_close_d,
+            payload=payload,
+        )
 
     # ------------------------------------------------------------------
     # Bar — entry & exit decisions both fire on 3-min bar close
@@ -217,7 +525,7 @@ class ChartSignalStrategy:
         # frozen entry line on this 3-min close. Independent of window
         # length — the entry line is already frozen.
         if pos == BotState.AWAITING_EXIT_TRIGGER:
-            return actions + self._evaluate_exit(event, ctx, bar_time)
+            return actions + await self._evaluate_exit(event, ctx, bar_time)
 
         # Entry check: gated on armed + deadzone + cooldown + FSM state.
         if pos != BotState.AWAITING_ENTRY_TRIGGER:
@@ -375,8 +683,14 @@ class ChartSignalStrategy:
                 "n_bars": len(closes),
                 "best_long_touches": long_line.touches if long_line else 0,
                 "best_long_slope": long_line.slope if long_line else None,
+                "best_long_intercept": long_line.intercept if long_line else None,
+                "best_long_from_idx": long_line.from_idx if long_line else None,
+                "best_long_anchor_b_idx": long_line.anchor_b_idx if long_line else None,
                 "best_short_touches": short_line.touches if short_line else 0,
                 "best_short_slope": short_line.slope if short_line else None,
+                "best_short_intercept": short_line.intercept if short_line else None,
+                "best_short_from_idx": short_line.from_idx if short_line else None,
+                "best_short_anchor_b_idx": short_line.anchor_b_idx if short_line else None,
                 "supports_found": len(supports),
                 "resistances_found": len(resistances),
                 "top_supports": _top(supports),
@@ -628,11 +942,12 @@ class ChartSignalStrategy:
                     actions.append(LogSignal(
                         event_type=LogEventType.SKIP,
                         message=(
-                            f"bad-shoulder filter — right shoulder "
+                            f"{FILTER_SHOULDER} filter — right shoulder "
                             f"{rejected_payload['right_shoulder']:.4f} "
                             f"vs left {rejected_payload['left_shoulder']:.4f}"
                         ),
-                        payload={**rejected_payload,
+                        payload={"filter": FILTER_SHOULDER,
+                                 **rejected_payload,
                                  "entry_decision": decision_diag},
                     ))
 
@@ -642,38 +957,169 @@ class ChartSignalStrategy:
         # about to resolve in EITHER direction and a fresh position
         # is exposed to the breakout going the wrong way. Set to 0 to
         # disable. Mirrors the on-chart wedge overlay's apex math.
-        tri_block_dist = int(self.config.get(
-            "entry_triangle_block_distance", 3,
-        ))
-        if tri_block_dist > 0 and (
-            long_line is not None or short_line is not None
-        ):
+        #
+        # 15-mo BID_ASK backtest (run_15mo_tight_triangle.py):
+        #   block ≤1  → −$10k aggregate vs baseline (mild cost)
+        #   block ≤3  → −$33k aggregate vs baseline (too aggressive)
+        #   block ≤5  → −$45k
+        # Default 2 is a compromise: it blocks the most-imminent
+        # ("apex inside the next 6 min") wedges where the operator
+        # is most likely to get whipsawed, while still entering at
+        # apex-3-bars-away where there's room to manage the trade.
+        # Compute wedges once — shared by the tight-triangle and
+        # min-target filters below.
+        wedges: list = []
+        if long_line is not None or short_line is not None:
             wedge_max_apex = int(self.config.get(
                 "wedge_max_apex_bars_ahead", 200,
             ))
             wedge_min_overlap = int(self.config.get(
                 "wedge_min_overlap_bars", 5,
             ))
+            # Flat-slope threshold so the bot and chart agree on
+            # which wedges to ignore (same-direction trendlines —
+            # see find_wedges docstring). Tied to TOUCH_TOLERANCE,
+            # matches /engine/sr.
+            avg_close = (
+                sum(closes) / len(closes) if closes else 0.0
+            )
+            flat_eps = avg_close * TOUCH_TOLERANCE_FRACTION / 20.0
             wedges = find_wedges(
                 supports, resistances, last_idx,
                 max_apex_bars_ahead=wedge_max_apex,
                 min_overlap_bars=wedge_min_overlap,
+                flat_slope_threshold=flat_eps,
             )
+
+        tri_block_dist = int(self.config.get(
+            "entry_triangle_block_distance", 2,
+        ))
+        if tri_block_dist > 0 and (
+            long_line is not None or short_line is not None
+        ):
             apex_min = wedges[0].apex_bars_ahead if wedges else None
             if apex_min is not None and apex_min <= tri_block_dist:
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
-                        f"tight-triangle filter — apex {apex_min} bars "
-                        f"ahead (≤ {tri_block_dist}); waiting for "
+                        f"{FILTER_TIGHT_TRIANGLE} filter — apex {apex_min} "
+                        f"bars ahead (≤ {tri_block_dist}); waiting for "
                         f"resolution"
                     ),
-                    payload={"apex_bars_ahead": apex_min,
+                    payload={"filter": FILTER_TIGHT_TRIANGLE,
+                             "apex_bars_ahead": apex_min,
                              "threshold": tri_block_dist,
                              "entry_decision": decision_diag},
                 ))
                 long_line = None
                 short_line = None
+
+        # Min-target entry filter (FILTER_MIN_TARGET). Uses the
+        # opposing edge of the nearest WEDGE — the structural
+        # ceiling/floor that price is converging toward. If no wedge
+        # exists, the filter doesn't apply (entry allowed).
+        #
+        # Apex distance is NOT capped here: even a far-future apex
+        # implies a near-term opposing edge worth measuring against.
+        # We rely on ``find_wedges``' default ``max_apex_bars_ahead``
+        # only for sanity (very-far-future apexes are usually
+        # nearly-parallel lines and uninteresting).
+        #
+        # Geometry — evaluated at the current bar's x:
+        #   LONG  : opposing edge = nearest wedge's resistance line.
+        #   SHORT : opposing edge = nearest wedge's support    line.
+        # Entry price proxy: closes[last_idx] (mid-fill assumption).
+        #
+        # Stop distance: max(trail_dist, line_breach_dist). The trail
+        # is ``entry * trail_width_pct``; the line-breach distance is
+        # ``|entry - chosen_line_at_last_idx|`` — usually small at a
+        # fresh touch but recorded for completeness. Whichever is wider
+        # is the worst-case loss the trade can take.
+        mt_enabled = bool(self.config.get(
+            "entry_min_target_filter_enabled", True,
+        ))
+        if mt_enabled and wedges and (
+            long_line is not None or short_line is not None
+        ):
+            nearest_wedge = wedges[0]
+            entry_price = closes[last_idx]
+            trail_pct = float(self.config.get("trail_width_pct", 0.0003))
+            trail_dist = abs(entry_price) * trail_pct
+
+            def _min_target_reject(side_line, side: str) -> dict | None:
+                if side == "LONG":
+                    opp = nearest_wedge.resistance
+                else:
+                    opp = nearest_wedge.support
+                opp_at = opp.intercept + opp.slope * last_idx
+                raw_target_dist = (
+                    opp_at - entry_price if side == "LONG"
+                    else entry_price - opp_at
+                )
+                # Wedge-already-broken case: if the opposing edge has
+                # crossed past the entry direction (resistance below a
+                # LONG entry / support above a SHORT entry), the wedge
+                # is structurally behind us — price has already broken
+                # out of the converging structure. min_target's
+                # "is the wedge target worth the stop" question is
+                # MOOT in that case. Skip the filter entirely so the
+                # entry isn't blocked on a wedge that no longer exists
+                # as a constraint. Per operator decision 2026-05-14
+                # after MNQ 21:42 PT setup got killed this way.
+                if raw_target_dist <= 0:
+                    return None
+                target_dist = raw_target_dist
+                line_at = (
+                    side_line.intercept + side_line.slope * last_idx
+                )
+                line_breach_dist = abs(entry_price - line_at)
+                stop_dist = max(trail_dist, line_breach_dist)
+                if target_dist >= stop_dist:
+                    return None
+                return {
+                    "filter": FILTER_MIN_TARGET,
+                    "side": side,
+                    "entry_price": round(entry_price, 4),
+                    "opposing_edge_price": round(opp_at, 4),
+                    "opposing_line_touches": opp.touches,
+                    "opposing_line_slope": round(opp.slope, 4),
+                    "wedge_apex_bars_ahead": nearest_wedge.apex_bars_ahead,
+                    "target_distance": round(target_dist, 4),
+                    "stop_distance": round(stop_dist, 4),
+                    "trail_distance": round(trail_dist, 4),
+                    "line_breach_distance": round(line_breach_dist, 4),
+                }
+
+            if long_line is not None:
+                rej = _min_target_reject(long_line, "LONG")
+                if rej is not None:
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"{FILTER_MIN_TARGET} filter (LONG) — target "
+                            f"${rej['target_distance']:.4f} < stop "
+                            f"${rej['stop_distance']:.4f} (opposing R at "
+                            f"{rej['opposing_edge_price']:.4f}, entry "
+                            f"{rej['entry_price']:.4f})"
+                        ),
+                        payload={**rej, "entry_decision": decision_diag},
+                    ))
+                    long_line = None
+            if short_line is not None:
+                rej = _min_target_reject(short_line, "SHORT")
+                if rej is not None:
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"{FILTER_MIN_TARGET} filter (SHORT) — target "
+                            f"${rej['target_distance']:.4f} < stop "
+                            f"${rej['stop_distance']:.4f} (opposing S at "
+                            f"{rej['opposing_edge_price']:.4f}, entry "
+                            f"{rej['entry_price']:.4f})"
+                        ),
+                        payload={**rej, "entry_decision": decision_diag},
+                    ))
+                    short_line = None
 
         if long_line is None and short_line is None:
             actions.append(LogSignal(
@@ -730,6 +1176,138 @@ class ChartSignalStrategy:
         else:
             return actions
         is_acceleration_entry = chosen_path == "accel"
+
+        # Entry-distance filter (FILTER_ENTRY_DISTANCE).
+        # Rejects entries where the bar's close has drifted past the
+        # SR line by more than the configured stop band. The line IS
+        # the trigger; entering far away from it means the bar already
+        # ran past the touch zone and we're entering "into thin air"
+        # with most of the trade's R:R consumed before fill.
+        #
+        # Cap = trail_dist × ``entry_distance_max_trail_mult`` (default
+        # 2.0). MGC trail $0.93 → cap $1.86; MES $2.26 → $4.52;
+        # MNQ $5.94 → $11.88. Acceleration-entry path is exempt by
+        # design — accel ALREADY entered beyond the line.
+        ed_enabled = bool(self.config.get(
+            "entry_distance_filter_enabled", True,
+        ))
+        if ed_enabled and not is_acceleration_entry:
+            entry_price = closes[last_idx]
+            trail_pct = float(self.config.get("trail_width_pct", 0.0003))
+            trail_dist = abs(entry_price) * trail_pct
+            mult = float(self.config.get("entry_distance_max_trail_mult", 2.0))
+            cap = trail_dist * mult
+            line_at = chosen.intercept + chosen.slope * last_idx
+            gap = abs(entry_price - line_at)
+            if gap > cap:
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_ENTRY_DISTANCE} filter ({direction.upper()})"
+                        f" — entry {entry_price:.4f} is ${gap:.4f} from "
+                        f"{kind} line {line_at:.4f} (cap ${cap:.4f} = "
+                        f"{mult:.1f}× trail)"
+                    ),
+                    payload={
+                        "filter": FILTER_ENTRY_DISTANCE,
+                        "direction": direction,
+                        "entry_price": round(entry_price, 4),
+                        "line_value": round(line_at, 4),
+                        "gap": round(gap, 4),
+                        "cap": round(cap, 4),
+                        "trail_distance": round(trail_dist, 4),
+                        "mult": mult,
+                        "entry_decision": decision_diag,
+                    },
+                ))
+                return actions
+
+        # Q-session filter (FILTER_Q_SESSION).
+        # The chosen line's earlier construction anchor (Q = from_idx)
+        # must share a PT session with the fire bar. Lines built in a
+        # prior session — e.g. a 4-touch support anchored 12h back at
+        # the morning's RTH session, fired against during evening
+        # Asia — represent stale structure that the new session's
+        # participants may not honor.
+        # Sessions (PT, futures): 06:30-15:00, 15:00-17:00,
+        # 17:00-24:00, 00:00-06:30. See ``futures_session_id``.
+        qs_enabled = bool(self.config.get(
+            "entry_q_session_filter_enabled", True,
+        ))
+        if qs_enabled:
+            q_time = None
+            if 0 <= chosen.from_idx < len(window):
+                wq = window[chosen.from_idx]
+                q_time = _parse_ts(
+                    wq.get("timestamp_utc") or wq.get("ts"),
+                )
+            if q_time is not None:
+                q_sess = futures_session_id(q_time)
+                cur_sess = futures_session_id(bar_time)
+                if q_sess != cur_sess:
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"{FILTER_Q_SESSION} filter ({direction.upper()})"
+                            f" — Q anchor in session {q_sess[1]} ({q_sess[0]})"
+                            f", fire bar in session {cur_sess[1]} "
+                            f"({cur_sess[0]}); line spans sessions"
+                        ),
+                        payload={
+                            "filter": FILTER_Q_SESSION,
+                            "direction": direction,
+                            "q_anchor_time": q_time.isoformat(),
+                            "q_session": list(q_sess),
+                            "current_session": list(cur_sess),
+                            "entry_decision": decision_diag,
+                        },
+                    ))
+                    return actions
+
+        # Opposing-dominance filter (FILTER_OPPOSING_DOMINANCE).
+        # Reject when the OPPOSITE-side market structure has many more
+        # touches than the chosen line — a signal that the prevailing
+        # trend is against this trade. For LONG, opposing = strongest
+        # resistance line; for SHORT, opposing = strongest support.
+        # Cap ratio default 3.0 (configurable). 18:36 PT MES on
+        # 2026-05-14 had 4-touch chosen support vs 20-touch dominant
+        # resistance (5× ratio) → reject.
+        od_enabled = bool(self.config.get(
+            "entry_opposing_dominance_filter_enabled", True,
+        ))
+        if od_enabled:
+            opp_pool = resistances if direction == "long" else supports
+            opp_max_touches = max(
+                (l.touches for l in opp_pool if l.break_idx is None),
+                default=0,
+            )
+            ratio = float(self.config.get(
+                "entry_opposing_dominance_ratio", 3.0,
+            ))
+            if (chosen.touches > 0
+                    and opp_max_touches >= chosen.touches * ratio):
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_OPPOSING_DOMINANCE} filter "
+                        f"({direction.upper()}) — opposing-side max "
+                        f"touches {opp_max_touches} ≥ {ratio:.1f}× "
+                        f"chosen touches {chosen.touches} "
+                        f"(market structure dominates against trade)"
+                    ),
+                    payload={
+                        "filter": FILTER_OPPOSING_DOMINANCE,
+                        "direction": direction,
+                        "chosen_touches": int(chosen.touches),
+                        "opposing_max_touches": int(opp_max_touches),
+                        "ratio_cap": ratio,
+                        "actual_ratio": round(
+                            opp_max_touches / chosen.touches, 2,
+                        ),
+                        "entry_decision": decision_diag,
+                    },
+                ))
+                return actions
 
         # Freeze the line in (time, price) space so future evaluations
         # survive the window sliding forward.
@@ -842,8 +1420,8 @@ class ChartSignalStrategy:
         }))
         return actions
 
-    def _evaluate_exit(self, event: BarCompleted, ctx: StrategyContext,
-                       bar_time: datetime) -> list[Action]:
+    async def _evaluate_exit(self, event: BarCompleted, ctx: StrategyContext,
+                              bar_time: datetime) -> list[Action]:
         actions: list[Action] = []
         entry_line = ctx.state.get("entry_line") or {}
         if not entry_line:
@@ -1011,7 +1589,86 @@ class ChartSignalStrategy:
             return actions + self.build_exit_actions(
                 ctx, ExitType.TRAILING_STOP, detail,
             )
+
+        # Refresh the counter-line cache used by the tick-time
+        # EXIT_COUNTER_LINE trigger in ``_on_quote``. Done at every
+        # bar close while in position so the tick check always reads
+        # a snapshot taken at the latest closed bar. Lines are static
+        # within a bar (last_idx fixed; intercept/slope frozen) so
+        # caching at bar close + reading on every tick is exact, not
+        # an approximation.
+        if bool(self.config.get("counter_exit_enabled", True)):
+            actions.extend(
+                await self._refresh_counter_lines_cache(direction)
+            )
         return actions
+
+    async def _refresh_counter_lines_cache(
+        self, direction: str,
+    ) -> list[Action]:
+        """Detect the opposing-side trendlines and write a flat cache
+        to state for tick-time consumption. Counter lines = the lines
+        the position would have to clear to keep running:
+          LONG  → resistance lines (above current price)
+          SHORT → support    lines (below current price)
+        Includes 2+ touch unbroken lines (the user explicitly opted
+        for the broader set; audit logs will tell us if it over-fires).
+        """
+        fetched = await self._fetch_history()
+        if not fetched:
+            return [UpdateState({"counter_lines_cache": [],
+                                 "counter_lines_tol": 0.0})]
+        closes = [float(b.get("close", 0)) for b in fetched]
+        if len(closes) < 4:
+            return [UpdateState({"counter_lines_cache": [],
+                                 "counter_lines_tol": 0.0})]
+        last_idx = len(closes) - 1
+        bar_close = closes[last_idx]
+        avg_close = sum(closes) / len(closes)
+        near_frac = self.config.get(
+            "near_touch_tolerance_fraction",
+            5 * TOUCH_TOLERANCE_FRACTION,
+        )
+        if near_frac is not None:
+            near_frac = float(near_frac)
+        opp_type = "resistance" if direction == "long" else "support"
+        from ib_trader.signals.sr_fan import detect_lines
+        opp_lines = detect_lines(
+            closes, up_to=last_idx, type_=opp_type,
+            near_touch_tolerance_fraction=near_frac,
+        )
+        min_touches = int(self.config.get("counter_exit_min_touches", 2))
+        cache: list[dict] = []
+        for ln in opp_lines:
+            if ln.break_idx is not None:
+                continue
+            if ln.touches < min_touches:
+                continue
+            value = ln.intercept + ln.slope * last_idx
+            # Only counter side relevant: above price for LONG /
+            # below price for SHORT. A "resistance" that sits below
+            # current price has already been crossed and isn't acting
+            # as a ceiling.
+            if direction == "long" and value <= bar_close:
+                continue
+            if direction == "short" and value >= bar_close:
+                continue
+            cache.append({
+                "value": round(value, 6),
+                "slope": round(ln.slope, 6),
+                "touches": int(ln.touches),
+            })
+        # Sort strongest-first so the touch test prefers high-touch
+        # lines when several sit near the same price.
+        cache.sort(key=lambda x: (-x["touches"], abs(x["value"])))
+        touch_frac = float(self.config.get(
+            "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+        ))
+        tol = max(1e-6, avg_close * touch_frac)
+        return [UpdateState({
+            "counter_lines_cache": cache,
+            "counter_lines_tol": round(tol, 6),
+        })]
 
     # ------------------------------------------------------------------
     # Quote — surface last price + unrealised P/L for the UI strip
@@ -1041,10 +1698,181 @@ class ChartSignalStrategy:
         # Long: profit when last > entry. Short: profit when last < entry.
         unrealized = (last - entry_price) * qty * mult if direction == "long" \
             else (entry_price - last) * qty * mult
-        return [UpdateState({
+
+        state_patch: dict = {
             "last_price": str(last),
             "unrealized_pnl": str(unrealized),
-        })]
+        }
+
+        # EXIT_COUNTER_LINE: tick-time touch-and-hold against the
+        # nearest unbroken opposing trendline. Fires irrespective of
+        # the bar-close trail/line-breach exits. The cache snapshot
+        # was written at the last bar close (see
+        # ``_refresh_counter_lines_cache``); lines are static within
+        # a bar so the snapshot is exact.
+        actions: list[Action] = []
+        if bool(self.config.get("counter_exit_enabled", True)):
+            actions.extend(self._check_counter_line_exit(
+                ctx, float(last), direction, state_patch,
+            ))
+            # If the counter-line check fired an exit, ``actions``
+            # already contains the LogSignal + UpdateState + PlaceOrder
+            # and we should NOT also emit a redundant UpdateState.
+            for a in actions:
+                if isinstance(a, PlaceOrder):
+                    return actions
+
+        actions.append(UpdateState(state_patch))
+        return actions
+
+    def _check_counter_line_exit(
+        self, ctx: StrategyContext, mid: float, direction: str,
+        state_patch: dict,
+    ) -> list[Action]:
+        """Tick-time check for the EXIT_COUNTER_LINE trigger.
+
+        Touch starts on first tick whose mid reaches the opposing line
+        within ``tol``. We then wait ``counter_exit_hold_seconds``.
+        At elapsed >= hold:
+          - if mid is STILL in the touch zone (no clean breakout) →
+            exit immediately;
+          - if mid is past the line by > tol (current breakout) →
+            clear the touch and keep the trade.
+
+        Brief breaches during the hold window do NOT reset state —
+        only the end-of-hold snapshot decides. Matches the operator's
+        "breach can be brief and come back down" intuition.
+        """
+        cache = ctx.state.get("counter_lines_cache") or []
+        tol = float(ctx.state.get("counter_lines_tol", 0.0))
+        if not cache or tol <= 0:
+            return []
+        hold_secs = float(self.config.get("counter_exit_hold_seconds", 10))
+        now = datetime.now(timezone.utc)
+        cur_touch = ctx.state.get("counter_touch")
+        # Direction-aware re-filter on every read. The cache build
+        # already drops geometrically-invalid lines (LONG: line below
+        # price; SHORT: line above), but the cache can leak across
+        # trades if it isn't rebuilt at entry (MGC SHORT trade #7 on
+        # 2026-05-14 exited on a resistance line carried over from a
+        # prior LONG). Belt-and-suspenders: validate against the
+        # current trade's entry price so a stale line from the wrong
+        # direction is silently skipped at consumption.
+        try:
+            entry_price = float(
+                ctx.state.get("entry_price") or 0
+            )
+        except (TypeError, ValueError):
+            entry_price = 0.0
+
+        def _line_valid_for_direction(lv: float) -> bool:
+            if entry_price <= 0:
+                return True  # entry price unavailable — fall back to legacy behavior
+            # LONG: opposing line must be ABOVE entry (resistance).
+            # SHORT: opposing line must be BELOW entry (support).
+            if direction == "long":
+                return lv > entry_price
+            return lv < entry_price
+
+        if cur_touch is None:
+            # No active touch — see if any line is currently touched.
+            for ln in cache:
+                lv = float(ln["value"])
+                if not _line_valid_for_direction(lv):
+                    continue
+                touched = (mid >= lv - tol) if direction == "long" \
+                    else (mid <= lv + tol)
+                breakout = (mid > lv + tol) if direction == "long" \
+                    else (mid < lv - tol)
+                if touched and not breakout:
+                    state_patch["counter_touch"] = {
+                        "started_at": now.isoformat(),
+                        "line_value": lv,
+                        "line_touches": int(ln["touches"]),
+                        "line_slope": float(ln.get("slope", 0)),
+                    }
+                    return [LogSignal(
+                        event_type=LogEventType.EXIT_CHECK,
+                        message=(
+                            f"{EXIT_COUNTER_LINE} armed — line {lv:.4f} "
+                            f"touched (touches={ln['touches']}, "
+                            f"mid={mid:.4f}); hold {hold_secs:.0f}s "
+                            f"for rejection confirm"
+                        ),
+                        payload={
+                            "exit_trigger_armed": EXIT_COUNTER_LINE,
+                            "line_value": lv,
+                            "line_touches": int(ln["touches"]),
+                            "line_slope": float(ln.get("slope", 0)),
+                            "mid": mid,
+                            "hold_seconds": hold_secs,
+                        },
+                    )]
+            return []
+
+        # Touch is active — check elapsed and current breakout status.
+        started = _parse_ts(cur_touch.get("started_at"))
+        if started is None:
+            state_patch["counter_touch"] = None
+            return []
+        line_value = float(cur_touch["line_value"])
+        # Validate the armed line still makes geometric sense for the
+        # current direction. Same defense as the arm-time gate above —
+        # an armed touch from a wrong-direction line should silently
+        # clear, not exit.
+        if not _line_valid_for_direction(line_value):
+            state_patch["counter_touch"] = None
+            return []
+        elapsed = (now - started).total_seconds()
+        cur_breakout = (mid > line_value + tol) if direction == "long" \
+            else (mid < line_value - tol)
+        if elapsed < hold_secs:
+            return []
+        if cur_breakout:
+            # Hold elapsed but we're past the line — treat as a real
+            # breakout; clear the touch and let the trade keep running.
+            state_patch["counter_touch"] = None
+            return [LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=(
+                    f"{EXIT_COUNTER_LINE} cleared — breakout past line "
+                    f"{line_value:.4f} (mid={mid:.4f}); resetting"
+                ),
+                payload={
+                    "exit_trigger_cleared": EXIT_COUNTER_LINE,
+                    "line_value": line_value,
+                    "mid": mid,
+                    "elapsed_seconds": round(elapsed, 2),
+                },
+            )]
+        # Rejection confirmed — exit immediately.
+        detail = (
+            f"counter-line held {elapsed:.1f}s "
+            f"(line={line_value:.4f}, "
+            f"touches={cur_touch['line_touches']}, mid={mid:.4f})"
+        )
+        state_patch["counter_touch"] = None
+        state_patch["exit_reason"] = EXIT_COUNTER_LINE
+        actions: list[Action] = [
+            LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=f"{EXIT_COUNTER_LINE} exit — {detail}",
+                payload={
+                    "exit_trigger": EXIT_COUNTER_LINE,
+                    "line_value": line_value,
+                    "line_touches": cur_touch["line_touches"],
+                    "line_slope": cur_touch.get("line_slope"),
+                    "mid": mid,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "hold_seconds": hold_secs,
+                },
+            ),
+            UpdateState(state_patch),
+        ]
+        actions.extend(self.build_exit_actions(
+            ctx, ExitType.TRAILING_STOP, detail,
+        ))
+        return actions
 
     # ------------------------------------------------------------------
     # Fills / Rejects
@@ -1107,6 +1935,17 @@ class ChartSignalStrategy:
                     "qty": str(event.qty),
                     "active_stop": str(initial_stop),
                     wm_field: str(fill_price_d),
+                    # Counter-line state reset at entry. A previous
+                    # trade's cache (built for the OPPOSITE direction)
+                    # would otherwise leak into the new trade's
+                    # ``_check_counter_line_exit`` reads — fired the
+                    # MGC SHORT trade #7 immediate-exit at $5 loss on
+                    # 2026-05-14. Empty cache here; first 3-min bar in
+                    # ``_evaluate_exit`` rebuilds it for the new
+                    # direction.
+                    "counter_lines_cache": [],
+                    "counter_lines_tol": 0.0,
+                    "counter_touch": None,
                 }),
             ])
         elif is_exit_leg:
@@ -1142,6 +1981,33 @@ class ChartSignalStrategy:
                     else (entry_price - event.fill_price) * event.qty * mult
             else:
                 pnl = Decimal("0")
+            # Round-trip summary for the operator-facing audit feed.
+            exit_reason = ctx.state.get("exit_reason") or "unknown"
+            entry_time_iso = ctx.state.get("entry_time")
+            duration_s: float | None = None
+            entry_dt = _parse_ts(entry_time_iso) if entry_time_iso else None
+            if entry_dt is not None:
+                try:
+                    duration_s = (datetime.now(timezone.utc)
+                                  - entry_dt.astimezone(timezone.utc)
+                                  ).total_seconds()
+                except Exception:  # noqa: BLE001
+                    duration_s = None
+            close_payload = {
+                "direction": direction,
+                "entry_price": str(entry_price),
+                "exit_price": str(event.fill_price),
+                "qty": str(event.qty),
+                "pnl_gross": str(pnl),
+                "exit_reason": exit_reason,
+                "entry_time": entry_time_iso,
+                "duration_seconds": duration_s,
+                "trade_serial": ctx.state.get("trade_serial"),
+                # commission isn't on the OrderFilled event for this
+                # strategy path; ib_realized_pnl is backfilled later.
+                # ``pnl_net`` left null in the audit row — frontend can
+                # join to bot_trades for the post-settlement number.
+            }
             actions.extend([
                 LogSignal(
                     event_type=LogEventType.CLOSED,
@@ -1150,6 +2016,13 @@ class ChartSignalStrategy:
                         f"({direction} close)"
                     ),
                     trade_serial=ctx.state.get("trade_serial"),
+                ),
+                EmitAudit(
+                    event_type="TRADE_CLOSED",
+                    decision=f"CLOSED·{direction.upper()}·{exit_reason}",
+                    symbol=event.symbol,
+                    pnl_net=pnl,
+                    payload=close_payload,
                 ),
                 UpdateState({
                     "trade_serial": None,
@@ -1171,6 +2044,10 @@ class ChartSignalStrategy:
                     "low_water_mark": None,
                     "active_stop": None,
                     "exit_reason": None,
+                    # Counter-line exit state cleared with the round.
+                    "counter_touch": None,
+                    "counter_lines_cache": [],
+                    "counter_lines_tol": 0.0,
                 }),
             ])
         return actions

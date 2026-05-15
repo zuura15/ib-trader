@@ -12,6 +12,8 @@ from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategies.chart_signal import ChartSignalStrategy
 from ib_trader.bots.strategy import (
     BarCompleted,
+    LogEventType,
+    LogSignal,
     OrderFilled,
     PlaceOrder,
     QuoteUpdate,
@@ -41,6 +43,12 @@ def _default_config(sec_type: str = "FUT") -> dict:
         # gate has its own dedicated tests that build wallclock-
         # recent bar events and use the production-default cap.
         "max_signal_age_seconds": 10 ** 9,
+        # The entry-distance filter (FILTER_ENTRY_DISTANCE) caps
+        # entry-to-line gap at 2× trail_dist. Fixture closes drift
+        # several units past the synthetic line by design, so the
+        # filter would reject most semantic tests. Disabled here;
+        # dedicated tests in TestEntryDistanceFilter cover the rule.
+        "entry_distance_filter_enabled": False,
     }
 
 
@@ -305,6 +313,302 @@ class TestEntry:
         actions = await s.on_event(event, ctx)
         place = [a for a in actions if isinstance(a, PlaceOrder)]
         assert place and place[0].side == "BUY"
+
+
+class TestEntryDistanceFilter:
+    """FILTER_ENTRY_DISTANCE: reject when entry-to-line gap > 2× trail_dist."""
+
+    def _bar_event_at(self, idx: int) -> BarCompleted:
+        bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES[: idx + 1])
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_gap_exceeds_cap(self):
+        # ZIGZAG bar 8 closes at 14.0; support line projects to 12.5
+        # at this bar (slope 0.5 from anchor 12.0 at idx 7) → gap 1.5.
+        # With trail_pct = 0.0003 (default) and 2× mult: cap = 0.0084.
+        # Gap 1.5 >> cap → reject.
+        cfg = _default_config()
+        cfg["entry_distance_filter_enabled"] = True
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and "entry_distance" in (a.message or "")]
+        assert skips, "expected entry_distance SKIP log"
+        p = skips[0].payload
+        assert p["filter"] == "entry_distance"
+        assert p["direction"] == "long"
+        assert p["gap"] > p["cap"]
+
+    @pytest.mark.asyncio
+    async def test_allows_when_gap_within_cap(self):
+        # Same fixture, but bump trail_pct so 2× × 14 ≥ 1.5 → cap ≥ 1.5.
+        # trail_pct = 0.06 → trail_dist 0.84 → cap 1.68 ≥ 1.5 → pass.
+        cfg = _default_config()
+        cfg["entry_distance_filter_enabled"] = True
+        cfg["trail_width_pct"] = 0.06
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place, f"expected PlaceOrder, got {[type(a).__name__ for a in actions]}"
+        assert place[0].side == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config_lets_far_entry_through(self):
+        cfg = _default_config()  # entry_distance_filter_enabled: False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place, "filter disabled → entry should fire"
+
+    @pytest.mark.asyncio
+    async def test_payload_has_cap_and_distance(self):
+        cfg = _default_config()
+        cfg["entry_distance_filter_enabled"] = True
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter") == "entry_distance"]
+        p = skips[0].payload
+        assert p["entry_price"] == pytest.approx(14.0)
+        assert p["line_value"] == pytest.approx(12.5)
+        assert p["gap"] == pytest.approx(1.5)
+        # mult default = 2.0
+        assert p["mult"] == 2.0
+        # cap = 14 * 0.0003 * 2 = 0.0084
+        assert p["cap"] == pytest.approx(0.0084, abs=1e-6)
+
+
+class TestQSessionFilter:
+    """FILTER_Q_SESSION: reject if chosen line's Q anchor is in a
+    different PT session from the fire bar. Defends against the
+    MES LONG @ 18:36 PT on 2026-05-14 where Q was 12h back in a
+    prior session."""
+
+    def _make_bar_event(self, bars):
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_q_in_prior_session(self):
+        # Build 100 bars: Q anchored at 09:00 PT (session 1), fire
+        # at 18:30 PT (session 3) — different sessions, must reject.
+        # Use one bar at 09:00 PT and a run from 18:00 PT onwards
+        # so a 3-touch line can form within the recent run.
+        cfg = _default_config()
+        cfg["entry_q_session_filter_enabled"] = True
+        # Disable other filters that might preempt.
+        cfg["entry_distance_filter_enabled"] = False
+        cfg["entry_opposing_dominance_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        # 09:00 AM PT 2026-05-10 = 16:00 UTC
+        morning = datetime(2026, 5, 10, 16, 0, tzinfo=timezone.utc)
+        # 18:00 PT same day = 01:00 UTC next day. Use a window that
+        # makes the older pivot the only viable Q.
+        # Construct: pivot-low at morning, then run upward into evening,
+        # creating a support line from morning → evening pivot.
+        # Simplest: morning low, mid-day high, evening low (= P), then
+        # rising right shoulder triggering 3rd touch fire.
+        bars = []
+        # 200 bars starting morning, 3-min spaced (=10h coverage)
+        for i in range(200):
+            t = morning + timedelta(seconds=BAR_SECONDS * i)
+            # V-shape: dip at idx 0 (4660), peak at idx 100 (4680),
+            # second dip at idx 195 (4660), rising into idx 199 (4670).
+            if i == 0:
+                close = 4660.0
+            elif i <= 100:
+                close = 4660.0 + (i / 100.0) * 20.0
+            elif i <= 195:
+                close = 4680.0 - ((i - 100) / 95.0) * 20.0
+            else:
+                close = 4660.0 + ((i - 195) / 4.0) * 10.0
+            bars.append(_bar(t, close))
+        actions = await s.on_event(self._make_bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and (a.payload or {}).get("filter") == "q_session"]
+        if skips:
+            p = skips[0].payload
+            assert p["q_session"] != p["current_session"]
+
+    def test_session_id_boundaries(self):
+        # Direct boundary verification on futures_session_id.
+        from ib_trader.signals.sr_fan import futures_session_id, _PT
+        # 06:30 PT exact → session 1 boundary
+        dt = datetime(2026, 5, 14, 6, 30, tzinfo=_PT)
+        assert futures_session_id(dt) == ("2026-05-14", 1)
+        # 14:59 PT → still session 1
+        assert futures_session_id(
+            datetime(2026, 5, 14, 14, 59, tzinfo=_PT)
+        ) == ("2026-05-14", 1)
+        # 15:00 PT → session 2
+        assert futures_session_id(
+            datetime(2026, 5, 14, 15, 0, tzinfo=_PT)
+        ) == ("2026-05-14", 2)
+        # 17:00 PT → session 3
+        assert futures_session_id(
+            datetime(2026, 5, 14, 17, 0, tzinfo=_PT)
+        ) == ("2026-05-14", 3)
+        # 23:59 PT → still session 3
+        assert futures_session_id(
+            datetime(2026, 5, 14, 23, 59, tzinfo=_PT)
+        ) == ("2026-05-14", 3)
+        # 00:00 PT next day → session 4 of next day
+        assert futures_session_id(
+            datetime(2026, 5, 15, 0, 0, tzinfo=_PT)
+        ) == ("2026-05-15", 4)
+        # 06:29 PT → still session 4
+        assert futures_session_id(
+            datetime(2026, 5, 15, 6, 29, tzinfo=_PT)
+        ) == ("2026-05-15", 4)
+
+
+class TestOpposingDominanceFilter:
+    """FILTER_OPPOSING_DOMINANCE: reject when opposite-side has many
+    more touches than the chosen line — market structure votes
+    against the trade direction. MES LONG @ 18:36 PT 2026-05-14
+    had 4-touch chosen vs 20-touch opposing (5×) → reject."""
+
+    def _bar_event_at(self, idx: int) -> BarCompleted:
+        bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES[: idx + 1])
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_passes_when_ratio_under_cap(self):
+        # ZIGZAG fixture has roughly symmetric supports/resistances
+        # (3-4 touches each); ratio well under 3.0 → should NOT
+        # trigger opposing_dominance.
+        cfg = _default_config()
+        cfg["entry_distance_filter_enabled"] = False
+        cfg["entry_q_session_filter_enabled"] = False
+        cfg["entry_opposing_dominance_filter_enabled"] = True
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and (a.payload or {}).get("filter") == "opposing_dominance"]
+        assert not skips
+        # Still emits an entry order on this fixture.
+        assert [a for a in actions if isinstance(a, PlaceOrder)]
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_ratio_at_or_above_cap(self):
+        # ZIGZAG fixture: chosen support 4 touches, opposing resistance
+        # 3 touches. Lower the cap to 0.5 so opposing(3) ≥ 4×0.5 = 2.0
+        # fires the filter.
+        cfg = _default_config()
+        cfg["entry_distance_filter_enabled"] = False
+        cfg["entry_q_session_filter_enabled"] = False
+        cfg["entry_opposing_dominance_filter_enabled"] = True
+        cfg["entry_opposing_dominance_ratio"] = 0.5
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and (a.payload or {}).get("filter") == "opposing_dominance"]
+        assert skips, "expected opposing_dominance SKIP"
+        p = skips[0].payload
+        assert p["opposing_max_touches"] >= p["chosen_touches"] * p["ratio_cap"]
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+
+
+class TestCounterLineCacheLifecycle:
+    """Counter_line cache must clear on entry fill and the read path must
+    skip lines whose geometry is wrong for the current direction.
+    Defends against the MGC SHORT trade #7 bug (2026-05-14) where a
+    stale LONG resistance line fired counter_line on a SHORT trade."""
+
+    @pytest.mark.asyncio
+    async def test_entry_fill_clears_cache(self):
+        s = ChartSignalStrategy(_default_config())
+        # Pre-existing cache (would be from a previous trade in real life).
+        ctx = _make_ctx(
+            state={
+                "armed": True,
+                "entry_line": {"direction": "long"},
+                "counter_lines_cache": [{"value": 4666.25, "slope": 0.137,
+                                         "touches": 2}],
+                "counter_lines_tol": 0.93,
+                "counter_touch": {"started_at": "2026-05-14T22:00:00+00:00",
+                                  "line_value": 4666.25, "line_touches": 2,
+                                  "line_slope": 0.137},
+            },
+            fsm_state=BotState.ENTRY_ORDER_PLACED,
+        )
+        event = OrderFilled(
+            trade_serial=1, symbol="MGCM6", side="BUY", fill_price=Decimal("4660.7"),
+            qty=Decimal("1"), commission=Decimal("0"), ib_order_id="x",
+        )
+        actions = await s.on_event(event, ctx)
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        # Find the UpdateState that zeroes the counter-line cache.
+        cache_clear = next(
+            (u for u in ups if "counter_lines_cache" in u.state), None,
+        )
+        assert cache_clear is not None
+        assert cache_clear.state["counter_lines_cache"] == []
+        assert cache_clear.state["counter_lines_tol"] == 0.0
+        assert cache_clear.state["counter_touch"] is None
+
+    def test_check_counter_line_skips_wrong_direction(self):
+        # SHORT trade entered at 4660.70; cache has a resistance line
+        # ABOVE entry (4666.25) — i.e. NOT a valid support for SHORT.
+        # Read-path filter should silently skip it.
+        s = ChartSignalStrategy(_default_config())
+        ctx = _make_ctx(
+            state={
+                "armed": True,
+                "entry_line": {"direction": "short"},
+                "entry_price": "4660.7",
+                "counter_lines_cache": [{"value": 4666.25, "slope": 0.137,
+                                         "touches": 2}],
+                "counter_lines_tol": 0.93,
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
+        state_patch: dict = {}
+        actions = s._check_counter_line_exit(
+            ctx, mid=4665.40, direction="short", state_patch=state_patch,
+        )
+        # Stale line should be skipped → no actions, no touch armed.
+        assert actions == []
+        assert state_patch.get("counter_touch") is None
+
+    def test_check_counter_line_accepts_valid_direction(self):
+        # LONG trade entered at 4660.70 below the resistance at 4666.25.
+        # Touch at mid 4666.20 (within tol 0.93) → should arm.
+        s = ChartSignalStrategy(_default_config())
+        ctx = _make_ctx(
+            state={
+                "armed": True,
+                "entry_line": {"direction": "long"},
+                "entry_price": "4660.7",
+                "counter_lines_cache": [{"value": 4666.25, "slope": 0.137,
+                                         "touches": 2}],
+                "counter_lines_tol": 0.93,
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+        )
+        state_patch: dict = {}
+        actions = s._check_counter_line_exit(
+            ctx, mid=4665.40, direction="long", state_patch=state_patch,
+        )
+        assert state_patch.get("counter_touch") is not None
+        armed = state_patch["counter_touch"]
+        assert armed["line_value"] == pytest.approx(4666.25)
 
 
 class TestShortEntry:

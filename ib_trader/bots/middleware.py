@@ -19,10 +19,14 @@ if TYPE_CHECKING:
 
 
 from ib_trader.bots.strategy import (
-    Action, PlaceOrder, CancelOrder, UpdateState, LogSignal,
+    Action, PlaceOrder, CancelOrder, UpdateState, LogSignal, EmitAudit,
     StrategyContext, LogEventType,
 )
 from ib_trader.data.models import BotEvent
+from ib_trader.data.repositories.audit_log_repository import (
+    AuditLogRepository,
+    EVENT_BAR_EVAL, EVENT_ORDER_PLACED, EVENT_TRADE_CLOSED,
+)
 from ib_trader.data.repositories.bot_repository import BotEventRepository
 # TODO(redis-positions): RiskMiddleware.max_positions reads open trades
 # from SQLite. Migrate to Redis position state or IB positions so this
@@ -37,6 +41,17 @@ def _now_utc() -> datetime:
     # Mirrors ``bots/base.py:_now_utc`` so all bot_events rows share one
     # timezone convention regardless of which middleware wrote them.
     return datetime.now().astimezone()
+
+
+def _real_utc_now() -> datetime:
+    """True UTC-now for the ``audit_log`` table.
+
+    Distinct from ``_now_utc`` above (which actually returns PT despite
+    its name — kept that way for bot_events compatibility per CLAUDE.md).
+    ``audit_log.event_ts_utc`` is specified to be UTC, so the AuditMiddleware
+    must use this helper, not ``_now_utc``.
+    """
+    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +237,175 @@ class LoggingMiddleware:
         if wrote and self._redis is not None:
             from ib_trader.redis.streams import publish_activity
             await publish_activity(self._redis, "bot_events")
+        return actions
+
+
+# ---------------------------------------------------------------------------
+# Audit Middleware
+# ---------------------------------------------------------------------------
+
+def _normalize_exit_reason(detail: str | None) -> str:
+    """Extract a short audit-feed tag from a TRAILING_STOP detail.
+
+    Maps the verbose exit-detail messages to one of:
+      counter_line · trail_stop · line_breach · both · hardstop
+    Falls back to the first hyphen/space-joined word, lowercased.
+    """
+    if not detail:
+        return ""
+    txt = detail.lower()
+    # The chart_signal detail strings carry the reason in two shapes:
+    #   "TRAILING_STOP [long]: counter-line held ..." → counter_line
+    #   "TRAILING_STOP [long]: 3-min bar close ... [trail_stop]"
+    #   "TRAILING_STOP [long]: 3-min bar close ... [line_breach]"
+    #   "TRAILING_STOP [long]: 3-min bar close ... [both]"
+    if "counter-line" in txt or "counter_line" in txt:
+        return "counter_line"
+    if "[trail_stop]" in txt or "trail_stop" in txt:
+        return "trail_stop"
+    if "[line_breach]" in txt or "line_breach" in txt:
+        return "line_breach"
+    if "[both]" in txt:
+        return "both"
+    if "hardstop" in txt or "[hard" in txt:
+        return "hardstop"
+    # Best-effort fallback — first word after the colon.
+    if ":" in detail:
+        after = detail.split(":", 1)[1].strip()
+        first = after.split()[0] if after.split() else ""
+        return first.lower().replace("-", "_")[:20]
+    return ""
+
+
+class AuditMiddleware:
+    """Writes EmitAudit actions to the operator-facing audit_log table.
+
+    Distinct from LoggingMiddleware (which writes to bot_events). One row
+    per EmitAudit; dispatches to the appropriate insert_* by event_type.
+    Pushes a redis activity ping when any rows were written so the SSE
+    stream can wake up.
+    """
+
+    def __init__(self, bot_id: str, symbol_default: str,
+                 audit_repo: AuditLogRepository, redis=None) -> None:
+        self.bot_id = bot_id
+        self._symbol_default = symbol_default
+        self._repo = audit_repo
+        self._redis = redis
+
+    async def process(self, actions: list[Action],
+                      ctx: StrategyContext) -> list[Action]:
+        wrote = False
+        # Pre-scan for the most recent EXIT_CHECK TRAILING_STOP LogSignal
+        # that precedes each PlaceOrder — used to attribute the exit
+        # reason to the emitted ORDER_PLACED row. Maps action-index to
+        # the trailing-stop signal that immediately precedes it.
+        trailing_stop_by_idx: dict[int, LogSignal] = {}
+        last_trail: LogSignal | None = None
+        for i, action in enumerate(actions):
+            if isinstance(action, LogSignal):
+                et = action.event_type.value if hasattr(
+                    action.event_type, "value",
+                ) else str(action.event_type)
+                if et == "EXIT_CHECK" and "TRAILING_STOP" in (action.message or ""):
+                    last_trail = action
+            elif isinstance(action, PlaceOrder):
+                if last_trail is not None:
+                    trailing_stop_by_idx[i] = last_trail
+                    last_trail = None
+
+        # Auto-emit ORDER_PLACED rows for PlaceOrder actions. The
+        # strategy doesn't need to emit them explicitly — anytime
+        # an order gets submitted, it shows up in the audit feed.
+        for i, action in enumerate(actions):
+            if not isinstance(action, PlaceOrder):
+                continue
+            is_exit = getattr(action, "origin", "strategy") == "exit"
+            reason_suffix = ""
+            exit_payload: dict | None = None
+            if is_exit:
+                ts_sig = trailing_stop_by_idx.get(i)
+                if ts_sig is not None:
+                    msg = ts_sig.message or ""
+                    short = _normalize_exit_reason(msg)
+                    reason_suffix = f"·{short}" if short else ""
+                    exit_payload = dict(ts_sig.payload or {})
+                    exit_payload["trail_message"] = msg
+            leg = "exit" if is_exit else "entry"
+            decision = f"ORDER·{action.side}·{leg}{reason_suffix}"
+            order_payload: dict = {
+                "side": action.side,
+                "qty": str(action.qty),
+                "order_type": action.order_type,
+                "origin": getattr(action, "origin", "strategy"),
+            }
+            if action.price is not None:
+                order_payload["price"] = str(action.price)
+            if exit_payload:
+                order_payload["exit_context"] = exit_payload
+            try:
+                self._repo.insert_order_placed(
+                    bot_id=self.bot_id,
+                    symbol=action.symbol or self._symbol_default,
+                    event_ts_utc=_real_utc_now(),
+                    decision=decision,
+                    payload=order_payload,
+                )
+                wrote = True
+            except Exception:
+                logger.exception(
+                    '{"event":"AUDIT_ORDER_INSERT_FAILED","bot_id":"%s"}',
+                    self.bot_id,
+                )
+
+        for action in actions:
+            if not isinstance(action, EmitAudit):
+                continue
+            ts = action.event_ts_utc or _real_utc_now()
+            symbol = action.symbol or self._symbol_default
+            payload = action.payload or None
+            try:
+                if action.event_type == EVENT_BAR_EVAL:
+                    self._repo.insert_bar_eval(
+                        bot_id=self.bot_id, symbol=symbol,
+                        event_ts_utc=ts,
+                        pivot_status=action.pivot_status or "NONE",
+                        line_status=action.line_status or "NONE",
+                        decision=action.decision,
+                        bar_close=action.bar_close,
+                        payload=payload,
+                    )
+                elif action.event_type == EVENT_ORDER_PLACED:
+                    self._repo.insert_order_placed(
+                        bot_id=self.bot_id, symbol=symbol,
+                        event_ts_utc=ts,
+                        decision=action.decision,
+                        bar_close=action.bar_close,
+                        payload=payload,
+                    )
+                elif action.event_type == EVENT_TRADE_CLOSED:
+                    self._repo.insert_trade_closed(
+                        bot_id=self.bot_id, symbol=symbol,
+                        event_ts_utc=ts,
+                        decision=action.decision,
+                        pnl_net=action.pnl_net,
+                        payload=payload,
+                    )
+                else:
+                    logger.warning(
+                        '{"event":"AUDIT_UNKNOWN_TYPE","bot_id":"%s",'
+                        '"event_type":"%s"}', self.bot_id, action.event_type,
+                    )
+                    continue
+                wrote = True
+            except Exception:
+                logger.exception(
+                    '{"event":"AUDIT_INSERT_FAILED","bot_id":"%s",'
+                    '"event_type":"%s"}', self.bot_id, action.event_type,
+                )
+        if wrote and self._redis is not None:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(self._redis, "audit_log")
         return actions
 
 

@@ -14,7 +14,10 @@ const TABS_PREFIX = 'ib-layout-tabs-';
 // rewrite on 2026-05-10). loadModel discards a cached layout whose
 // stored version differs from this and falls back to the default.
 const LAYOUT_VERSION: Partial<Record<LayoutVariant, number>> = {
-  T: 2,
+  // T v3: Slot 2 (Micro Oil chart) replaced by the Audit Feed pane.
+  // Stale v2 layouts cached in localStorage get discarded and reseeded
+  // from variantT so the MCL chart no longer renders on reload.
+  T: 3,
 };
 const VERSION_PREFIX = 'ib-layout-ver-';
 

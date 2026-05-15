@@ -179,7 +179,13 @@ export function BotChart({
 
   const activeFilterCount = (showBrokenSr ? 1 : 0)
     + (showCounterSupport ? 1 : 0)
-    + (showCounterResistance ? 1 : 0);
+    + (showCounterResistance ? 1 : 0)
+    // Hide-S/R and FE-mode are diagnostic toggles that also live in
+    // the popover now — surface them in the chip count so the
+    // operator knows the popover holds a non-default setting even
+    // when they leave it closed.
+    + (srHidden ? 1 : 0)
+    + (srSourceMode === 'fe' ? 1 : 0);
 
   useBotState(symbol ?? '', botRef ?? botId, {
     subscribeBot: true,
@@ -320,49 +326,6 @@ export function BotChart({
       >
         {VISIBLE_MINUTES}m
       </button>
-      <button
-        onClick={() => {
-          if (srHidden) {
-            chartRef.current?.showSupportResistance();
-            setSrHidden(false);
-          } else {
-            chartRef.current?.clearSupportResistance();
-            setSrHidden(true);
-          }
-        }}
-        title={srHidden
-          ? 'Re-enable auto support/resistance overlay'
-          : 'Hide auto support/resistance lines for this pane'}
-        style={{
-          background: srHidden ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
-          border: '1px solid var(--border-default)',
-          color: srHidden ? '#000' : 'var(--text-secondary)',
-          padding: '1px 6px',
-          borderRadius: 3, cursor: 'pointer',
-        }}
-      >
-        {srHidden ? 'Show S/R' : 'Clear S/R'}
-      </button>
-      <button
-        onClick={() => {
-          const m = chartRef.current?.toggleSrSourceMode();
-          if (m) setSrSourceMode(m);
-        }}
-        title={
-          srSourceMode === 'be'
-            ? 'SR data from backend (canonical) — click to switch to local'
-            : 'SR data from local detector — click to switch to backend'
-        }
-        style={{
-          background: srSourceMode === 'fe'
-            ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
-          border: '1px solid var(--border-default)',
-          color: srSourceMode === 'fe' ? '#000' : 'var(--text-secondary)',
-          padding: '1px 6px', borderRadius: 3, cursor: 'pointer',
-        }}
-      >
-        SR: {srSourceMode}
-      </button>
       <div ref={filtersWrapRef} style={{ position: 'relative' }}>
         <button
           onClick={() => setFiltersOpen((v) => !v)}
@@ -389,6 +352,63 @@ export function BotChart({
               fontSize: 11, color: 'var(--text-primary)',
             }}
           >
+            {/* Pane-scoped overlay + data-source controls. Moved
+              * from the toolbar into the popover so the toolbar
+              * doesn't squeeze the bot state banner on small panes. */}
+            <div style={{
+              display: 'flex', gap: 6, marginBottom: 8,
+              paddingBottom: 6,
+              borderBottom: '1px solid var(--border-default)',
+            }}>
+              <button
+                onClick={() => {
+                  if (srHidden) {
+                    chartRef.current?.showSupportResistance();
+                    setSrHidden(false);
+                  } else {
+                    chartRef.current?.clearSupportResistance();
+                    setSrHidden(true);
+                  }
+                }}
+                title={srHidden
+                  ? 'Re-enable auto support/resistance overlay'
+                  : 'Hide auto support/resistance lines for this pane'}
+                style={{
+                  flex: 1,
+                  background: srHidden
+                    ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
+                  border: '1px solid var(--border-default)',
+                  color: srHidden ? '#000' : 'var(--text-primary)',
+                  padding: '2px 6px', borderRadius: 3, cursor: 'pointer',
+                  fontSize: 11,
+                }}
+              >
+                {srHidden ? 'Show S/R' : 'Hide S/R'}
+              </button>
+              <button
+                onClick={() => {
+                  const m = chartRef.current?.toggleSrSourceMode();
+                  if (m) setSrSourceMode(m);
+                }}
+                title={
+                  srSourceMode === 'be'
+                    ? 'SR data from backend (canonical) — click to switch to local'
+                    : 'SR data from local detector — click to switch to backend'
+                }
+                style={{
+                  flex: 1,
+                  background: srSourceMode === 'fe'
+                    ? 'var(--accent-yellow, #f7bd5c)' : 'transparent',
+                  border: '1px solid var(--border-default)',
+                  color: srSourceMode === 'fe' ? '#000'
+                    : 'var(--text-primary)',
+                  padding: '2px 6px', borderRadius: 3, cursor: 'pointer',
+                  fontSize: 11,
+                }}
+              >
+                SR: {srSourceMode}
+              </button>
+            </div>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>
               Show extra S/R lines:
             </div>
