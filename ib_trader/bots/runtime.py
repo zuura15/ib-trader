@@ -2614,30 +2614,70 @@ class StrategyBotRunner(BotBase):
             self._on_tick_warned = True
 
     async def _entry_order_already_filled(self) -> bool:
-        """Return True if a transactions row for the bot's awaiting
-        ib_order_id is terminal-Filled. Race-aware guard for the
-        supervisor timeout: if IB filled the order but the notification
-        is in-flight to the bot, the timeout should NOT revert — the
-        ``on_entry_filled`` handler will land momentarily.
+        """Return True if IB shows a non-zero position in the bot's
+        symbol — meaning the entry order has filled even if the
+        bot's own state machine hasn't seen the notification yet.
+
+        Hits IB authoritatively via the engine's
+        ``/engine/positions/refresh`` endpoint, which issues a fresh
+        ``reqPositionsAsync`` to the gateway. The local transactions
+        table is also checked as a fast pre-pass — if our specific
+        ib_order_id has a Filled row, we don't need to hit IB.
+
+        Used by ``check_entry_timeout`` to avoid reverting state on
+        an order that actually filled at the exact instant of the
+        30s timeout boundary.
         """
         ib_order_id = (self.ctx.state.get("awaiting_ib_order_id")
                         or self.ctx.state.get("ib_order_id"))
-        if not ib_order_id:
+        symbol = self.strategy_config.get("symbol")
+
+        # Fast pre-pass: local transactions table. If we already have
+        # the FILLED row for our order, no need to hit IB.
+        if ib_order_id:
+            try:
+                from ib_trader.data.models import TransactionEvent
+                session = self._session_factory()
+                row = (session.query(TransactionEvent)
+                       .filter(TransactionEvent.ib_order_id == int(ib_order_id))
+                       .filter(TransactionEvent.ib_status == "Filled")
+                       .filter(TransactionEvent.ib_filled_qty != None)  # noqa: E711
+                       .order_by(TransactionEvent.ib_responded_at.desc())
+                       .first())
+                if row is not None:
+                    return True
+            except Exception:
+                logger.exception(
+                    '{"event": "ENTRY_TIMEOUT_LOCAL_PRECHECK_FAILED", '
+                    '"bot_id": "%s"}', self.bot_id,
+                )
+                # Fall through to the IB check rather than silently
+                # bailing — IB is the canonical answer either way.
+
+        # IB-authoritative check: ask the gateway for the live
+        # position in this symbol. The bot was in AWAITING_ENTRY
+        # before this entry attempt, so any non-zero position
+        # at this moment is the entry filling.
+        if not symbol:
             return False
         try:
-            from ib_trader.data.models import TransactionEvent
-            session = self._session_factory()
-            row = (session.query(TransactionEvent)
-                   .filter(TransactionEvent.ib_order_id == int(ib_order_id))
-                   .filter(TransactionEvent.ib_status == "Filled")
-                   .filter(TransactionEvent.ib_filled_qty != None)  # noqa: E711
-                   .order_by(TransactionEvent.ib_responded_at.desc())
-                   .first())
-            return row is not None
+            ib_qty = await self._verify_position_via_pull(symbol)
+            if ib_qty is None:
+                # IB unreachable — we don't know. Per project tenet,
+                # IB is the source of truth; if we can't reach it,
+                # err on the side of NOT cancelling (the order may
+                # still fill when connectivity returns).
+                logger.warning(
+                    '{"event": "ENTRY_TIMEOUT_IB_UNREACHABLE", '
+                    '"bot_id": "%s", "symbol": "%s"}',
+                    self.bot_id, symbol,
+                )
+                return True  # safer to skip the timeout than to revert blindly
+            return ib_qty != Decimal("0")
         except Exception:
             logger.exception(
-                '{"event": "ENTRY_TIMEOUT_FILL_PRECHECK_FAILED", '
-                '"bot_id": "%s"}', self.bot_id,
+                '{"event": "ENTRY_TIMEOUT_IB_PRECHECK_FAILED", '
+                '"bot_id": "%s", "symbol": "%s"}', self.bot_id, symbol,
             )
             return False
 
