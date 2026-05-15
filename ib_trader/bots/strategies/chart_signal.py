@@ -1978,18 +1978,15 @@ class ChartSignalStrategy:
                 await self._refresh_counter_lines_cache(direction, ctx)
             )
 
-        # Marginal trades get a tight tick-time exit on top of the
-        # bar-close gates: 10s mid-touch hold against the trigger
-        # line or the active_stop, both of which sit on the
-        # favorable side of price for an in-position trade. ``_on_quote``
-        # reads the same ``counter_lines_tol`` and applies the touch +
-        # hold rule with flipped geometry.
+        # Marginal trades — refresh the trigger-line snapshot for the
+        # tick-time touch+hold check. SL is NOT included: the
+        # ``_on_quote`` immediate-fire path reads ``active_stop``
+        # directly and exits the moment mid breaches it (no linger).
         is_marginal_for_tight = bool(entry_line.get("marginal", False))
         if is_marginal_for_tight:
             actions.append(UpdateState({
                 "tight_zones": [
                     {"value": float(line_value_d), "kind": "trigger"},
-                    {"value": float(active_stop), "kind": "stop"},
                 ],
             }))
         return actions
@@ -2122,22 +2119,20 @@ class ChartSignalStrategy:
                 if isinstance(a, PlaceOrder):
                     return actions
 
-        # Tight-zone tick-time check — marginal trades only.
-        # Lingering 10s within tol of the trigger line or the
-        # active_stop fires an immediate exit, without waiting
-        # for the next 3-min bar close.
+        # Tick-time exit checks for marginal trades. Two paths:
+        #   (1) IMMEDIATE SL — every tick we ratchet the trail (HWM/LWM
+        #       moves on tick instead of every 3 min) and exit the
+        #       moment mid breaches ``active_stop``. No linger; lingers
+        #       only apply to LINES that price can hover near.
+        #   (2) Tight-zone touch+hold — trigger trendline only. The
+        #       opposing-line linger is handled separately by
+        #       ``_check_counter_line_exit`` above.
         if bool(entry_line.get("marginal", False)):
-            # Tick-time trail tighten. The bar-close path advances
-            # HWM/LWM and ``active_stop`` once every 3 min; marginal
-            # trades opt into a faster update so the SL ratchets in
-            # on every favorable tick. Trades off a few $$ on
-            # winners that briefly retrace for a tighter exit on
-            # winners that stall.
             try:
                 trail_pct = Decimal(str(
                     self.config.get("trail_width_pct", "0.0003")
                 ))
-            except Exception:  # noqa: BLE001 — fall back to default on bad config
+            except Exception:  # noqa: BLE001
                 trail_pct = Decimal("0.0003")
             mid_d = Decimal(str(last))
             wm_field = (
@@ -2163,11 +2158,10 @@ class ChartSignalStrategy:
                 else new_wm * (Decimal("1") + trail_pct)
             )
             # ``active_stop = max/min(line, trail)`` mirrors the
-            # bar-close formula. For tick-time we keep the LAST
-            # bar-close line value (frozen on tight_zones) instead
-            # of re-computing the line — the line itself drifts
-            # slowly enough that the per-tick mismatch is small,
-            # and the bar-close path re-converges every 3 min.
+            # bar-close formula. We use the last bar-close line value
+            # (frozen on tight_zones[kind=trigger]) instead of
+            # re-deriving — line drift over 3 min is small and the
+            # bar-close path reconverges.
             zones = list(ctx.state.get("tight_zones") or [])
             line_val_d: Decimal | None = None
             for z in zones:
@@ -2186,22 +2180,48 @@ class ChartSignalStrategy:
                 active_stop = trail_stop
             state_patch[wm_field] = str(new_wm)
             state_patch["active_stop"] = str(active_stop)
-            # Mirror the ratcheted stop into tight_zones so the
-            # tick-time touch check below sees the latest value
-            # rather than the stale bar-close snapshot.
-            new_zones: list[dict] = []
-            for z in zones:
-                if z.get("kind") == "stop":
-                    new_zones.append({
-                        **z, "value": float(active_stop),
-                    })
-                else:
-                    new_zones.append(z)
-            state_patch["tight_zones"] = new_zones
-            # Replace ctx.state's view of tight_zones for the touch
-            # check below — _check_tight_zones_exit reads from
-            # ctx.state, not from state_patch.
-            ctx.state["tight_zones"] = new_zones
+
+            # (1) IMMEDIATE SL — fire the exit the moment mid is past
+            # the stop in the unfavorable direction. No 10 s hold,
+            # because the stop level is computed by the bot (not a
+            # market line price might legitimately revisit). Operator
+            # spec 2026-05-15: "SL has to kick in every tick."
+            sl_breached = (
+                (mid_d <= active_stop) if direction == "long"
+                else (mid_d >= active_stop)
+            )
+            if sl_breached:
+                detail = (
+                    f"mid {float(mid_d):.4f} "
+                    + ("<= " if direction == "long" else ">= ")
+                    + f"active_stop {float(active_stop):.4f} "
+                    f"(trail_only, tick-time, marginal)"
+                )
+                state_patch["exit_reason"] = "trail_stop"
+                actions.append(LogSignal(
+                    event_type=LogEventType.EXIT_CHECK,
+                    message=f"TRAILING_STOP [{direction}]: {detail}",
+                    payload={
+                        "exit_type": ExitType.TRAILING_STOP.value,
+                        "direction": direction,
+                        "mid": float(mid_d),
+                        "active_stop": float(active_stop),
+                        "marginal_trade": True,
+                    },
+                ))
+                actions.append(UpdateState(state_patch))
+                actions.extend(self.build_exit_actions(
+                    ctx, ExitType.TRAILING_STOP, detail,
+                ))
+                return actions
+
+            # (2) Trigger-line touch+hold — keep only the trigger zone
+            # in the tight_zones cache. The SL is handled by the
+            # immediate-fire path above; including it in tight_zones
+            # would re-introduce the 10 s linger on the stop.
+            trigger_zones = [z for z in zones if z.get("kind") == "trigger"]
+            state_patch["tight_zones"] = trigger_zones
+            ctx.state["tight_zones"] = trigger_zones
             tight_actions = self._check_tight_zones_exit(
                 ctx, float(last), direction, state_patch,
             )
@@ -2608,17 +2628,17 @@ class ChartSignalStrategy:
                     ),
                     "counter_touch": None,
                     # Tight-exit zones — marginal trades only. Seed
-                    # with BOTH the trigger line value and the
-                    # initial SL so a tick-time touch fires during
-                    # the gap before the first bar close populates
-                    # them via _evaluate_exit.
+                    # with the trigger line value so the 10 s touch
+                    # check is armed from the first tick. The SL is
+                    # handled by the IMMEDIATE-fire tick path in
+                    # ``_on_quote`` (no linger), so it does NOT belong
+                    # in tight_zones.
                     "tight_zones": (
                         [
                             {"value": float(
                                 entry_line.get("line_value_at_entry")
                                 or event.fill_price
                             ), "kind": "trigger"},
-                            {"value": float(initial_stop), "kind": "stop"},
                         ]
                         if bool(entry_line.get("marginal", False))
                         else []
