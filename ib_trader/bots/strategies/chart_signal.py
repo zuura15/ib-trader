@@ -164,6 +164,13 @@ class ChartSignalStrategy:
                 "counter_lines_cache": "list|null",
                 "counter_lines_tol": "decimal|null",
                 "counter_touch": "dict|null",
+                # Tight-exit zones (marginal trades only). Trigger
+                # line value + active_stop at the last closed bar.
+                # ``_on_quote`` runs the same touch+hold rule as
+                # counter-lines but with flipped geometry — these
+                # zones sit on the FAVORABLE side of price.
+                "tight_zones": "list|null",
+                "tight_touch": "dict|null",
             },
             version="1.0",
             supported_sec_types=("STK", "ETF", "FUT", "FOP"),
@@ -1944,6 +1951,21 @@ class ChartSignalStrategy:
             actions.extend(
                 await self._refresh_counter_lines_cache(direction, ctx)
             )
+
+        # Marginal trades get a tight tick-time exit on top of the
+        # bar-close gates: 10s mid-touch hold against the trigger
+        # line or the active_stop, both of which sit on the
+        # favorable side of price for an in-position trade. ``_on_quote``
+        # reads the same ``counter_lines_tol`` and applies the touch +
+        # hold rule with flipped geometry.
+        is_marginal_for_tight = bool(entry_line.get("marginal", False))
+        if is_marginal_for_tight:
+            actions.append(UpdateState({
+                "tight_zones": [
+                    {"value": float(line_value_d), "kind": "trigger"},
+                    {"value": float(active_stop), "kind": "stop"},
+                ],
+            }))
         return actions
 
     async def _refresh_counter_lines_cache(
@@ -2071,6 +2093,19 @@ class ChartSignalStrategy:
             # already contains the LogSignal + UpdateState + PlaceOrder
             # and we should NOT also emit a redundant UpdateState.
             for a in actions:
+                if isinstance(a, PlaceOrder):
+                    return actions
+
+        # Tight-zone tick-time check — marginal trades only.
+        # Lingering 10s within tol of the trigger line or the
+        # active_stop fires an immediate exit, without waiting
+        # for the next 3-min bar close.
+        if bool(entry_line.get("marginal", False)):
+            tight_actions = self._check_tight_zones_exit(
+                ctx, float(last), direction, state_patch,
+            )
+            actions.extend(tight_actions)
+            for a in tight_actions:
                 if isinstance(a, PlaceOrder):
                     return actions
 
@@ -2235,6 +2270,117 @@ class ChartSignalStrategy:
         ))
         return actions
 
+    def _check_tight_zones_exit(
+        self, ctx: StrategyContext, mid: float, direction: str,
+        state_patch: dict,
+    ) -> list[Action]:
+        """Tick-time touch-and-hold against the trigger line and the
+        active_stop. Marginal trades only.
+
+        Geometry is flipped vs the opposing-line check: trigger line
+        and SL sit on the FAVORABLE side of price (above for SHORT,
+        below for LONG), so a touch means price has retraced *back*
+        to the line and the trade is failing.
+        """
+        zones = ctx.state.get("tight_zones") or []
+        tol = float(ctx.state.get("counter_lines_tol", 0.0))
+        if not zones or tol <= 0:
+            return []
+        hold_secs = float(self.config.get("counter_exit_hold_seconds", 10))
+        now = datetime.now(timezone.utc)
+        cur_touch = ctx.state.get("tight_touch")
+
+        def _touched(lv: float) -> bool:
+            # LONG: trigger/SL below price → touched when mid ≤ lv + tol.
+            # SHORT: trigger/SL above price → touched when mid ≥ lv - tol.
+            return (mid <= lv + tol) if direction == "long" \
+                else (mid >= lv - tol)
+
+        def _breakout(lv: float) -> bool:
+            # "Breakout" here = price moved AWAY from the zone in the
+            # favorable direction, i.e. the trade is back on track.
+            return (mid < lv - tol) if direction == "long" \
+                else (mid > lv + tol)
+
+        if cur_touch is None:
+            for z in zones:
+                lv = float(z["value"])
+                if _touched(lv) and not _breakout(lv):
+                    state_patch["tight_touch"] = {
+                        "started_at": now.isoformat(),
+                        "zone_value": lv,
+                        "zone_kind": z.get("kind", "?"),
+                    }
+                    return [LogSignal(
+                        event_type=LogEventType.EXIT_CHECK,
+                        message=(
+                            f"{EXIT_TIGHT_COUNTER_LINE} armed "
+                            f"({z.get('kind', '?')}) — zone {lv:.4f} "
+                            f"touched (mid={mid:.4f}); hold "
+                            f"{hold_secs:.0f}s for failure confirm"
+                        ),
+                        payload={
+                            "exit_trigger_armed": EXIT_TIGHT_COUNTER_LINE,
+                            "zone_value": lv,
+                            "zone_kind": z.get("kind", "?"),
+                            "mid": mid,
+                            "hold_seconds": hold_secs,
+                        },
+                    )]
+            return []
+
+        started = _parse_ts(cur_touch.get("started_at"))
+        if started is None:
+            state_patch["tight_touch"] = None
+            return []
+        lv = float(cur_touch["zone_value"])
+        zone_kind = str(cur_touch.get("zone_kind", "?"))
+        elapsed = (now - started).total_seconds()
+        cur_brk = _breakout(lv)
+        if elapsed < hold_secs:
+            return []
+        if cur_brk:
+            state_patch["tight_touch"] = None
+            return [LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=(
+                    f"{EXIT_TIGHT_COUNTER_LINE} cleared ({zone_kind}) — "
+                    f"breakout past zone {lv:.4f} (mid={mid:.4f}); "
+                    f"resetting"
+                ),
+                payload={
+                    "exit_trigger_cleared": EXIT_TIGHT_COUNTER_LINE,
+                    "zone_value": lv,
+                    "zone_kind": zone_kind,
+                    "mid": mid,
+                    "elapsed_seconds": round(elapsed, 2),
+                },
+            )]
+        detail = (
+            f"{EXIT_TIGHT_COUNTER_LINE} ({zone_kind}) held "
+            f"{elapsed:.1f}s at {lv:.4f} (mid={mid:.4f})"
+        )
+        state_patch["tight_touch"] = None
+        state_patch["exit_reason"] = EXIT_TIGHT_COUNTER_LINE
+        return [
+            LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=f"{EXIT_TIGHT_COUNTER_LINE} exit — {detail}",
+                payload={
+                    "exit_trigger": EXIT_TIGHT_COUNTER_LINE,
+                    "zone_value": lv,
+                    "zone_kind": zone_kind,
+                    "mid": mid,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "hold_seconds": hold_secs,
+                    "marginal_trade": True,
+                },
+            ),
+            UpdateState(state_patch),
+        ] + list(self.build_exit_actions(
+            ctx, ExitType.TRAILING_STOP, detail,
+        ))
+
     # ------------------------------------------------------------------
     # Fills / Rejects
     # ------------------------------------------------------------------
@@ -2307,6 +2453,17 @@ class ChartSignalStrategy:
                     "counter_lines_cache": [],
                     "counter_lines_tol": 0.0,
                     "counter_touch": None,
+                    # Tight-exit zones — marginal trades only. Seed
+                    # with the active_stop so a tick-time SL hit can
+                    # fire in the ~3 min gap before the first bar
+                    # close populates the trigger-line zone. The
+                    # bar-close path overwrites this list every cycle.
+                    "tight_zones": (
+                        [{"value": float(initial_stop), "kind": "stop"}]
+                        if bool(entry_line.get("marginal", False))
+                        else []
+                    ),
+                    "tight_touch": None,
                 }),
             ])
         elif is_exit_leg:
@@ -2409,6 +2566,8 @@ class ChartSignalStrategy:
                     "counter_touch": None,
                     "counter_lines_cache": [],
                     "counter_lines_tol": 0.0,
+                    "tight_zones": [],
+                    "tight_touch": None,
                 }),
             ])
         return actions
