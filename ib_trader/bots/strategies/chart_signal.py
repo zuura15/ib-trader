@@ -1115,18 +1115,34 @@ class ChartSignalStrategy:
         # (acceleration continuation). The chosen line's path
         # propagates into the entry_line state so exit eval can
         # skip the line-breach check on accel entries.
+        #
+        # Iterate the sorted candidate lists (already touches-desc)
+        # and pick the FIRST line that passes the touch/accel gate.
+        # Previously only longs[0] / shorts[0] were tested; if the
+        # universe-best line wasn't the one the pivot lay on,
+        # entries silently skipped — observed on MGC 2026-05-15
+        # 11:00 PIVOT·H TOUCH·9 PASSED: shorts[0] anchored at idx
+        # 108 (line ~$44 away from pivot, no touch) shadowed a
+        # different 9-touch line at idx 268 that the pivot strictly
+        # touched. After the fix we fall through to that one.
         long_path: str | None = None
         short_path: str | None = None
-        if long_line is not None:
-            if _has_new_touch(long_line, support_pivots):
-                long_path = "touch"
-            elif accel_enabled and _has_acceleration_entry(long_line):
-                long_path = "accel"
-        if short_line is not None:
-            if _has_new_touch(short_line, resistance_pivots):
-                short_path = "touch"
-            elif accel_enabled and _has_acceleration_entry(short_line):
-                short_path = "accel"
+        long_line = None
+        short_line = None
+        for cand in longs:
+            if _has_new_touch(cand, support_pivots):
+                long_line, long_path = cand, "touch"
+                break
+            if accel_enabled and _has_acceleration_entry(cand):
+                long_line, long_path = cand, "accel"
+                break
+        for cand in shorts:
+            if _has_new_touch(cand, resistance_pivots):
+                short_line, short_path = cand, "touch"
+                break
+            if accel_enabled and _has_acceleration_entry(cand):
+                short_line, short_path = cand, "accel"
+                break
         if long_path is None:
             long_line = None
         if short_path is None:
