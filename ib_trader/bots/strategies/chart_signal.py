@@ -2496,9 +2496,14 @@ class ChartSignalStrategy:
                 UpdateState({
                     "trade_serial": event.trade_serial,
                     "entry_price": str(event.fill_price),
-                    # Server-local (PT) per CLAUDE.md; the UI / PositionStrip
-                    # parses with ``new Date(iso)`` which respects the offset.
-                    "entry_time": datetime.now().astimezone().isoformat(),
+                    # UTC to match the runtime's exit-leg ``now_iso()``
+                    # convention. Mixing PT-with-offset here and UTC at
+                    # exit caused SQL math on ``bot_trades.entry_time``
+                    # vs ``exit_time`` to come out 7h off because
+                    # SQLAlchemy strips the offset on naive DateTime
+                    # columns. UI ``new Date(iso)`` handles either, so
+                    # the renderer was fine — just the SQL math broke.
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
                     "qty": str(event.qty),
                     "active_stop": str(initial_stop),
                     wm_field: str(fill_price_d),

@@ -167,6 +167,20 @@ def clear_position_fields() -> dict:
         "low_water_mark": None,
         "active_stop": None,
         "exit_reason": None,
+        # Counter-line and tight-zone tick-time caches. Without these
+        # in the clear, a prior trade's snapshot leaked into the next
+        # round — observed on 2026-05-14 MGC SHORT (-$55) which armed
+        # on a resistance line from the prior LONG's cache before the
+        # SHORT had its own bar-close refresh. The strategy's exit-leg
+        # path also clears these post-901fda4, but doing it here is
+        # belt-and-suspenders: the runtime owns clear_position_fields
+        # and runs on every terminal exit fill, regardless of strategy
+        # notification timing.
+        "counter_lines_cache": [],
+        "counter_lines_tol": 0.0,
+        "counter_touch": None,
+        "tight_zones": [],
+        "tight_touch": None,
     }
 
 
