@@ -743,24 +743,15 @@ class ChartSignalStrategy:
             near_touch_tolerance_fraction=near_frac,
             break_stale_bars=break_stale_bars,
         )
-        # Entry-path filter now also accepts lines that broke within
-        # the same 24 h window — covers the session-rollover case
-        # where a long-standing line "breaks" on a maintenance-gap
-        # candle and then re-establishes itself. A line that broke
-        # OUTSIDE the window stays excluded (genuinely stale).
-        max_break_age = int(self.config.get(
-            "entry_break_max_age_bars", 480,
-        ))
-        def _break_ok(ln) -> bool:
-            if ln.break_idx is None:
-                return True
-            return (last_idx - ln.break_idx) <= max_break_age
+        # Note: ``break_idx`` is no longer a hard gate here. The
+        # ``stale_line`` filter further down checks "most recent
+        # strict touch within 24 h" which subsumes the broken-line
+        # case (a line with no recent touch — including one that
+        # broke long ago — fails that check).
         longs = [ln for ln in supports
-                 if ln.touches >= MIN_TOUCHES and ln.slope > 0
-                 and _break_ok(ln)]
+                 if ln.touches >= MIN_TOUCHES and ln.slope > 0]
         shorts = [ln for ln in resistances
-                  if ln.touches >= MIN_TOUCHES and ln.slope < 0
-                  and _break_ok(ln)]
+                  if ln.touches >= MIN_TOUCHES and ln.slope < 0]
         longs.sort(key=lambda ln: (-ln.touches, -ln.slope))
         shorts.sort(key=lambda ln: (-ln.touches, ln.slope))   # most-negative slope first
 
@@ -875,13 +866,29 @@ class ChartSignalStrategy:
                                 strict_old += 1
                         if strict_old < MIN_TOUCHES:
                             continue
-                    # Stale-line gate: Q anchor must be within
-                    # max_q_age_hours of the fire bar.
+                    # Stale-line gate: the line's MOST RECENT strict
+                    # touch must be within ``max_q_age_hours`` of the
+                    # fire bar (same rule as the entry filter). Lines
+                    # built long ago but still being touched recently
+                    # remain valid; lines whose only touches were >24 h
+                    # ago drop out.
                     if fire_dt is not None:
-                        q_dt = _bar_dt(ln.from_idx)
-                        if q_dt is not None:
-                            q_age_h = (fire_dt - q_dt).total_seconds() / 3600.0
-                            if q_age_h > max_q_age_hours_audit:
+                        latest_idx = ln.anchor_b_idx
+                        line_to_idx = (
+                            ln.break_idx if ln.break_idx is not None
+                            else last_idx
+                        )
+                        for piv in side_pivots:
+                            if piv <= ln.anchor_b_idx or piv > line_to_idx:
+                                continue
+                            if abs(closes[piv]
+                                   - (ln.intercept + ln.slope * piv)) <= touch_tol_early:
+                                if piv > latest_idx:
+                                    latest_idx = piv
+                        latest_dt = _bar_dt(latest_idx)
+                        if latest_dt is not None:
+                            age_h = (fire_dt - latest_dt).total_seconds() / 3600.0
+                            if age_h > max_q_age_hours_audit:
                                 continue
                     out.append({
                         "kind": ln.type,
@@ -1595,14 +1602,16 @@ class ChartSignalStrategy:
                     return actions
 
         # Stale-line filter (FILTER_STALE_LINE).
-        # Caps the age of the chosen line's Q anchor. Lines whose Q
-        # anchor is more than ``entry_max_q_age_hours`` old represent
-        # stale structure that the current bar's participants may not
-        # honor.
-        # Replaces the older PT-session-bucket approach (operator's
-        # call 2026-05-15) — flat 24h is simpler to reason about than
-        # 4 boundary breakpoints, and inter-session lines have proven
-        # legitimate often enough to not warrant a hard reject.
+        # Caps the age of the chosen line's MOST RECENT strict touch.
+        # A line whose latest touch is more than ``entry_max_q_age_hours``
+        # (legacy name, kept for back-compat) ago means price hasn't
+        # respected the line in the last 24 h — stale structure that
+        # current participants may not honor. Q-anchor age is not
+        # checked: a line built 5 d ago that's still getting touched
+        # is valid; a fresh line whose only touches are 25 h old
+        # is not.
+        # 2026-05-15 operator call: "latest touch within 24 h, not
+        # necessarily the original."
         sl_enabled = bool(self.config.get(
             "entry_stale_line_filter_enabled",
             # Back-compat with old key name.
@@ -1612,33 +1621,57 @@ class ChartSignalStrategy:
             "entry_max_q_age_hours", 24.0,
         ))
         if sl_enabled:
-            q_time = None
-            if 0 <= chosen.from_idx < len(window):
-                wq = window[chosen.from_idx]
-                q_time = _parse_ts(
-                    wq.get("timestamp_utc") or wq.get("ts"),
+            # Find the most recent strict touch on the chosen line.
+            # Iterates over the matching side's pivots within the
+            # line's valid lifespan [from_idx, to_idx] and tracks
+            # the highest index whose pivot close lies within
+            # touch_tol of the line value. If no later strict touch
+            # exists, P-anchor (anchor_b_idx) is itself a strict
+            # touch by construction so it's the floor.
+            side_pivots = (
+                support_pivots if direction == "long"
+                else resistance_pivots
+            )
+            to_idx = (
+                chosen.break_idx if chosen.break_idx is not None
+                else last_idx
+            )
+            latest_touch_idx = chosen.anchor_b_idx
+            for piv in side_pivots:
+                if piv <= chosen.anchor_b_idx or piv > to_idx:
+                    continue
+                line_val_at_piv = (
+                    chosen.intercept + chosen.slope * piv
                 )
-            if q_time is not None:
+                if abs(closes[piv] - line_val_at_piv) <= touch_tol:
+                    if piv > latest_touch_idx:
+                        latest_touch_idx = piv
+            lt_time = None
+            if 0 <= latest_touch_idx < len(window):
+                wlt = window[latest_touch_idx]
+                lt_time = _parse_ts(
+                    wlt.get("timestamp_utc") or wlt.get("ts"),
+                )
+            if lt_time is not None:
                 from datetime import timedelta as _td
-                q_age_seconds = (
-                    bar_time - q_time
-                ).total_seconds()
-                q_age_hours = q_age_seconds / 3600.0
-                if q_age_hours > max_q_age_hours:
+                lt_age_hours = (
+                    bar_time - lt_time
+                ).total_seconds() / 3600.0
+                if lt_age_hours > max_q_age_hours:
                     actions.append(LogSignal(
                         event_type=LogEventType.SKIP,
                         message=(
                             f"{FILTER_STALE_LINE} filter ({direction.upper()})"
-                            f" — Q anchor {q_age_hours:.1f}h old "
+                            f" — latest touch {lt_age_hours:.1f}h old "
                             f"(cap {max_q_age_hours:.1f}h); line is "
                             f"stale relative to current price action"
                         ),
                         payload={
                             "filter": FILTER_STALE_LINE,
                             "direction": direction,
-                            "q_anchor_time": q_time.isoformat(),
-                            "q_age_hours": round(q_age_hours, 2),
-                            "max_q_age_hours": max_q_age_hours,
+                            "latest_touch_time": lt_time.isoformat(),
+                            "latest_touch_age_hours": round(lt_age_hours, 2),
+                            "max_age_hours": max_q_age_hours,
                             "entry_decision": decision_diag,
                         },
                     ))
