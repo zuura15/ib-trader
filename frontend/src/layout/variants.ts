@@ -273,6 +273,7 @@ export const variantT: IJsonModel = {
             weight: 60,
             children: [
               { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
+              { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
               { type: 'tab', name: 'Positions', component: 'positions', config: { compact: true } },
               { type: 'tab', name: 'Watchlist', component: 'watchlist', config: { compact: true } },
               { type: 'tab', name: 'Alerts', component: 'alerts' },
