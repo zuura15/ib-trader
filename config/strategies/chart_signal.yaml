@@ -46,3 +46,15 @@ max_shares: 100
 # well away from the line; trail alone manages the exit).
 acceleration_entry_enabled: false
 min_slope_ratio: 1.5
+
+# Marginal-entry mode. When ``allow_marginal_entries`` is true,
+# entries that the shoulder / far_from_pivot / min_target filters
+# would normally REJECT still fire — but the trade is tagged as
+# ``marginal`` and uses a tighter exit ("tight counter_line"):
+# the counter_line cache contains 3+touch lines from BOTH sides
+# (in the current PT session, excluding the trigger line itself),
+# and the same 10s mid-touch hold rule exits the trade.
+# Clean trades (no filter rejection) continue to use the normal
+# opposing-only counter_line exit. Operator can A/B at trade
+# level via the audit feed (decision: ``FIRED·B·marginal``).
+allow_marginal_entries: false

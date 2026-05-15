@@ -96,6 +96,7 @@ FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
 #                   broken through within ``counter_exit_hold_seconds``
 #                   (default 10) → immediate close.
 EXIT_COUNTER_LINE = "counter_line"
+EXIT_TIGHT_COUNTER_LINE = "tight_counter_line"
 
 
 def _parse_ts(ts: Any) -> datetime | None:
@@ -331,10 +332,25 @@ class ChartSignalStrategy:
             except Exception:  # noqa: BLE001
                 bar_close_d = None
 
+        # Detect marginal entry from the SIGNAL payload's entry_line.
+        # When ``allow_marginal_entries=True`` lets a filter-rejected
+        # trade fire, entry_line.marginal == True propagates through.
+        signal_sig_for_marginal: LogSignal | None = next(
+            (a for a in actions if isinstance(a, LogSignal)
+             and (a.event_type.value if hasattr(a.event_type, "value")
+                  else str(a.event_type)) == "SIGNAL"),
+            None,
+        )
+        is_marginal_entry = False
+        if signal_sig_for_marginal and signal_sig_for_marginal.payload:
+            el = signal_sig_for_marginal.payload.get("entry_line") or {}
+            is_marginal_entry = bool(el.get("marginal", False))
+
         # Decision — tiered.
         decision = ""
         if place_order is not None:
-            decision = f"FIRED·{place_order.side}"
+            tag = "·marginal" if is_marginal_entry else ""
+            decision = f"FIRED·{place_order.side}{tag}"
             pivot_status = ("PIVOT_LOW" if place_order.side == "BUY"
                             else "PIVOT_HIGH")
         elif exit_sig is not None:
@@ -1108,6 +1124,19 @@ class ChartSignalStrategy:
         if short_path is None:
             short_line = None
 
+        # Marginal-entry mode (``allow_marginal_entries`` config flag).
+        # When enabled, the per-side filters (shoulder, min_target) and
+        # the post-chosen filter (far_from_pivot) tag the trade as
+        # "marginal" instead of nuking the line. The entry still fires
+        # but uses the tighter counter_line exit (cache contains both
+        # sides' lines, not just opposing). Operator can A/B clean vs
+        # marginal at trade level via the audit feed.
+        allow_marginal = bool(self.config.get(
+            "allow_marginal_entries", False,
+        ))
+        marginal_filters_long: list[str] = []
+        marginal_filters_short: list[str] = []
+
         # Entry-decision diagnostic — one structured block captured on
         # EVERY eval (including when no entry fires). Lets us answer
         # "why didn't this bar fire?" without restarting with a more
@@ -1179,7 +1208,11 @@ class ChartSignalStrategy:
                         "left_shoulder": round(left_shoulder, 4),
                         "right_shoulder": round(right_shoulder, 4),
                     }
-                    long_line = None
+                    # Marginal mode: tag but don't nuke. Else: hard-reject.
+                    if allow_marginal:
+                        marginal_filters_long.append(FILTER_SHOULDER)
+                    else:
+                        long_line = None
                     rejected_by_filter = True
                 if short_line is not None and right_shoulder >= left_shoulder:
                     rejected_payload = {
@@ -1187,7 +1220,10 @@ class ChartSignalStrategy:
                         "left_shoulder": round(left_shoulder, 4),
                         "right_shoulder": round(right_shoulder, 4),
                     }
-                    short_line = None
+                    if allow_marginal:
+                        marginal_filters_short.append(FILTER_SHOULDER)
+                    else:
+                        short_line = None
                     rejected_by_filter = True
                 if rejected_by_filter:
                     actions.append(LogSignal(
@@ -1196,8 +1232,10 @@ class ChartSignalStrategy:
                             f"{FILTER_SHOULDER} filter — right shoulder "
                             f"{rejected_payload['right_shoulder']:.4f} "
                             f"vs left {rejected_payload['left_shoulder']:.4f}"
+                            + (" [marginal mode]" if allow_marginal else "")
                         ),
                         payload={"filter": FILTER_SHOULDER,
+                                 "marginal": allow_marginal,
                                  **rejected_payload,
                                  "entry_decision": decision_diag},
                     ))
@@ -1352,10 +1390,15 @@ class ChartSignalStrategy:
                             f"${rej['stop_distance']:.4f} (opposing R at "
                             f"{rej['opposing_edge_price']:.4f}, entry "
                             f"{rej['entry_price']:.4f})"
+                            + (" [marginal mode]" if allow_marginal else "")
                         ),
-                        payload={**rej, "entry_decision": decision_diag},
+                        payload={**rej, "marginal": allow_marginal,
+                                  "entry_decision": decision_diag},
                     ))
-                    long_line = None
+                    if allow_marginal:
+                        marginal_filters_long.append(FILTER_MIN_TARGET)
+                    else:
+                        long_line = None
             if short_line is not None:
                 rej = _min_target_reject(short_line, "SHORT")
                 if rej is not None:
@@ -1367,10 +1410,15 @@ class ChartSignalStrategy:
                             f"${rej['stop_distance']:.4f} (opposing S at "
                             f"{rej['opposing_edge_price']:.4f}, entry "
                             f"{rej['entry_price']:.4f})"
+                            + (" [marginal mode]" if allow_marginal else "")
                         ),
-                        payload={**rej, "entry_decision": decision_diag},
+                        payload={**rej, "marginal": allow_marginal,
+                                  "entry_decision": decision_diag},
                     ))
-                    short_line = None
+                    if allow_marginal:
+                        marginal_filters_short.append(FILTER_MIN_TARGET)
+                    else:
+                        short_line = None
 
         if long_line is None and short_line is None:
             actions.append(LogSignal(
@@ -1468,9 +1516,11 @@ class ChartSignalStrategy:
                         f"fire bar overshot pivot's {kind} line by "
                         f"${gap:.4f} (cap ${cap:.4f} = {mult:.1f}× trail). "
                         f"line @ {line_at:.4f}, entry @ {entry_price:.4f}"
+                        + (" [marginal mode]" if allow_marginal else "")
                     ),
                     payload={
                         "filter": FILTER_FAR_FROM_PIVOT,
+                        "marginal": allow_marginal,
                         "direction": direction,
                         "entry_price": round(entry_price, 4),
                         "line_value": round(line_at, 4),
@@ -1481,7 +1531,14 @@ class ChartSignalStrategy:
                         "entry_decision": decision_diag,
                     },
                 ))
-                return actions
+                if allow_marginal:
+                    # Tag the chosen direction as marginal and proceed.
+                    if direction == "long":
+                        marginal_filters_long.append(FILTER_FAR_FROM_PIVOT)
+                    else:
+                        marginal_filters_short.append(FILTER_FAR_FROM_PIVOT)
+                else:
+                    return actions
 
         # Q-session filter (FILTER_Q_SESSION).
         # The chosen line's earlier construction anchor (Q = from_idx)
@@ -1599,6 +1656,15 @@ class ChartSignalStrategy:
         )
         slope_per_sec = chosen.slope / self.bar_seconds
 
+        # Resolve marginal status for the chosen side. Used by the
+        # counter_line cache build to decide between opposing-only
+        # (clean) and all-sides-except-trigger (marginal/tight) caches.
+        chosen_marginal_filters = (
+            marginal_filters_long if direction == "long"
+            else marginal_filters_short
+        )
+        is_marginal_entry = bool(chosen_marginal_filters)
+
         entry_line_doc = {
             "kind": kind,
             "direction": direction,
@@ -1615,6 +1681,13 @@ class ChartSignalStrategy:
             # line-breach gate (price is far from the line and the
             # line is no longer a useful stop reference).
             "entry_path": "accel" if is_acceleration_entry else "touch",
+            # Marginal-mode bookkeeping. ``marginal=True`` means the
+            # entry would have been rejected by at least one of the
+            # bypassable filters (shoulder / far_from_pivot /
+            # min_target) but ``allow_marginal_entries=True`` let it
+            # fire anyway. Exit path uses the tight counter_line cache.
+            "marginal": is_marginal_entry,
+            "marginal_filters": list(chosen_marginal_filters),
         }
 
         qty = int(self.config.get("qty_default", 1))
@@ -1892,32 +1965,87 @@ class ChartSignalStrategy:
         )
         if near_frac is not None:
             near_frac = float(near_frac)
-        opp_type = "resistance" if direction == "long" else "support"
-        from ib_trader.signals.sr_fan import detect_lines
-        opp_lines = detect_lines(
-            closes, up_to=last_idx, type_=opp_type,
-            near_touch_tolerance_fraction=near_frac,
+        # Marginal trades use the TIGHT cache: 3+touch current-session
+        # lines from BOTH sides, excluding the trigger line. Clean
+        # trades use the existing OPPOSING-only cache.
+        entry_line = ctx.state.get("entry_line") or {}
+        is_marginal = bool(entry_line.get("marginal", False))
+        from ib_trader.signals.sr_fan import (
+            detect_lines, futures_session_id,
         )
+        if is_marginal:
+            supports = detect_lines(
+                closes, up_to=last_idx, type_="support",
+                near_touch_tolerance_fraction=near_frac,
+            )
+            resistances = detect_lines(
+                closes, up_to=last_idx, type_="resistance",
+                near_touch_tolerance_fraction=near_frac,
+            )
+            scanned = list(supports) + list(resistances)
+        else:
+            opp_type = "resistance" if direction == "long" else "support"
+            scanned = detect_lines(
+                closes, up_to=last_idx, type_=opp_type,
+                near_touch_tolerance_fraction=near_frac,
+            )
+        # Trigger line identity (for marginal-mode exclusion).
+        trigger_from_idx = entry_line.get("from_idx")
+        trigger_anchor_b_idx = entry_line.get("anchor_b_idx")
+
+        # Current-session gate (marginal mode only). Reuses the same
+        # futures_session_id helper the q_session entry filter uses.
+        # Looks up the bar's timestamp via fetched[i]["ts"] (the
+        # /engine/history field).
+        cur_sess = None
+        if is_marginal:
+            from datetime import datetime as _dt
+            def _bar_dt(i):
+                if 0 <= i < len(fetched):
+                    raw = fetched[i].get("ts") or fetched[i].get("timestamp_utc")
+                    if raw:
+                        try:
+                            return _dt.fromisoformat(
+                                raw.replace("Z", "+00:00"),
+                            )
+                        except Exception:  # noqa: BLE001
+                            return None
+                return None
+            last_dt = _bar_dt(last_idx)
+            cur_sess = futures_session_id(last_dt) if last_dt else None
+
         min_touches = int(self.config.get("counter_exit_min_touches", 2))
         cache: list[dict] = []
-        for ln in opp_lines:
+        for ln in scanned:
             if ln.break_idx is not None:
                 continue
             if ln.touches < min_touches:
                 continue
+            # Marginal mode: exclude trigger line + current-session-only.
+            if is_marginal:
+                if (ln.from_idx == trigger_from_idx
+                        and ln.anchor_b_idx == trigger_anchor_b_idx):
+                    continue
+                if cur_sess is not None:
+                    q_dt = _bar_dt(ln.from_idx)
+                    if q_dt is not None:
+                        q_sess = futures_session_id(q_dt)
+                        if q_sess != cur_sess:
+                            continue
             value = ln.intercept + ln.slope * last_idx
-            # Only counter side relevant: above price for LONG /
-            # below price for SHORT. A "resistance" that sits below
-            # current price has already been crossed and isn't acting
-            # as a ceiling.
-            if direction == "long" and value <= bar_close:
-                continue
-            if direction == "short" and value >= bar_close:
-                continue
+            if not is_marginal:
+                # Clean trade — keep only the OPPOSING side relative
+                # to the trade direction. (A "resistance" that sits
+                # below current price has already been crossed.)
+                if direction == "long" and value <= bar_close:
+                    continue
+                if direction == "short" and value >= bar_close:
+                    continue
             cache.append({
                 "value": round(value, 6),
                 "slope": round(ln.slope, 6),
                 "touches": int(ln.touches),
+                "kind": ln.type,
             })
         # Sort strongest-first so the touch test prefers high-touch
         # lines when several sit near the same price.
@@ -2106,26 +2234,35 @@ class ChartSignalStrategy:
                     "elapsed_seconds": round(elapsed, 2),
                 },
             )]
-        # Rejection confirmed — exit immediately.
+        # Rejection confirmed — exit immediately. Reason flavor
+        # depends on whether the trade was tagged marginal at entry:
+        # ``tight_counter_line`` for marginal (both-side cache),
+        # ``counter_line`` for clean (opposing-only cache). Operator
+        # can split clean vs marginal performance via the audit feed.
+        entry_line = ctx.state.get("entry_line") or {}
+        is_marginal = bool(entry_line.get("marginal", False))
+        exit_label = (EXIT_TIGHT_COUNTER_LINE if is_marginal
+                       else EXIT_COUNTER_LINE)
         detail = (
-            f"counter-line held {elapsed:.1f}s "
+            f"{exit_label} held {elapsed:.1f}s "
             f"(line={line_value:.4f}, "
             f"touches={cur_touch['line_touches']}, mid={mid:.4f})"
         )
         state_patch["counter_touch"] = None
-        state_patch["exit_reason"] = EXIT_COUNTER_LINE
+        state_patch["exit_reason"] = exit_label
         actions: list[Action] = [
             LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
-                message=f"{EXIT_COUNTER_LINE} exit — {detail}",
+                message=f"{exit_label} exit — {detail}",
                 payload={
-                    "exit_trigger": EXIT_COUNTER_LINE,
+                    "exit_trigger": exit_label,
                     "line_value": line_value,
                     "line_touches": cur_touch["line_touches"],
                     "line_slope": cur_touch.get("line_slope"),
                     "mid": mid,
                     "elapsed_seconds": round(elapsed, 2),
                     "hold_seconds": hold_secs,
+                    "marginal_trade": is_marginal,
                 },
             ),
             UpdateState(state_patch),

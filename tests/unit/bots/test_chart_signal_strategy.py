@@ -395,6 +395,54 @@ class TestEntryDistanceFilter:
         assert p["cap"] == pytest.approx(0.0084, abs=1e-6)
 
 
+class TestMarginalEntryMode:
+    """``allow_marginal_entries=True`` — far_from_pivot would normally
+    reject, but the entry fires anyway and entry_line is tagged
+    ``marginal=True``."""
+
+    def _bar_event_at(self, idx: int) -> BarCompleted:
+        bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES[: idx + 1])
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_far_from_pivot_marginal_lets_entry_fire(self):
+        cfg = _default_config()
+        cfg["far_from_pivot_filter_enabled"] = True   # filter would reject
+        cfg["allow_marginal_entries"] = True          # bypass enabled
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        # Entry STILL fires.
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert place and place[0].side == "BUY"
+        # SIGNAL payload's entry_line has marginal=True.
+        sig = next(a for a in actions if isinstance(a, LogSignal)
+                   and a.event_type == LogEventType.SIGNAL)
+        el = sig.payload["entry_line"]
+        assert el.get("marginal") is True
+        assert "far_from_pivot" in (el.get("marginal_filters") or [])
+        # SKIP log notes "marginal mode".
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and "marginal" in (a.payload or {})]
+        assert any(s.payload.get("marginal") is True for s in skips)
+
+    @pytest.mark.asyncio
+    async def test_clean_trade_not_tagged_marginal(self):
+        cfg = _default_config()
+        cfg["allow_marginal_entries"] = True
+        # All bypass-able filters disabled — entry path is fully clean.
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        sig = next(a for a in actions if isinstance(a, LogSignal)
+                   and a.event_type == LogEventType.SIGNAL)
+        el = sig.payload["entry_line"]
+        assert el.get("marginal") is False
+        assert (el.get("marginal_filters") or []) == []
+
+
 class TestQSessionFilter:
     """FILTER_Q_SESSION: reject if chosen line's Q anchor is in a
     different PT session from the fire bar. Defends against the
