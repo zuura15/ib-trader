@@ -39,7 +39,7 @@ function formatDuration(seconds: number | null): string {
   return `${h}h${m}m`;
 }
 
-/** Format an ISO timestamp as ``HH:MM M/D`` (24h time first, then
+/** Format an ISO timestamp as ``HH:MM, mm/dd`` (24h time first, then
  *  date) for the Closed column. Slot-end style — most-recent first
  *  reads top-to-bottom. Falls back to ``—`` on bad input. */
 function fmtClosedTime(s: string | null): string {
@@ -51,7 +51,9 @@ function fmtClosedTime(s: string | null): string {
   if (!Number.isFinite(d.getTime())) return '—';
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${hh}:${mm} ${d.getMonth() + 1}/${d.getDate()}`;
+  const MM = String(d.getMonth() + 1).padStart(2, '0');
+  const DD = String(d.getDate()).padStart(2, '0');
+  return `${hh}:${mm}, ${MM}/${DD}`;
 }
 
 function formatPnl(pnl: string | null): { text: string; color: string } {
@@ -200,12 +202,16 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
             <tr>
               <th style={{ width: 22 }}></th>
               <SortHeader label="Symbol" myKey="symbol" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              <SortHeader label="Dir" myKey="direction" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              {!compact && (
+                <SortHeader label="Dir" myKey="direction" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              )}
               <SortHeader label="Dur" myKey="duration_seconds" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               <SortHeader label="P&L (net)" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              {!compact && (
-                <SortHeader label="Closed" myKey="exit_time" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              )}
+              {/* Closed column is shown in BOTH compact (mobile) and
+                  desktop modes. Compact folds the Dir column into the
+                  Symbol cell as ``SYMBOL(S)`` / ``SYMBOL(L)`` so the
+                  time fits on a narrow viewport. */}
+              <SortHeader label="Closed" myKey="exit_time" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
             </tr>
           </thead>
           <tbody>
@@ -237,11 +243,27 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                       {isExpanded ? '▾' : '▸'}
                     </td>
                     <td className="font-semibold" style={{ color: 'var(--text-primary)' }}>
-                      {t.symbol}
+                      {compact ? (
+                        <>
+                          {t.symbol}
+                          <span style={{
+                            color: t.direction === 'LONG'
+                              ? 'var(--accent-green)'
+                              : 'var(--accent-red)',
+                            fontWeight: 600,
+                            marginLeft: 2,
+                          }}>
+                            ({t.direction === 'LONG' ? 'L' : 'S'})
+                          </span>
+                        </>
+                      ) : t.symbol}
                     </td>
-                    <td style={{ color: t.direction === 'LONG' ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                      {t.direction === 'LONG' ? 'L' : 'S'}
-                    </td>
+                    {!compact && (
+                      <td style={{ color: t.direction === 'LONG'
+                        ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                        {t.direction === 'LONG' ? 'L' : 'S'}
+                      </td>
+                    )}
                     <td className="font-mono"
                         style={{ color: 'var(--text-primary)', width: 70 }}>
                       {dur}
@@ -249,12 +271,10 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                     <td className="font-mono" style={{ color: pnl.color, fontWeight: 600 }}>
                       {pnl.text}
                     </td>
-                    {!compact && (
-                      <td className="font-mono"
-                          style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-                        {fmtClosedTime(t.exit_time)}
-                      </td>
-                    )}
+                    <td className="font-mono"
+                        style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                      {fmtClosedTime(t.exit_time)}
+                    </td>
                   </tr>,
                 ];
                 if (isExpanded) {
