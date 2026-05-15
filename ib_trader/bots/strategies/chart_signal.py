@@ -1942,12 +1942,12 @@ class ChartSignalStrategy:
         # an approximation.
         if bool(self.config.get("counter_exit_enabled", True)):
             actions.extend(
-                await self._refresh_counter_lines_cache(direction)
+                await self._refresh_counter_lines_cache(direction, ctx)
             )
         return actions
 
     async def _refresh_counter_lines_cache(
-        self, direction: str,
+        self, direction: str, ctx: StrategyContext,
     ) -> list[Action]:
         """Detect the opposing-side trendlines and write a flat cache
         to state for tick-time consumption. Counter lines = the lines
