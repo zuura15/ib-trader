@@ -2316,26 +2316,47 @@ class ChartSignalStrategy:
         now = datetime.now(timezone.utc)
         cur_touch = ctx.state.get("tight_touch")
 
-        def _touched(lv: float) -> bool:
-            # LONG: trigger/SL below price → touched when mid ≤ lv + tol.
-            # SHORT: trigger/SL above price → touched when mid ≥ lv - tol.
-            return (mid <= lv + tol) if direction == "long" \
-                else (mid >= lv - tol)
+        def _touched(lv: float, kind: str) -> bool:
+            # ``stop`` is one-sided — touched only when mid has crossed
+            # to the BAD side of the stop. The trail-only seed sits just
+            # $tol away from entry, so the original symmetric tol-band
+            # put entry price itself inside the touch zone and armed on
+            # the first tick. Observed on MGC 2026-05-15 11:36 SHORT:
+            # SL @ 4560.21 fired at mid 4559.80 (BELOW stop, favorable
+            # side) after 11.5 s.
+            #
+            # ``trigger`` (and any other line kind) keeps the symmetric
+            # tol-band: a trigger line is something price leaves at
+            # entry and may retrace to from either side, so lingering
+            # near it is the failure signal.
+            if kind == "stop":
+                # LONG stop sits BELOW entry; bad = mid at or below it.
+                # SHORT stop sits ABOVE entry; bad = mid at or above it.
+                return (mid <= lv) if direction == "long" else (mid >= lv)
+            # Symmetric tol-band — mid within tol of the line.
+            return abs(mid - lv) <= tol
 
-        def _breakout(lv: float) -> bool:
-            # "Breakout" here = price moved AWAY from the zone in the
-            # favorable direction, i.e. the trade is back on track.
-            return (mid < lv - tol) if direction == "long" \
-                else (mid > lv + tol)
+        def _cleared(lv: float, kind: str) -> bool:
+            # The trade has clearly retreated to the favorable side of
+            # the zone by > tol — touch state should reset rather than
+            # fire an exit. Direction-specific: favorable for LONG is
+            # UP, favorable for SHORT is DOWN.
+            if direction == "long":
+                # Stop sits below entry: favorable = mid back UP past
+                # stop. Line: favorable = mid back UP past line.
+                return mid > lv + tol
+            # SHORT
+            return mid < lv - tol
 
         if cur_touch is None:
             for z in zones:
                 lv = float(z["value"])
-                if _touched(lv) and not _breakout(lv):
+                kind = str(z.get("kind", "?"))
+                if _touched(lv, kind):
                     state_patch["tight_touch"] = {
                         "started_at": now.isoformat(),
                         "zone_value": lv,
-                        "zone_kind": z.get("kind", "?"),
+                        "zone_kind": kind,
                     }
                     return [LogSignal(
                         event_type=LogEventType.EXIT_CHECK,
@@ -2362,16 +2383,22 @@ class ChartSignalStrategy:
         lv = float(cur_touch["zone_value"])
         zone_kind = str(cur_touch.get("zone_kind", "?"))
         elapsed = (now - started).total_seconds()
-        cur_brk = _breakout(lv)
         if elapsed < hold_secs:
             return []
-        if cur_brk:
+        # At hold-elapsed, decide on the CURRENT touch state, not on
+        # a one-sided "breakout" — for SHORTs the old logic counted
+        # mid being favorable-side of the line as "still touched"
+        # (only ``mid > lv + tol`` cleared), so MGC 11:36 SHORT fired
+        # at mid 4559.80 while the stop sat at 4560.21 above it.
+        # Clearing now requires mid to be clearly on the favorable
+        # side of the zone by > tol.
+        if _cleared(lv, zone_kind):
             state_patch["tight_touch"] = None
             return [LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
                 message=(
                     f"{EXIT_TIGHT_COUNTER_LINE} cleared ({zone_kind}) — "
-                    f"breakout past zone {lv:.4f} (mid={mid:.4f}); "
+                    f"mid {mid:.4f} on favorable side of zone {lv:.4f}; "
                     f"resetting"
                 ),
                 payload={
