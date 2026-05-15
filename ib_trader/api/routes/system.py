@@ -8,7 +8,8 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
-from ib_trader.api.deps import get_redis
+from ib_trader.api.deps import get_bot_trades, get_redis
+from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 from ib_trader.redis.state import StateKeys, StateStore
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,10 @@ async def get_system_health():
 
 
 @router.get("/status")
-async def get_status(redis=Depends(get_redis)):
+async def get_status(
+    redis=Depends(get_redis),
+    bot_trades: BotTradeRepository = Depends(get_bot_trades),
+):
     """Return full system status from Redis."""
     now = datetime.now(timezone.utc)
 
@@ -131,20 +135,20 @@ async def get_status(redis=Depends(get_redis)):
         except Exception as e:
             logger.debug("alerts fetch failed", exc_info=e)
 
-    # Realized P&L from bot:stats:* Redis hashes
-    realized_pnl = 0.0
-    if redis:
-        try:
-            async for key in redis.scan_iter(match="bot:stats:*"):
-                raw = await redis.get(key)
-                if raw:
-                    try:
-                        stats = _json.loads(raw)
-                        realized_pnl += float(stats.get("pnl_today", 0))
-                    except (ValueError, TypeError) as e:
-                        logger.debug("failed to parse bot stats", exc_info=e)
-        except Exception as e:
-            logger.debug("realized pnl scan failed", exc_info=e)
+    # Realized P&L — rolling 24h window summed from bot_trades. Aligns
+    # with the Bot Trades panel (same source, same window) so the
+    # header number equals the sum of visible rows. Replaces the
+    # previous calendar-day pnl_today read off Redis bot:stats:*,
+    # which (a) midnight-rotated to zero, and (b) drifted from the
+    # panel when force-quit / crash-path exits bypassed
+    # ``_risk_mw.record_pnl``.
+    try:
+        realized_pnl = float(
+            bot_trades.sum_realized_pnl_last_hours(24.0)
+        )
+    except Exception as e:
+        logger.debug("rolling 24h pnl query failed", exc_info=e)
+        realized_pnl = 0.0
 
     return {
         "heartbeats": hb_list,

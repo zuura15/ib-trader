@@ -12,10 +12,11 @@ from the bot's state doc.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import scoped_session, Session
 
 from ib_trader.data.models import BotTrade
@@ -69,6 +70,24 @@ class BotTradeRepository:
             .limit(limit)
             .all()
         )
+
+    def sum_realized_pnl_last_hours(self, hours: float = 24.0) -> Decimal:
+        """Return sum of realized_pnl for trades closed in the last
+        ``hours`` (rolling window). Header "Realized P&L" reads this
+        so summing the Bot Trades panel rows matches the header.
+        """
+        since = _now_utc() - timedelta(hours=hours)
+        result = (
+            self._session()
+            .query(func.coalesce(func.sum(BotTrade.realized_pnl), 0))
+            .filter(BotTrade.exit_time >= since)
+            .scalar()
+        )
+        if result is None:
+            return Decimal("0")
+        if isinstance(result, Decimal):
+            return result
+        return Decimal(str(result))
 
     def add_commission_by_serial(
         self, serial: int, delta: Decimal,

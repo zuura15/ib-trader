@@ -111,7 +111,12 @@ export function GlobalHeader() {
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-3">
         {/* P&L */}
         <div className="rounded border px-3 py-1.5" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
-          <div style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>Realized P&L</div>
+          <div
+            style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}
+            title="Sum of realized P&L on closed bot trades in the last 24 hours (rolling window)"
+          >
+            Realized P&L · 24h
+          </div>
           <div className="font-mono" style={{ fontSize: 13, fontWeight: 600, color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
             {formatCurrency(realizedPnl)}
           </div>
