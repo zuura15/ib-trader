@@ -72,6 +72,19 @@ function Chip({ text, fg, bg, title }: {
   );
 }
 
+interface TouchingLine {
+  kind?: string;
+  touches?: number;
+  slope_per_bar?: number;
+  intercept?: number;
+  from_idx?: number;
+  anchor_b_idx?: number;
+  anchor_q_time?: string | null;
+  anchor_b_time?: string | null;
+  anchor_q_close?: number;
+  anchor_b_close?: number;
+}
+
 interface AuditPayload {
   audit?: {
     pivot?: 'low' | 'high' | null;
@@ -81,9 +94,11 @@ interface AuditPayload {
       touches?: number;
       slope_per_bar?: number;
       intercept?: number;
-      anchor_b_time?: string;
-      anchor_q_time?: string;
+      anchor_b_time?: string | null;
+      anchor_q_time?: string | null;
       anchor_b_price?: number;
+      count?: number;
+      lines?: TouchingLine[];
     } | null;
     filter_name?: string | null;
     filter_detail?: string | null;
@@ -108,11 +123,12 @@ function BarEvalRow({ r }: { r: AuditRow }) {
     ? <Chip text="PIVOT·H" fg="#dc2626" bg="rgba(220,38,38,0.14)" title="pivot HIGH at last_idx-1" />
     : <Chip text="NO_PIVOT" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
-  // Touch chip — "TOUCH·N" if a line was actually touched at this bar.
-  const touchN = a.touch?.touches;
-  const touchChip = touchN
-    ? <Chip text={`TOUCH·${touchN}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
-            title={`touched the ${a.touch?.line_kind} (${a.touch?.direction})`} />
+  // Touch chip — "TOUCH·N" where N = how many current-session
+  // trendlines this pivot landed on. NO_TOUCH = no lines at all.
+  const lineCount = a.touch?.count ?? 0;
+  const touchChip = lineCount > 0
+    ? <Chip text={`TOUCH·${lineCount}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
+            title={`pivot lies on ${lineCount} current-session trendline(s)`} />
     : <Chip text="NO_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
   // Filter chip — green PASSED if no filter, amber FILTER·<name> if filtered.
@@ -251,14 +267,21 @@ function ExpandedBarEval({ row, onShowRaw }: {
     return () => { cancelled = true; };
   }, [row.event_ts_utc, row.symbol]);
 
-  const touch = a.touch;
-  const lineSummary = touch
-    ? `${touch.line_kind ?? '?'} · touches=${touch.touches ?? '?'} · `
-      + `slope/bar=${(touch.slope_per_bar ?? 0).toFixed(4)} · `
-      + `Q@${_fmtPT(touch.anchor_q_time ?? null)} · `
-      + `P@${_fmtPT(touch.anchor_b_time ?? null)} · `
-      + `P close=${_fmtPrice(touch.anchor_b_price)}`
-    : '—';
+  // List one line per trendline this pivot touched. Each line shows
+  // its identity (kind · N-touch · slope) and vertices (Q anchor /
+  // P anchor with timestamps and prices). When N=0, show "—".
+  const touchedLines = a.touch?.lines ?? [];
+  const lineEntries = touchedLines.length === 0 ? [
+    <DetailLine key="none" label="lines" value="—" />
+  ] : touchedLines.map((ln, i) => {
+    const summary = `${ln.kind ?? '?'} · ${ln.touches ?? '?'}-touch · `
+      + `slope/bar=${(ln.slope_per_bar ?? 0).toFixed(4)} · `
+      + `Q@${_fmtPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
+      + `P@${_fmtPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
+    return (
+      <DetailLine key={i} label={`line ${i + 1}`} value={summary} />
+    );
+  });
 
   return (
     <div style={{
@@ -274,7 +297,7 @@ function ExpandedBarEval({ row, onShowRaw }: {
           : nextClose === null ? '— (bar not closed yet)'
           : _fmtPrice(nextClose)}
       />
-      <DetailLine label="line" value={lineSummary} />
+      {lineEntries}
       <DetailLine
         label="filter"
         value={a.filter_name

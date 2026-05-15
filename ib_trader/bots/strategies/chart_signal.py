@@ -409,46 +409,32 @@ class ChartSignalStrategy:
                   else str(a.event_type)) == "SIGNAL"),
             None,
         )
-        # Step 1: derive from BAR payload. The TOUCH chip is gated on
-        # ``long_has_new_touch`` / ``short_has_new_touch`` — strict
-        # "the just-confirmed pivot lies on the chosen line within
-        # touch_tol" flags. Without that gate, a 20-touch line that
-        # the current bar's pivot did NOT touch was incorrectly
-        # tagged as TOUCH·20 (operator caught this 2026-05-14 at
-        # 22:45 PT MESM6: NO_PIVOT + TOUCH·20).
+        # Touch info — the BAR payload carries the authoritative list
+        # ``pivot_touching_lines``: every current-session 3+touch line
+        # (matching the pivot's side) that the just-confirmed pivot
+        # lies on within tol. TOUCH·N counts N = len(this list).
         if bar_sig and bar_sig.payload:
-            bp = bar_sig.payload
-            blt = int(bp.get("best_long_touches") or 0)
-            bst = int(bp.get("best_short_touches") or 0)
-            long_touched = bool(bp.get("long_has_new_touch"))
-            short_touched = bool(bp.get("short_has_new_touch"))
-            # Prefer the side that actually touched; tie → prefer the
-            # higher-touch line (matches the bot's tie-break).
-            if long_touched and (not short_touched or blt >= bst):
+            touching = bar_sig.payload.get("pivot_touching_lines") or []
+            if isinstance(touching, list) and len(touching) > 0:
+                # Pick the highest-touch line as the "primary" for the
+                # touch chip (matches the bot's tie-break).
+                primary = touching[0]
                 audit["touch"] = {
-                    "line_kind": "support",
-                    "direction": "long",
-                    "touches": blt,
-                    "slope_per_bar": bp.get("best_long_slope"),
-                    "intercept": bp.get("best_long_intercept"),
-                    "anchor_b_idx": bp.get("best_long_anchor_b_idx"),
-                    "anchor_q_idx": bp.get("best_long_from_idx"),
-                    "anchor_b_time": None,
-                    "anchor_q_time": None,
-                    "anchor_b_price": None,
-                }
-            elif short_touched:
-                audit["touch"] = {
-                    "line_kind": "resistance",
-                    "direction": "short",
-                    "touches": bst,
-                    "slope_per_bar": bp.get("best_short_slope"),
-                    "intercept": bp.get("best_short_intercept"),
-                    "anchor_b_idx": bp.get("best_short_anchor_b_idx"),
-                    "anchor_q_idx": bp.get("best_short_from_idx"),
-                    "anchor_b_time": None,
-                    "anchor_q_time": None,
-                    "anchor_b_price": None,
+                    "line_kind": primary.get("kind"),
+                    "direction": (
+                        "long" if primary.get("kind") == "support"
+                        else "short"
+                    ),
+                    "touches": int(primary.get("touches", 0) or 0),
+                    "slope_per_bar": primary.get("slope_per_bar"),
+                    "intercept": primary.get("intercept"),
+                    "anchor_b_idx": primary.get("anchor_b_idx"),
+                    "anchor_q_idx": primary.get("from_idx"),
+                    "anchor_b_time": primary.get("anchor_b_time"),
+                    "anchor_q_time": primary.get("anchor_q_time"),
+                    "anchor_b_price": primary.get("anchor_b_close"),
+                    "count": len(touching),
+                    "lines": touching,
                 }
         # Step 2: refine with SIGNAL payload anchor timestamps (only
         # present when entry actually fired).
@@ -730,6 +716,102 @@ class ChartSignalStrategy:
 
         long_has_new_touch = _strict_new_touch(long_line, support_pivots)
         short_has_new_touch = _strict_new_touch(short_line, resistance_pivots)
+
+        # Enumerate ALL current-session 3+touch lines (on the
+        # pivot's matching side) that the just-confirmed pivot lies
+        # on within touch_tol. This is what the audit feed's
+        # TOUCH·N chip counts: "N = number of trendlines this
+        # pivot landed on". Current-session = same PT futures
+        # session as the fire bar (Q anchor in the same session).
+        pivot_touching_lines: list[dict] = []
+        if np_idx >= 0:
+            from ib_trader.signals.sr_fan import futures_session_id
+            # Bar timestamps come from /engine/history into ``window``.
+            # The bar at index i has timestamp window[i]["ts"] or
+            # ["timestamp_utc"]. Use that to look up its session.
+            def _bar_dt(i):
+                if 0 <= i < len(window):
+                    ts = (window[i].get("timestamp_utc")
+                          or window[i].get("ts"))
+                    return _parse_ts(ts)
+                return None
+
+            fire_dt = _bar_dt(last_idx)
+            cur_sess = futures_session_id(fire_dt) if fire_dt else None
+
+            def _enumerate_touching(lines, side_pivots, pivot_kind):
+                out: list[dict] = []
+                if np_idx not in side_pivots:
+                    return out
+                pivot_close = closes[np_idx]
+                for ln in lines:
+                    if ln.touches < MIN_TOUCHES:
+                        continue
+                    if ln.break_idx is not None:
+                        continue
+                    # Side-correct slope check.
+                    if pivot_kind == "low" and ln.slope <= 0:
+                        continue
+                    if pivot_kind == "high" and ln.slope >= 0:
+                        continue
+                    line_at = ln.intercept + ln.slope * np_idx
+                    delta = abs(pivot_close - line_at)
+                    if delta > touch_tol_early:
+                        # Allow near-touch only if line already holds
+                        # MIN_TOUCHES strict from older pivots — same
+                        # rule as ``_has_new_touch``.
+                        if (near_tol_early is None
+                                or delta > near_tol_early):
+                            continue
+                        strict_old = 0
+                        for piv in side_pivots:
+                            if (piv == np_idx or piv < ln.from_idx
+                                    or piv > last_idx):
+                                continue
+                            d = abs(closes[piv]
+                                    - (ln.intercept + ln.slope * piv))
+                            if d <= touch_tol_early:
+                                strict_old += 1
+                        if strict_old < MIN_TOUCHES:
+                            continue
+                    # Current-session gate on Q anchor.
+                    if cur_sess is not None:
+                        q_dt = _bar_dt(ln.from_idx)
+                        if q_dt is not None:
+                            q_sess = futures_session_id(q_dt)
+                            if q_sess != cur_sess:
+                                continue
+                    out.append({
+                        "kind": ln.type,
+                        "touches": int(ln.touches),
+                        "slope_per_bar": round(ln.slope, 6),
+                        "intercept": round(ln.intercept, 6),
+                        "from_idx": int(ln.from_idx),
+                        "anchor_b_idx": int(ln.anchor_b_idx),
+                        "anchor_q_time": (
+                            _bar_dt(ln.from_idx).isoformat()
+                            if _bar_dt(ln.from_idx) else None
+                        ),
+                        "anchor_b_time": (
+                            _bar_dt(ln.anchor_b_idx).isoformat()
+                            if _bar_dt(ln.anchor_b_idx) else None
+                        ),
+                        "anchor_q_close": round(closes[ln.from_idx], 4),
+                        "anchor_b_close": round(closes[ln.anchor_b_idx], 4),
+                    })
+                # Sort by touches desc so the highest-confidence
+                # line lands first in the detail pane.
+                out.sort(key=lambda d: -d["touches"])
+                return out
+
+            if np_idx in support_pivots:
+                pivot_touching_lines = _enumerate_touching(
+                    supports, support_pivots, "low",
+                )
+            elif np_idx in resistance_pivots:
+                pivot_touching_lines = _enumerate_touching(
+                    resistances, resistance_pivots, "high",
+                )
         # Diagnostic — emit ONE compact record per bar even when nothing
         # qualifies. The visibility gap during testing was: "frontend
         # shows a B but no bot trade fires" — without this, the logs
@@ -799,6 +881,13 @@ class ChartSignalStrategy:
                 # the pivot's close is within tol of the line.
                 "long_has_new_touch": long_has_new_touch,
                 "short_has_new_touch": short_has_new_touch,
+                # Authoritative list for the audit's TOUCH·N chip:
+                # every CURRENT-SESSION 3+touch line (matching the
+                # pivot's side) that the just-confirmed pivot lies on
+                # within touch_tol. N = len(this list). When N == 0,
+                # the audit shows NO_TOUCH; when N >= 1, shows
+                # TOUCH·N with the list rendered in the detail pane.
+                "pivot_touching_lines": pivot_touching_lines,
             },
         ))
         # Freshness gates — two guards, both must pass.
