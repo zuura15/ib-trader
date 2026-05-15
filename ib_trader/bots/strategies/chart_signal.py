@@ -409,15 +409,22 @@ class ChartSignalStrategy:
                   else str(a.event_type)) == "SIGNAL"),
             None,
         )
-        # Step 1: derive from BAR payload — works for every row where
-        # the bot detected a candidate (including FILTERED ones).
+        # Step 1: derive from BAR payload. The TOUCH chip is gated on
+        # ``long_has_new_touch`` / ``short_has_new_touch`` — strict
+        # "the just-confirmed pivot lies on the chosen line within
+        # touch_tol" flags. Without that gate, a 20-touch line that
+        # the current bar's pivot did NOT touch was incorrectly
+        # tagged as TOUCH·20 (operator caught this 2026-05-14 at
+        # 22:45 PT MESM6: NO_PIVOT + TOUCH·20).
         if bar_sig and bar_sig.payload:
             bp = bar_sig.payload
             blt = int(bp.get("best_long_touches") or 0)
             bst = int(bp.get("best_short_touches") or 0)
-            # Prefer the side that's set; if both, the one with more
-            # touches (the bot's tie-break picks higher touches).
-            if blt >= bst and blt > 0:
+            long_touched = bool(bp.get("long_has_new_touch"))
+            short_touched = bool(bp.get("short_has_new_touch"))
+            # Prefer the side that actually touched; tie → prefer the
+            # higher-touch line (matches the bot's tie-break).
+            if long_touched and (not short_touched or blt >= bst):
                 audit["touch"] = {
                     "line_kind": "support",
                     "direction": "long",
@@ -426,13 +433,11 @@ class ChartSignalStrategy:
                     "intercept": bp.get("best_long_intercept"),
                     "anchor_b_idx": bp.get("best_long_anchor_b_idx"),
                     "anchor_q_idx": bp.get("best_long_from_idx"),
-                    # Anchor times not in BAR payload — refined below
-                    # from SIGNAL when available.
                     "anchor_b_time": None,
                     "anchor_q_time": None,
                     "anchor_b_price": None,
                 }
-            elif bst > 0:
+            elif short_touched:
                 audit["touch"] = {
                     "line_kind": "resistance",
                     "direction": "short",
@@ -678,6 +683,53 @@ class ChartSignalStrategy:
         # (entry on dip is the bias the user originally tuned for).
         long_line = longs[0] if longs else None
         short_line = shorts[0] if shorts else None
+
+        # Touch tolerances — computed early so the BAR audit row can
+        # surface ``has_new_touch`` (the strict "this bar's pivot
+        # actually lies on the line within tol" check) alongside the
+        # raw line presence flag. The bot uses these same values
+        # later in the entry-decision path.
+        TOUCH_FRAC_EARLY = float(self.config.get(
+            "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+        ))
+        avg_close_early = sum(closes) / max(1, len(closes))
+        touch_tol_early = max(1e-6, avg_close_early * TOUCH_FRAC_EARLY)
+        near_tol_early: float | None = None
+        if near_frac is not None and near_frac > TOUCH_FRAC_EARLY:
+            near_tol_early = max(touch_tol_early,
+                                  avg_close_early * near_frac)
+        np_idx = last_idx - 1
+
+        def _strict_new_touch(line, side_pivots) -> bool:
+            """``_has_new_touch`` minus the 4th-loose path — used by
+            the audit row to determine whether THIS bar's pivot
+            actually landed on the line. Same gate the entry uses;
+            cached to avoid duplicate work at line 805."""
+            if line is None:
+                return False
+            if np_idx < 0 or np_idx not in side_pivots:
+                return False
+            line_at = line.intercept + line.slope * np_idx
+            delta = abs(closes[np_idx] - line_at)
+            if delta <= touch_tol_early:
+                return True
+            if near_tol_early is None or delta > near_tol_early:
+                return False
+            # 4th+ near touch — line must already hold MIN_TOUCHES
+            # strict touches from older pivots.
+            strict_old = 0
+            for piv in side_pivots:
+                if piv == np_idx or piv < line.from_idx:
+                    continue
+                if piv > last_idx:
+                    continue
+                if abs(closes[piv]
+                       - (line.intercept + line.slope * piv)) <= touch_tol_early:
+                    strict_old += 1
+            return strict_old >= MIN_TOUCHES
+
+        long_has_new_touch = _strict_new_touch(long_line, support_pivots)
+        short_has_new_touch = _strict_new_touch(short_line, resistance_pivots)
         # Diagnostic — emit ONE compact record per bar even when nothing
         # qualifies. The visibility gap during testing was: "frontend
         # shows a B but no bot trade fires" — without this, the logs
@@ -739,6 +791,14 @@ class ChartSignalStrategy:
                     else "high" if (last_idx - 1) in resistance_pivots
                     else None
                 ),
+                # Strict "this bar's pivot actually landed on the
+                # chosen line within touch tolerance" flags. The audit
+                # feed's TOUCH·N chip uses these instead of just the
+                # raw line-presence — a pivot HIGH at this bar with
+                # best_short_touches > 0 ≠ a touch on the line unless
+                # the pivot's close is within tol of the line.
+                "long_has_new_touch": long_has_new_touch,
+                "short_has_new_touch": short_has_new_touch,
             },
         ))
         # Freshness gates — two guards, both must pass.
