@@ -532,10 +532,13 @@ export function AuditFeedPane() {
   }, []);
 
   const filterOptions = useMemo(() => {
+    // The audit feed is primarily for chart_signal bots — they're
+    // the ones that emit BAR_EVAL rows. Use the ``chart-bot-*`` id
+    // prefix as the discriminator since the API's ``strategy`` field
+    // collapses every bot to the generic "strategy_bot" runner type.
+    const chartBots = bots.filter((b) => b.id.startsWith('chart-bot-'));
     return [{ id: 'all', label: 'All bots' } as const].concat(
-      bots
-        .filter((b) => b.strategy === 'chart_signal')
-        .map((b) => ({ id: b.id as 'all', label: b.name })),
+      chartBots.map((b) => ({ id: b.id as 'all', label: b.name })),
     );
   }, [bots]);
 
