@@ -810,6 +810,15 @@ class StrategyBotRunner(BotBase):
         """Supervisor detected an entry order sitting in
         ENTRY_ORDER_PLACED past the timeout. Cancel at engine and
         revert to AWAITING_ENTRY_TRIGGER.
+
+        Uses ``clear_position_fields_for_entry_timeout`` (NOT the
+        full clear) so the strategy's ``entry_line`` / ``entry_bar_time``
+        / ``position_direction`` survive the revert. If the IB fill
+        notification arrives a moment after this timeout fires (a
+        documented race), the late ``on_entry_filled`` will transition
+        state to AWAITING_EXIT_TRIGGER and the exit evaluator will
+        still have a line to evaluate against. Without that, the bot
+        is in a position with no line → "exit eval skipped" every bar.
         """
         async with self._state_lock:
             doc = await self._load_doc()
@@ -823,7 +832,10 @@ class StrategyBotRunner(BotBase):
                 "serial": doc.get("serial"),
                 "ib_order_id": doc.get("ib_order_id"),
             }
-            patch = clear_position_fields()
+            from ib_trader.bots.lifecycle import (
+                clear_position_fields_for_entry_timeout,
+            )
+            patch = clear_position_fields_for_entry_timeout()
             await self._apply_transition(
                 doc, BotState.AWAITING_ENTRY_TRIGGER, patch, "on_entry_timeout",
             )
@@ -2601,12 +2613,45 @@ class StrategyBotRunner(BotBase):
             )
             self._on_tick_warned = True
 
+    async def _entry_order_already_filled(self) -> bool:
+        """Return True if a transactions row for the bot's awaiting
+        ib_order_id is terminal-Filled. Race-aware guard for the
+        supervisor timeout: if IB filled the order but the notification
+        is in-flight to the bot, the timeout should NOT revert — the
+        ``on_entry_filled`` handler will land momentarily.
+        """
+        ib_order_id = (self.ctx.state.get("awaiting_ib_order_id")
+                        or self.ctx.state.get("ib_order_id"))
+        if not ib_order_id:
+            return False
+        try:
+            from ib_trader.data.models import TransactionEvent
+            session = self._session_factory()
+            row = (session.query(TransactionEvent)
+                   .filter(TransactionEvent.ib_order_id == int(ib_order_id))
+                   .filter(TransactionEvent.ib_status == "Filled")
+                   .filter(TransactionEvent.ib_filled_qty != None)  # noqa: E711
+                   .order_by(TransactionEvent.ib_responded_at.desc())
+                   .first())
+            return row is not None
+        except Exception:
+            logger.exception(
+                '{"event": "ENTRY_TIMEOUT_FILL_PRECHECK_FAILED", '
+                '"bot_id": "%s"}', self.bot_id,
+            )
+            return False
+
     async def check_entry_timeout(self) -> None:
         """Supervisory check: cancel entry if ENTRY_ORDER_PLACED has sat
         longer than entry_timeout_seconds.
 
         Called periodically by the runner's supervisory task — not driven
         by market events because timeout is purely time-based.
+
+        Race guard: before cancelling, check whether the order has
+        already filled (transactions row with Filled status). If yes,
+        leave the bot alone — ``on_entry_filled`` is about to drive
+        the transition.
         """
         if not self.strategy or not self.ctx:
             return
@@ -2622,6 +2667,14 @@ class StrategyBotRunner(BotBase):
         entry_time = _parse_aware_dt(entry_time_str)
         elapsed = (datetime.now(timezone.utc) - entry_time).total_seconds()
         if elapsed > timeout:
+            # Race-aware pre-check: don't time out if the fill is in.
+            if await self._entry_order_already_filled():
+                logger.info(
+                    '{"event": "ENTRY_TIMEOUT_SKIPPED_FILL_RACE", '
+                    '"bot_id": "%s", "elapsed_s": %.1f}',
+                    self.bot_id, elapsed,
+                )
+                return
             try:
                 await self.on_entry_timeout()
             except Exception:

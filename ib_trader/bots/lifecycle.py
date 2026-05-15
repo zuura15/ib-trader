@@ -91,6 +91,42 @@ def bot_doc_key(bot_id: str) -> str:
     return f"bot:{bot_id}"
 
 
+def clear_position_fields_for_entry_timeout() -> dict:
+    """Return a patch that zeroes position fields BUT preserves the
+    strategy-owned ``entry_line`` / ``entry_bar_time`` /
+    ``position_direction`` fields.
+
+    Used by ``on_entry_timeout`` to handle the race where the
+    supervisor's 30s clock fires at the same moment as the IB fill
+    notification: state reverts to AWAITING_ENTRY_TRIGGER, then a
+    moment later the fill arrives and drives state to
+    AWAITING_EXIT_TRIGGER. Without preserving entry_line here, the
+    strategy's exit evaluator finds no line and bombs "exit eval
+    skipped — entry_line missing from state" on every subsequent
+    bar.
+
+    If the timeout was legitimate (no fill came in), the next entry
+    SIGNAL emits a fresh ``UpdateState({"entry_line": ...})`` that
+    overwrites whatever stale value sits here, so leaving it in
+    place is safe.
+    """
+    return {
+        "qty": "0",
+        "entry_price": None,
+        "entry_time": None,
+        "serial": None,
+        "ib_order_id": None,
+        "awaiting_ib_order_id": None,
+        "high_water_mark": None,
+        "current_stop": None,
+        "trail_activated": False,
+        "order_qty": None,
+        "filled_qty": "0",
+        # Intentionally NOT cleared: entry_line, entry_bar_time,
+        # position_direction — see docstring above.
+    }
+
+
 def clear_position_fields() -> dict:
     """Return a patch that zeroes every position-specific field.
 
