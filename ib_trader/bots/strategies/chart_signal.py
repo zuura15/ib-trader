@@ -239,7 +239,17 @@ class ChartSignalStrategy:
         the strategy bailed before emitting anything) — we skip the
         audit row in that case to keep the feed clean.
         """
-        bar_ts = _parse_ts(event.bar.get("timestamp_utc"))
+        # /engine/history and the bar aggregator both label bars by
+        # slot-START. The chart's frontend converts to slot-END for
+        # display so a "06:48" tick means the bar that just CLOSED
+        # at 06:48 (started at 06:45). The audit feed should match
+        # the chart's convention so prices line up with what the
+        # operator sees — shift bar_ts forward by one bar's duration.
+        from datetime import timedelta as _td
+        bar_ts_raw = _parse_ts(event.bar.get("timestamp_utc"))
+        bar_seconds = int(self.config.get("bar_size_seconds", 180))
+        bar_ts = (bar_ts_raw + _td(seconds=bar_seconds)
+                   if bar_ts_raw is not None else None)
         try:
             bar_close_d = Decimal(str(event.bar.get("close", "0")))
         except Exception:  # noqa: BLE001
