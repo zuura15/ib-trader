@@ -268,11 +268,20 @@ class ChartSignalStrategy:
                 elif et == "SKIP" and skip_sig is None:
                     skip_sig = a
 
-        # Pivot status — derive from chosen-line direction (when fired)
-        # or from skip diag (when filtered). Fall back to NO_PIVOT/NONE.
-        pivot_status = "NONE"
+        # Pivot status — canonical source is the BAR payload's
+        # ``pivot_detected`` field (filled from find_pivot_lows/highs
+        # at last_idx-1). Independent of whether a 3-touch line
+        # accepted the pivot — operator sees "pivot existed but got
+        # filtered" cases. Falls back to NO_PIVOT when BAR carried
+        # an explicit None.
+        pivot_status = "NO_PIVOT"
         line_status = "LINES_NONE"
         if bar_sig and bar_sig.payload:
+            pd = bar_sig.payload.get("pivot_detected")
+            if pd == "low":
+                pivot_status = "PIVOT_LOW"
+            elif pd == "high":
+                pivot_status = "PIVOT_HIGH"
             blt = int(bar_sig.payload.get("best_long_touches") or 0)
             bst = int(bar_sig.payload.get("best_short_touches") or 0)
             if blt > 0 and bst > 0:
@@ -281,6 +290,10 @@ class ChartSignalStrategy:
                 line_status = "LINES_LONG"
             elif bst > 0:
                 line_status = "LINES_SHORT"
+        else:
+            # No BAR signal in this action list — gated path (cooldown,
+            # warmup, etc.). Pivot status unknown.
+            pivot_status = "NONE"
 
         # Decision — tiered.
         decision = ""
@@ -362,21 +375,29 @@ class ChartSignalStrategy:
             "outcome": "—",
             "prior_bar_close": None,
         }
-        # prior_bar_close — look back one bar in the window we received.
-        try:
-            wnd = event.window or []
-            if len(wnd) >= 2:
-                pc = wnd[-2].get("close")
-                if pc is not None:
+        # prior_bar_close and pivot — sourced from the BAR payload
+        # (which the strategy emits using its own /engine/history
+        # closes series, the canonical source). event.window's bar
+        # dicts vary in shape across runtime paths so we don't rely
+        # on them here.
+        if bar_sig and bar_sig.payload:
+            pc = bar_sig.payload.get("prior_bar_close")
+            if pc is not None:
+                try:
                     audit["prior_bar_close"] = float(pc)
-        except Exception:  # noqa: BLE001
-            pass
+                except (TypeError, ValueError):
+                    pass
+            pd = bar_sig.payload.get("pivot_detected")
+            if pd in ("low", "high"):
+                audit["pivot"] = pd
 
-        # Pivot bit — derived from the chosen direction.
-        if pivot_status == "PIVOT_LOW":
-            audit["pivot"] = "low"
-        elif pivot_status == "PIVOT_HIGH":
-            audit["pivot"] = "high"
+        # Backfill pivot from chosen-side info if BAR didn't carry it
+        # (older bot_events rows pre-payload-extension).
+        if audit["pivot"] is None:
+            if pivot_status == "PIVOT_LOW":
+                audit["pivot"] = "low"
+            elif pivot_status == "PIVOT_HIGH":
+                audit["pivot"] = "high"
 
         # Touch info — primary source is the BAR payload (which is
         # emitted on EVERY bar, regardless of whether SIGNAL fires or
@@ -614,6 +635,14 @@ class ChartSignalStrategy:
             return actions
         last_idx = len(closes) - 1
 
+        # Pivot lookup early — the BAR audit row needs to know whether
+        # the just-confirmed pivot at last_idx-1 was a LOW or a HIGH,
+        # regardless of whether a 3-touch line ended up accepting it.
+        # Cheap O(n) walk; reused later by the line-accept loop.
+        support_pivots = find_pivot_lows(closes)
+        resistance_pivots = find_pivot_highs(closes)
+        new_pivot_idx_for_audit = last_idx - 1
+
         # Scan both sides. Long candidates from uptrending support
         # (slope > 0); short candidates from downtrending resistance
         # (slope < 0). Both filtered to 3-touch, not broken.
@@ -695,6 +724,21 @@ class ChartSignalStrategy:
                 "resistances_found": len(resistances),
                 "top_supports": _top(supports),
                 "top_resistances": _top(resistances),
+                # Prior-bar close for the audit feed's expanded view.
+                # event.window's bar-dict shape varies across runtime
+                # paths, so we surface it from the bot's own ``closes``
+                # series (sourced from /engine/history). Always there
+                # because the strategy needs ≥ 3 closes to evaluate.
+                "prior_bar_close": (closes[-2] if len(closes) >= 2 else None),
+                # Pivot bit derived from the just-confirmed pivot
+                # detection at last_idx-1. Independent of whether a
+                # 3-touch line accepted it — operator can see "a
+                # pivot existed here but got filtered" cases.
+                "pivot_detected": (
+                    "low" if (last_idx - 1) in support_pivots
+                    else "high" if (last_idx - 1) in resistance_pivots
+                    else None
+                ),
             },
         ))
         # Freshness gates — two guards, both must pass.
@@ -741,8 +785,8 @@ class ChartSignalStrategy:
         near_tol: float | None = None
         if near_frac is not None and near_frac > TOUCH_FRAC:
             near_tol = max(touch_tol, avg_close * near_frac)
-        support_pivots = find_pivot_lows(closes)
-        resistance_pivots = find_pivot_highs(closes)
+        # support_pivots / resistance_pivots already computed earlier
+        # for the BAR audit row; reuse them here.
         new_pivot_idx = last_idx - 1   # the just-confirmed pivot
 
         # Acceleration-continuation entry: opt-in, off by default.
