@@ -562,7 +562,7 @@ class TestCounterLineCacheLifecycle:
                                   "line_value": 4666.25, "line_touches": 2,
                                   "line_slope": 0.137},
             },
-            fsm_state=BotState.ENTRY_ORDER_PLACED,
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
         )
         event = OrderFilled(
             trade_serial=1, symbol="MGCM6", side="BUY", fill_price=Decimal("4660.7"),
@@ -741,7 +741,7 @@ class TestShortEntry:
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx(
             state={"armed": True, "entry_line": {"direction": "short"}},
-            fsm_state=BotState.ENTRY_ORDER_PLACED,
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
         )
         fill = OrderFilled(
             trade_serial=99, symbol="MGCM6", side="SELL",
@@ -764,7 +764,7 @@ class TestShortEntry:
             state={"armed": True, "qty": "0", "entry_price": "18.0",
                    "trade_serial": 99,
                    "entry_line": {"direction": "short"}},
-            fsm_state=BotState.EXIT_ORDER_PLACED,
+            fsm_state=BotState.AWAITING_ENTRY_TRIGGER,
         )
         fill = OrderFilled(
             trade_serial=99, symbol="MGCM6", side="BUY",
@@ -1115,7 +1115,7 @@ class TestFills:
     async def test_buy_fill_records_entry_state(self):
         s = ChartSignalStrategy(_default_config())
         ctx = _make_ctx(state={"armed": True},
-                         fsm_state=BotState.ENTRY_ORDER_PLACED)
+                         fsm_state=BotState.AWAITING_EXIT_TRIGGER)
         fill = OrderFilled(
             trade_serial=42, symbol="MGCM6", side="BUY",
             fill_price=Decimal("12.50"), qty=Decimal("1"),
@@ -1137,7 +1137,7 @@ class TestFills:
         ctx = _make_ctx(
             state={"armed": True, "qty": "0", "entry_price": "12.0",
                    "trade_serial": 42, "entry_line": {"kind": "support"}},
-            fsm_state=BotState.EXIT_ORDER_PLACED,
+            fsm_state=BotState.AWAITING_ENTRY_TRIGGER,
         )
         fill = OrderFilled(
             trade_serial=42, symbol="MGCM6", side="SELL",

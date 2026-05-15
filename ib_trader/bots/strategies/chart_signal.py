@@ -2418,13 +2418,20 @@ class ChartSignalStrategy:
         entry_line = ctx.state.get("entry_line") or {}
         direction = str(entry_line.get("direction", "long")).lower()
         # Map FSM-stage + fill side to (entry-leg vs exit-leg) for both
-        # directions. Long entry = BUY; long exit = SELL. Short entry =
-        # SELL; short exit = BUY (buy-to-cover).
-        is_entry_leg = pos == BotState.ENTRY_ORDER_PLACED and (
+        # directions. The runtime transitions the FSM BEFORE notifying
+        # the strategy, so by the time we get here the post-fill state
+        # is what's in ``pos`` — AWAITING_EXIT_TRIGGER for an entry
+        # fill, AWAITING_ENTRY_TRIGGER for an exit fill. The earlier
+        # ENTRY_ORDER_PLACED / EXIT_ORDER_PLACED checks were never
+        # truthy and the entry-leg seeding silently never ran. Side
+        # vs direction still disambiguates the two legs:
+        #   LONG  entry = BUY,  LONG  exit = SELL
+        #   SHORT entry = SELL, SHORT exit = BUY (buy-to-cover)
+        is_entry_leg = pos == BotState.AWAITING_EXIT_TRIGGER and (
             (direction == "long" and event.side == "BUY")
             or (direction == "short" and event.side == "SELL")
         )
-        is_exit_leg = pos == BotState.EXIT_ORDER_PLACED and (
+        is_exit_leg = pos == BotState.AWAITING_ENTRY_TRIGGER and (
             (direction == "long" and event.side == "SELL")
             or (direction == "short" and event.side == "BUY")
         )
