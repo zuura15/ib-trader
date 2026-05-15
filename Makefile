@@ -95,7 +95,15 @@ dev:
 		.local/bin/redis-server config/redis.conf --daemonize yes; \
 		sleep 0.5; \
 	fi
-	@trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' INT TERM; \
+	@# Ctrl+C (SIGINT): check for live bot positions first. If any
+	@# bot is in ENTRY_ORDER_PLACED / AWAITING_EXIT_TRIGGER /
+	@# EXIT_ORDER_PLACED the helper exits non-zero, the trap body
+	@# returns early, and the session stays up. Force-quit the bots
+	@# from the UI first or escape via Ctrl+\ (SIGQUIT) / Ctrl+Z.
+	@# SIGTERM keeps the unconditional shutdown for programmatic
+	@# kills (systemctl, parent kill, etc.).
+	@trap 'scripts/dev/check_dev_can_shutdown.sh && { trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0; }' INT; \
+	trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' TERM; \
 	if command -v systemd-inhibit >/dev/null 2>&1; then \
 		echo "[DEV] systemd-inhibit: blocking sleep/idle for this session."; \
 		systemd-inhibit --what=sleep:idle --mode=block \
