@@ -721,16 +721,46 @@ class ChartSignalStrategy:
         )
         if near_frac is not None:
             near_frac = float(near_frac)
-        supports = detect_lines(closes, up_to=last_idx, type_="support",
-                                 near_touch_tolerance_fraction=near_frac)
-        resistances = detect_lines(closes, up_to=last_idx, type_="resistance",
-                                    near_touch_tolerance_fraction=near_frac)
+        # ``break_stale_bars`` extends the lifetime of broken lines in
+        # the detect output. Default 480 bars = 24 h of 3-min bars,
+        # so a line that briefly "breaks" at a session-rollover gap
+        # stays in the universe long enough for the post-rollover
+        # entry path to consider it. 24 h sits inside the same
+        # window as the stale_line filter so the two are consistent.
+        # Observed on MNQ 2026-05-15 13:00 PT — after the session gap
+        # detect_lines was returning 0 lines because every prior line
+        # broke at the gap and aged past the old 20-bar (1 h) window.
+        break_stale_bars = int(self.config.get(
+            "detect_break_stale_bars", 480,
+        ))
+        supports = detect_lines(
+            closes, up_to=last_idx, type_="support",
+            near_touch_tolerance_fraction=near_frac,
+            break_stale_bars=break_stale_bars,
+        )
+        resistances = detect_lines(
+            closes, up_to=last_idx, type_="resistance",
+            near_touch_tolerance_fraction=near_frac,
+            break_stale_bars=break_stale_bars,
+        )
+        # Entry-path filter now also accepts lines that broke within
+        # the same 24 h window — covers the session-rollover case
+        # where a long-standing line "breaks" on a maintenance-gap
+        # candle and then re-establishes itself. A line that broke
+        # OUTSIDE the window stays excluded (genuinely stale).
+        max_break_age = int(self.config.get(
+            "entry_break_max_age_bars", 480,
+        ))
+        def _break_ok(ln) -> bool:
+            if ln.break_idx is None:
+                return True
+            return (last_idx - ln.break_idx) <= max_break_age
         longs = [ln for ln in supports
                  if ln.touches >= MIN_TOUCHES and ln.slope > 0
-                 and ln.break_idx is None]
+                 and _break_ok(ln)]
         shorts = [ln for ln in resistances
                   if ln.touches >= MIN_TOUCHES and ln.slope < 0
-                  and ln.break_idx is None]
+                  and _break_ok(ln)]
         longs.sort(key=lambda ln: (-ln.touches, -ln.slope))
         shorts.sort(key=lambda ln: (-ln.touches, ln.slope))   # most-negative slope first
 
@@ -2029,9 +2059,15 @@ class ChartSignalStrategy:
             detect_lines,
         )
         opp_type = "resistance" if direction == "long" else "support"
+        # Same break-stale window as the entry path so the opposing
+        # line cache survives session rollovers symmetrically.
+        break_stale_bars = int(self.config.get(
+            "detect_break_stale_bars", 480,
+        ))
         scanned = detect_lines(
             closes, up_to=last_idx, type_=opp_type,
             near_touch_tolerance_fraction=near_frac,
+            break_stale_bars=break_stale_bars,
         )
 
         min_touches = int(self.config.get("counter_exit_min_touches", 2))
