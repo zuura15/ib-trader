@@ -278,7 +278,7 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                       {pnl.text}
                     </td>
                     <td className="font-mono"
-                        style={{ color: 'var(--text-muted)' }}>
+                        style={{ color: 'var(--text-primary)' }}>
                       {fmtClosedTime(t.exit_time)}
                     </td>
                   </tr>,
