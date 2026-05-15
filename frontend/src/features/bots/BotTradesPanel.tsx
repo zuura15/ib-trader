@@ -127,20 +127,24 @@ function compareValues(a: BotTradeResponse, b: BotTradeResponse, key: SortKey): 
 }
 
 function SortHeader({
-  label, myKey, sortKey, sortDir, onSort,
+  label, myKey, sortKey, sortDir, onSort, align,
 }: {
   label: string;
   myKey: SortKey;
   sortKey: SortKey;
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
+  align?: 'left' | 'right';
 }) {
   const active = sortKey === myKey;
   const arrow = !active ? '⇅' : sortDir === 'asc' ? '▲' : '▼';
   return (
     <th
       onClick={() => onSort(myKey)}
-      style={{ cursor: 'pointer', userSelect: 'none' }}
+      style={{
+        cursor: 'pointer', userSelect: 'none',
+        textAlign: align ?? 'left',
+      }}
       title={`Sort by ${label}`}
     >
       {label}{' '}
@@ -206,7 +210,7 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                 <SortHeader label="Dir" myKey="direction" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
               )}
               <SortHeader label="Dur" myKey="duration_seconds" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-              <SortHeader label="P&L (net)" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              <SortHeader label="P&L" myKey="realized_pnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} align="right" />
               {/* Closed column is shown in BOTH compact (mobile) and
                   desktop modes. Compact folds the Dir column into the
                   Symbol cell as ``SYMBOL(S)`` / ``SYMBOL(L)`` so the
@@ -268,11 +272,13 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                         style={{ color: 'var(--text-primary)', width: 70 }}>
                       {dur}
                     </td>
-                    <td className="font-mono" style={{ color: pnl.color, fontWeight: 600 }}>
+                    <td className="font-mono"
+                        style={{ color: pnl.color, fontWeight: 600,
+                                  textAlign: 'right' }}>
                       {pnl.text}
                     </td>
                     <td className="font-mono"
-                        style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+                        style={{ color: 'var(--text-muted)' }}>
                       {fmtClosedTime(t.exit_time)}
                     </td>
                   </tr>,
