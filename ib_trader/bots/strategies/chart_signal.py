@@ -2127,6 +2127,81 @@ class ChartSignalStrategy:
         # active_stop fires an immediate exit, without waiting
         # for the next 3-min bar close.
         if bool(entry_line.get("marginal", False)):
+            # Tick-time trail tighten. The bar-close path advances
+            # HWM/LWM and ``active_stop`` once every 3 min; marginal
+            # trades opt into a faster update so the SL ratchets in
+            # on every favorable tick. Trades off a few $$ on
+            # winners that briefly retrace for a tighter exit on
+            # winners that stall.
+            try:
+                trail_pct = Decimal(str(
+                    self.config.get("trail_width_pct", "0.0003")
+                ))
+            except Exception:  # noqa: BLE001 — fall back to default on bad config
+                trail_pct = Decimal("0.0003")
+            mid_d = Decimal(str(last))
+            wm_field = (
+                "high_water_mark" if direction == "long"
+                else "low_water_mark"
+            )
+            wm_raw = ctx.state.get(wm_field)
+            try:
+                cur_wm = (
+                    Decimal(str(wm_raw))
+                    if wm_raw not in (None, "")
+                    else mid_d
+                )
+            except Exception:  # noqa: BLE001
+                cur_wm = mid_d
+            new_wm = (
+                max(cur_wm, mid_d) if direction == "long"
+                else min(cur_wm, mid_d)
+            )
+            trail_stop = (
+                new_wm * (Decimal("1") - trail_pct)
+                if direction == "long"
+                else new_wm * (Decimal("1") + trail_pct)
+            )
+            # ``active_stop = max/min(line, trail)`` mirrors the
+            # bar-close formula. For tick-time we keep the LAST
+            # bar-close line value (frozen on tight_zones) instead
+            # of re-computing the line — the line itself drifts
+            # slowly enough that the per-tick mismatch is small,
+            # and the bar-close path re-converges every 3 min.
+            zones = list(ctx.state.get("tight_zones") or [])
+            line_val_d: Decimal | None = None
+            for z in zones:
+                if z.get("kind") == "trigger":
+                    try:
+                        line_val_d = Decimal(str(z["value"]))
+                    except Exception:  # noqa: BLE001
+                        line_val_d = None
+                    break
+            if line_val_d is not None:
+                active_stop = (
+                    max(line_val_d, trail_stop) if direction == "long"
+                    else min(line_val_d, trail_stop)
+                )
+            else:
+                active_stop = trail_stop
+            state_patch[wm_field] = str(new_wm)
+            state_patch["active_stop"] = str(active_stop)
+            # Mirror the ratcheted stop into tight_zones so the
+            # tick-time touch check below sees the latest value
+            # rather than the stale bar-close snapshot.
+            new_zones: list[dict] = []
+            for z in zones:
+                if z.get("kind") == "stop":
+                    new_zones.append({
+                        **z, "value": float(active_stop),
+                    })
+                else:
+                    new_zones.append(z)
+            state_patch["tight_zones"] = new_zones
+            # Replace ctx.state's view of tight_zones for the touch
+            # check below — _check_tight_zones_exit reads from
+            # ctx.state, not from state_patch.
+            ctx.state["tight_zones"] = new_zones
             tight_actions = self._check_tight_zones_exit(
                 ctx, float(last), direction, state_patch,
             )
