@@ -1974,55 +1974,20 @@ class ChartSignalStrategy:
         )
         if near_frac is not None:
             near_frac = float(near_frac)
-        # Marginal trades use the TIGHT cache: 3+touch current-session
-        # lines from BOTH sides, excluding the trigger line. Clean
-        # trades use the existing OPPOSING-only cache.
-        entry_line = ctx.state.get("entry_line") or {}
-        is_marginal = bool(entry_line.get("marginal", False))
+        # Counter-line cache = OPPOSING-side 3+touch unbroken lines
+        # on the right side of price. Same shape for clean and
+        # marginal trades — the marginal-vs-clean distinction lives
+        # at the entry tier (which filters get bypassed); the exit
+        # logic is identical: bar-close line breach on the trigger
+        # line + 10s mid-touch hold on the opposing line.
         from ib_trader.signals.sr_fan import (
             detect_lines,
         )
-        if is_marginal:
-            supports = detect_lines(
-                closes, up_to=last_idx, type_="support",
-                near_touch_tolerance_fraction=near_frac,
-            )
-            resistances = detect_lines(
-                closes, up_to=last_idx, type_="resistance",
-                near_touch_tolerance_fraction=near_frac,
-            )
-            scanned = list(supports) + list(resistances)
-        else:
-            opp_type = "resistance" if direction == "long" else "support"
-            scanned = detect_lines(
-                closes, up_to=last_idx, type_=opp_type,
-                near_touch_tolerance_fraction=near_frac,
-            )
-        # Trigger line identity (for marginal-mode exclusion).
-        trigger_from_idx = entry_line.get("from_idx")
-        trigger_anchor_b_idx = entry_line.get("anchor_b_idx")
-
-        # Stale-line gate (marginal mode only). Same threshold the
-        # bot's stale_line entry filter uses — Q anchor must be
-        # within entry_max_q_age_hours of the current bar.
-        last_dt = None
-        max_q_age_hours_cache = float(self.config.get(
-            "entry_max_q_age_hours", 24.0,
-        ))
-        if is_marginal:
-            from datetime import datetime as _dt
-            def _bar_dt(i):
-                if 0 <= i < len(fetched):
-                    raw = fetched[i].get("ts") or fetched[i].get("timestamp_utc")
-                    if raw:
-                        try:
-                            return _dt.fromisoformat(
-                                raw.replace("Z", "+00:00"),
-                            )
-                        except Exception:  # noqa: BLE001
-                            return None
-                return None
-            last_dt = _bar_dt(last_idx)
+        opp_type = "resistance" if direction == "long" else "support"
+        scanned = detect_lines(
+            closes, up_to=last_idx, type_=opp_type,
+            near_touch_tolerance_fraction=near_frac,
+        )
 
         min_touches = int(self.config.get("counter_exit_min_touches", 2))
         cache: list[dict] = []
@@ -2031,27 +1996,14 @@ class ChartSignalStrategy:
                 continue
             if ln.touches < min_touches:
                 continue
-            # Marginal mode: exclude trigger line + stale-line gate
-            # (Q anchor within max_q_age_hours of current bar).
-            if is_marginal:
-                if (ln.from_idx == trigger_from_idx
-                        and ln.anchor_b_idx == trigger_anchor_b_idx):
-                    continue
-                if last_dt is not None:
-                    q_dt = _bar_dt(ln.from_idx)
-                    if q_dt is not None:
-                        q_age_h = (last_dt - q_dt).total_seconds() / 3600.0
-                        if q_age_h > max_q_age_hours_cache:
-                            continue
             value = ln.intercept + ln.slope * last_idx
-            if not is_marginal:
-                # Clean trade — keep only the OPPOSING side relative
-                # to the trade direction. (A "resistance" that sits
-                # below current price has already been crossed.)
-                if direction == "long" and value <= bar_close:
-                    continue
-                if direction == "short" and value >= bar_close:
-                    continue
+            # Keep only the OPPOSING side relative to the trade
+            # direction. (A "resistance" that sits below current
+            # price has already been crossed.)
+            if direction == "long" and value <= bar_close:
+                continue
+            if direction == "short" and value >= bar_close:
+                continue
             cache.append({
                 "value": round(value, 6),
                 "slope": round(ln.slope, 6),
