@@ -1681,12 +1681,22 @@ class ChartSignalStrategy:
         )
         is_marginal_entry = bool(chosen_marginal_filters)
 
+        # Trigger line value at the fire bar (last_idx). Frozen here
+        # so ``_on_fill`` can seed the marginal-mode tight-zones cache
+        # the moment the entry fill arrives — before the first bar
+        # close has had a chance to populate it via _evaluate_exit.
+        # Drift over the first 3 min is negligible vs the entry
+        # cushion at typical slopes.
+        trigger_line_value_at_entry = (
+            chosen.intercept + chosen.slope * last_idx
+        )
         entry_line_doc = {
             "kind": kind,
             "direction": direction,
             "slope_per_bar": chosen.slope,
             "intercept": chosen.intercept,
             "slope_per_sec": slope_per_sec,
+            "line_value_at_entry": trigger_line_value_at_entry,
             "anchor_time": (anchor_b_time or bar_time).isoformat(),
             "anchor_price": anchor_b_price,
             "anchor_b_idx": chosen.anchor_b_idx,
@@ -2451,15 +2461,35 @@ class ChartSignalStrategy:
                     # ``_evaluate_exit`` rebuilds it for the new
                     # direction.
                     "counter_lines_cache": [],
-                    "counter_lines_tol": 0.0,
+                    # Seed ``counter_lines_tol`` at fill so the tight
+                    # tick-time check can run during the first 3 min
+                    # before _evaluate_exit's bar-close refresh fires.
+                    # Without this the check returned early (tol == 0)
+                    # and the bar-close line_breach always won the
+                    # race — observed on MNQ 2026-05-15 10:51 marginal
+                    # SHORT which exited at the bar close instead of
+                    # at the trigger-line touch ~10 s after fill.
+                    "counter_lines_tol": float(
+                        Decimal(str(event.fill_price))
+                        * Decimal(str(self.config.get(
+                            "touch_tolerance_fraction",
+                            TOUCH_TOLERANCE_FRACTION,
+                        )))
+                    ),
                     "counter_touch": None,
                     # Tight-exit zones — marginal trades only. Seed
-                    # with the active_stop so a tick-time SL hit can
-                    # fire in the ~3 min gap before the first bar
-                    # close populates the trigger-line zone. The
-                    # bar-close path overwrites this list every cycle.
+                    # with BOTH the trigger line value and the
+                    # initial SL so a tick-time touch fires during
+                    # the gap before the first bar close populates
+                    # them via _evaluate_exit.
                     "tight_zones": (
-                        [{"value": float(initial_stop), "kind": "stop"}]
+                        [
+                            {"value": float(
+                                entry_line.get("line_value_at_entry")
+                                or event.fill_price
+                            ), "kind": "trigger"},
+                            {"value": float(initial_stop), "kind": "stop"},
+                        ]
                         if bool(entry_line.get("marginal", False))
                         else []
                     ),

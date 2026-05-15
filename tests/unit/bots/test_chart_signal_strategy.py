@@ -576,7 +576,10 @@ class TestCounterLineCacheLifecycle:
         )
         assert cache_clear is not None
         assert cache_clear.state["counter_lines_cache"] == []
-        assert cache_clear.state["counter_lines_tol"] == 0.0
+        # tol is now seeded at fill (fill_price * touch_tolerance_fraction)
+        # so the marginal tick-time check has a working tolerance during
+        # the first 3 min before _evaluate_exit's bar-close refresh.
+        assert cache_clear.state["counter_lines_tol"] > 0
         assert cache_clear.state["counter_touch"] is None
 
     def test_check_counter_line_skips_wrong_direction(self):
