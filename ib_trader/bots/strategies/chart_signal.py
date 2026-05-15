@@ -239,21 +239,30 @@ class ChartSignalStrategy:
         the strategy bailed before emitting anything) — we skip the
         audit row in that case to keep the feed clean.
         """
-        # /engine/history and the bar aggregator both label bars by
-        # slot-START. The chart's frontend converts to slot-END for
-        # display so a "06:48" tick means the bar that just CLOSED
-        # at 06:48 (started at 06:45). The audit feed should match
-        # the chart's convention so prices line up with what the
-        # operator sees — shift bar_ts forward by one bar's duration.
+        # Bar-vs-eval-bar semantics: the bot evaluates at the close of
+        # bar X (last_idx) and the pivot under consideration is at
+        # bar X-1 (last_idx-1). The audit row labels and contents
+        # should all refer to the PIVOT BAR (X-1) — that's the chart
+        # tick the operator sees with the pivot on it. The eval
+        # itself ran 3 min later when bar X closed.
+        #
+        # /engine/history labels bars by slot-START. event.bar is
+        # bar X (slot-start T_eval, slot-end T_eval+180s). The pivot
+        # bar X-1 has slot-end = T_eval = pivot's chart-tick.
+        # So event_ts_utc = event.bar.timestamp_utc gives us the
+        # pivot bar's chart-tick (matches the chart's slot-end
+        # convention).
         from datetime import timedelta as _td
-        bar_ts_raw = _parse_ts(event.bar.get("timestamp_utc"))
+        bar_ts = _parse_ts(event.bar.get("timestamp_utc"))  # pivot bar's chart-tick
         bar_seconds = int(self.config.get("bar_size_seconds", 180))
-        bar_ts = (bar_ts_raw + _td(seconds=bar_seconds)
-                   if bar_ts_raw is not None else None)
-        try:
-            bar_close_d = Decimal(str(event.bar.get("close", "0")))
-        except Exception:  # noqa: BLE001
-            bar_close_d = None
+        eval_ts = (bar_ts + _td(seconds=bar_seconds)
+                    if bar_ts is not None else None)
+        # bar_close = the PIVOT bar's close, sourced from the BAR
+        # payload (which the strategy emits using its own closes
+        # series). Falls back to event.bar.close (= eval bar's close,
+        # off by one bar) only if the BAR LogSignal hasn't been
+        # collected yet.
+        bar_close_d: "Decimal | None" = None
         symbol = self.config.get("symbol", "")
 
         # BAR signal carries the line/pivot universe at evaluation time.
@@ -300,10 +309,27 @@ class ChartSignalStrategy:
                 line_status = "LINES_LONG"
             elif bst > 0:
                 line_status = "LINES_SHORT"
+            # Pull pivot bar's close from the BAR payload — this is
+            # the price tag for the audit row (matches the chart-tick
+            # the row is labeled with).
+            pbc = bar_sig.payload.get("pivot_bar_close")
+            if pbc is not None:
+                try:
+                    bar_close_d = Decimal(str(pbc))
+                except (TypeError, ValueError, ArithmeticError):
+                    pass
         else:
             # No BAR signal in this action list — gated path (cooldown,
             # warmup, etc.). Pivot status unknown.
             pivot_status = "NONE"
+        # Fallback for bar_close: if BAR payload didn't carry it
+        # (gated/early-bail path), use event.bar.close — the eval bar's
+        # close. Off by one bar but better than NULL.
+        if bar_close_d is None:
+            try:
+                bar_close_d = Decimal(str(event.bar.get("close", "0")))
+            except Exception:  # noqa: BLE001
+                bar_close_d = None
 
         # Decision — tiered.
         decision = ""
@@ -384,6 +410,12 @@ class ChartSignalStrategy:
             "filter_detail": None,
             "outcome": "—",
             "prior_bar_close": None,
+            # ``eval_ts_utc`` = the chart-tick when the bot actually
+            # processed this pivot (always pivot's chart-tick + bar_seconds).
+            # ``eval_bar_close`` = the close of the eval bar = "next close"
+            # relative to the pivot bar.
+            "eval_ts_utc": eval_ts.isoformat() if eval_ts is not None else None,
+            "eval_bar_close": None,
         }
         # prior_bar_close and pivot — sourced from the BAR payload
         # (which the strategy emits using its own /engine/history
@@ -395,6 +427,12 @@ class ChartSignalStrategy:
             if pc is not None:
                 try:
                     audit["prior_bar_close"] = float(pc)
+                except (TypeError, ValueError):
+                    pass
+            ebc = bar_sig.payload.get("eval_bar_close")
+            if ebc is not None:
+                try:
+                    audit["eval_bar_close"] = float(ebc)
                 except (TypeError, ValueError):
                     pass
             pd = bar_sig.payload.get("pivot_detected")
@@ -869,11 +907,21 @@ class ChartSignalStrategy:
                 "top_supports": _top(supports),
                 "top_resistances": _top(resistances),
                 # Prior-bar close for the audit feed's expanded view.
-                # event.window's bar-dict shape varies across runtime
-                # paths, so we surface it from the bot's own ``closes``
-                # series (sourced from /engine/history). Always there
-                # because the strategy needs ≥ 3 closes to evaluate.
-                "prior_bar_close": (closes[-2] if len(closes) >= 2 else None),
+                # The audit row is now labeled with the PIVOT bar's
+                # chart-tick (= bar X-1), so ``prior_bar_close`` here
+                # is the bar BEFORE the pivot bar (= bar X-2, two
+                # 3-min slots before the eval). The pivot bar's own
+                # close is ``pivot_bar_close`` below.
+                "prior_bar_close": (closes[-3] if len(closes) >= 3 else None),
+                # The pivot bar's close — the chart-tick price the
+                # audit row's label refers to. Sourced from closes[-2]
+                # (= last_idx - 1) because the pivot is at last_idx-1
+                # and the bot evaluates at last_idx.
+                "pivot_bar_close": (closes[-2] if len(closes) >= 2 else None),
+                # Eval bar's close — the bar that just closed and
+                # triggered evaluation. Displayed in the detail pane
+                # as "next close" relative to the pivot.
+                "eval_bar_close": (closes[-1] if len(closes) >= 1 else None),
                 # Pivot bit derived from the just-confirmed pivot
                 # detection at last_idx-1. Independent of whether a
                 # 3-touch line accepted it — operator can see "a

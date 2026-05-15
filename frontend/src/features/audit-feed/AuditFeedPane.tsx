@@ -104,6 +104,8 @@ interface AuditPayload {
     filter_detail?: string | null;
     outcome?: 'B' | 'S' | 'exit' | '—' | string;
     prior_bar_close?: number | null;
+    eval_ts_utc?: string | null;
+    eval_bar_close?: number | null;
   };
   signal?: { entry_line?: Record<string, unknown> };
   skip?: Record<string, unknown>;
@@ -283,6 +285,10 @@ function ExpandedBarEval({ row, onShowRaw }: {
     );
   });
 
+  // Eval bar close from the BAR payload directly — the chart-tick
+  // 3 min after the pivot bar's tick.
+  const evalClose = a.eval_bar_close ?? null;
+  const evalAt = _fmtPT(a.eval_ts_utc ?? null);
   return (
     <div style={{
       marginTop: 6, marginLeft: 8,
@@ -293,7 +299,9 @@ function ExpandedBarEval({ row, onShowRaw }: {
       <DetailLine label="prior close" value={_fmtPrice(a.prior_bar_close ?? null)} />
       <DetailLine
         label="next close"
-        value={nextClose === 'pending' ? '…'
+        value={evalClose !== null
+          ? `${_fmtPrice(evalClose)}  (eval @ ${evalAt})`
+          : nextClose === 'pending' ? '…'
           : nextClose === null ? '— (bar not closed yet)'
           : _fmtPrice(nextClose)}
       />

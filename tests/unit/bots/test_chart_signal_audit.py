@@ -43,8 +43,12 @@ class TestBarEvalEmission:
         assert a.event_type == "BAR_EVAL"
         assert a.decision == "FIRED·BUY"
         assert a.pivot_status == "PIVOT_LOW"
-        # bar_close at last fixture bar is 14.0.
-        assert a.bar_close == Decimal("14.0")
+        # bar_close is the PIVOT bar's close (= closes[-2]) — the
+        # bar at last_idx-1 in the fixture is index 7 with close 12.0.
+        # The eval bar (last_idx=8) closed at 14.0 but the audit row
+        # is labeled with the pivot's chart-tick, so its bar_close
+        # reflects the pivot bar's close.
+        assert a.bar_close == Decimal("12.0")
         # ZIGZAG yields both long and short candidates with positive
         # touches in the test fixture, so the line_status is one of
         # the valid populated states.
