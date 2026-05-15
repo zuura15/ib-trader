@@ -125,12 +125,16 @@ function BarEvalRow({ r }: { r: AuditRow }) {
     ? <Chip text="PIVOT·H" fg="#dc2626" bg="rgba(220,38,38,0.14)" title="pivot HIGH at last_idx-1" />
     : <Chip text="NO_PIVOT" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
-  // Touch chip — "TOUCH·N" where N = how many current-session
-  // trendlines this pivot landed on. NO_TOUCH = no lines at all.
-  const lineCount = a.touch?.count ?? 0;
-  const touchChip = lineCount > 0
-    ? <Chip text={`TOUCH·${lineCount}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
-            title={`pivot lies on ${lineCount} current-session trendline(s)`} />
+  // Touch chip — "TOUCH·N" where N = strict touch count of the
+  // BEST line the pivot landed on, i.e. "this pivot is the Nth
+  // point on a trendline". N >= 3 means it's a real order-trigger
+  // candidate. Per-line breakdown is in the detail pane.
+  const bestTouches = (a.touch?.lines ?? []).reduce(
+    (m, ln) => Math.max(m, ln.touches ?? 0), 0,
+  );
+  const touchChip = bestTouches > 0
+    ? <Chip text={`TOUCH·${bestTouches}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
+            title={`pivot is the ${bestTouches}th touch on its strongest line`} />
     : <Chip text="NO_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
   // Filter chip — three states, with N/A taking precedence over
