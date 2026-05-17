@@ -129,7 +129,13 @@ interface AuditPayload {
     eval_ts_utc?: string | null;
     eval_bar_close?: number | null;
   };
-  signal?: { entry_line?: Record<string, unknown> };
+  signal?: { entry_line?: {
+    entry_path?: 'touch' | 'accel' | string;
+    touches?: number;
+    marginal?: boolean;
+    marginal_filters?: string[];
+    [k: string]: unknown;
+  } };
   skip?: Record<string, unknown>;
   exit?: Record<string, unknown>;
   bar?: Record<string, unknown>;
@@ -147,14 +153,29 @@ function BarEvalRow({ r }: { r: AuditRow }) {
     ? <Chip text="PIVOT·H" fg="#dc2626" bg="rgba(220,38,38,0.14)" title="pivot HIGH at last_idx-1" />
     : <Chip text="NO_PIVOT" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
-  // Touch chip — "TOUCH·N" where N = strict touch count of the
-  // BEST line the pivot landed on, i.e. "this pivot is the Nth
-  // point on a trendline". N >= 3 means it's a real order-trigger
-  // candidate. Per-line breakdown is in the detail pane.
+  // Touch chip — three states:
+  //   TOUCH·N   pivot landed on a line with N strict touches (purple).
+  //   ACCEL·N   pivot is an acceleration entry — overshot the line
+  //             beyond near_tol AND implied slope ≥ min_slope_ratio
+  //             × line slope. N is the underlying line's touch
+  //             count (orange, to distinguish from touch entries).
+  //   NO_TOUCH  pivot didn't qualify for either path (gray).
+  // Accel detection: the SIGNAL's entry_line carries entry_path;
+  // when "accel", the pivot doesn't strictly touch (TOUCH·N is 0)
+  // but the trade still fired — flag it explicitly so the operator
+  // doesn't read NO_TOUCH next to a B/S outcome and wonder how
+  // the entry happened.
   const bestTouches = (a.touch?.lines ?? []).reduce(
     (m, ln) => Math.max(m, ln.touches ?? 0), 0,
   );
-  const touchChip = bestTouches > 0
+  const signalEntryLine = (r.payload as AuditPayload | null)?.signal?.entry_line;
+  const isAccel = signalEntryLine?.entry_path === 'accel';
+  const accelTouches = typeof signalEntryLine?.touches === 'number'
+    ? signalEntryLine.touches : null;
+  const touchChip = isAccel && accelTouches !== null
+    ? <Chip text={`ACCEL·${accelTouches}`} fg="#ea580c" bg="rgba(249,115,22,0.20)"
+            title={`acceleration entry on a ${accelTouches}-touch line — pivot overshot the line, implied slope ≥ min_slope_ratio × line slope`} />
+    : bestTouches > 0
     ? <Chip text={`TOUCH·${bestTouches}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
             title={`pivot is the ${bestTouches}th touch on its strongest line`} />
     : <Chip text="NO_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
@@ -179,7 +200,11 @@ function BarEvalRow({ r }: { r: AuditRow }) {
   // entry in ``pivot_touching_lines`` has >= 3 touches. The strategy
   // already gates that list on (a) 3+ touches and (b) current PT
   // session, so an empty/2-touch-only list = no candidate.
-  const hasOrderCandidate = (a.touch?.lines ?? []).some(
+  // Accel entries also count as order candidates: their pivot didn't
+  // strictly touch a line, but the SIGNAL still chose an underlying
+  // multi-touch line and fired — the filter chain ran on it and the
+  // operator should see PASSED/FILTER·*, not N/A.
+  const hasOrderCandidate = isAccel || (a.touch?.lines ?? []).some(
     (ln) => (ln.touches ?? 0) >= 3,
   );
   const filterChip = !hasOrderCandidate
