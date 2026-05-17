@@ -278,8 +278,19 @@ class ChartSignalStrategy:
         place_order: PlaceOrder | None = None
         # Exit signal (in-position bar that triggered TRAILING_STOP).
         exit_sig: LogSignal | None = None
-        # First SKIP wins for the decision (most specific reject).
+        # First non-bypassed SKIP wins for the decision. SKIPs from the
+        # bypassable filters (shoulder / min_target / far_from_pivot)
+        # under ``allow_marginal_entries=True`` carry ``marginal=True``
+        # in their payload — these were tagged for diagnostics but the
+        # trade continued past them, so they're NOT the rejection cause.
+        # Without this filter the audit label misreports the first
+        # bypassed filter (e.g. ``FILTERED·shoulder``) when the trade
+        # was actually killed downstream (e.g. opposing_dominance,
+        # stale_line, max_signal_age).
         skip_sig: LogSignal | None = None
+        # Full chain of SKIPs for the operator-facing entry_decision
+        # diag (every filter that fired this bar, bypassed or not).
+        skip_chain: list[dict] = []
         for a in actions:
             if isinstance(a, PlaceOrder):
                 if place_order is None:
@@ -291,8 +302,16 @@ class ChartSignalStrategy:
                     bar_sig = a
                 elif et == "EXIT_CHECK" and "TRAILING_STOP" in (a.message or ""):
                     exit_sig = a
-                elif et == "SKIP" and skip_sig is None:
-                    skip_sig = a
+                elif et == "SKIP":
+                    p = a.payload or {}
+                    bypassed = bool(p.get("marginal", False))
+                    skip_chain.append({
+                        "filter": p.get("filter"),
+                        "bypassed": bypassed,
+                        "message_head": (a.message or "")[:80],
+                    })
+                    if skip_sig is None and not bypassed:
+                        skip_sig = a
 
         # Pivot status — canonical source is the BAR payload's
         # ``pivot_detected`` field (filled from find_pivot_lows/highs
@@ -547,6 +566,12 @@ class ChartSignalStrategy:
                 "qty": str(place_order.qty),
                 "order_type": getattr(place_order, "order_type", None),
             }
+        # Full SKIP chain — every filter that fired this bar, in order,
+        # with whether marginal-mode bypassed it. Lets the operator
+        # answer "why didn't this fire?" without log digging. Empty
+        # list when no SKIPs occurred (clean fire / pre-pivot gate).
+        if skip_chain:
+            payload["skip_chain"] = skip_chain
 
         return EmitAudit(
             event_type="BAR_EVAL",

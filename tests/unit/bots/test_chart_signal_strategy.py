@@ -442,6 +442,130 @@ class TestMarginalEntryMode:
         assert (el.get("marginal_filters") or []) == []
 
 
+class TestSynthesizeBarEvalSkipChain:
+    """Audit-row decision label and skip_chain — when a bypassable
+    filter (shoulder / min_target / far_from_pivot) tags a SKIP under
+    ``allow_marginal_entries=True`` and a later hard-reject filter
+    actually kills the trade, the decision must point at the real
+    rejection (not the misleading bypassed first SKIP)."""
+
+    def _bar_event(self) -> BarCompleted:
+        bar = {
+            "timestamp_utc": "2026-05-17T22:00:00+00:00",
+            "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+            "volume": 0,
+        }
+        return BarCompleted(
+            symbol="MGCM6", bar=bar, window=[bar], bar_count=1,
+        )
+
+    def _shoulder_skip_bypassed(self) -> LogSignal:
+        return LogSignal(
+            event_type=LogEventType.SKIP,
+            message="shoulder filter — right shoulder 100 vs left 99 [marginal mode]",
+            payload={
+                "filter": "shoulder",
+                "marginal": True,
+                "side": "SHORT",
+            },
+        )
+
+    def _opposing_dominance_skip(self) -> LogSignal:
+        return LogSignal(
+            event_type=LogEventType.SKIP,
+            message="opposing_dominance filter (SHORT) — opposing-side max touches 12 ≥ 3.0×",
+            payload={
+                "filter": "opposing_dominance",
+                "direction": "short",
+            },
+        )
+
+    def _shoulder_skip_hard(self) -> LogSignal:
+        """Shoulder SKIP when allow_marginal=False — actually rejected."""
+        return LogSignal(
+            event_type=LogEventType.SKIP,
+            message="shoulder filter — right shoulder 100 vs left 99",
+            payload={
+                "filter": "shoulder",
+                "marginal": False,
+                "side": "SHORT",
+            },
+        )
+
+    def test_bypassed_skip_does_not_become_decision(self):
+        """Shoulder bypassed (marginal=True) + opposing_dominance reject
+        → decision = FILTERED·opposing_dominance, not FILTERED·shoulder."""
+        s = ChartSignalStrategy(_default_config())
+        actions = [
+            self._shoulder_skip_bypassed(),
+            self._opposing_dominance_skip(),
+        ]
+        audit = s._synthesize_bar_eval(
+            self._bar_event(), actions, BotState.AWAITING_ENTRY_TRIGGER,
+        )
+        assert audit is not None
+        assert audit.decision == "FILTERED·opposing_dominance"
+        assert audit.payload["audit"]["filter_name"] == "opposing_dominance"
+
+    def test_skip_chain_records_every_skip_with_bypassed_flag(self):
+        s = ChartSignalStrategy(_default_config())
+        actions = [
+            self._shoulder_skip_bypassed(),
+            self._opposing_dominance_skip(),
+        ]
+        audit = s._synthesize_bar_eval(
+            self._bar_event(), actions, BotState.AWAITING_ENTRY_TRIGGER,
+        )
+        chain = audit.payload.get("skip_chain")
+        assert chain is not None
+        assert len(chain) == 2
+        assert chain[0]["filter"] == "shoulder"
+        assert chain[0]["bypassed"] is True
+        assert chain[1]["filter"] == "opposing_dominance"
+        assert chain[1]["bypassed"] is False
+
+    def test_non_bypassed_shoulder_still_drives_decision(self):
+        """When ``allow_marginal_entries=False`` shoulder really rejects
+        (marginal=False) — decision must remain FILTERED·shoulder."""
+        s = ChartSignalStrategy(_default_config())
+        actions = [self._shoulder_skip_hard()]
+        audit = s._synthesize_bar_eval(
+            self._bar_event(), actions, BotState.AWAITING_ENTRY_TRIGGER,
+        )
+        assert audit.decision == "FILTERED·shoulder"
+
+    def test_all_bypassed_with_place_order_fires(self):
+        """Sanity: PlaceOrder takes precedence over any SKIP. Decision
+        label is FIRED, regardless of how many bypassed SKIPs preceded."""
+        s = ChartSignalStrategy(_default_config())
+        actions = [
+            self._shoulder_skip_bypassed(),
+            PlaceOrder(symbol="MGCM6", side="SELL",
+                       qty=Decimal("1"), order_type="mid"),
+        ]
+        audit = s._synthesize_bar_eval(
+            self._bar_event(), actions, BotState.AWAITING_ENTRY_TRIGGER,
+        )
+        assert audit.decision.startswith("FIRED·SELL")
+        # skip_chain still surfaces the bypassed filter for diagnostics.
+        chain = audit.payload.get("skip_chain") or []
+        assert len(chain) == 1
+        assert chain[0]["bypassed"] is True
+
+    def test_no_skips_yields_no_skip_chain(self):
+        """When the bar has no SKIPs, skip_chain is omitted to keep the
+        audit payload lean (the operator only cares about it on
+        filter-reject bars)."""
+        s = ChartSignalStrategy(_default_config())
+        audit = s._synthesize_bar_eval(
+            self._bar_event(),
+            [PlaceOrder(symbol="MGCM6", side="BUY",
+                        qty=Decimal("1"), order_type="mid")],
+            BotState.AWAITING_ENTRY_TRIGGER,
+        )
+        assert "skip_chain" not in audit.payload
+
+
 class TestStaleLineFilter:
     """FILTER_STALE_LINE: reject if the chosen line's Q anchor is
     older than the configured max age (default 24h). Defends against
