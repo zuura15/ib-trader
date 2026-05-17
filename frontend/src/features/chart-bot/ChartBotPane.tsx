@@ -29,7 +29,8 @@ function botIdForSlot(slot: number): string {
 }
 
 async function postBotAction(
-  botId: string, path: 'force-quit' | 'rearm' | 'start' | 'stop',
+  botId: string,
+  path: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset',
 ): Promise<{ ok: boolean; detail?: string }> {
   try {
     const resp = await fetch(`/api/bots/${botId}/${path}`, { method: 'POST' });
@@ -64,7 +65,7 @@ export function ChartBotPane({ slot }: Props) {
   // FSM gate and surfaced as "Quit failed", even when the first one
   // had already succeeded.
   const [pendingAction, setPendingAction] = useState<
-    'force-quit' | 'rearm' | 'start' | 'stop' | null
+    'force-quit' | 'rearm' | 'start' | 'stop' | 'reset' | null
   >(null);
 
   useEffect(() => {
@@ -103,7 +104,7 @@ export function ChartBotPane({ slot }: Props) {
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
 
   const runAction = async (
-    action: 'force-quit' | 'rearm' | 'start' | 'stop',
+    action: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset',
     pendingMsg: string, okMsg: string, failPrefix: string,
   ) => {
     if (pendingAction) return;
@@ -125,6 +126,11 @@ export function ChartBotPane({ slot }: Props) {
     runAction('start', 'Starting…', 'Started.', 'Start failed');
   const onStop = () =>
     runAction('stop', 'Stopping…', 'Stopped.', 'Stop failed');
+  // Reset is the only path out of ERRORED — the runner's ``/start``
+  // gate (``is_clean_for_start``) rejects anything but ``state=OFF``,
+  // so a Start click on an ERRORED bot would silently 409.
+  const onReset = () =>
+    runAction('reset', 'Resetting…', 'Reset to OFF.', 'Reset failed');
 
   // (was a PanelShell title — now redundant with the flexlayout tab label)
 
@@ -132,16 +138,23 @@ export function ChartBotPane({ slot }: Props) {
     const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
     const armed = state.armed ?? false;
     const hasPosition = POSITION_STATES.has(fsmState);
-    // ``isStopped`` covers fresh bots (state==OFF after first registry
-    // load) and bots that were explicitly stopped. Re-arm requires a
-    // running bot — the runner rejects with 409 "Bot is not running"
-    // otherwise — so a Start button is shown instead when stopped.
-    const isStopped = fsmState === 'OFF' || fsmState === 'STOPPED'
-      || fsmState === 'UNKNOWN' || fsmState === 'ERRORED';
+    // ERRORED is sticky and requires an explicit Reset before Start
+    // is allowed (lifecycle.is_clean_for_start gates on state==OFF).
+    // Treat the two "not-running" buckets separately so the toolbar
+    // surfaces the right next-step button.
+    const isErrored = fsmState === 'ERRORED';
+    const isOff = fsmState === 'OFF' || fsmState === 'STOPPED'
+      || fsmState === 'UNKNOWN';
+    const isStopped = isOff || isErrored;
+    const errMsg = typeof state.error_message === 'string'
+      ? state.error_message : null;
+    const errReason = typeof state.error_reason === 'string'
+      ? state.error_reason : null;
     const statusTone =
       fsmState === 'AWAITING_EXIT_TRIGGER' ? 'var(--accent-green)' :
       fsmState === 'ENTRY_ORDER_PLACED' || fsmState === 'EXIT_ORDER_PLACED' ? 'var(--accent-yellow)' :
       fsmState === 'AWAITING_ENTRY_TRIGGER' && armed ? 'var(--accent-blue)' :
+      isErrored ? 'var(--accent-red)' :
       isStopped ? 'var(--text-muted)' :
       'var(--text-muted)';
     return (
@@ -152,7 +165,9 @@ export function ChartBotPane({ slot }: Props) {
             border: `1px solid ${statusTone}`, color: statusTone,
             fontWeight: 600, letterSpacing: '0.02em',
           }}
-          title={`fsm=${fsmState} armed=${armed}`}
+          title={isErrored && (errMsg || errReason)
+            ? `ERRORED — ${errMsg || errReason}`
+            : `fsm=${fsmState} armed=${armed}`}
         >
           {fsmState
             .replace(/_/g, ' ')
@@ -163,7 +178,7 @@ export function ChartBotPane({ slot }: Props) {
             !isStopped && !armed ? ' · DISARMED' : ''
           }
         </span>
-        {isStopped && (
+        {isOff && (
           <button
             onClick={onStart}
             disabled={pendingAction !== null}
@@ -177,6 +192,25 @@ export function ChartBotPane({ slot }: Props) {
             }}
           >
             Start
+          </button>
+        )}
+        {isErrored && (
+          <button
+            onClick={onReset}
+            disabled={pendingAction !== null}
+            title={errMsg || errReason
+              ? `Reset to OFF (${errMsg || errReason})`
+              : 'Reset bot state to OFF (required after ERRORED)'}
+            style={{
+              background: 'var(--accent-blue)', color: '#fff',
+              border: 'none', borderRadius: 3, padding: '2px 8px',
+              fontSize: 11, fontWeight: 600,
+              cursor: pendingAction ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'reset' ? 0.5 : 1,
+            }}
+            data-testid={`bot-reset-${botId}`}
+          >
+            Reset
           </button>
         )}
         {hasPosition && (
