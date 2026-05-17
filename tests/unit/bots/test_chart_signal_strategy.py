@@ -664,6 +664,83 @@ class TestOpposingDominanceFilter:
         assert p["opposing_max_touches"] >= p["chosen_touches"] * p["ratio_cap"]
         assert not [a for a in actions if isinstance(a, PlaceOrder)]
 
+    @pytest.mark.asyncio
+    async def test_marginal_bypass_lets_entry_fire(self):
+        """``allow_marginal_entries=True`` lets opposing_dominance
+        tag the trade as marginal instead of returning. PlaceOrder
+        is emitted and entry_line.marginal_filters carries
+        ``opposing_dominance``."""
+        cfg = _default_config()
+        cfg["far_from_pivot_filter_enabled"] = False
+        cfg["entry_stale_line_filter_enabled"] = False
+        cfg["entry_opposing_dominance_filter_enabled"] = True
+        cfg["entry_opposing_dominance_ratio"] = 0.5
+        cfg["allow_marginal_entries"] = True
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        actions = await s.on_event(self._bar_event_at(8), ctx)
+        assert [a for a in actions if isinstance(a, PlaceOrder)], \
+            "marginal mode should let the trade fire"
+        sig = next(a for a in actions if isinstance(a, LogSignal)
+                   and a.event_type == LogEventType.SIGNAL)
+        el = sig.payload["entry_line"]
+        assert el.get("marginal") is True
+        assert "opposing_dominance" in (el.get("marginal_filters") or [])
+        # SKIP still emitted with marginal=True (so audit can suppress
+        # it from the decision label and surface the trade as FIRED).
+        skip = next(a for a in actions if isinstance(a, LogSignal)
+                    and (a.payload or {}).get("filter") == "opposing_dominance")
+        assert skip.payload.get("marginal") is True
+
+
+class TestStaleLineMarginalBypass:
+    """``allow_marginal_entries=True`` lets stale_line tag the trade
+    instead of returning. Mirrors TestStaleLineFilter setup but with
+    the marginal flag on."""
+
+    def _make_bar_event(self, bars):
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_marginal_bypass_lets_entry_fire(self):
+        cfg = _default_config()
+        cfg["entry_stale_line_filter_enabled"] = True
+        cfg["entry_max_q_age_hours"] = 4.0
+        cfg["far_from_pivot_filter_enabled"] = False
+        cfg["entry_opposing_dominance_filter_enabled"] = False
+        cfg["allow_marginal_entries"] = True
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        morning = datetime(2026, 5, 10, 16, 0, tzinfo=timezone.utc)
+        bars = []
+        for i in range(200):
+            t = morning + timedelta(seconds=BAR_SECONDS * i)
+            if i == 0:
+                close = 4660.0
+            elif i <= 100:
+                close = 4660.0 + (i / 100.0) * 20.0
+            elif i <= 195:
+                close = 4680.0 - ((i - 100) / 95.0) * 20.0
+            else:
+                close = 4660.0 + ((i - 195) / 4.0) * 10.0
+            bars.append(_bar(t, close))
+        actions = await s.on_event(self._make_bar_event(bars), ctx)
+        # If the stale_line filter triggered at all, the SKIP must be
+        # tagged marginal AND a PlaceOrder must accompany it.
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and (a.payload or {}).get("filter") == "stale_line"]
+        if skips:
+            assert skips[0].payload.get("marginal") is True
+            assert [a for a in actions if isinstance(a, PlaceOrder)], \
+                "marginal mode should let stale_line trade fire"
+            sig = next(a for a in actions if isinstance(a, LogSignal)
+                       and a.event_type == LogEventType.SIGNAL)
+            el = sig.payload["entry_line"]
+            assert el.get("marginal") is True
+            assert "stale_line" in (el.get("marginal_filters") or [])
+
 
 class TestCounterLineCacheLifecycle:
     """Counter_line cache must clear on entry fill and the read path must

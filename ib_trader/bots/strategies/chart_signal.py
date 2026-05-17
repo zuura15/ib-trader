@@ -1380,14 +1380,27 @@ class ChartSignalStrategy:
                         f"{FILTER_TIGHT_TRIANGLE} filter — apex {apex_min} "
                         f"bars ahead (≤ {tri_block_dist}); waiting for "
                         f"resolution"
+                        + (" [marginal mode]" if allow_marginal else "")
                     ),
                     payload={"filter": FILTER_TIGHT_TRIANGLE,
+                             "marginal": allow_marginal,
                              "apex_bars_ahead": apex_min,
                              "threshold": tri_block_dist,
                              "entry_decision": decision_diag},
                 ))
-                long_line = None
-                short_line = None
+                # Marginal mode: tag whichever direction(s) have a
+                # candidate and let the trade fire. Tight-exit
+                # machinery (counter_line linger + trigger-line
+                # linger + tick-time SL on marginals) handles the
+                # whipsaw risk that this filter was guarding against.
+                if allow_marginal:
+                    if long_line is not None:
+                        marginal_filters_long.append(FILTER_TIGHT_TRIANGLE)
+                    if short_line is not None:
+                        marginal_filters_short.append(FILTER_TIGHT_TRIANGLE)
+                else:
+                    long_line = None
+                    short_line = None
 
         # Min-target entry filter (FILTER_MIN_TARGET). Uses the
         # opposing edge of the nearest WEDGE — the structural
@@ -1690,9 +1703,11 @@ class ChartSignalStrategy:
                             f" — latest touch {lt_age_hours:.1f}h old "
                             f"(cap {max_q_age_hours:.1f}h); line is "
                             f"stale relative to current price action"
+                            + (" [marginal mode]" if allow_marginal else "")
                         ),
                         payload={
                             "filter": FILTER_STALE_LINE,
+                            "marginal": allow_marginal,
                             "direction": direction,
                             "latest_touch_time": lt_time.isoformat(),
                             "latest_touch_age_hours": round(lt_age_hours, 2),
@@ -1700,7 +1715,13 @@ class ChartSignalStrategy:
                             "entry_decision": decision_diag,
                         },
                     ))
-                    return actions
+                    if allow_marginal:
+                        if direction == "long":
+                            marginal_filters_long.append(FILTER_STALE_LINE)
+                        else:
+                            marginal_filters_short.append(FILTER_STALE_LINE)
+                    else:
+                        return actions
 
         # Opposing-dominance filter (FILTER_OPPOSING_DOMINANCE).
         # Reject when the OPPOSITE-side market structure has many more
@@ -1732,9 +1753,11 @@ class ChartSignalStrategy:
                         f"touches {opp_max_touches} ≥ {ratio:.1f}× "
                         f"chosen touches {chosen.touches} "
                         f"(market structure dominates against trade)"
+                        + (" [marginal mode]" if allow_marginal else "")
                     ),
                     payload={
                         "filter": FILTER_OPPOSING_DOMINANCE,
+                        "marginal": allow_marginal,
                         "direction": direction,
                         "chosen_touches": int(chosen.touches),
                         "opposing_max_touches": int(opp_max_touches),
@@ -1745,7 +1768,13 @@ class ChartSignalStrategy:
                         "entry_decision": decision_diag,
                     },
                 ))
-                return actions
+                if allow_marginal:
+                    if direction == "long":
+                        marginal_filters_long.append(FILTER_OPPOSING_DOMINANCE)
+                    else:
+                        marginal_filters_short.append(FILTER_OPPOSING_DOMINANCE)
+                else:
+                    return actions
 
         # Freeze the line in (time, price) space so future evaluations
         # survive the window sliding forward.

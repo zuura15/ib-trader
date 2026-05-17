@@ -48,13 +48,24 @@ acceleration_entry_enabled: true
 min_slope_ratio: 1.5
 
 # Marginal-entry mode. When ``allow_marginal_entries`` is true,
-# entries that the shoulder / far_from_pivot / min_target filters
-# would normally REJECT still fire — but the trade is tagged as
-# ``marginal`` and uses a tighter exit ("tight counter_line"):
-# the counter_line cache contains 3+touch lines from BOTH sides
-# (in the current PT session, excluding the trigger line itself),
-# and the same 10s mid-touch hold rule exits the trade.
-# Clean trades (no filter rejection) continue to use the normal
-# opposing-only counter_line exit. Operator can A/B at trade
-# level via the audit feed (decision: ``FIRED·B·marginal``).
+# entries that ANY entry-side filter except ``max_signal_age`` would
+# normally REJECT still fire — they're tagged ``marginal`` and use
+# the tick-time exit machinery (trail ratchet + immediate SL + 10s
+# counter-line / trigger-line linger) so a snap-back exits the trade
+# quickly. The bypassed filters are:
+#   - shoulder            (right-shoulder reversal confirmation)
+#   - min_target          (wedge target ≥ stop)
+#   - far_from_pivot      (entry-to-line gap cap; touch path only)
+#   - tight_triangle      (wedge apex within block distance)
+#   - stale_line          (latest-touch age > cap)
+#   - opposing_dominance  (opposing-side touch count ≥ ratio × chosen)
+# Only ``max_signal_age`` remains a hard reject — it's a freshness
+# safety check against acting on bars that arrived late through
+# the engine queue, not a market-structure judgement.
+# Clean trades (no filter rejection) use the normal opposing-only
+# counter_line exit. Audit feed tags with ``·marginal`` so the
+# operator can A/B per trade. Review periodically: any bypassed
+# filter that consistently bleeds P&L should move back to
+# hard-reject (move the per-direction tag append back to a
+# ``return actions``).
 allow_marginal_entries: true
