@@ -128,9 +128,26 @@ export function ChartBotPane({ slot }: Props) {
     runAction('stop', 'Stopping…', 'Stopped.', 'Stop failed');
   // Reset is the only path out of ERRORED — the runner's ``/start``
   // gate (``is_clean_for_start``) rejects anything but ``state=OFF``,
-  // so a Start click on an ERRORED bot would silently 409.
-  const onReset = () =>
-    runAction('reset', 'Resetting…', 'Reset to OFF.', 'Reset failed');
+  // so a Start click on an ERRORED bot would silently 409. Reset
+  // itself refuses while the bot task is still registered (the
+  // runner returns 409 "Bot is running — call /stop first"), so we
+  // chain stop → reset. Both are idempotent; stop on an already-off
+  // task is a no-op.
+  const onReset = async () => {
+    if (pendingAction) return;
+    setPendingAction('reset');
+    setActionMsg('Resetting…');
+    try {
+      // Stop swallows its result intentionally — a 409 here just
+      // means the task wasn't running and reset will succeed anyway.
+      await postBotAction(botId, 'stop');
+      const res = await postBotAction(botId, 'reset');
+      setActionMsg(res.ok ? 'Reset to OFF.' : `Reset failed: ${res.detail}`);
+    } finally {
+      setPendingAction(null);
+      setTimeout(() => setActionMsg(null), 4000);
+    }
+  };
 
   // (was a PanelShell title — now redundant with the flexlayout tab label)
 
