@@ -1,14 +1,20 @@
 /**
  * Audit Feed Pane — live-updating event feed for the trader bot view.
  *
- * Three event types share the feed:
+ * Event types in the feed:
  *   - BAR_EVAL      (per 3-min bar evaluation)
  *   - ORDER_PLACED  (entry / exit order submitted to IB)
- *   - TRADE_CLOSED  (round-trip closed)
+ *
+ * TRADE_CLOSED rows are still written to ``audit_log`` for raw lookup
+ * but suppressed from the live feed — the per-leg ORDER_PLACED rows
+ * (BUY entry + SELL exit with its exit_context) carry the operator-
+ * relevant info, and the summary row's pnl_net is unreliable due to
+ * a race between strategy ``_on_fill`` and the runtime's
+ * ``clear_position_fields`` on the exit leg.
  *
  * Each row is collapsed by default. Click to expand for structured
- * detail (one line per fact). The 📋 icon opens a modal with the
- * raw JSON dump for copy/paste.
+ * detail (one line per fact). The clipboard icon opens a modal with
+ * the raw JSON dump for copy/paste.
  *
  * Live updates: subscribes to /api/audit/stream (Server-Sent Events).
  */
@@ -581,8 +587,9 @@ export function AuditFeedPane() {
     getAuditFeed({ botId, limit: 100 })
       .then((data) => {
         if (cancelled) return;
-        setRows(data);
-        seenIds.current = new Set(data.map((r) => r.id));
+        const filtered = data.filter((r) => r.event_type !== 'TRADE_CLOSED');
+        setRows(filtered);
+        seenIds.current = new Set(filtered.map((r) => r.id));
       })
       .catch((e) => { if (!cancelled) setError(String(e)); });
     return () => { cancelled = true; };
@@ -598,6 +605,7 @@ export function AuditFeedPane() {
     es.onmessage = (ev) => {
       try {
         const row = JSON.parse(ev.data) as AuditRow;
+        if (row.event_type === 'TRADE_CLOSED') return;
         if (seenIds.current.has(row.id)) return;
         seenIds.current.add(row.id);
         setRows((prev) => [row, ...prev].slice(0, 500));
