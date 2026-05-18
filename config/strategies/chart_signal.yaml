@@ -160,7 +160,16 @@ counter_exit_trigger_nearby_atr_mult: 1.0
 #                            (b) pivot near Donchian extreme.
 #   20 ≤ ADX ≤ 25:
 #     uncertain → same as flat (conservative).
-regime_filter_enabled: true
+# A/B TEST 2026-05-18: regime gate disabled to evaluate whether
+# the filters (adx_regime / local_peak_in_uptrend /
+# local_trough_in_downtrend / flat_extreme / flat_amplitude /
+# insufficient_bars_for_regime) are net-helpful. Today's
+# next-5-bar peek analysis showed the direction-side filters
+# (local_peak/trough) had positive avg final move — i.e. they
+# blocked trades that would have been favorable. Flipping to
+# `false` for a live test window during the 3 PM PT reopen.
+# Flip back to `true` after the test.
+regime_filter_enabled: false
 # ADX period dropped from 14 to 7 (2026-05-18) — Wilder smoothing
 # on 14 bars (~42 min of 3-min bars) lagged V recoveries by 15-25
 # minutes; ADX stayed pinned to the prior trend while the market
