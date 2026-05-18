@@ -39,6 +39,23 @@ function _fmtPT(iso: string | null): string {
   });
 }
 
+/** Format a BAR timestamp in PT, shifted to slot-END (close time).
+ *  Backend stores bar timestamps at slot-start (the moment the bar
+ *  opened); the chart labels bars at slot-end (close), so audit-feed
+ *  line vertices were rendered exactly one bar earlier than the
+ *  chart's tick labels. Add BAR_SECONDS to align. */
+const BAR_SECONDS = 180;
+function _fmtBarPT(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const adj = new Date(d.getTime() + BAR_SECONDS * 1000);
+  return adj.toLocaleTimeString('en-US', {
+    timeZone: 'America/Los_Angeles', hour12: false,
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
 function _fmtPrice(s: string | null | number | undefined): string {
   if (s === null || s === undefined || s === '') return '—';
   const n = typeof s === 'number' ? s : Number(s);
@@ -479,8 +496,8 @@ function ExpandedBarEval({ row, onShowRaw }: {
     lineEntries = touchedLines.map((ln, i) => {
       const summary = `${ln.kind ?? '?'} · ${ln.touches ?? '?'}-touch · `
         + `slope/bar=${(ln.slope_per_bar ?? 0).toFixed(4)} · `
-        + `Q@${_fmtPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
-        + `P@${_fmtPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
+        + `Q@${_fmtBarPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
+        + `P@${_fmtBarPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
       return (
         <DetailLine key={i} label={`line ${i + 1}`} value={summary} />
       );
@@ -501,8 +518,8 @@ function ExpandedBarEval({ row, onShowRaw }: {
       ? sel.line_value_at_entry : null;
     const summary = `${kind} · ${touches}-touch · `
       + `slope/bar=${slope.toFixed(4)} · `
-      + `Q@${_fmtPT(fromTime)} · `
-      + `P@${_fmtPT(anchorTime)} (${_fmtPrice(anchorPrice)}) · `
+      + `Q@${_fmtBarPT(fromTime)} · `
+      + `P@${_fmtBarPT(anchorTime)} (${_fmtPrice(anchorPrice)}) · `
       + `line@entry=${_fmtPrice(lineValAtEntry)}`;
     lineEntries = [
       <DetailLine key="accel" label="accel line" value={summary} />,
@@ -554,15 +571,27 @@ function ExpandedBarEval({ row, onShowRaw }: {
         })()}
         <DetailLine
           label="filter"
-          value={
-            isAccel
-              ? '— (acceleration entry — line overshot, far_from_pivot exempt)'
-              : !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
-              ? 'N/A — no current-session 3+touch candidate'
-              : a.filter_name
-              ? _fmtFilter(a.filter_name, a.filter_detail ?? '')
-              : '— (passed all filters)'
-          }
+          value={(() => {
+            if (isAccel) {
+              return '— (acceleration entry — line overshot, far_from_pivot exempt)';
+            }
+            if (!(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)) {
+              return 'N/A — no current-session 3+touch candidate';
+            }
+            if (a.filter_name) {
+              return _fmtFilter(a.filter_name, a.filter_detail ?? '');
+            }
+            // No filter REJECTED, but the entry may still be tagged
+            // marginal — meaning one or more bypassable filters
+            // would have rejected if allow_marginal_entries were
+            // off. Surface them so "passed all filters" doesn't
+            // mask the bypass.
+            const bypassed = signalEntryLine?.marginal_filters ?? [];
+            if (bypassed.length > 0) {
+              return `marginal · bypassed: ${bypassed.join(', ')}`;
+            }
+            return '— (passed all filters)';
+          })()}
         />
         {/* Filter-specific structured row (far_from_pivot only for
             now). Format: "price at: $X, needs to be below/above:
