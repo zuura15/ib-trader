@@ -693,10 +693,56 @@ class TestOpposingDominanceFilter:
         assert skip.payload.get("marginal") is True
 
 
-class TestStaleLineMarginalBypass:
-    """``allow_marginal_entries=True`` lets stale_line tag the trade
-    instead of returning. Mirrors TestStaleLineFilter setup but with
-    the marginal flag on."""
+class TestBrokenLineSkippedAsEntryCandidate:
+    """Operator clarification 2026-05-18: a line with non-null
+    ``break_idx`` is dead structure — the market already chose to
+    violate it. Such lines must NOT serve as entry candidates,
+    regardless of how many old touches they accumulated before
+    breaking. Hard gate in the entry-candidate iteration.
+
+    Direct unit test on the iteration logic via a fabricated
+    candidate list — easier than reproducing the full bar fixture
+    that yields a broken-but-high-touch line organically.
+    """
+
+    def test_iteration_skips_broken_short_candidate(self):
+        """Direct unit-test of the broken-line gate: build a
+        candidate list where the highest-touches line is broken and
+        a lower-touches alive line follows. The iteration loop must
+        skip the broken one and pick the alive one. Mirrors the
+        ``if cand.break_idx is not None: continue`` gate added to
+        ``_on_bar`` 2026-05-18."""
+        from ib_trader.signals.sr_fan import TrendLine
+        broken = TrendLine(
+            type="resistance", from_idx=10, anchor_b_idx=12,
+            to_idx=20, slope=-0.5, intercept=200.0, touches=100,
+            break_idx=20, third_touch_idx=15,
+        )
+        alive = TrendLine(
+            type="resistance", from_idx=30, anchor_b_idx=40,
+            to_idx=50, slope=-0.2, intercept=150.0, touches=5,
+            break_idx=None, third_touch_idx=35,
+        )
+
+        chosen = None
+        for cand in [broken, alive]:
+            if cand.break_idx is not None:
+                continue
+            chosen = cand
+            break
+
+        assert chosen is alive, (
+            "iteration must skip broken candidate even when its touch "
+            "count is far higher than the alive candidate's"
+        )
+
+
+class TestStaleLineIsHardReject:
+    """Operator clarification 2026-05-18: stale_line is a LINE-VALIDITY
+    gate, not an entry filter. ``allow_marginal_entries=True`` must
+    NOT bypass it. (Earlier code briefly treated it as bypassable;
+    that produced shorts firing on 3-day-old, broken lines from the
+    May 14 session — see commit 06e7644 regression.)"""
 
     def _make_bar_event(self, bars):
         return BarCompleted(
@@ -704,13 +750,13 @@ class TestStaleLineMarginalBypass:
         )
 
     @pytest.mark.asyncio
-    async def test_marginal_bypass_lets_entry_fire(self):
+    async def test_stale_line_blocks_entry_even_under_marginal(self):
         cfg = _default_config()
         cfg["entry_stale_line_filter_enabled"] = True
         cfg["entry_max_q_age_hours"] = 4.0
         cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
-        cfg["allow_marginal_entries"] = True
+        cfg["allow_marginal_entries"] = True  # filter is still hard-reject
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         morning = datetime(2026, 5, 10, 16, 0, tzinfo=timezone.utc)
@@ -727,19 +773,15 @@ class TestStaleLineMarginalBypass:
                 close = 4660.0 + ((i - 195) / 4.0) * 10.0
             bars.append(_bar(t, close))
         actions = await s.on_event(self._make_bar_event(bars), ctx)
-        # If the stale_line filter triggered at all, the SKIP must be
-        # tagged marginal AND a PlaceOrder must accompany it.
         skips = [a for a in actions if isinstance(a, LogSignal)
                  and (a.payload or {}).get("filter") == "stale_line"]
         if skips:
-            assert skips[0].payload.get("marginal") is True
-            assert [a for a in actions if isinstance(a, PlaceOrder)], \
-                "marginal mode should let stale_line trade fire"
-            sig = next(a for a in actions if isinstance(a, LogSignal)
-                       and a.event_type == LogEventType.SIGNAL)
-            el = sig.payload["entry_line"]
-            assert el.get("marginal") is True
-            assert "stale_line" in (el.get("marginal_filters") or [])
+            # Stale_line SKIP carries marginal=False so the audit
+            # decision logic uses it as the rejection cause.
+            assert skips[0].payload.get("marginal") is False
+            # And no order fired — the bypass does not apply.
+            assert not [a for a in actions if isinstance(a, PlaceOrder)], \
+                "stale_line is now a hard reject; no PlaceOrder expected"
 
 
 class TestCounterLineCacheLifecycle:

@@ -1199,7 +1199,23 @@ class ChartSignalStrategy:
         short_path: str | None = None
         long_line = None
         short_line = None
+        # Line-validity gate: a broken line is dead structure. The
+        # market already chose to violate it; treating new pivots near
+        # its projected level as fresh touches would fire entries on
+        # zombie lines. ``break_stale_bars`` controls how long the
+        # engine RETAINS broken lines for rendering; for ENTRY
+        # candidates the answer is "never". Hard-reject — not a
+        # marginal-bypassable filter (operator clarification
+        # 2026-05-18: validity gates ≠ entry filters).
+        # Same reasoning for ``stale_line`` — if the latest strict
+        # touch is more than ``entry_max_q_age_hours`` (24h default)
+        # old, the line isn't being honored by current participants
+        # and shouldn't trigger entries. Stale_line is enforced
+        # downstream in its own filter block; broken-line is gated
+        # right here at iteration time.
         for cand in longs:
+            if cand.break_idx is not None:
+                continue
             if _has_new_touch(cand, support_pivots):
                 long_line, long_path = cand, "touch"
                 break
@@ -1207,6 +1223,8 @@ class ChartSignalStrategy:
                 long_line, long_path = cand, "accel"
                 break
         for cand in shorts:
+            if cand.break_idx is not None:
+                continue
             if _has_new_touch(cand, resistance_pivots):
                 short_line, short_path = cand, "touch"
                 break
@@ -1711,11 +1729,23 @@ class ChartSignalStrategy:
                             f" — latest touch {lt_age_hours:.1f}h old "
                             f"(cap {max_q_age_hours:.1f}h); line is "
                             f"stale relative to current price action"
-                            + (" [marginal mode]" if allow_marginal else "")
                         ),
                         payload={
                             "filter": FILTER_STALE_LINE,
-                            "marginal": allow_marginal,
+                            # Stale_line is a LINE-VALIDITY gate, not
+                            # an entry filter — hard-reject regardless
+                            # of allow_marginal_entries. Operator
+                            # clarification 2026-05-18: filters that
+                            # validate the line itself (broken,
+                            # stale) are not bypassable; only the
+                            # post-pivot entry filters (shoulder,
+                            # min_target, far_from_pivot,
+                            # tight_triangle, opposing_dominance)
+                            # are. We keep ``marginal: False`` in the
+                            # payload so the audit-decision logic
+                            # picks this SKIP as the rejection cause
+                            # (not skipped over as a bypassed tag).
+                            "marginal": False,
                             "direction": direction,
                             "latest_touch_time": lt_time.isoformat(),
                             "latest_touch_age_hours": round(lt_age_hours, 2),
@@ -1723,13 +1753,7 @@ class ChartSignalStrategy:
                             "entry_decision": decision_diag,
                         },
                     ))
-                    if allow_marginal:
-                        if direction == "long":
-                            marginal_filters_long.append(FILTER_STALE_LINE)
-                        else:
-                            marginal_filters_short.append(FILTER_STALE_LINE)
-                    else:
-                        return actions
+                    return actions
 
         # Opposing-dominance filter (FILTER_OPPOSING_DOMINANCE).
         # Reject when the OPPOSITE-side market structure has many more

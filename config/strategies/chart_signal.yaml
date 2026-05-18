@@ -48,24 +48,34 @@ acceleration_entry_enabled: true
 min_slope_ratio: 1.5
 
 # Marginal-entry mode. When ``allow_marginal_entries`` is true,
-# entries that ANY entry-side filter except ``max_signal_age`` would
-# normally REJECT still fire — they're tagged ``marginal`` and use
-# the tick-time exit machinery (trail ratchet + immediate SL + 10s
-# counter-line / trigger-line linger) so a snap-back exits the trade
-# quickly. The bypassed filters are:
+# entries that the entry-side filters below would normally REJECT
+# still fire — they're tagged ``marginal`` and use the tick-time
+# exit machinery (trail ratchet + 5s touch+hold SL + 10s
+# counter-line / trigger-line linger) so a snap-back exits the
+# trade quickly. The bypassable filters are entry-quality
+# judgements made AFTER a valid pivot has been confirmed on a
+# valid line:
 #   - shoulder            (right-shoulder reversal confirmation)
 #   - min_target          (wedge target ≥ stop)
 #   - far_from_pivot      (entry-to-line gap cap; touch path only)
 #   - tight_triangle      (wedge apex within block distance)
-#   - stale_line          (latest-touch age > cap)
 #   - opposing_dominance  (opposing-side touch count ≥ ratio × chosen)
-# Only ``max_signal_age`` remains a hard reject — it's a freshness
-# safety check against acting on bars that arrived late through
-# the engine queue, not a market-structure judgement.
+# Hard-reject (NOT bypassable, regardless of allow_marginal):
+#   - max_signal_age      (bar event arrived too late — engine queue
+#                          freshness check, not a market judgement)
+#   - stale_line          (latest strict touch > 24h old — the line
+#                          isn't being honored by current participants;
+#                          firing here means fading dead structure.
+#                          Validity gate, not an entry filter.)
+#   - broken lines        (line.break_idx is not None — the market
+#                          already chose to violate this line. Hard
+#                          gate in the entry-candidate iteration
+#                          itself, not even a SKIP signal.)
+# Operator distinction 2026-05-18: filters that VALIDATE THE LINE
+# (broken, stale) are line-validity gates and never bypassable;
+# filters that judge the ENTRY off a valid pivot on a valid line
+# are entry-quality and bypassable.
 # Clean trades (no filter rejection) use the normal opposing-only
 # counter_line exit. Audit feed tags with ``·marginal`` so the
-# operator can A/B per trade. Review periodically: any bypassed
-# filter that consistently bleeds P&L should move back to
-# hard-reject (move the per-direction tag append back to a
-# ``return actions``).
+# operator can A/B per trade.
 allow_marginal_entries: true
