@@ -1408,99 +1408,121 @@ class ChartSignalStrategy:
                     strict_old += 1
             return strict_old >= MIN_TOUCHES
 
-        def _has_acceleration_entry(line) -> bool:
-            """Steeper-3rd-point momentum entry.
+        def _find_2pivot_accel():
+            """2-pivot accel: 3 consecutive same-kind pivots, the
+            most recent being ``new_pivot_idx``. The older 2 form
+            a base line; the new pivot is the "3rd point" that
+            overshoots the line in the favorable direction.
 
-            Conditions:
-              1. new_pivot_idx is a strict 1/1 pivot of the matching
-                 side (find_pivot_lows for support, highs for
-                 resistance).
-              2. closes[new_pivot] is strictly outside the line in
-                 the favorable direction beyond ``near_tol`` — i.e.
-                 above the support / below the resistance.
-              3. The implied slope from the LATEST RECENT STRICT
-                 TOUCH (within ``entry_max_q_age_hours``) to
-                 new_pivot has the same sign as line.slope and is
-                 at least ``min_slope_ratio`` × steeper. Price is
-                 accelerating in the trend's direction.
+            Why 2-pivot (not 3+touch line) — operator decision
+            2026-05-18: a 3+touch base line means accel fires at
+            the 4th+ pivot, by which time the trend is established
+            (often stale). Lowering the base to 2 consecutive
+            pivots means accel fires at the 3rd pivot — the
+            earliest the directional pattern is recognizable. The
+            "consecutive" rule ensures we're working with current
+            local structure: no other same-kind pivot between Q
+            and P, AND no other between P and new_pivot.
 
-            Reference-pivot rule (2026-05-18 operator fix): the
-            implied-slope reference must be a SUBSEQUENT pivot on
-            the line within the recent window — NOT
-            ``line.anchor_b_idx`` (the line's 2nd construction
-            pivot). Using anchor_b_idx averages over multiple days
-            of unrelated price action, so on a 3-day-old downtrending
-            resistance, a current uptrend's pivots can trip an
-            artificial "acceleration" check. By requiring the
-            reference to be a recent strict touch, accel becomes a
-            measure of LOCAL momentum, not weeks-long averages.
+            Conditions (all must hold):
+              1. new_pivot_idx is a strict 1/1 pivot of either side.
+              2. The 2 immediately-preceding same-side pivots (Q, P)
+                 both lie within ``entry_max_q_age_hours`` of the
+                 fire bar — local, not weeks-old structure.
+              3. Q→P slope has the right sign: positive for support,
+                 negative for resistance.
+              4. closes[new_pivot] is strictly outside the Q→P line
+                 in the favorable direction beyond ``near_tol``.
+              5. Implied slope P→new_pivot is at least
+                 ``min_slope_ratio`` × steeper than the Q→P slope
+                 in the same direction.
+
+            Returns (synthetic_line, direction_str) on hit, None
+            otherwise.
             """
             if near_tol is None:
-                return False
-            side_pivots = (
-                support_pivots if line.type == "support"
-                else resistance_pivots
-            )
-            if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
-                return False
-            line_at = line.intercept + line.slope * new_pivot_idx
-            delta = closes[new_pivot_idx] - line_at
-            if line.type == "support":
-                # New pivot must be ABOVE the support line.
-                if delta <= near_tol:
-                    return False
+                return None
+            if new_pivot_idx < 0:
+                return None
+            if new_pivot_idx in support_pivots:
+                side_pivots = support_pivots
+                direction_str = "long"
+                line_kind = "support"
+            elif new_pivot_idx in resistance_pivots:
+                side_pivots = resistance_pivots
+                direction_str = "short"
+                line_kind = "resistance"
             else:
-                # New pivot must be BELOW the resistance line.
-                if delta >= -near_tol:
-                    return False
+                return None
 
-            # Locate the most-recent strict touch on the line, scoped
-            # to ``entry_max_q_age_hours`` bars from last_idx. The
-            # line.anchor_b_idx fallback that used to live here is
-            # intentionally removed — see docstring.
+            # Last 2 same-kind pivots strictly before new_pivot_idx.
+            # ``side_pivots`` is sorted ascending; "consecutive" is
+            # implicit (no other same-kind pivot can appear between
+            # adjacent list entries).
+            earlier = [p for p in side_pivots if p < new_pivot_idx]
+            if len(earlier) < 2:
+                return None
+            P_idx = earlier[-1]
+            Q_idx = earlier[-2]
+
+            # Freshness window — both Q and P must lie within
+            # entry_max_q_age_hours of the fire bar.
             max_q_age_hours_local = float(self.config.get(
                 "entry_max_q_age_hours", 24.0,
             ))
             window_bars_local = int(
                 max_q_age_hours_local * 3600.0 / self.bar_seconds
             )
-            window_start_idx_local = max(
-                line.anchor_b_idx + 1,
-                last_idx - window_bars_local,
-            )
-            to_idx_local = (
-                line.break_idx if line.break_idx is not None
-                else last_idx
-            )
-            P_idx = -1
-            for piv in side_pivots:
-                if piv >= new_pivot_idx or piv > to_idx_local:
-                    continue
-                if piv < window_start_idx_local:
-                    continue
-                line_val_at_piv = line.intercept + line.slope * piv
-                if abs(closes[piv] - line_val_at_piv) <= touch_tol:
-                    if piv > P_idx:
-                        P_idx = piv
-            if P_idx < 0:
-                # No recent strict touch — no valid local reference,
-                # so accel can't claim "subsequent acceleration."
-                return False
+            if Q_idx < last_idx - window_bars_local:
+                return None
 
-            span = new_pivot_idx - P_idx
-            if span <= 0:
-                return False
-            implied_slope = (closes[new_pivot_idx] - closes[P_idx]) / span
-            if line.type == "support":
-                # Long: line.slope > 0; need implied steeper (more +).
-                if line.slope <= 0:
-                    return False
-                return implied_slope >= line.slope * min_slope_ratio
+            if P_idx <= Q_idx or new_pivot_idx <= P_idx:
+                return None
+
+            base_span = P_idx - Q_idx
+            base_slope = (closes[P_idx] - closes[Q_idx]) / base_span
+            base_intercept = closes[P_idx] - base_slope * P_idx
+
+            # Direction-sign check.
+            if direction_str == "long" and base_slope <= 0:
+                return None
+            if direction_str == "short" and base_slope >= 0:
+                return None
+
+            # Overshoot check at new_pivot_idx.
+            line_at_new = base_intercept + base_slope * new_pivot_idx
+            delta = closes[new_pivot_idx] - line_at_new
+            if direction_str == "long":
+                if delta <= near_tol:
+                    return None
             else:
-                # Short: line.slope < 0; need implied steeper (more -).
-                if line.slope >= 0:
-                    return False
-                return implied_slope <= line.slope * min_slope_ratio
+                if delta >= -near_tol:
+                    return None
+
+            # Implied-slope check (P → new_pivot).
+            implied_span = new_pivot_idx - P_idx
+            implied_slope = (closes[new_pivot_idx] - closes[P_idx]) / implied_span
+            if direction_str == "long":
+                if implied_slope < base_slope * min_slope_ratio:
+                    return None
+            else:
+                if implied_slope > base_slope * min_slope_ratio:
+                    return None
+
+            # Synthetic TrendLine — touches=2 (Q + P).
+            from ib_trader.signals.sr_fan import TrendLine
+            synthetic = TrendLine(
+                type=line_kind,
+                from_idx=Q_idx,
+                anchor_b_idx=P_idx,
+                to_idx=last_idx,
+                slope=base_slope,
+                intercept=base_intercept,
+                touches=2,
+                break_idx=None,
+                third_touch_idx=None,
+            )
+            return (synthetic, direction_str)
 
         # Track which path each line passed: ``"touch"`` (strict /
         # 4th+ loose, the original 3rd-touch entry) or ``"accel"``
@@ -1541,18 +1563,28 @@ class ChartSignalStrategy:
             if _has_new_touch(cand, support_pivots):
                 long_line, long_path = cand, "touch"
                 break
-            if accel_enabled and _has_acceleration_entry(cand):
-                long_line, long_path = cand, "accel"
-                break
         for cand in shorts:
             if cand.break_idx is not None:
                 continue
             if _has_new_touch(cand, resistance_pivots):
                 short_line, short_path = cand, "touch"
                 break
-            if accel_enabled and _has_acceleration_entry(cand):
-                short_line, short_path = cand, "accel"
-                break
+
+        # Accel path: try the 2-pivot consecutive-peaks pattern when
+        # no 3+touch TOUCH candidate was found on the matching side.
+        # The 2-pivot accel uses the last 2 same-kind pivots as the
+        # base line and treats the just-confirmed pivot as the
+        # overshoot — fires at the 3rd pivot, not the 4th+ which
+        # the old 3+touch-base accel required.
+        if accel_enabled:
+            accel_result = _find_2pivot_accel()
+            if accel_result is not None:
+                synth_line, accel_dir = accel_result
+                if accel_dir == "long" and long_line is None:
+                    long_line, long_path = synth_line, "accel"
+                elif accel_dir == "short" and short_line is None:
+                    short_line, short_path = synth_line, "accel"
+
         if long_path is None:
             long_line = None
         if short_path is None:

@@ -36,14 +36,22 @@ exit_order_strategy: mid
 max_position_value: 100000
 max_shares: 100
 
-# Acceleration-continuation entry. When ``acceleration_entry_enabled``
-# is true and the just-confirmed pivot lies strictly outside the
-# Q→P line in the favourable direction (above for support / below
-# for resistance) beyond ``near_touch_tolerance_fraction``, AND the
-# implied slope (P → new_pivot) is ≥ ``min_slope_ratio`` × the
-# line's slope, the bot fires an acceleration entry. The exit
-# evaluator skips the line-breach gate on these trades (price is
-# well away from the line; trail alone manages the exit).
+# Acceleration-continuation entry (2-pivot base, 2026-05-18).
+# When ``acceleration_entry_enabled`` is true, the bot looks at the
+# 2 immediately-preceding same-kind pivots (Q older, P newer) and
+# treats the just-confirmed pivot as the "3rd" overshoot point.
+# Q→P forms the base line. Accel fires when:
+#   (a) Q and P are both inside ``entry_max_q_age_hours`` of the
+#       fire bar (local structure, not weeks-old),
+#   (b) the just-confirmed pivot is strictly outside the Q→P line
+#       in the favorable direction beyond ``near_touch_tolerance_fraction``,
+#   (c) implied slope (P → new_pivot) is ≥ ``min_slope_ratio`` ×
+#       the Q→P slope (in the same direction).
+# Earlier accel implementation required a 3+touch base line, which
+# meant accel only fired at the 4th+ pivot — by then the trend
+# was established and the entry was often stale. The 2-pivot base
+# means accel fires at the 3rd pivot, the earliest the directional
+# pattern is recognizable.
 acceleration_entry_enabled: true
 min_slope_ratio: 1.5
 

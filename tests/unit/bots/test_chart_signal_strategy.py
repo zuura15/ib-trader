@@ -321,6 +321,97 @@ class TestEntry:
         assert place and place[0].side == "BUY"
 
 
+class TestTwoPivotAccel:
+    """2-pivot accel: 3 consecutive same-kind pivots, the new pivot
+    overshoots the Q→P line in the favorable direction with implied
+    slope ≥ min_slope_ratio × base slope. Fires at the 3rd pivot
+    instead of the 4th+ pivot the old 3+touch-base accel required."""
+
+    def _build_window(self, closes: list[float]) -> list[dict]:
+        return _zigzag_bars(START_UTC, closes)
+
+    def _bar_event(self, bars: list[dict]) -> BarCompleted:
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    @pytest.mark.asyncio
+    async def test_three_descending_highs_fires_short_accel(self):
+        """3 pivot HIGHS in a descending sequence; 3rd overshoots
+        the Q→P line and accelerates → SHORT accel fires."""
+        # Pivots at idx 1, 3, 5 with closes 12.0, 11.0, 9.5.
+        # Line through Q(1,12) → P(3,11): slope −0.5/bar, intercept 12.5.
+        # Line at idx 5 = 10.0. Pivot at 5 = 9.5 → overshoot −0.5.
+        # Implied (P→new) = (9.5-11)/(5-3) = −0.75/bar.
+        # Ratio |−0.75 / −0.5| = 1.5 = min_slope_ratio default → pass.
+        closes = [10.0, 12.0, 9.5, 11.0, 9.0, 9.5, 8.5]
+        cfg = _default_config()
+        cfg["acceleration_entry_enabled"] = True
+        # Disable regime gate so it doesn't pre-empt — synthetic
+        # window is too short for sensible ADX anyway.
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(closes)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert place, f"expected SHORT accel PlaceOrder, got {actions}"
+
+    @pytest.mark.asyncio
+    async def test_three_ascending_lows_fires_long_accel(self):
+        """Symmetric: 3 pivot LOWS in ascending sequence, 3rd
+        overshoots above the support line → LONG accel fires."""
+        # Pivots at idx 1, 3, 5 with closes 8.0, 9.0, 10.5.
+        # Line through Q(1,8) → P(3,9): slope +0.5/bar, intercept 7.5.
+        # Line at idx 5 = 10.0. Pivot at 5 = 10.5 → overshoot +0.5.
+        # Implied (P→new) = (10.5-9)/(5-3) = +0.75/bar.
+        closes = [10.0, 8.0, 10.5, 9.0, 11.0, 10.5, 12.0]
+        cfg = _default_config()
+        cfg["acceleration_entry_enabled"] = True
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(closes)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "BUY"]
+        assert place, f"expected LONG accel PlaceOrder, got {actions}"
+
+    @pytest.mark.asyncio
+    async def test_implied_slope_below_ratio_no_accel(self):
+        """3 descending pivot HIGHS but the 3rd doesn't accelerate
+        enough (implied slope < min_slope_ratio × base) → no accel."""
+        # Same line as the first test (Q→P slope −0.5) but new
+        # pivot at idx 5 close 9.8 (overshoot only −0.2, implied
+        # slope (9.8-11)/2 = −0.6 — ratio 1.2, below 1.5).
+        closes = [10.0, 12.0, 9.5, 11.0, 9.0, 9.8, 8.5]
+        cfg = _default_config()
+        cfg["acceleration_entry_enabled"] = True
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(closes)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert not place, f"accel should not fire below ratio, got {place}"
+
+    @pytest.mark.asyncio
+    async def test_accel_disabled_by_flag(self):
+        """acceleration_entry_enabled=False → no accel even when
+        the 3-pivot pattern is textbook."""
+        closes = [10.0, 12.0, 9.5, 11.0, 9.0, 9.5, 8.5]
+        cfg = _default_config()
+        cfg["acceleration_entry_enabled"] = False
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(closes)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert not place, f"accel disabled → no PlaceOrder, got {place}"
+
+
 class TestEntryDistanceFilter:
     """FILTER_FAR_FROM_PIVOT: reject when the fire bar's close has
     drifted from the just-confirmed pivot's close by more than
