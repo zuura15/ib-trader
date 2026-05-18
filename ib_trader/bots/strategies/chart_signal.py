@@ -1061,8 +1061,9 @@ class ChartSignalStrategy:
                 # every CURRENT-SESSION 3+touch line (matching the
                 # pivot's side) that the just-confirmed pivot lies on
                 # within touch_tol. N = len(this list). When N == 0,
-                # the audit shows NO_TOUCH; when N >= 1, shows
-                # TOUCH·N with the list rendered in the detail pane.
+                # the audit shows NO_3RD_TOUCH (2-touch lines may exist
+                # on the chart but aren't entry-eligible); when N >= 1,
+                # shows TOUCH·N with the list rendered in the detail.
                 "pivot_touching_lines": pivot_touching_lines,
             },
         ))

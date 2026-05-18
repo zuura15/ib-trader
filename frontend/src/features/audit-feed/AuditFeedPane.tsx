@@ -156,16 +156,21 @@ function BarEvalRow({ r }: { r: AuditRow }) {
     : <Chip text="NO_PIVOT" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
 
   // Touch chip — three states:
-  //   TOUCH·N   pivot landed on a line with N strict touches (purple).
-  //   ACCEL·N   pivot is an acceleration entry — overshot the line
-  //             beyond near_tol AND implied slope ≥ min_slope_ratio
-  //             × line slope. N is the underlying line's touch
-  //             count (orange, to distinguish from touch entries).
-  //   NO_TOUCH  pivot didn't qualify for either path (gray).
+  //   TOUCH·N        pivot landed on a line with N strict touches
+  //                  (purple). N ≥ 3 by definition since 2-touch
+  //                  lines are below the entry-eligibility floor.
+  //   ACCEL·N        pivot is an acceleration entry — overshot the
+  //                  line beyond near_tol AND implied slope ≥
+  //                  min_slope_ratio × line slope. N is the
+  //                  underlying line's touch count (orange).
+  //   NO_3RD_TOUCH   pivot didn't land on any 3+touch line (gray).
+  //                  2-touch lines may exist on the chart at this
+  //                  pivot — they're surfaced visually but don't
+  //                  qualify as an entry candidate yet.
   // Accel detection: the SIGNAL's entry_line carries entry_path;
   // when "accel", the pivot doesn't strictly touch (TOUCH·N is 0)
   // but the trade still fired — flag it explicitly so the operator
-  // doesn't read NO_TOUCH next to a B/S outcome and wonder how
+  // doesn't read NO_3RD_TOUCH next to a B/S outcome and wonder how
   // the entry happened.
   const bestTouches = (a.touch?.lines ?? []).reduce(
     (m, ln) => Math.max(m, ln.touches ?? 0), 0,
@@ -180,7 +185,8 @@ function BarEvalRow({ r }: { r: AuditRow }) {
     : bestTouches > 0
     ? <Chip text={`TOUCH·${bestTouches}`} fg="#9333ea" bg="rgba(168,85,247,0.16)"
             title={`pivot is the ${bestTouches}th touch on its strongest line`} />
-    : <Chip text="NO_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)" />;
+    : <Chip text="NO_3RD_TOUCH" fg="#94a3b8" bg="rgba(148,163,184,0.10)"
+            title="no 3+ touch line at this pivot (2-touch lines may exist on the chart but aren't yet entry-eligible)" />;
 
   // Filter chip — three states, with N/A taking precedence over
   // FILTER·<name> when there's no real order-trigger candidate.
