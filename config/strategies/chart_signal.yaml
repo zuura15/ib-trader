@@ -154,6 +154,16 @@ regime_min_edge_mult: 2.0
 # Donchian extreme tol multiplier. tol = touch_tol × this. Larger
 # values are more permissive (pivot can be further from the band).
 regime_extreme_tol_mult: 1.0
+# DI-lean override (flat/uncertain regime). When the regime is not
+# trending (ADX below trending_threshold) but DI dominance toward
+# the entry direction is at least this many points, skip the
+# Donchian extreme check (amplitude gate still applies). ADX is
+# laggy — a fresh downtrend often has −DI clearly above +DI well
+# before ADX confirms. Lower this to be more permissive (allow
+# entries on weaker directional signal); raise to require stronger
+# confirmation. Default 7 separates "clearly directional" (10+
+# observed in MES sell-offs) from "noise" (1-5 in chop).
+regime_di_lean_threshold: 7.0
 # Per-symbol round-trip commission used as cost floor. Falls back
 # to the in-code default {MGCM6: 1.94, MESM6: 1.24, MNQM6: 1.24}
 # when unset; override here for non-default symbols.

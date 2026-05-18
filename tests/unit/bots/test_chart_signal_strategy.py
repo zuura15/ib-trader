@@ -1823,6 +1823,54 @@ class TestRegimeGate:
         assert p["direction"] == "short"
         assert p["expected_swing"] < p["cost_floor"] * p["min_edge_mult"]
 
+    def _downtrend_with_pivot_high_at_end(self) -> list[float]:
+        """30 strongly-downtrending bars (−DI dominant) ending in a
+        small bounce that confirms a pivot HIGH at last_idx-1 — the
+        "lower-high in a downtrend" pattern the DI-lean override is
+        designed to allow as a SHORT entry."""
+        base = [150.0 - i * 1.5 for i in range(27)]
+        # Last three: low-high-low so idx-2 is a pivot HIGH.
+        bounce = base[-1] + 1.0
+        base.append(bounce)
+        base.append(bounce - 2.0)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_di_lean_override_skips_extreme_check(self):
+        """Downtrend (−DI ≫ +DI) + pivot HIGH at end + flat regime
+        forced via high ADX thresholds → DI-lean override fires.
+        Verifies no flat_extreme SKIP and a RISK row is emitted."""
+        cfg = _default_config()
+        # Force flat regime regardless of pandas-ta output.
+        cfg["adx_trending_threshold"] = 100.0
+        cfg["adx_ranging_threshold"] = 100.0
+        # Low threshold so the synthetic downtrend triggers override.
+        cfg["regime_di_lean_threshold"] = 5.0
+        # Tiny cost floor so amplitude passes deterministically.
+        cfg["regime_round_trip_commission"] = 0.001
+        cfg["regime_min_edge_mult"] = 0.01
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._downtrend_with_pivot_high_at_end())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        # No flat_extreme SKIP — override took effect.
+        extreme_skips = [a for a in actions if isinstance(a, LogSignal)
+                         and a.event_type == LogEventType.SKIP
+                         and (a.payload or {}).get("filter")
+                         == "flat_extreme"]
+        assert not extreme_skips, (
+            f"DI-lean override should have skipped extreme check, "
+            f"got {extreme_skips}"
+        )
+        # RISK row surfaced for audit visibility.
+        risk_rows = [a for a in actions if isinstance(a, LogSignal)
+                     and a.event_type == LogEventType.RISK
+                     and (a.payload or {}).get("filter")
+                     == "regime_di_lean_override"]
+        assert risk_rows, f"expected DI-lean RISK row, got {actions}"
+        assert risk_rows[0].payload["direction"] == "short"
+        assert risk_rows[0].payload["di_lean"] >= 5.0
+
     @pytest.mark.asyncio
     async def test_insufficient_bars_warns_does_not_block(self):
         """9-bar fixture: regime falls to 'insufficient'. Surface a

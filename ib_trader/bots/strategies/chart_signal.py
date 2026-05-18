@@ -1235,40 +1235,88 @@ class ChartSignalStrategy:
 
                 # 2b) Donchian extreme — pivot must be near the
                 # regime-side band.
-                ext_tol_rg = touch_tol_rg * float(self.config.get(
-                    "regime_extreme_tol_mult", 1.0,
+                # DI-lean override (2026-05-18): in flat/uncertain
+                # regime, if DI dominance toward the entry direction
+                # is strong enough, skip the Donchian extreme check.
+                # ADX is laggy — Wilder smoothing means a fresh
+                # downtrend can have −DI clearly above +DI well
+                # before ADX climbs past 25. When the directional
+                # signal is unambiguous, the "must be at the recent
+                # peak/trough" rule is too strict — lower-highs in a
+                # confirmed bearish drift (and lower-lows in a
+                # confirmed bullish drift) are valid entries. The
+                # amplitude gate above still applies.
+                di_lean_threshold = float(self.config.get(
+                    "regime_di_lean_threshold", 7.0,
                 ))
-                if not at_donchian_extreme(
-                    reading, price=entry_close_rg,
-                    side=side_in_play, tol=ext_tol_rg,
-                ):
-                    band_val = (
-                        reading.dcu if side_in_play == "short"
-                        else reading.dcl
-                    )
+                dmp_val = reading.dmp or 0.0
+                dmn_val = reading.dmn or 0.0
+                di_lean = (
+                    (dmn_val - dmp_val) if side_in_play == "short"
+                    else (dmp_val - dmn_val)
+                )
+                if di_lean >= di_lean_threshold:
+                    # Skip the extreme check entirely — emit a RISK
+                    # row so the audit trail captures that the gate
+                    # was relaxed (and why).
                     actions.append(LogSignal(
-                        event_type=LogEventType.SKIP,
+                        event_type=LogEventType.RISK,
                         message=(
-                            f"{FILTER_FLAT_EXTREME} ({side_in_play.upper()}) "
-                            f"— flat regime, entry @ "
-                            f"{entry_close_rg:.4f} not at Donchian "
-                            f"{'upper' if side_in_play == 'short' else 'lower'} "
-                            f"band {band_val:.4f} (tol ${ext_tol_rg:.4f})"
+                            f"regime DI-lean override "
+                            f"({side_in_play.upper()}) — DI sep "
+                            f"{di_lean:.1f} ≥ {di_lean_threshold:.1f}, "
+                            f"skipping Donchian extreme check"
                         ),
                         payload={
-                            "filter": FILTER_FLAT_EXTREME,
+                            "filter": "regime_di_lean_override",
                             "marginal": False,
                             "direction": side_in_play,
-                            "entry_price": round(entry_close_rg, 4),
-                            "band_value": (
-                                round(band_val, 4)
-                                if band_val is not None else None
-                            ),
-                            "tol": round(ext_tol_rg, 4),
+                            "di_lean": round(di_lean, 2),
+                            "threshold": di_lean_threshold,
                             **reading.to_audit_payload(),
                         },
                     ))
-                    return actions
+                else:
+                    ext_tol_rg = touch_tol_rg * float(self.config.get(
+                        "regime_extreme_tol_mult", 1.0,
+                    ))
+                    if not at_donchian_extreme(
+                        reading, price=entry_close_rg,
+                        side=side_in_play, tol=ext_tol_rg,
+                    ):
+                        band_val = (
+                            reading.dcu if side_in_play == "short"
+                            else reading.dcl
+                        )
+                        actions.append(LogSignal(
+                            event_type=LogEventType.SKIP,
+                            message=(
+                                f"{FILTER_FLAT_EXTREME} "
+                                f"({side_in_play.upper()}) — flat regime, "
+                                f"entry @ {entry_close_rg:.4f} not at "
+                                f"Donchian "
+                                f"{'upper' if side_in_play == 'short' else 'lower'} "
+                                f"band {band_val:.4f} "
+                                f"(tol ${ext_tol_rg:.4f}); "
+                                f"DI sep {di_lean:.1f} below override "
+                                f"threshold {di_lean_threshold:.1f}"
+                            ),
+                            payload={
+                                "filter": FILTER_FLAT_EXTREME,
+                                "marginal": False,
+                                "direction": side_in_play,
+                                "entry_price": round(entry_close_rg, 4),
+                                "band_value": (
+                                    round(band_val, 4)
+                                    if band_val is not None else None
+                                ),
+                                "tol": round(ext_tol_rg, 4),
+                                "di_lean": round(di_lean, 2),
+                                "di_lean_threshold": di_lean_threshold,
+                                **reading.to_audit_payload(),
+                            },
+                        ))
+                        return actions
 
         # ----------------------------------------------------------
         # End regime gate.
