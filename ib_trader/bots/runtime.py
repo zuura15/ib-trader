@@ -1112,6 +1112,37 @@ class StrategyBotRunner(BotBase):
                     '{"event": "ENTRY_FILL_STRATEGY_NOTIFY_FAILED", '
                     '"bot_id": "%s"}', self.bot_id,
                 )
+
+        # Email notification on entry fill — fire-and-forget. Skipped
+        # on rejection. Notifier is a no-op when
+        # EMAIL_NOTIFICATIONS_ENABLED != "true" in the env. Failure
+        # is logged WARNING and swallowed — never blocks the trade.
+        if not notify_rejected and symbol:
+            try:
+                from ib_trader.notifications.email_notifier import (
+                    send_entry_email,
+                )
+                entry_line_doc = doc.get("entry_line") or {}
+                send_entry_email(
+                    bot_name=(self.name if hasattr(self, "name") else None),
+                    symbol=symbol,
+                    sec_type=str(
+                        self.config.get("sec_type", "STK")
+                    ).upper(),
+                    direction=position_direction,
+                    qty=str(qty),
+                    fill_price=str(price),
+                    fill_time=now_iso(),
+                    serial=serial,
+                    entry_path=entry_line_doc.get("entry_path"),
+                    marginal_filters=entry_line_doc.get("marginal_filters"),
+                )
+            except Exception:
+                logger.warning(
+                    '{"event": "EMAIL_ENTRY_SEND_FAILED", "bot_id": "%s"}',
+                    self.bot_id,
+                )
+
         return (BotState.AWAITING_ENTRY_TRIGGER if qty == 0
                 else BotState.AWAITING_EXIT_TRIGGER)
 
@@ -1999,6 +2030,50 @@ class StrategyBotRunner(BotBase):
             except Exception:
                 logger.exception(
                     '{"event": "TRADE_CLOSED_AUDIT_FAILED", '
+                    '"bot_id": "%s", "symbol": "%s"}',
+                    self.bot_id, symbol,
+                )
+
+            # Email notification — fire-and-forget. Notifier is a
+            # no-op when EMAIL_NOTIFICATIONS_ENABLED != "true" in
+            # the env, and any send failure is caught and logged
+            # WARNING without exposing the password. Never blocks
+            # the trading path.
+            try:
+                from ib_trader.notifications.email_notifier import (
+                    send_close_email,
+                )
+                send_close_email(
+                    bot_name=(self.name if hasattr(self, "name") else None),
+                    symbol=symbol,
+                    sec_type=str(
+                        self.config.get("sec_type", "STK")
+                    ).upper(),
+                    direction=direction,
+                    entry_price=entry_price_str,
+                    entry_qty=args.get("entry_qty"),
+                    entry_time=(entry_time_dt.isoformat()
+                                if entry_time_dt else None),
+                    exit_price=exit_price_str,
+                    exit_qty=args.get("exit_qty"),
+                    exit_time=exit_time_dt.isoformat(),
+                    gross_pnl=str(pnl),
+                    commission=str(comm_for_audit),
+                    net_pnl=str(net_pnl),
+                    commission_source=comm_source,
+                    exit_reason=exit_reason,
+                    duration_seconds=duration,
+                    trail_reset_count=int(
+                        args.get("trail_reset_count") or 0
+                    ),
+                    entry_serial=entry_serial,
+                    exit_serial=exit_serial,
+                    entry_path=entry_path,
+                    marginal_filters=marginal_filters,
+                )
+            except Exception:
+                logger.warning(
+                    '{"event": "EMAIL_CLOSE_SEND_FAILED", '
                     '"bot_id": "%s", "symbol": "%s"}',
                     self.bot_id, symbol,
                 )
