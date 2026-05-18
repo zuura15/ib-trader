@@ -25,7 +25,10 @@ from ib_trader.data.repository import (
     create_db_engine, create_session_factory, init_db,
 )
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
-from ib_trader.daemon.reconciler import run_reconciliation, run_transaction_reconciliation
+from ib_trader.daemon.reconciler import (
+    run_reconciliation, run_transaction_reconciliation,
+    run_commission_reconciliation,
+)
 from ib_trader.daemon.monitor import check_repl_heartbeat, check_ib_connectivity
 from ib_trader.daemon.integrity import run_integrity_check
 from ib_trader.engine.exceptions import ConfigurationError
@@ -187,12 +190,16 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
         recon_interval = ctx.settings["reconciliation_interval_seconds"]
         integrity_interval = ctx.settings["db_integrity_check_interval_seconds"]
         heartbeat_interval = ctx.settings["heartbeat_interval_seconds"]
+        commission_recon_interval = ctx.settings.get(
+            "commission_reconciliation_interval_seconds", 600,
+        )
         ib_check_interval = 1800  # 30 minutes passive IB check
 
         recon_counter = 0
         integrity_counter = 0
         hb_counter = 0
         ib_counter = 0
+        commission_recon_counter = 0
 
         while True:
             await asyncio.sleep(30)  # Check every 30 seconds
@@ -244,6 +251,27 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
                 else:
                     print("[DAEMON] Reconciliation complete — no discrepancies")
                 recon_counter = 0
+
+            # Commission reconciliation — periodic safety net for the
+            # race where IB's commissionReport lands before the
+            # bot_trade row exists. Default 10 min cadence is much
+            # tighter than the legacy hourly reconciliation since
+            # commission backfills should normally land within
+            # seconds; a multi-minute gap is operator-visible drift
+            # on the 24h header.
+            commission_recon_counter += 30
+            if commission_recon_counter >= commission_recon_interval:
+                try:
+                    cresult = await run_commission_reconciliation(ctx)
+                    if cresult["backfilled"] or cresult["warned"]:
+                        print(
+                            f"[DAEMON] Commission reconciler: "
+                            f"backfilled {cresult['backfilled']}, "
+                            f"warned {cresult['warned']}"
+                        )
+                except Exception as e:
+                    print(f"[DAEMON] WARNING  commission reconciler failed: {e}")
+                commission_recon_counter = 0
 
             # Integrity check (every 6 hours)
             integrity_counter += 30

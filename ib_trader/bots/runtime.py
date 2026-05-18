@@ -1901,6 +1901,73 @@ class StrategyBotRunner(BotBase):
                 int(args.get("trail_reset_count") or 0),
             )
 
+            # TRADE_CLOSED audit row — emitted HERE (not from the
+            # strategy's exit-leg ``_on_fill``) because:
+            #   1. ``pnl`` is the correctly-computed gross realized P&L
+            #      from the exit fill; the strategy used to read
+            #      ``ctx.state["entry_price"]`` AFTER
+            #      ``clear_position_fields`` had wiped it and always
+            #      logged $0.00 (commit 37bc409 suppressed the row in
+            #      the frontend for this reason).
+            #   2. ``seeded_commission`` is in scope from the
+            #      transactions-sourced backfill just above.
+            # When ``seeded_commission`` is below the symbol's expected
+            # round-trip floor (e.g. the commission report hasn't
+            # landed yet), fall back to the standard so the operator
+            # sees a sensible net P&L on the row immediately.
+            # ``commission_source`` in the payload distinguishes the
+            # two paths so a lagging backfill is visible in the
+            # expanded detail view.
+            try:
+                from ib_trader.data.commissions import expected_min
+                comm_for_audit = seeded_commission
+                comm_source = "transactions"
+                floor = expected_min(symbol)
+                if comm_for_audit < floor:
+                    comm_for_audit = floor
+                    comm_source = "fallback_standard"
+                net_pnl = pnl - comm_for_audit
+                exit_reason = str(args.get("exit_reason") or "unknown")
+                direction = str(args.get("direction", "LONG")).upper()
+                close_payload = {
+                    "direction": direction,
+                    "entry_price": entry_price_str,
+                    "exit_price": exit_price_str,
+                    "entry_qty": args.get("entry_qty") or "0",
+                    "exit_qty": args.get("exit_qty") or "0",
+                    "entry_time": (entry_time_dt.isoformat()
+                                   if entry_time_dt else None),
+                    "exit_time": exit_time_dt.isoformat(),
+                    "gross_pnl": str(pnl),
+                    "commission": str(comm_for_audit),
+                    "commission_source": comm_source,
+                    "net_pnl": str(net_pnl),
+                    "exit_reason": exit_reason,
+                    "duration_seconds": duration,
+                    "trail_reset_count": int(
+                        args.get("trail_reset_count") or 0,
+                    ),
+                    "entry_serial": entry_serial,
+                    "exit_serial": exit_serial,
+                    "bot_name": (
+                        self.name if hasattr(self, "name") else None
+                    ),
+                }
+                self._audit_repo.insert_trade_closed(
+                    bot_id=self.bot_id,
+                    symbol=symbol,
+                    event_ts_utc=exit_time_dt,
+                    decision=f"CLOSED·{direction}·{exit_reason}",
+                    pnl_net=net_pnl,
+                    payload=close_payload,
+                )
+            except Exception:
+                logger.exception(
+                    '{"event": "TRADE_CLOSED_AUDIT_FAILED", '
+                    '"bot_id": "%s", "symbol": "%s"}',
+                    self.bot_id, symbol,
+                )
+
             # Stamp both trade_groups so the Trades panel (which reads
             # trade_groups.realized_pnl / status) no longer shows the
             # bot's round-trips as perpetually OPEN with null P&L.

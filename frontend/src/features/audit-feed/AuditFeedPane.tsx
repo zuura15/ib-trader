@@ -4,13 +4,15 @@
  * Event types in the feed:
  *   - BAR_EVAL      (per 3-min bar evaluation)
  *   - ORDER_PLACED  (entry / exit order submitted to IB)
+ *   - TRADE_CLOSED  (round-trip summary on exit fill, with net P&L)
  *
- * TRADE_CLOSED rows are still written to ``audit_log`` for raw lookup
- * but suppressed from the live feed — the per-leg ORDER_PLACED rows
- * (BUY entry + SELL exit with its exit_context) carry the operator-
- * relevant info, and the summary row's pnl_net is unreliable due to
- * a race between strategy ``_on_fill`` and the runtime's
- * ``clear_position_fields`` on the exit leg.
+ * TRADE_CLOSED rows were briefly suppressed (commit 37bc409) because
+ * the server-side pnl_net was always $0.00 — the strategy read
+ * entry_price from ctx.state AFTER the runtime had wiped it on
+ * exit. The row is now emitted from runtime._handle_record_trade_closed
+ * where realized_pnl AND the transactions-seeded commission are both
+ * in scope, so the row carries a correct net P&L. Suppression
+ * reverted.
  *
  * Each row is collapsed by default. Click to expand for structured
  * detail (one line per fact). The clipboard icon opens a modal with
@@ -269,8 +271,17 @@ function TradeClosedRow({ r }: { r: AuditRow }) {
     ? 'var(--text-secondary)'
     : pnl > 0 ? '#16a34a' : pnl < 0 ? '#dc2626' : 'var(--text-secondary)';
   const star = pnl !== null ? (pnl > 0 ? '★' : '✗') : '·';
-  const duration = (r.payload as AuditPayload | null)?.duration_seconds;
+  const p = r.payload as Record<string, unknown> | null;
+  const duration = (p?.duration_seconds as number | undefined)
+    ?? (r.payload as AuditPayload | null)?.duration_seconds;
   const direction = r.decision.split('·')[1] || '';
+  const reason = r.decision.split('·').slice(2).join('·');
+  // Headline carries entry → exit prices alongside P&L per operator
+  // ask 2026-05-18: "add the entry, exit prices along with the P/L".
+  // Falls back gracefully when the audit row predates the payload
+  // expansion (older rows have only direction/qty/realized_pnl).
+  const entryPx = p?.entry_price as string | number | undefined;
+  const exitPx = p?.exit_price as string | number | undefined;
   return (
     <div style={{
       display: 'flex', gap: 8, alignItems: 'center',
@@ -279,13 +290,21 @@ function TradeClosedRow({ r }: { r: AuditRow }) {
       background: tone.bg, padding: '4px 8px', borderRadius: 4,
     }}>
       <span style={{ color: 'var(--text-muted)' }}>{_fmtPT(r.event_ts_utc)}</span>
-      <span style={{ color: 'var(--text-secondary)', minWidth: 50 }}>{r.symbol}</span>
+      <span style={{ color: 'var(--text-secondary)', minWidth: 50, fontWeight: 600 }}>{r.symbol}</span>
       <span style={{ color: tone.fg, fontWeight: 600 }}>{direction}</span>
+      {reason && (
+        <span style={{ color: tone.fg, fontSize: 10 }}>· {reason}</span>
+      )}
       <span style={{ color: pnlColor, fontWeight: 600 }}>
         {star} {_fmtMoney(r.pnl_net)}
       </span>
+      {entryPx !== undefined && exitPx !== undefined && (
+        <span style={{ color: 'var(--text-secondary)' }}>
+          {_fmtPrice(entryPx)} → {_fmtPrice(exitPx)}
+        </span>
+      )}
       {duration && (
-        <span style={{ color: 'var(--text-secondary)' }}>{_fmtDuration(duration)}</span>
+        <span style={{ color: 'var(--text-secondary)' }}>({_fmtDuration(duration)})</span>
       )}
     </div>
   );
@@ -420,27 +439,136 @@ function ExpandedBarEval({ row, onShowRaw }: {
 function ExpandedTradeClosed({ row, onShowRaw }: {
   row: AuditRow; onShowRaw: () => void;
 }) {
+  // Mirrors the BotTradesPanel detail layout — Entry / Exit / P&L
+  // breakdown / Trail resets / Bot / Serials. Operator ask
+  // 2026-05-18: "details can be replica of the info we put in the
+  // bot-trades pane".
   const p = row.payload as Record<string, unknown> | null;
   const direction = row.decision.split('·')[1] || '';
   const reason = row.decision.split('·').slice(2).join('·') || '—';
-  const get = (k: string) => (p?.[k] as string | number | undefined);
+  const get = (k: string) => p?.[k] as string | number | undefined;
+  const getStr = (k: string) => {
+    const v = p?.[k];
+    return v === undefined || v === null ? null : String(v);
+  };
+  const fmtPnlPart = (v: string | null) => {
+    if (v === null) return { text: '—', color: 'var(--text-secondary)' };
+    const n = Number(v);
+    if (!Number.isFinite(n)) return { text: '—', color: 'var(--text-secondary)' };
+    const sign = n >= 0 ? '+' : '-';
+    return {
+      text: `${sign}$${Math.abs(n).toFixed(2)}`,
+      color: n >= 0 ? '#16a34a' : '#dc2626',
+    };
+  };
+  const fmtPriceQty = (px: string | null, qty: string | null) => {
+    if (px === null) return '—';
+    const pxF = Number(px);
+    const qF = qty ? Number(qty) : NaN;
+    const pxStr = Number.isFinite(pxF) ? `$${pxF.toFixed(2)}` : px;
+    if (Number.isFinite(qF)) {
+      const qStr = Number.isInteger(qF) ? String(qF) : qF.toFixed(4);
+      return `${pxStr} × ${qStr}`;
+    }
+    return pxStr;
+  };
+  const grossStr = getStr('gross_pnl') ?? getStr('realized_pnl');
+  const commissionStr = getStr('commission');
+  const netStr = getStr('net_pnl');
+  const commSource = getStr('commission_source');
+  const gross = fmtPnlPart(grossStr);
+  const commission = commissionStr ? Number(commissionStr) : 0;
+  const net = fmtPnlPart(netStr);
+
+  const labelStyle: React.CSSProperties = {
+    color: 'var(--text-muted)', fontSize: 10,
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+    marginBottom: 3,
+  };
+  const valueStyle: React.CSSProperties = {
+    fontSize: 13, color: 'var(--text-primary)',
+    fontWeight: 600,
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+  };
+  const metaStyle: React.CSSProperties = {
+    fontSize: 10, color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    marginTop: 2,
+  };
+
   return (
     <div style={{
       marginTop: 6, marginLeft: 8,
-      padding: '8px 10px',
+      padding: '12px 14px',
       background: 'var(--panel-bg-alt, rgba(0,0,0,0.04))',
       borderLeft: '2px solid var(--border-default)',
     }}>
-      <DetailLine label="direction" value={direction} />
-      <DetailLine label="entry price" value={_fmtPrice(get('entry_price') ?? null)} />
-      <DetailLine label="exit price"  value={_fmtPrice(get('exit_price') ?? null)} />
-      <DetailLine label="entry time"  value={_fmtPT(String(get('entry_time') ?? '')) || '—'} />
-      <DetailLine label="exit time"   value={_fmtPT(String(get('exit_time') ?? '')) || '—'} />
-      <DetailLine label="duration"    value={_fmtDuration(get('duration_seconds') as number | undefined)} />
-      <DetailLine label="realized PnL" value={_fmtMoney(String(get('realized_pnl') ?? '')) || '—'} />
-      <DetailLine label="commission"  value={_fmtMoney(String(get('commission') ?? '')) || '—'} />
-      <DetailLine label="exit reason" value={reason} />
-      <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gap: '10px 18px',
+      }}>
+        <div>
+          <div style={labelStyle}>Entry</div>
+          <div style={valueStyle}>
+            {fmtPriceQty(getStr('entry_price'), getStr('entry_qty'))}
+          </div>
+          <div style={metaStyle}>{_fmtPT(String(get('entry_time') ?? '')) || '—'}</div>
+        </div>
+        <div>
+          <div style={labelStyle}>Exit</div>
+          <div style={valueStyle}>
+            {fmtPriceQty(getStr('exit_price'), getStr('exit_qty'))}
+          </div>
+          <div style={metaStyle}>{_fmtPT(String(get('exit_time') ?? '')) || '—'}</div>
+        </div>
+        <div>
+          <div style={labelStyle}>P&amp;L breakdown</div>
+          <div style={{ ...valueStyle, color: gross.color }}>
+            Gross {gross.text}
+          </div>
+          <div style={metaStyle}>
+            − ${commission.toFixed(2)} commission
+            {commSource === 'fallback_standard' && (
+              <span style={{ color: '#b45309', marginLeft: 4 }}>
+                (est. — backfill pending)
+              </span>
+            )}
+          </div>
+          <div style={{ ...valueStyle, color: net.color, marginTop: 2 }}>
+            Net {net.text}
+          </div>
+        </div>
+        <div>
+          <div style={labelStyle}>Direction · Reason</div>
+          <div style={valueStyle}>{direction}</div>
+          <div style={metaStyle}>{reason}</div>
+        </div>
+        <div>
+          <div style={labelStyle}>Duration · Trail resets</div>
+          <div style={valueStyle}>
+            {_fmtDuration(get('duration_seconds') as number | undefined)}
+          </div>
+          <div style={metaStyle}>
+            {String(get('trail_reset_count') ?? 0)} resets
+          </div>
+        </div>
+        {getStr('bot_name') && (
+          <div>
+            <div style={labelStyle}>Bot</div>
+            <div style={valueStyle}>{getStr('bot_name')}</div>
+          </div>
+        )}
+        {(getStr('entry_serial') || getStr('exit_serial')) && (
+          <div>
+            <div style={labelStyle}>Serials</div>
+            <div style={valueStyle}>
+              #{getStr('entry_serial') ?? '—'} → #{getStr('exit_serial') ?? '—'}
+            </div>
+          </div>
+        )}
+      </div>
+      <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
         <button
           onClick={(e) => { e.stopPropagation(); onShowRaw(); }}
           style={{
@@ -612,9 +740,8 @@ export function AuditFeedPane() {
     getAuditFeed({ botId, limit: 100 })
       .then((data) => {
         if (cancelled) return;
-        const filtered = data.filter((r) => r.event_type !== 'TRADE_CLOSED');
-        setRows(filtered);
-        seenIds.current = new Set(filtered.map((r) => r.id));
+        setRows(data);
+        seenIds.current = new Set(data.map((r) => r.id));
       })
       .catch((e) => { if (!cancelled) setError(String(e)); });
     return () => { cancelled = true; };
@@ -630,7 +757,6 @@ export function AuditFeedPane() {
     es.onmessage = (ev) => {
       try {
         const row = JSON.parse(ev.data) as AuditRow;
-        if (row.event_type === 'TRADE_CLOSED') return;
         if (seenIds.current.has(row.id)) return;
         seenIds.current.add(row.id);
         setRows((prev) => [row, ...prev].slice(0, 500));

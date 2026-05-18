@@ -101,6 +101,14 @@ order_terminal_timeout_seconds: 300
 quotes_heartbeat_stale_halt_seconds: 120
 bot_runner_internal_port: 8082
 reconciliation_interval_seconds: 3600
+# Commission reconciler — periodic sweep that backfills
+# ``bot_trades.commission`` from ``transactions.commission`` for any
+# closed trade whose stored value is below the symbol's expected
+# round-trip floor (see ``ib_trader.data.commissions``). Closes the
+# race where IB's commissionReport arrives BEFORE the bot_trade row
+# exists. Tighter cadence than the legacy reconciliation because
+# commission gaps are operator-visible drift on the 24h header.
+commission_reconciliation_interval_seconds: 600
 db_integrity_check_interval_seconds: 21600
 daemon_tui_refresh_seconds: 5
 tui_refresh_interval_seconds: 5

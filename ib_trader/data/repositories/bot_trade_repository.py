@@ -104,6 +104,86 @@ class BotTradeRepository:
             return result
         return Decimal(str(result))
 
+    def find_undercommissioned_trades(
+        self, hours: float = 24.0,
+        *,
+        skip_bot_ids: set[str] | None = None,
+    ) -> list[BotTrade]:
+        """Return closed rows in the last ``hours`` whose stored
+        commission is BELOW the symbol-specific round-trip floor
+        (``ib_trader.data.commissions.ROUND_TRIP_MIN``). Symbols with
+        no expected floor are excluded by definition (threshold = 0,
+        so commission >= 0 always passes).
+
+        ``skip_bot_ids`` filters out bots whose live FSM state means
+        a fresh fill might still be in flight — the caller passes the
+        set of bot_ids currently in ``lifecycle.ACTIVE_STATES`` so
+        the reconciler doesn't race the live commission backfill.
+
+        Caller is expected to do the per-row backfill via
+        ``update_commission_if_higher``. Returns the raw BotTrade
+        objects so the caller can read entry/exit serials and
+        exit_time for the time-bounded transactions sum.
+        """
+        from ib_trader.data.commissions import ROUND_TRIP_MIN
+
+        if not ROUND_TRIP_MIN:
+            return []
+        since = _now_utc() - timedelta(hours=hours)
+        # Pull every closed row in window for the symbols we know about
+        # and filter in Python — per-symbol threshold via SQL CASE is
+        # noisier than this and the candidate set is small (hundreds
+        # of rows/day, not millions).
+        skip = skip_bot_ids or set()
+        rows = (
+            self._session()
+            .query(BotTrade)
+            .filter(
+                BotTrade.exit_time >= since,
+                BotTrade.symbol.in_(list(ROUND_TRIP_MIN.keys())),
+            )
+            .all()
+        )
+        out: list[BotTrade] = []
+        for row in rows:
+            if row.bot_id in skip:
+                continue
+            floor = ROUND_TRIP_MIN.get(row.symbol, Decimal("0"))
+            current = row.commission or Decimal("0")
+            if current < floor:
+                out.append(row)
+        return out
+
+    def update_commission_if_higher(
+        self, trade_id: str, new_value: Decimal,
+    ) -> bool:
+        """Idempotent UPDATE — writes ``new_value`` only when it
+        strictly exceeds the current stored value. Returns True iff
+        the row was changed.
+
+        Safe to call from a periodic sweep even when the live
+        ``add_commission_by_serial`` path has already populated the
+        commission: a sweep value equal-or-lower is a no-op.
+        """
+        if new_value is None:
+            return False
+        if not isinstance(new_value, Decimal):
+            new_value = Decimal(str(new_value))
+        s = self._session()
+        row = (
+            s.query(BotTrade)
+            .filter(BotTrade.id == trade_id)
+            .first()
+        )
+        if row is None:
+            return False
+        current = row.commission or Decimal("0")
+        if new_value <= current:
+            return False
+        row.commission = new_value
+        s.commit()
+        return True
+
     def add_commission_by_serial(
         self, serial: int, delta: Decimal,
     ) -> int:

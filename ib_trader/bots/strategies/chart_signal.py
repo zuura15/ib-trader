@@ -2835,21 +2835,15 @@ class ChartSignalStrategy:
                                   ).total_seconds()
                 except Exception:  # noqa: BLE001
                     duration_s = None
-            close_payload = {
-                "direction": direction,
-                "entry_price": str(entry_price),
-                "exit_price": str(event.fill_price),
-                "qty": str(event.qty),
-                "pnl_gross": str(pnl),
-                "exit_reason": exit_reason,
-                "entry_time": entry_time_iso,
-                "duration_seconds": duration_s,
-                "trade_serial": ctx.state.get("trade_serial"),
-                # commission isn't on the OrderFilled event for this
-                # strategy path; ib_realized_pnl is backfilled later.
-                # ``pnl_net`` left null in the audit row — frontend can
-                # join to bot_trades for the post-settlement number.
-            }
+            # NOTE: the TRADE_CLOSED audit row used to be emitted here
+            # with ``pnl_net=pnl`` (gross, no commission). It hit the
+            # ``clear_position_fields``-wipes-``entry_price`` race in
+            # ``ctx.state`` and always logged $0.00, so we suppressed
+            # the row in the frontend (commit 37bc409).
+            # The row is now emitted from ``runtime._handle_record_trade_closed``
+            # where realized_pnl AND the seeded commission are both
+            # correctly in scope. Keep the dev LogSignal for the
+            # structured log only.
             actions.extend([
                 LogSignal(
                     event_type=LogEventType.CLOSED,
@@ -2858,13 +2852,6 @@ class ChartSignalStrategy:
                         f"({direction} close)"
                     ),
                     trade_serial=ctx.state.get("trade_serial"),
-                ),
-                EmitAudit(
-                    event_type="TRADE_CLOSED",
-                    decision=f"CLOSED·{direction.upper()}·{exit_reason}",
-                    symbol=event.symbol,
-                    pnl_net=pnl,
-                    payload=close_payload,
                 ),
                 UpdateState({
                     "trade_serial": None,

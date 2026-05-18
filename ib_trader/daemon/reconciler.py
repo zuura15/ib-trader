@@ -12,7 +12,7 @@ CLOSED, writes closed_at, and computes realized_pnl when entry and
 exit fill prices are both available.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from ib_trader.config.context import AppContext
@@ -20,6 +20,7 @@ from ib_trader.data.models import (
     LegType, TradeStatus,
     TransactionAction, TransactionEvent, AlertSeverity, SystemAlert,
 )
+from ib_trader.logging_.alerts import log_and_alert
 
 # Fill actions used for P&L calculation and position tracking
 _FILL_ACTIONS = {TransactionAction.FILLED, TransactionAction.PARTIAL_FILL}
@@ -305,3 +306,192 @@ async def run_transaction_reconciliation(ctx: AppContext) -> dict:
         len(discrepancies),
     )
     return result
+
+
+async def run_commission_reconciliation(
+    ctx: AppContext, lookback_hours: float = 24.0,
+) -> dict:
+    """Sweep bot_trades for rows whose stored commission is below the
+    expected per-symbol round-trip floor and backfill them from
+    ``transactions.commission`` (time-bounded ±1h around exit_time so
+    stale serials can't contaminate).
+
+    Closes the race where IB's ``commissionReport`` lands BEFORE the
+    bot_trade row exists — in that window ``add_commission_by_serial``
+    matches 0 rows and the commission is effectively lost. The
+    forward-fix (``runtime._handle_record_trade_closed`` seeds from
+    transactions at creation) handles the common case; this is the
+    safety net.
+
+    Stragglers older than 24h that STILL undercount are surfaced via
+    ``log_and_alert(trigger="COMMISSION_DELIVERY_GAP", severity="WARNING")``
+    so the upstream ``_on_commission_report`` bug shows up instead of
+    being silently papered over.
+
+    Skips bots currently in an active FSM state (per the bot's Redis
+    doc) so we don't race the live commission backfill.
+    """
+    logger.info('{"event": "COMMISSION_RECONCILIATION_STARTED"}')
+
+    if ctx.bot_trades is None or ctx.redis is None:
+        logger.info('{"event": "COMMISSION_RECONCILIATION_SKIPPED",'
+                    ' "reason": "bot_trades or redis unavailable"}')
+        return {"backfilled": 0, "warned": 0, "details": []}
+
+    # Build the active-bot skip set from Redis. Best-effort: if Redis
+    # is unreachable, run the sweep without the skip filter.
+    from ib_trader.bots.lifecycle import ACTIVE_STATES, bot_doc_key
+    from ib_trader.redis.state import StateStore
+    skip_bot_ids: set[str] = set()
+    try:
+        store = StateStore(ctx.redis)
+        candidates_for_skip = ctx.bot_trades.find_undercommissioned_trades(
+            lookback_hours,
+        )
+        # Probe each candidate's bot doc once; cheap and bounded by
+        # candidate count.
+        seen: set[str] = set()
+        for row in candidates_for_skip:
+            if row.bot_id in seen:
+                continue
+            seen.add(row.bot_id)
+            doc = await store.get(bot_doc_key(row.bot_id)) or {}
+            state_str = str(doc.get("state", ""))
+            if any(state_str == s.value for s in ACTIVE_STATES):
+                skip_bot_ids.add(row.bot_id)
+    except Exception:
+        logger.debug("commission reconciler skip-set probe failed",
+                     exc_info=True)
+
+    candidates = ctx.bot_trades.find_undercommissioned_trades(
+        lookback_hours, skip_bot_ids=skip_bot_ids,
+    )
+
+    backfilled: list[dict] = []
+    warned: list[dict] = []
+    now = _now_utc()
+
+    for row in candidates:
+        # Time-bounded sum from transactions for both legs. Mirrors the
+        # SQL backfill we ran one-shot — ±1h around exit_time keeps
+        # stale serial references from poisoning the result.
+        # `row.exit_time` is UTC-naive (server-local stored as UTC);
+        # treat as aware UTC for the comparison.
+        exit_t = row.exit_time
+        if exit_t is None:
+            continue
+        if exit_t.tzinfo is None:
+            exit_t = exit_t.replace(tzinfo=timezone.utc)
+        from sqlalchemy import func, or_, and_
+        s = ctx.transactions._session()
+        lo = exit_t - timedelta(hours=1)
+        hi = exit_t + timedelta(hours=1)
+        serials = [x for x in (row.entry_serial, row.exit_serial)
+                   if x is not None]
+        if not serials:
+            continue
+        result = (
+            s.query(func.coalesce(
+                func.sum(TransactionEvent.commission), 0,
+            ))
+            .filter(
+                TransactionEvent.trade_serial.in_(serials),
+                TransactionEvent.action.in_([
+                    TransactionAction.FILLED,
+                    TransactionAction.PARTIAL_FILL,
+                ]),
+                TransactionEvent.requested_at >= lo,
+                TransactionEvent.requested_at <= hi,
+            )
+            .scalar()
+        )
+        summed = Decimal(str(result)) if result is not None else Decimal("0")
+        old_commission = row.commission or Decimal("0")
+
+        if summed > old_commission:
+            wrote = ctx.bot_trades.update_commission_if_higher(
+                row.id, summed,
+            )
+            if wrote:
+                logger.info(
+                    '{"event": "BOT_TRADE_COMMISSION_BACKFILLED", '
+                    '"trade_id": "%s", "symbol": "%s", '
+                    '"old_commission": "%s", "new_commission": "%s", '
+                    '"source": "transactions_sweep"}',
+                    row.id, row.symbol, str(old_commission), str(summed),
+                )
+                backfilled.append({
+                    "trade_id": row.id,
+                    "symbol": row.symbol,
+                    "old_commission": str(old_commission),
+                    "new_commission": str(summed),
+                })
+                # Recheck: if still below floor, fall through to warn.
+                if summed < _floor_for(row.symbol):
+                    await _warn_delivery_gap(ctx, row, summed, now, warned)
+            else:
+                # Concurrent write won — that's fine.
+                continue
+        elif exit_t < now - timedelta(hours=24):
+            await _warn_delivery_gap(ctx, row, old_commission, now, warned)
+
+    result = {
+        "backfilled": len(backfilled),
+        "warned": len(warned),
+        "details": {"backfilled": backfilled, "warned": warned},
+    }
+    logger.info(
+        '{"event": "COMMISSION_RECONCILIATION_COMPLETE", '
+        '"backfilled": %d, "warned": %d}',
+        len(backfilled), len(warned),
+    )
+    return result
+
+
+def _floor_for(symbol: str) -> Decimal:
+    from ib_trader.data.commissions import expected_min
+    return expected_min(symbol)
+
+
+async def _warn_delivery_gap(
+    ctx: AppContext, row, current_commission: Decimal,
+    now: datetime, warned: list[dict],
+) -> None:
+    """Emit a WARNING surfacing the upstream commission-delivery bug.
+    Only called for rows whose ``exit_time`` is older than 24h AND
+    whose commission is STILL below the symbol floor — anything fresher
+    might just be waiting on a ``commissionReport`` that hasn't landed
+    yet, and we don't want to fire false alarms during normal latency
+    windows.
+    """
+    floor = _floor_for(row.symbol)
+    msg = (
+        f"bot_trade {row.id[:8]} ({row.symbol}) commission "
+        f"${current_commission} is below the expected floor "
+        f"${floor} more than 24h after exit — the IB "
+        f"commissionReport for this round-trip was never applied. "
+        f"Investigate _on_commission_report dispatch / dedup."
+    )
+    await log_and_alert(
+        redis=ctx.redis,
+        trigger="COMMISSION_DELIVERY_GAP",
+        message=msg,
+        severity="WARNING",
+        bot_id=row.bot_id,
+        symbol=row.symbol,
+        extra={
+            "trade_id": row.id,
+            "stored_commission": str(current_commission),
+            "expected_floor": str(floor),
+            "exit_time": (
+                row.exit_time.isoformat() if row.exit_time else None
+            ),
+        },
+        exc_info=False,
+    )
+    warned.append({
+        "trade_id": row.id,
+        "symbol": row.symbol,
+        "stored_commission": str(current_commission),
+        "expected_floor": str(floor),
+    })
