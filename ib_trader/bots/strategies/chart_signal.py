@@ -3006,13 +3006,71 @@ class ChartSignalStrategy:
                     "elapsed_seconds": round(elapsed, 2),
                 },
             )]
-        # Rejection confirmed — exit immediately. Reason flavor
-        # depends on whether the trade was tagged marginal at entry:
-        # ``tight_counter_line`` for marginal (both-side cache),
-        # ``counter_line`` for clean (opposing-only cache). Operator
-        # can split clean vs marginal performance via the audit feed.
+        # Counter touch persisted through linger. By itself this is
+        # NOT an exit — operator decision 2026-05-18. The exit
+        # condition is now: counter-line touch AND trigger-line
+        # (entry line) breach. Bouncing off the opposing line back
+        # toward the trigger is normal wedge behavior; only treat
+        # it as a real failure when the trigger has ALSO failed.
+        # Compute the trigger line value at the current tick and
+        # check whether mid is on the wrong side beyond breach_tol.
         entry_line = ctx.state.get("entry_line") or {}
         is_marginal = bool(entry_line.get("marginal", False))
+        trigger_breached = False
+        trigger_value: float | None = None
+        try:
+            anchor_t = _parse_ts(entry_line.get("anchor_time"))
+            anchor_p = entry_line.get("anchor_price")
+            slope_per_sec_t = entry_line.get("slope_per_sec")
+            if (anchor_t is not None and anchor_p is not None
+                    and slope_per_sec_t is not None):
+                elapsed_t = (now - anchor_t).total_seconds()
+                trigger_value = (
+                    float(anchor_p) + float(slope_per_sec_t) * elapsed_t
+                )
+            else:
+                lv_at_entry = entry_line.get("line_value_at_entry")
+                if lv_at_entry is not None:
+                    trigger_value = float(lv_at_entry)
+        except Exception:  # noqa: BLE001
+            trigger_value = None
+        if trigger_value is not None:
+            breach_tol_frac = float(self.config.get(
+                "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+            ))
+            breach_tol = abs(trigger_value) * breach_tol_frac
+            if direction == "long":
+                trigger_breached = mid < (trigger_value - breach_tol)
+            else:
+                trigger_breached = mid > (trigger_value + breach_tol)
+
+        if not trigger_breached:
+            # Counter touch lingered but the trigger line still holds
+            # — bouncing off the opposing line back toward the trigger
+            # is normal. Clear the counter_touch state and keep the
+            # trade.
+            state_patch["counter_touch"] = None
+            return [LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=(
+                    f"{EXIT_COUNTER_LINE} touched but trigger holds — "
+                    f"counter @ {line_value:.4f}, mid {mid:.4f}, "
+                    f"trigger @ "
+                    f"{trigger_value if trigger_value is not None else 'N/A'}; "
+                    f"clearing touch, keeping trade"
+                ),
+                payload={
+                    "exit_trigger_cleared": EXIT_COUNTER_LINE,
+                    "reason": "trigger_holds",
+                    "line_value": line_value,
+                    "mid": mid,
+                    "trigger_value": trigger_value,
+                    "elapsed_seconds": round(elapsed, 2),
+                },
+            )]
+
+        # Trigger ALSO breached — rejection confirmed. Reason flavor
+        # depends on whether the trade was tagged marginal at entry.
         exit_label = (EXIT_TIGHT_COUNTER_LINE if is_marginal
                        else EXIT_COUNTER_LINE)
         detail = (
