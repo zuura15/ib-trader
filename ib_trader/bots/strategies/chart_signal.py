@@ -88,6 +88,13 @@ FILTER_MIN_TARGET = "min_target"
 FILTER_FAR_FROM_PIVOT = "far_from_pivot"
 FILTER_STALE_LINE = "stale_line"
 FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
+# Counter-trend entry filter. Up-sloping resistance shorts and
+# down-sloping support longs fade their own prevailing direction —
+# bad fit during clear trends, especially after a strong move. The
+# chart frontend hides these lines by default
+# (``showCounterResistance``/``showCounterSupport`` toggles); the
+# bot mirrors that default here. Bypassable in marginal mode.
+FILTER_COUNTER_TREND = "counter_trend"
 
 # Named exit triggers (alongside the bar-close line_breach / trail_stop).
 #   counter_line  — tick-time touch-and-hold: mid touches an opposing
@@ -1601,6 +1608,54 @@ class ChartSignalStrategy:
             return actions
         is_acceleration_entry = chosen_path == "accel"
 
+        # Counter-trend filter (FILTER_COUNTER_TREND). Reject SHORT on
+        # an up-sloping resistance and LONG on a down-sloping support
+        # — those entries fade their own direction (e.g., a resistance
+        # whose touches are STEPPING UP is the rally's upper envelope,
+        # not failed sellers). Slope == 0 (horizontal) is kept either
+        # way; an honest level is not counter-trend.
+        # Mirrors the chart frontend's ``showCounterResistance``
+        # /``showCounterSupport`` defaults so the bot doesn't enter on
+        # lines the operator can't even see by default.
+        # Bypassable in marginal mode; emits a SKIP either way so the
+        # audit feed records the counter-trend identification.
+        # Operator-driven 2026-05-18 after observing every MGC rally
+        # peak post-17:12 PT fire a SHORT.
+        ct_enabled = bool(self.config.get(
+            "entry_counter_trend_filter_enabled", True,
+        ))
+        if ct_enabled:
+            ct_violation = (
+                (direction == "long" and chosen.slope < 0)
+                or (direction == "short" and chosen.slope > 0)
+            )
+            if ct_violation:
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_COUNTER_TREND} filter "
+                        f"({direction.upper()}) — chosen "
+                        f"{kind} line slope={chosen.slope:+.4f}/bar "
+                        f"is counter-trend to entry direction"
+                        + (" [marginal mode]" if allow_marginal else "")
+                    ),
+                    payload={
+                        "filter": FILTER_COUNTER_TREND,
+                        "marginal": allow_marginal,
+                        "direction": direction,
+                        "line_kind": kind,
+                        "line_slope_per_bar": round(chosen.slope, 6),
+                        "entry_decision": decision_diag,
+                    },
+                ))
+                if allow_marginal:
+                    if direction == "long":
+                        marginal_filters_long.append(FILTER_COUNTER_TREND)
+                    else:
+                        marginal_filters_short.append(FILTER_COUNTER_TREND)
+                else:
+                    return actions
+
         # Far-from-pivot filter (FILTER_FAR_FROM_PIVOT). Rejects
         # entries where the fire bar's close has overshot the pivot's
         # rejection point on the trigger line by more than the
@@ -1666,16 +1721,24 @@ class ChartSignalStrategy:
                     return actions
 
         # Stale-line filter (FILTER_STALE_LINE).
-        # Caps the age of the chosen line's MOST RECENT strict touch.
-        # A line whose latest touch is more than ``entry_max_q_age_hours``
-        # (legacy name, kept for back-compat) ago means price hasn't
-        # respected the line in the last 24 h — stale structure that
-        # current participants may not honor. Q-anchor age is not
-        # checked: a line built 5 d ago that's still getting touched
-        # is valid; a fresh line whose only touches are 25 h old
-        # is not.
-        # 2026-05-15 operator call: "latest touch within 24 h, not
-        # necessarily the original."
+        # Line-validity gate (hard-reject; not bypassable in marginal
+        # mode — operator clarification 2026-05-18).
+        #
+        # Rule (post 2026-05-18): require AT LEAST
+        # ``entry_min_recent_strict_touches`` (default 2) strict
+        # touches on the chosen line within the last
+        # ``entry_max_q_age_hours`` (default 24h) of bars.
+        #
+        # The earlier "latest strict touch within 24h" rule passed any
+        # line whose newest touch happened to land inside the window —
+        # but a near-horizontal line that only got ONE accidental
+        # strict touch in 24h (and otherwise hasn't been respected
+        # since construction days ago) was still firing entries. Today
+        # on MGC, the bot fired ~15 phantom shorts on a May-15 line
+        # with only one strict touch in the recent window, dominated
+        # by loose-band coincidences. Requiring ≥ 2 RECENT strict
+        # touches forces a line to demonstrate ongoing relevance —
+        # the construction P-anchor alone isn't enough.
         sl_enabled = bool(self.config.get(
             "entry_stale_line_filter_enabled",
             # Back-compat with old key name.
@@ -1684,14 +1747,10 @@ class ChartSignalStrategy:
         max_q_age_hours = float(self.config.get(
             "entry_max_q_age_hours", 24.0,
         ))
+        min_recent_strict = int(self.config.get(
+            "entry_min_recent_strict_touches", 2,
+        ))
         if sl_enabled:
-            # Find the most recent strict touch on the chosen line.
-            # Iterates over the matching side's pivots within the
-            # line's valid lifespan [from_idx, to_idx] and tracks
-            # the highest index whose pivot close lies within
-            # touch_tol of the line value. If no later strict touch
-            # exists, P-anchor (anchor_b_idx) is itself a strict
-            # touch by construction so it's the floor.
             side_pivots = (
                 support_pivots if direction == "long"
                 else resistance_pivots
@@ -1700,60 +1759,60 @@ class ChartSignalStrategy:
                 chosen.break_idx if chosen.break_idx is not None
                 else last_idx
             )
-            latest_touch_idx = chosen.anchor_b_idx
+            # Window start in bar-index space: ``last_idx`` minus the
+            # number of bars covering ``max_q_age_hours``. Bar duration
+            # comes from ``self.bar_seconds`` (3-min default).
+            window_bars = int(
+                max_q_age_hours * 3600.0 / self.bar_seconds
+            )
+            window_start_idx = max(0, last_idx - window_bars)
+            recent_strict = 0
+            latest_touch_idx = -1
             for piv in side_pivots:
-                if piv <= chosen.anchor_b_idx or piv > to_idx:
+                if piv < window_start_idx or piv > to_idx:
                     continue
                 line_val_at_piv = (
                     chosen.intercept + chosen.slope * piv
                 )
                 if abs(closes[piv] - line_val_at_piv) <= touch_tol:
+                    recent_strict += 1
                     if piv > latest_touch_idx:
                         latest_touch_idx = piv
-            lt_time = None
-            if 0 <= latest_touch_idx < len(window):
-                wlt = window[latest_touch_idx]
-                lt_time = _parse_ts(
-                    wlt.get("timestamp_utc") or wlt.get("ts"),
-                )
-            if lt_time is not None:
-                from datetime import timedelta as _td
-                lt_age_hours = (
-                    bar_time - lt_time
-                ).total_seconds() / 3600.0
-                if lt_age_hours > max_q_age_hours:
-                    actions.append(LogSignal(
-                        event_type=LogEventType.SKIP,
-                        message=(
-                            f"{FILTER_STALE_LINE} filter ({direction.upper()})"
-                            f" — latest touch {lt_age_hours:.1f}h old "
-                            f"(cap {max_q_age_hours:.1f}h); line is "
-                            f"stale relative to current price action"
-                        ),
-                        payload={
-                            "filter": FILTER_STALE_LINE,
-                            # Stale_line is a LINE-VALIDITY gate, not
-                            # an entry filter — hard-reject regardless
-                            # of allow_marginal_entries. Operator
-                            # clarification 2026-05-18: filters that
-                            # validate the line itself (broken,
-                            # stale) are not bypassable; only the
-                            # post-pivot entry filters (shoulder,
-                            # min_target, far_from_pivot,
-                            # tight_triangle, opposing_dominance)
-                            # are. We keep ``marginal: False`` in the
-                            # payload so the audit-decision logic
-                            # picks this SKIP as the rejection cause
-                            # (not skipped over as a bypassed tag).
-                            "marginal": False,
-                            "direction": direction,
-                            "latest_touch_time": lt_time.isoformat(),
-                            "latest_touch_age_hours": round(lt_age_hours, 2),
-                            "max_age_hours": max_q_age_hours,
-                            "entry_decision": decision_diag,
-                        },
-                    ))
-                    return actions
+            if recent_strict < min_recent_strict:
+                # Translate latest_touch_idx → wallclock time for the
+                # SKIP payload's diagnostic (operator wants to see how
+                # old the most recent strict touch was, even when the
+                # COUNT is what tripped the reject).
+                lt_time_iso = None
+                if 0 <= latest_touch_idx < len(window):
+                    wlt = window[latest_touch_idx]
+                    lt = _parse_ts(
+                        wlt.get("timestamp_utc") or wlt.get("ts"),
+                    )
+                    if lt is not None:
+                        lt_time_iso = lt.isoformat()
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_STALE_LINE} filter ({direction.upper()})"
+                        f" — only {recent_strict} strict touch(es) in "
+                        f"the last {max_q_age_hours:.0f}h (need "
+                        f"≥ {min_recent_strict}); line is stale "
+                        f"relative to current price action"
+                    ),
+                    payload={
+                        "filter": FILTER_STALE_LINE,
+                        # Line-validity gate — not marginal-bypassable.
+                        "marginal": False,
+                        "direction": direction,
+                        "recent_strict_touches": recent_strict,
+                        "min_recent_strict": min_recent_strict,
+                        "max_age_hours": max_q_age_hours,
+                        "latest_strict_touch_time": lt_time_iso,
+                        "entry_decision": decision_diag,
+                    },
+                ))
+                return actions
 
         # Opposing-dominance filter (FILTER_OPPOSING_DOMINANCE).
         # Reject when the OPPOSITE-side market structure has many more

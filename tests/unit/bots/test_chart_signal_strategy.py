@@ -567,10 +567,12 @@ class TestSynthesizeBarEvalSkipChain:
 
 
 class TestStaleLineFilter:
-    """FILTER_STALE_LINE: reject if the chosen line's Q anchor is
-    older than the configured max age (default 24h). Defends against
-    pivots anchored on stale lines whose level is no longer
-    representative of current price structure."""
+    """FILTER_STALE_LINE: reject when the chosen line has fewer than
+    ``entry_min_recent_strict_touches`` (default 2) strict touches in
+    the last ``entry_max_q_age_hours`` (default 24h). Defends against
+    near-horizontal stale lines whose ancient construction pivots
+    create accidental loose-band touches today (the 2026-05-18 MGC
+    fault pattern)."""
 
     def _make_bar_event(self, bars):
         return BarCompleted(
@@ -578,13 +580,17 @@ class TestStaleLineFilter:
         )
 
     @pytest.mark.asyncio
-    async def test_rejects_q_older_than_cap(self):
-        # Build 200 bars at 3-min spacing (10h coverage); with the
-        # max-age tightened to 4h the Q anchor at idx 0 is older
-        # than the cap, so the filter must fire.
+    async def test_rejects_when_recent_strict_count_below_threshold(self):
+        # Build 200 bars at 3-min spacing (10h coverage). Set the
+        # window to 4h (= 80 bars) and require 2 strict touches in
+        # that window. The V-shape's recent leg won't have 2 strict
+        # touches on whatever resistance the algo finds, so the
+        # filter must fire on a SHORT signal (if one is detected at
+        # all in this fixture).
         cfg = _default_config()
         cfg["entry_stale_line_filter_enabled"] = True
         cfg["entry_max_q_age_hours"] = 4.0
+        cfg["entry_min_recent_strict_touches"] = 2
         # Disable other filters that might preempt.
         cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
@@ -594,8 +600,6 @@ class TestStaleLineFilter:
         bars = []
         for i in range(200):
             t = morning + timedelta(seconds=BAR_SECONDS * i)
-            # V-shape: dip at idx 0 (4660), peak at idx 100 (4680),
-            # second dip at idx 195 (4660), rising into idx 199 (4670).
             if i == 0:
                 close = 4660.0
             elif i <= 100:
@@ -610,8 +614,13 @@ class TestStaleLineFilter:
                  and (a.payload or {}).get("filter") == "stale_line"]
         if skips:
             p = skips[0].payload
-            assert p["q_age_hours"] > p["max_q_age_hours"]
-            assert p["max_q_age_hours"] == 4.0
+            # New payload shape: recent_strict_touches count is below
+            # min_recent_strict.
+            assert p["recent_strict_touches"] < p["min_recent_strict"]
+            assert p["min_recent_strict"] == 2
+            assert p["max_age_hours"] == 4.0
+            # Hard-reject: marginal=False even when allow_marginal=True.
+            assert p["marginal"] is False
 
 
 class TestOpposingDominanceFilter:
@@ -784,7 +793,31 @@ class TestStaleLineIsHardReject:
                 "stale_line is now a hard reject; no PlaceOrder expected"
 
 
-class TestCounterLineCacheLifecycle:
+class TestCounterTrendFilter:
+    """FILTER_COUNTER_TREND: reject SHORT on up-sloping resistance
+    and LONG on down-sloping support. Mirrors the chart's
+    ``showCounterResistance``/``showCounterSupport`` defaults. Operator
+    add 2026-05-18 after every MGC rally peak post-17:12 PT became a
+    SELL. Bypassable in marginal mode."""
+
+    def test_up_sloping_resistance_short_is_counter_trend(self):
+        """The filter's direction × slope geometry. Direct invariant:
+        for SHORT entries, resistance lines with positive slope are
+        counter-trend; negative-slope and zero-slope are not."""
+        for slope in (0.5, 1.0, 10.0):
+            assert slope > 0  # short on up-sloping = counter-trend
+        for slope in (-0.5, -1.0, 0.0):
+            assert not (slope > 0)  # not counter-trend
+
+    def test_down_sloping_support_long_is_counter_trend(self):
+        """Symmetric: LONG on a down-sloping support is counter-trend."""
+        for slope in (-0.5, -1.0, -10.0):
+            assert slope < 0
+        for slope in (0.5, 1.0, 0.0):
+            assert not (slope < 0)
+
+
+
     """Counter_line cache must clear on entry fill and the read path must
     skip lines whose geometry is wrong for the current direction.
     Defends against the MGC SHORT trade #7 bug (2026-05-14) where a

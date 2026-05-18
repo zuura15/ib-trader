@@ -60,13 +60,21 @@ min_slope_ratio: 1.5
 #   - far_from_pivot      (entry-to-line gap cap; touch path only)
 #   - tight_triangle      (wedge apex within block distance)
 #   - opposing_dominance  (opposing-side touch count ≥ ratio × chosen)
+#   - counter_trend       (SHORT on up-sloping resistance or LONG on
+#                          down-sloping support — fading the line's
+#                          own direction. Mirrors the chart's
+#                          ``showCounterResistance``/``showCounterSupport``
+#                          defaults.)
 # Hard-reject (NOT bypassable, regardless of allow_marginal):
 #   - max_signal_age      (bar event arrived too late — engine queue
 #                          freshness check, not a market judgement)
-#   - stale_line          (latest strict touch > 24h old — the line
-#                          isn't being honored by current participants;
-#                          firing here means fading dead structure.
-#                          Validity gate, not an entry filter.)
+#   - stale_line          (line has fewer than
+#                          ``entry_min_recent_strict_touches`` (default 2)
+#                          strict touches in the last
+#                          ``entry_max_q_age_hours`` (default 24h);
+#                          line isn't being honored by current
+#                          participants. Validity gate, not entry
+#                          filter.)
 #   - broken lines        (line.break_idx is not None — the market
 #                          already chose to violate this line. Hard
 #                          gate in the entry-candidate iteration
@@ -79,3 +87,14 @@ min_slope_ratio: 1.5
 # counter_line exit. Audit feed tags with ``·marginal`` so the
 # operator can A/B per trade.
 allow_marginal_entries: true
+
+# Counter-trend filter enabled. Reject SHORT on up-sloping
+# resistance and LONG on down-sloping support. Bypassable in
+# marginal mode (entry-quality, not line-validity).
+entry_counter_trend_filter_enabled: true
+
+# Stale-line minimum recent strict touches. Set to 2 per operator
+# call 2026-05-18 after observing every MGC rally peak post-17:12
+# PT fire a SHORT on a line whose only recent "touch" was a single
+# strict coincidence and 25 loose accidental near-touches.
+entry_min_recent_strict_touches: 2
