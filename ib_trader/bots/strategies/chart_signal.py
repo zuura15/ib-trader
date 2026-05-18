@@ -2634,26 +2634,30 @@ class ChartSignalStrategy:
             if direction == "long"
             else new_wm * (Decimal("1") + trail_pct)
         )
-        # Re-project the entry line value at this tick. Anchor +
-        # slope_per_sec × elapsed gives the current line; fall back
-        # to the fill-time snapshot if the anchor data is missing.
-        anchor_t_q = _parse_ts(entry_line.get("anchor_time"))
-        anchor_p_q = entry_line.get("anchor_price")
-        slope_per_sec_q = entry_line.get("slope_per_sec")
+        # Line component of active_stop is FROZEN at the entry-time
+        # line value, not re-projected at each tick (2026-05-18 fix
+        # after MGC 13:21 LONG was knifed at -$7 on a flat market).
+        #
+        # Why: re-projecting a steep up-sloping support (e.g.
+        # +1.025/bar = +$0.34/min) makes the line ratchet above the
+        # entry within seconds — even if price doesn't move, the
+        # line catches up to the mid and the touch+hold linger fires.
+        # That's an implicit "must rally as fast as the line slope"
+        # condition the operator didn't ask for and can't see on the
+        # chart.
+        #
+        # Freezing keeps the floor at the support level we entered
+        # on. If price holds at or above that level → no breach. As
+        # the trade works, HWM rises and trail eventually dominates
+        # anyway (trail > frozen line). The bar-close ``breach_line``
+        # check still re-projects, so we don't lose the "did the
+        # support actually fail" semantic at bar boundaries.
         now_utc = datetime.now(timezone.utc)
         line_val_d: Decimal | None = None
         try:
-            if (anchor_t_q is not None and anchor_p_q is not None
-                    and slope_per_sec_q is not None):
-                elapsed_q = (now_utc - anchor_t_q).total_seconds()
-                line_val_d = Decimal(str(
-                    float(anchor_p_q)
-                    + float(slope_per_sec_q) * elapsed_q
-                ))
-            else:
-                lv_at_entry = entry_line.get("line_value_at_entry")
-                if lv_at_entry is not None:
-                    line_val_d = Decimal(str(lv_at_entry))
+            lv_at_entry = entry_line.get("line_value_at_entry")
+            if lv_at_entry is not None:
+                line_val_d = Decimal(str(lv_at_entry))
         except Exception:  # noqa: BLE001
             line_val_d = None
         if line_val_d is not None:
