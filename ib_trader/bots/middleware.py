@@ -254,11 +254,18 @@ def _normalize_exit_reason(detail: str | None) -> str:
     if not detail:
         return ""
     txt = detail.lower()
-    # The chart_signal detail strings carry the reason in two shapes:
+    # The chart_signal detail strings carry the reason in shapes like:
     #   "TRAILING_STOP [long]: counter-line held ..." → counter_line
+    #   "TRAILING_STOP [long]: tight_counter_line held ..." → counter_line
+    #   "TRAILING_STOP [long]: trigger_retest (trigger) held ..." → trigger_retest
     #   "TRAILING_STOP [long]: 3-min bar close ... [trail_stop]"
     #   "TRAILING_STOP [long]: 3-min bar close ... [line_breach]"
     #   "TRAILING_STOP [long]: 3-min bar close ... [both]"
+    # Order matters: ``trigger_retest`` must match BEFORE
+    # ``counter_line`` since the legacy ``tight_counter_line`` label
+    # would otherwise win against any future ``tight_*_retest`` shape.
+    if "trigger_retest" in txt or "trigger-retest" in txt:
+        return "trigger_retest"
     if "counter-line" in txt or "counter_line" in txt:
         return "counter_line"
     if "[trail_stop]" in txt or "trail_stop" in txt:

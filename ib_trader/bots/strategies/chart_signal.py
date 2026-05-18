@@ -103,6 +103,17 @@ FILTER_COUNTER_TREND = "counter_trend"
 #                   (default 10) → immediate close.
 EXIT_COUNTER_LINE = "counter_line"
 EXIT_TIGHT_COUNTER_LINE = "tight_counter_line"
+# Trigger-line retest exit (touch+hold against the entry trendline
+# itself, NOT against an opposing line). The trigger line for a
+# SHORT is the resistance the bot faded to enter; for a LONG it's
+# the support it bounced off. When price retraces back to that line
+# and HOLDS within tol for ``counter_exit_hold_seconds``, the
+# original entry rejection is considered failed → exit.
+# This was previously labelled ``tight_counter_line`` (same constant
+# as the opposing-line marginal exit) which was operator-confusing —
+# the audit feed read "counter_line at 7386" but there was no
+# counter line at 7386, only the trigger line. Renamed 2026-05-18.
+EXIT_TRIGGER_LINE_RETEST = "trigger_retest"
 
 
 def _parse_ts(ts: Any) -> datetime | None:
@@ -2711,13 +2722,24 @@ class ChartSignalStrategy:
         self, ctx: StrategyContext, mid: float, direction: str,
         state_patch: dict,
     ) -> list[Action]:
-        """Tick-time touch-and-hold against the trigger line and the
-        active_stop. Marginal trades only.
+        """Tick-time touch-and-hold against the TRIGGER LINE (the line
+        the entry was based on). Runs for BOTH clean and marginal
+        trades (post f352330).
 
-        Geometry is flipped vs the opposing-line check: trigger line
-        and SL sit on the FAVORABLE side of price (above for SHORT,
+        For a SHORT, the trigger line is the RESISTANCE the bot
+        faded; for a LONG it's the SUPPORT it bounced off. If price
+        retraces back to within ``tol`` of that line and holds for
+        ``counter_exit_hold_seconds``, the original entry rejection
+        is considered failed → exit.
+
+        Geometry is flipped vs the opposing-line check: the trigger
+        line sits on the FAVORABLE side of price (above for SHORT,
         below for LONG), so a touch means price has retraced *back*
-        to the line and the trade is failing.
+        to the line.
+
+        Exit reason logged as ``trigger_retest`` (not
+        ``tight_counter_line`` — the latter is reserved for the
+        marginal opposing-line case in ``_check_counter_line_exit``).
         """
         zones = ctx.state.get("tight_zones") or []
         tol = float(ctx.state.get("counter_lines_tol", 0.0))
@@ -2772,13 +2794,13 @@ class ChartSignalStrategy:
                     return [LogSignal(
                         event_type=LogEventType.EXIT_CHECK,
                         message=(
-                            f"{EXIT_TIGHT_COUNTER_LINE} armed "
-                            f"({z.get('kind', '?')}) — zone {lv:.4f} "
+                            f"{EXIT_TRIGGER_LINE_RETEST} armed "
+                            f"({z.get('kind', '?')}) — line {lv:.4f} "
                             f"touched (mid={mid:.4f}); hold "
                             f"{hold_secs:.0f}s for failure confirm"
                         ),
                         payload={
-                            "exit_trigger_armed": EXIT_TIGHT_COUNTER_LINE,
+                            "exit_trigger_armed": EXIT_TRIGGER_LINE_RETEST,
                             "zone_value": lv,
                             "zone_kind": z.get("kind", "?"),
                             "mid": mid,
@@ -2808,12 +2830,12 @@ class ChartSignalStrategy:
             return [LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
                 message=(
-                    f"{EXIT_TIGHT_COUNTER_LINE} cleared ({zone_kind}) — "
-                    f"mid {mid:.4f} on favorable side of zone {lv:.4f}; "
+                    f"{EXIT_TRIGGER_LINE_RETEST} cleared ({zone_kind}) — "
+                    f"mid {mid:.4f} on favorable side of line {lv:.4f}; "
                     f"resetting"
                 ),
                 payload={
-                    "exit_trigger_cleared": EXIT_TIGHT_COUNTER_LINE,
+                    "exit_trigger_cleared": EXIT_TRIGGER_LINE_RETEST,
                     "zone_value": lv,
                     "zone_kind": zone_kind,
                     "mid": mid,
@@ -2821,23 +2843,22 @@ class ChartSignalStrategy:
                 },
             )]
         detail = (
-            f"{EXIT_TIGHT_COUNTER_LINE} ({zone_kind}) held "
+            f"{EXIT_TRIGGER_LINE_RETEST} ({zone_kind}) held "
             f"{elapsed:.1f}s at {lv:.4f} (mid={mid:.4f})"
         )
         state_patch["tight_touch"] = None
-        state_patch["exit_reason"] = EXIT_TIGHT_COUNTER_LINE
+        state_patch["exit_reason"] = EXIT_TRIGGER_LINE_RETEST
         return [
             LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
-                message=f"{EXIT_TIGHT_COUNTER_LINE} exit — {detail}",
+                message=f"{EXIT_TRIGGER_LINE_RETEST} exit — {detail}",
                 payload={
-                    "exit_trigger": EXIT_TIGHT_COUNTER_LINE,
+                    "exit_trigger": EXIT_TRIGGER_LINE_RETEST,
                     "zone_value": lv,
                     "zone_kind": zone_kind,
                     "mid": mid,
                     "elapsed_seconds": round(elapsed, 2),
                     "hold_seconds": hold_secs,
-                    "marginal_trade": True,
                 },
             ),
             UpdateState(state_patch),
