@@ -326,3 +326,34 @@ export function getHistory(opts: {
   if (opts.barSize) qs.set('bar_size', opts.barSize);
   return request<HistoryBar[]>(`/history?${qs.toString()}`);
 }
+
+// --- Regime (ADX/ATR/Donchian — chart top-left badge) ---
+
+export interface RegimeReading {
+  regime: 'up' | 'down' | 'flat' | 'uncertain' | 'insufficient';
+  n_bars: number;
+  sufficient_bars?: boolean;
+  last_ts?: string | null;
+  adx?: number;
+  dmp?: number;  // +DI
+  dmn?: number;  // -DI
+  atr?: number;
+  dcu?: number;  // Donchian upper
+  dcl?: number;  // Donchian lower
+}
+
+export function getRegime(opts: {
+  conId?: number | null;
+  symbol?: string;
+  secType?: string;
+  hours?: number;
+  barSize?: string;
+}) {
+  const qs = new URLSearchParams();
+  if (opts.conId != null) qs.set('con_id', String(opts.conId));
+  if (opts.symbol) qs.set('symbol', opts.symbol);
+  if (opts.secType) qs.set('sec_type', opts.secType);
+  if (opts.hours != null) qs.set('hours', String(opts.hours));
+  if (opts.barSize) qs.set('bar_size', opts.barSize);
+  return request<RegimeReading>(`/regime?${qs.toString()}`);
+}

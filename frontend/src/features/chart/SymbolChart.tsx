@@ -5,7 +5,7 @@ import {
   createChart, ColorType, LineSeries, HistogramSeries,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
 } from 'lightweight-charts';
-import { getHistory } from '../../api/client';
+import { getHistory, getRegime, type RegimeReading } from '../../api/client';
 import {
   type SavedRange, type Bar,
   VISIBLE_MINUTES, PRELOAD_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
@@ -523,6 +523,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Called from the SR recompute and from pan/zoom/resize events.
   const repositionSrSignalsRef = useRef<(() => void) | null>(null);
   const paintApexBadgeRef = useRef<(() => void) | null>(null);
+  // Regime badge — top-left, directly under the SR apex badge.
+  // Shows ADX / +DI / −DI / ATR / Donchian extremes from the
+  // backend's chart_signal regime classifier (/api/regime). Single
+  // value per chart, fetched alongside SR every 15s.
+  const regimeBadgeRef = useRef<HTMLDivElement | null>(null);
+  const regimeReadingRef = useRef<RegimeReading | null>(null);
+  const paintRegimeBadgeRef = useRef<(() => void) | null>(null);
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
   // The old ``SR_MIN_BARS`` viewport gate was removed (2026-05-10): it
@@ -1131,6 +1138,75 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // ``title`` is the native browser tooltip. Multi-line text
       // works in Chrome/Safari/Firefox via embedded ``\n``.
       badge.title = srBackendTooltipRef.current || '';
+    };
+
+    // Regime badge — single-line ADX/+DI/−DI/ATR/Donchian summary,
+    // colored by regime classification. Sits directly under the SR
+    // apex badge (top: 28px) so both readings are visible at a
+    // glance. Hover for full numbers + n_bars + last_ts.
+    paintRegimeBadgeRef.current = () => {
+      let badge = regimeBadgeRef.current;
+      if (!badge && el) {
+        badge = document.createElement('div');
+        badge.setAttribute(
+          'style',
+          'position:absolute;top:28px;left:8px;z-index:11;'
+          + 'font-family:ui-monospace,Menlo,monospace;font-size:11px;'
+          + 'padding:1px 6px;border-radius:4px;line-height:1.25;'
+          + 'background:rgba(120,120,120,0.12);color:rgba(80,80,80,0.85);'
+          + 'user-select:none;letter-spacing:0.3px;font-weight:500;'
+          + 'white-space:pre;cursor:default;',
+        );
+        el.appendChild(badge);
+        regimeBadgeRef.current = badge;
+      }
+      if (!badge) return;
+      const r = regimeReadingRef.current;
+      if (r === null) {
+        badge.textContent = '◇ …';
+        badge.title = '';
+        return;
+      }
+      const regimeLabel = r.regime.toUpperCase();
+      // Color by regime: up=green, down=red, flat/uncertain=amber,
+      // insufficient=gray.
+      let bg = 'rgba(120,120,120,0.12)';
+      let fg = 'rgba(80,80,80,0.85)';
+      if (r.regime === 'up') {
+        bg = 'rgba(34,139,75,0.15)';
+        fg = 'rgba(20,100,55,0.95)';
+      } else if (r.regime === 'down') {
+        bg = 'rgba(200,60,60,0.15)';
+        fg = 'rgba(150,30,30,0.95)';
+      } else if (r.regime === 'flat' || r.regime === 'uncertain') {
+        bg = 'rgba(220,160,40,0.15)';
+        fg = 'rgba(160,100,20,0.95)';
+      }
+      badge.style.background = bg;
+      badge.style.color = fg;
+      const fmt = (v: number | undefined, d = 1): string =>
+        v == null || !Number.isFinite(v) ? '—' : v.toFixed(d);
+      const adxPart = r.adx != null
+        ? `ADX ${fmt(r.adx, 1)} +DI ${fmt(r.dmp, 1)} −DI ${fmt(r.dmn, 1)}`
+        : `n=${r.n_bars}`;
+      const atrPart = r.atr != null ? `ATR ${fmt(r.atr, 4)}` : '';
+      const dcPart = (r.dcl != null && r.dcu != null)
+        ? `DC ${fmt(r.dcl, 2)}/${fmt(r.dcu, 2)}` : '';
+      const parts = [`◇ ${regimeLabel}`, adxPart, atrPart, dcPart]
+        .filter(Boolean);
+      badge.textContent = parts.join(' · ');
+      const tip: string[] = [
+        `regime: ${r.regime}`,
+        `n_bars: ${r.n_bars}`,
+      ];
+      if (r.adx != null) tip.push(`ADX: ${fmt(r.adx, 2)}`);
+      if (r.dmp != null) tip.push(`+DI: ${fmt(r.dmp, 2)}`);
+      if (r.dmn != null) tip.push(`−DI: ${fmt(r.dmn, 2)}`);
+      if (r.atr != null) tip.push(`ATR: ${fmt(r.atr, 4)}`);
+      if (r.dcu != null) tip.push(`DCU: ${fmt(r.dcu, 4)}`);
+      if (r.dcl != null) tip.push(`DCL: ${fmt(r.dcl, 4)}`);
+      if (r.last_ts) tip.push(`last bar: ${r.last_ts}`);
+      badge.title = tip.join('\n');
     };
 
     setChartVersion((v) => v + 1);
@@ -1904,6 +1980,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         srApexBadgeRef.current.parentNode.removeChild(srApexBadgeRef.current);
       }
       srApexBadgeRef.current = null;
+      if (regimeBadgeRef.current && regimeBadgeRef.current.parentNode) {
+        regimeBadgeRef.current.parentNode.removeChild(regimeBadgeRef.current);
+      }
+      regimeBadgeRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -2272,6 +2352,38 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         srBackendDataRef.current = payload;
       }
       scheduleSrRecomputeRef.current?.(true);
+    };
+    doFetch();
+    const id = window.setInterval(doFetch, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [target?.conId, target?.symbol, target?.secType]);
+
+  // Regime fetch — one ADX/ATR/Donchian reading per chart, refreshed
+  // on the same 15s cadence as SR. ``insufficient`` regimes still
+  // return a payload (we render the regime label + n_bars only); a
+  // 503/error leaves the last good reading in place so a flaky
+  // engine restart doesn't blank the badge.
+  useEffect(() => {
+    if (!target) return;
+    let cancelled = false;
+    const doFetch = async () => {
+      try {
+        const reading = await getRegime({
+          conId: target.conId,
+          symbol: target.symbol,
+          secType: target.secType,
+          hours: 24,
+          barSize: '3 mins',
+        });
+        if (cancelled) return;
+        if (reading) regimeReadingRef.current = reading;
+      } catch {
+        // Preserve last-good reading on transient failures.
+      }
+      paintRegimeBadgeRef.current?.();
     };
     doFetch();
     const id = window.setInterval(doFetch, 15000);

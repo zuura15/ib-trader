@@ -355,6 +355,72 @@ function DetailLine({ label, value }: { label: string; value: React.ReactNode })
   );
 }
 
+/** Copy the rendered text content of ``ref`` to the clipboard.
+ *  Uses ``innerText`` (preserves line breaks from block layout)
+ *  rather than ``textContent`` (jams everything on one line). */
+async function copyDetailsToClipboard(
+  ref: React.RefObject<HTMLDivElement | null>,
+  setCopied: (v: boolean) => void,
+) {
+  const el = ref.current;
+  if (!el) return;
+  const text = el.innerText.trim();
+  try {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  } catch {
+    // Older browsers / non-secure contexts: fall back to a manual
+    // textarea + execCommand. Best-effort; modern Chrome on https
+    // takes the path above.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch { /* swallow */ }
+    document.body.removeChild(ta);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+}
+
+function DetailFooter({ onCopy, onShowRaw, copied }: {
+  onCopy: () => void;
+  onShowRaw: () => void;
+  copied: boolean;
+}) {
+  const btn = {
+    background: 'transparent',
+    border: '1px solid var(--border-default)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    fontSize: 10, padding: '2px 6px', borderRadius: 3,
+  };
+  return (
+    <div style={{
+      marginTop: 6, display: 'flex',
+      justifyContent: 'flex-end', gap: 6,
+    }}>
+      <button
+        onClick={(e) => { e.stopPropagation(); onCopy(); }}
+        title="copy details as text"
+        style={btn}
+      >
+        {copied ? '✓ copied' : '📋 copy'}
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); onShowRaw(); }}
+        title="show raw JSON dump for this row"
+        style={btn}
+      >
+        {'{ }'} raw JSON
+      </button>
+    </div>
+  );
+}
+
 /** Fetch the next 3-min bar's close from /api/history. Returns null
  *  if it hasn't closed yet (the bar timestamp is in the future). */
 async function fetchNextBarClose(
@@ -380,6 +446,8 @@ function ExpandedBarEval({ row, onShowRaw }: {
 }) {
   const a = (row.payload as AuditPayload | null)?.audit ?? {};
   const [nextClose, setNextClose] = useState<number | null | 'pending'>('pending');
+  const detailsRef = useRef<HTMLDivElement | null>(null);
+  const [copied, setCopied] = useState(false);
   useEffect(() => {
     let cancelled = false;
     if (row.event_ts_utc) {
@@ -417,47 +485,39 @@ function ExpandedBarEval({ row, onShowRaw }: {
       background: 'var(--panel-bg-alt, rgba(0,0,0,0.04))',
       borderLeft: '2px solid var(--border-default)',
     }}>
-      <DetailLine label="prior close" value={_fmtPrice(a.prior_bar_close ?? null)} />
-      <DetailLine
-        label="next close"
-        value={evalClose !== null
-          ? `${_fmtPrice(evalClose)}  (eval @ ${evalAt})`
-          : nextClose === 'pending' ? '…'
-          : nextClose === null ? '— (bar not closed yet)'
-          : _fmtPrice(nextClose)}
-      />
-      <DetailLine
-        label="filter"
-        value={
-          !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
-            ? 'N/A — no current-session 3+touch candidate'
-            : a.filter_name
-            ? _fmtFilter(a.filter_name, a.filter_detail ?? '')
-            : '— (passed all filters)'
-        }
-      />
-      {lineEntries}
-      <DetailLine label="outcome" value={
-        a.outcome === 'B' ? 'BUY · entry order placed'
-        : a.outcome === 'S' ? 'SELL · entry order placed'
-        : a.outcome === 'exit' ? 'EXIT · trailing stop or counter-line fired'
-        : a.outcome ?? '—'
-      } />
-      <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end' }}>
-        <button
-          onClick={(e) => { e.stopPropagation(); onShowRaw(); }}
-          title="show raw JSON dump for this row"
-          style={{
-            background: 'transparent',
-            border: '1px solid var(--border-default)',
-            color: 'var(--text-secondary)',
-            cursor: 'pointer',
-            fontSize: 10, padding: '2px 6px', borderRadius: 3,
-          }}
-        >
-          📋 raw JSON
-        </button>
+      <div ref={detailsRef}>
+        <DetailLine label="prior close" value={_fmtPrice(a.prior_bar_close ?? null)} />
+        <DetailLine
+          label="next close"
+          value={evalClose !== null
+            ? `${_fmtPrice(evalClose)}  (eval @ ${evalAt})`
+            : nextClose === 'pending' ? '…'
+            : nextClose === null ? '— (bar not closed yet)'
+            : _fmtPrice(nextClose)}
+        />
+        <DetailLine
+          label="filter"
+          value={
+            !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
+              ? 'N/A — no current-session 3+touch candidate'
+              : a.filter_name
+              ? _fmtFilter(a.filter_name, a.filter_detail ?? '')
+              : '— (passed all filters)'
+          }
+        />
+        {lineEntries}
+        <DetailLine label="outcome" value={
+          a.outcome === 'B' ? 'BUY · entry order placed'
+          : a.outcome === 'S' ? 'SELL · entry order placed'
+          : a.outcome === 'exit' ? 'EXIT · trailing stop or counter-line fired'
+          : a.outcome ?? '—'
+        } />
       </div>
+      <DetailFooter
+        onCopy={() => copyDetailsToClipboard(detailsRef, setCopied)}
+        onShowRaw={onShowRaw}
+        copied={copied}
+      />
     </div>
   );
 }
@@ -472,6 +532,8 @@ function ExpandedTradeClosed({ row, onShowRaw }: {
   const p = row.payload as Record<string, unknown> | null;
   const direction = row.decision.split('·')[1] || '';
   const reason = row.decision.split('·').slice(2).join('·') || '—';
+  const detailsRef = useRef<HTMLDivElement | null>(null);
+  const [copied, setCopied] = useState(false);
   const get = (k: string) => p?.[k] as string | number | undefined;
   const getStr = (k: string) => {
     const v = p?.[k];
@@ -529,7 +591,7 @@ function ExpandedTradeClosed({ row, onShowRaw }: {
       background: 'var(--panel-bg-alt, rgba(0,0,0,0.04))',
       borderLeft: '2px solid var(--border-default)',
     }}>
-      <div style={{
+      <div ref={detailsRef} style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
         gap: '10px 18px',
@@ -622,19 +684,11 @@ function ExpandedTradeClosed({ row, onShowRaw }: {
           </div>
         )}
       </div>
-      <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
-        <button
-          onClick={(e) => { e.stopPropagation(); onShowRaw(); }}
-          style={{
-            background: 'transparent',
-            border: '1px solid var(--border-default)',
-            color: 'var(--text-secondary)',
-            cursor: 'pointer', fontSize: 10, padding: '2px 6px', borderRadius: 3,
-          }}
-        >
-          📋 raw JSON
-        </button>
-      </div>
+      <DetailFooter
+        onCopy={() => copyDetailsToClipboard(detailsRef, setCopied)}
+        onShowRaw={onShowRaw}
+        copied={copied}
+      />
     </div>
   );
 }
@@ -645,6 +699,8 @@ function ExpandedOrder({ row, onShowRaw }: {
   const p = row.payload as Record<string, unknown> | null;
   const get = (k: string) => (p?.[k] as string | undefined);
   const ec = (p?.exit_context as Record<string, unknown> | undefined) ?? {};
+  const detailsRef = useRef<HTMLDivElement | null>(null);
+  const [copied, setCopied] = useState(false);
   return (
     <div style={{
       marginTop: 6, marginLeft: 8,
@@ -652,27 +708,21 @@ function ExpandedOrder({ row, onShowRaw }: {
       background: 'var(--panel-bg-alt, rgba(0,0,0,0.04))',
       borderLeft: '2px solid var(--border-default)',
     }}>
-      <DetailLine label="side"       value={get('side') || '—'} />
-      <DetailLine label="qty"        value={get('qty') || '—'} />
-      <DetailLine label="order type" value={get('order_type') || '—'} />
-      <DetailLine label="origin"     value={get('origin') || '—'} />
-      {Object.keys(ec).length > 0 && (
-        <DetailLine label="exit context"
-          value={JSON.stringify(ec).slice(0, 200)} />
-      )}
-      <div style={{ marginTop: 6, display: 'flex', justifyContent: 'flex-end' }}>
-        <button
-          onClick={(e) => { e.stopPropagation(); onShowRaw(); }}
-          style={{
-            background: 'transparent',
-            border: '1px solid var(--border-default)',
-            color: 'var(--text-secondary)',
-            cursor: 'pointer', fontSize: 10, padding: '2px 6px', borderRadius: 3,
-          }}
-        >
-          📋 raw JSON
-        </button>
+      <div ref={detailsRef}>
+        <DetailLine label="side"       value={get('side') || '—'} />
+        <DetailLine label="qty"        value={get('qty') || '—'} />
+        <DetailLine label="order type" value={get('order_type') || '—'} />
+        <DetailLine label="origin"     value={get('origin') || '—'} />
+        {Object.keys(ec).length > 0 && (
+          <DetailLine label="exit context"
+            value={JSON.stringify(ec).slice(0, 200)} />
+        )}
       </div>
+      <DetailFooter
+        onCopy={() => copyDetailsToClipboard(detailsRef, setCopied)}
+        onShowRaw={onShowRaw}
+        copied={copied}
+      />
     </div>
   );
 }
@@ -756,25 +806,45 @@ function FeedRow({ row, onShowRaw }: {
   row: AuditRow; onShowRaw: (r: AuditRow) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  // Click + userSelect:none only on the header so it toggles cleanly
+  // without swallowing text selection. The expanded body sits as a
+  // sibling and is freely selectable (and stops click propagation so
+  // dragging-to-select doesn't collapse the row).
   return (
     <div
-      onClick={() => setExpanded((v) => !v)}
       style={{
-        padding: '5px 8px',
         borderBottom: '1px solid var(--border-default)',
-        cursor: 'pointer',
-        userSelect: 'none',
       }}
     >
-      {row.event_type === 'BAR_EVAL' && <BarEvalRow r={row} />}
-      {row.event_type === 'ORDER_PLACED' && <OrderRow r={row} />}
-      {row.event_type === 'TRADE_CLOSED' && <TradeClosedRow r={row} />}
-      {expanded && row.event_type === 'BAR_EVAL'
-        && <ExpandedBarEval row={row} onShowRaw={() => onShowRaw(row)} />}
-      {expanded && row.event_type === 'TRADE_CLOSED'
-        && <ExpandedTradeClosed row={row} onShowRaw={() => onShowRaw(row)} />}
-      {expanded && row.event_type === 'ORDER_PLACED'
-        && <ExpandedOrder row={row} onShowRaw={() => onShowRaw(row)} />}
+      <div
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          padding: '5px 8px',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        {row.event_type === 'BAR_EVAL' && <BarEvalRow r={row} />}
+        {row.event_type === 'ORDER_PLACED' && <OrderRow r={row} />}
+        {row.event_type === 'TRADE_CLOSED' && <TradeClosedRow r={row} />}
+      </div>
+      {expanded && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          style={{
+            padding: '0 8px 5px',
+            userSelect: 'text',
+          }}
+        >
+          {row.event_type === 'BAR_EVAL'
+            && <ExpandedBarEval row={row} onShowRaw={() => onShowRaw(row)} />}
+          {row.event_type === 'TRADE_CLOSED'
+            && <ExpandedTradeClosed row={row} onShowRaw={() => onShowRaw(row)} />}
+          {row.event_type === 'ORDER_PLACED'
+            && <ExpandedOrder row={row} onShowRaw={() => onShowRaw(row)} />}
+        </div>
+      )}
     </div>
   );
 }

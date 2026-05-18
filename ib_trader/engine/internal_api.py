@@ -788,6 +788,52 @@ async def get_sr(
     }
 
 
+@app.get("/engine/regime")
+async def get_regime(
+    con_id: int | None = None,
+    symbol: str | None = None,
+    sec_type: str = "STK",
+    hours: int = 24,
+    bar_size: str = "3 mins",
+    adx_period: int = 14,
+    atr_period: int = 14,
+    donchian_period: int = 20,
+    trending_threshold: float = 25.0,
+    ranging_threshold: float = 20.0,
+):
+    """Local regime classification (ADX + ATR + Donchian).
+
+    Computes the same regime reading the chart_signal entry gate
+    uses, so the chart can display it next to the price action. Bar
+    window matches ``/engine/sr`` (closed-bar slice, no in-progress).
+
+    Returns ``RegimeReading.to_audit_payload()`` augmented with the
+    bar window's last timestamp so the frontend can show staleness.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    bars_raw = await get_history(
+        con_id=con_id, symbol=symbol, sec_type=sec_type,
+        hours=hours, bar_size=bar_size, include_partial=False,
+    )
+    if not bars_raw:
+        return {"regime": "insufficient", "n_bars": 0, "last_ts": None}
+
+    from ib_trader.bots.strategies.regime import compute_regime
+    reading = compute_regime(
+        bars_raw,
+        adx_period=adx_period,
+        atr_period=atr_period,
+        donchian_period=donchian_period,
+        trending_threshold=trending_threshold,
+        ranging_threshold=ranging_threshold,
+    )
+    payload = reading.to_audit_payload()
+    payload["last_ts"] = bars_raw[-1].get("ts") if bars_raw else None
+    payload["sufficient_bars"] = reading.sufficient_bars
+    return payload
+
+
 @app.get("/engine/health", response_model=HealthResponse)
 async def health():
     """Engine health check."""
