@@ -1192,10 +1192,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         : v.direction === 'v_down'
         ? 'V·DOWN'
         : 'V·—';
+      // Append the ADX regime direction at the end so the operator
+      // sees BOTH readings on one line: V detection (the bar-level
+      // event) and ADX regime (the longer-term direction the entry
+      // gate uses). Separator is " ; " so the two halves are
+      // visually distinct.
+      const regimeLabel = r.regime === 'up' ? 'ADX·UP'
+        : r.regime === 'down' ? 'ADX·DOWN'
+        : r.regime === 'flat' ? 'ADX·FLAT'
+        : r.regime === 'uncertain' ? 'ADX·UNCERTAIN'
+        : 'ADX·…';
       badge.textContent = (
         `${dirLabel}  BOS:${mark(v.bos_confirmed)} `
         + `A:${mark(v.trigger_a_fired)} `
         + `B:${mark(v.trigger_b_fired)}`
+        + ` ; ${regimeLabel}`
       );
       // Tooltip with full diagnostic.
       const fmt = (x: number | null | undefined, d = 4) =>
