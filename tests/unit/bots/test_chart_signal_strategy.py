@@ -1757,8 +1757,9 @@ class TestRegimeGate:
         actions = await s.on_event(self._bar_event(bars), ctx)
         skips = [a for a in actions if isinstance(a, LogSignal)
                  and a.event_type == LogEventType.SKIP
-                 and (a.payload or {}).get("filter") == "adx_regime"]
-        assert skips, f"expected adx_regime SKIP, got {actions}"
+                 and (a.payload or {}).get("filter")
+                 == "local_peak_in_uptrend"]
+        assert skips, f"expected local_peak_in_uptrend SKIP, got {actions}"
         s_payload = skips[0].payload
         assert s_payload["direction"] == "short"
         assert s_payload["regime"] == "up"
@@ -1774,27 +1775,30 @@ class TestRegimeGate:
         actions = await s.on_event(self._bar_event(bars), ctx)
         skips = [a for a in actions if isinstance(a, LogSignal)
                  and a.event_type == LogEventType.SKIP
-                 and (a.payload or {}).get("filter") == "adx_regime"]
-        assert skips, f"expected adx_regime SKIP, got {actions}"
+                 and (a.payload or {}).get("filter")
+                 == "local_trough_in_downtrend"]
+        assert skips, f"expected local_trough_in_downtrend SKIP, got {actions}"
         s_payload = skips[0].payload
         assert s_payload["direction"] == "long"
         assert s_payload["regime"] == "down"
 
     @pytest.mark.asyncio
     async def test_pro_regime_long_not_blocked_by_regime(self):
-        """Up regime + LONG candidate — should NOT trip the adx_regime
+        """Up regime + LONG candidate — should NOT trip the regime
         gate. Other filters may still reject but regime stays out."""
         cfg = _default_config()
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         bars = self._build_window(self._uptrend_with_pivot_low_at_end())
         actions = await s.on_event(self._bar_event(bars), ctx)
-        adx_skips = [a for a in actions if isinstance(a, LogSignal)
-                     and a.event_type == LogEventType.SKIP
-                     and (a.payload or {}).get("filter") == "adx_regime"]
-        assert not adx_skips, (
-            f"adx_regime should not fire on pro-regime direction, "
-            f"got {adx_skips}"
+        regime_skips = [a for a in actions if isinstance(a, LogSignal)
+                        and a.event_type == LogEventType.SKIP
+                        and (a.payload or {}).get("filter") in (
+                            "local_peak_in_uptrend",
+                            "local_trough_in_downtrend",
+                        )]
+        assert not regime_skips, (
+            f"regime gate should not fire on pro-direction, got {regime_skips}"
         )
 
     @pytest.mark.asyncio
@@ -1840,7 +1844,9 @@ class TestRegimeGate:
         regime_skips = [a for a in actions if isinstance(a, LogSignal)
                         and a.event_type == LogEventType.SKIP
                         and (a.payload or {}).get("filter") in (
-                            "adx_regime", "flat_amplitude", "flat_extreme",
+                            "local_peak_in_uptrend",
+                            "local_trough_in_downtrend",
+                            "flat_amplitude", "flat_extreme",
                         )]
         assert not regime_skips, (
             f"insufficient bars should not gate, got {regime_skips}"
@@ -1860,7 +1866,9 @@ class TestRegimeGate:
         regime_skips = [a for a in actions if isinstance(a, LogSignal)
                         and a.event_type == LogEventType.SKIP
                         and (a.payload or {}).get("filter") in (
-                            "adx_regime", "flat_amplitude", "flat_extreme",
+                            "local_peak_in_uptrend",
+                            "local_trough_in_downtrend",
+                            "flat_amplitude", "flat_extreme",
                         )]
         assert not regime_skips, (
             f"disabled regime gate should not fire, got {regime_skips}"

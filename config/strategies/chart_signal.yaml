@@ -120,7 +120,8 @@ sl_linger_marginal_seconds: 10
 # Runs AFTER pivot detection and BEFORE the entry-filter chain.
 # Bar-level gates — hard-reject, not bypassable in marginal mode
 # (these classify the market, not the entry quality):
-#   - adx_regime         (direction conflicts with trending regime)
+#   - local_peak_in_uptrend     (SHORT candidate, but local regime is up)
+#   - local_trough_in_downtrend (LONG candidate, but local regime is down)
 #   - flat_amplitude     (flat regime + expected swing < cost floor)
 #   - flat_extreme       (flat regime + pivot not at Donchian extreme)
 #   - insufficient_bars_for_regime  (warm-up not complete; falls

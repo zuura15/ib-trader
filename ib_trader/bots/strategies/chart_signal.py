@@ -99,14 +99,19 @@ FILTER_COUNTER_TREND = "counter_trend"
 # Local-regime gates (2026-05-17). Bar-level, run AFTER pivot
 # detection and BEFORE 3-touch line search. Each is hard-reject —
 # these are market-regime decisions, not entry-quality bypasses.
-#   adx_regime        — direction conflicts with the trending regime
-#                       (ADX > 25 + +DI/−DI sign).
+#   local_peak_in_uptrend    — SHORT candidate, but local regime is
+#                              UP (ADX > 25, +DI > −DI). Don't sell
+#                              into a confirmed uptrend.
+#   local_trough_in_downtrend — LONG candidate, but local regime is
+#                              DOWN (ADX > 25, −DI > +DI). Don't buy
+#                              into a confirmed downtrend.
 #   flat_amplitude    — flat regime + ATR × N-bars < edge-mult × costs.
 #   flat_extreme      — flat regime + pivot not at the Donchian
 #                       N-bar extreme (within tol).
 #   insufficient_bars — bar window too small to derive a regime;
 #                       falls through to flat-conservative gates.
-FILTER_ADX_REGIME = "adx_regime"
+FILTER_LOCAL_PEAK_IN_UPTREND = "local_peak_in_uptrend"
+FILTER_LOCAL_TROUGH_IN_DOWNTREND = "local_trough_in_downtrend"
 FILTER_FLAT_AMPLITUDE = "flat_amplitude"
 FILTER_FLAT_EXTREME = "flat_extreme"
 FILTER_INSUFFICIENT_BARS_FOR_REGIME = "insufficient_bars_for_regime"
@@ -1114,12 +1119,14 @@ class ChartSignalStrategy:
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
-                        f"{FILTER_ADX_REGIME} (SHORT) — local regime UP "
+                        f"{FILTER_LOCAL_PEAK_IN_UPTREND} — local pivot "
+                        f"high but the broader regime is UP "
                         f"(ADX={reading.adx:.1f}, "
-                        f"+DI={reading.dmp:.1f} > −DI={reading.dmn:.1f})"
+                        f"+DI={reading.dmp:.1f} > −DI={reading.dmn:.1f}); "
+                        f"don't sell into an uptrend"
                     ),
                     payload={
-                        "filter": FILTER_ADX_REGIME,
+                        "filter": FILTER_LOCAL_PEAK_IN_UPTREND,
                         "marginal": False,
                         "direction": "short",
                         **reading.to_audit_payload(),
@@ -1130,12 +1137,14 @@ class ChartSignalStrategy:
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
-                        f"{FILTER_ADX_REGIME} (LONG) — local regime DOWN "
+                        f"{FILTER_LOCAL_TROUGH_IN_DOWNTREND} — local "
+                        f"pivot low but the broader regime is DOWN "
                         f"(ADX={reading.adx:.1f}, "
-                        f"−DI={reading.dmn:.1f} > +DI={reading.dmp:.1f})"
+                        f"−DI={reading.dmn:.1f} > +DI={reading.dmp:.1f}); "
+                        f"don't buy into a downtrend"
                     ),
                     payload={
-                        "filter": FILTER_ADX_REGIME,
+                        "filter": FILTER_LOCAL_TROUGH_IN_DOWNTREND,
                         "marginal": False,
                         "direction": "long",
                         **reading.to_audit_payload(),
