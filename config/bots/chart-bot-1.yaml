@@ -15,8 +15,9 @@ config:
   # chart_signal bots share the same strategy yaml, so they'd
   # collide on the strategy's ref_id without this.
   ref_id: chart-bot-1-mgc
-  # June 2026 contract (M6). Roll to Q6 (Aug) before late-June expiry.
-  symbol: MGCM6
+  # August 2026 contract (Q6). Rolled from M6 on 2026-05-18.
+  # Next roll: V6 (Oct) before late-August expiry.
+  symbol: MGCQ6
   sec_type: FUT
   # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
   contract_multiplier: 10
@@ -28,4 +29,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MGCM6
+- MGCQ6

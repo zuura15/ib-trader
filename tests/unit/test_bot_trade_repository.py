@@ -34,7 +34,7 @@ def _insert(repo: BotTradeRepository, *, realized_pnl, commission,
     """Default symbol is intentionally a fake STK ticker — it has no
     entry in ``ROUND_TRIP_MIN`` so the rollup's floor logic is a
     no-op. Tests targeting the floor behavior pass a futures symbol
-    explicitly (MGCM6, MESM6, MNQM6)."""
+    explicitly (MGCQ6, MESU6, MNQU6)."""
     s = repo._session()
     row = BotTrade(
         id=str(uuid.uuid4()),
@@ -130,7 +130,7 @@ class TestSumRealizedPnlFloorsCommission:
     def test_partial_mgc_commission_floored_to_round_trip(self, repo):
         now = datetime.now(timezone.utc)
         _insert(repo, realized_pnl=20, commission=Decimal("0.97"),
-                exit_time=now - timedelta(minutes=10), symbol="MGCM6")
+                exit_time=now - timedelta(minutes=10), symbol="MGCQ6")
         # stored $0.97 < floor $1.94 → uses floor.
         # net = 20 - 1.94 = 18.06
         assert repo.sum_realized_pnl_last_hours(24.0) == Decimal("18.06")
@@ -138,7 +138,7 @@ class TestSumRealizedPnlFloorsCommission:
     def test_stored_above_floor_used_as_is(self, repo):
         now = datetime.now(timezone.utc)
         _insert(repo, realized_pnl=50, commission=Decimal("2.50"),
-                exit_time=now - timedelta(minutes=10), symbol="MGCM6")
+                exit_time=now - timedelta(minutes=10), symbol="MGCQ6")
         # stored $2.50 > floor $1.94 → uses stored.
         # net = 50 - 2.50 = 47.50
         assert repo.sum_realized_pnl_last_hours(24.0) == Decimal("47.50")
@@ -148,7 +148,7 @@ class TestSumRealizedPnlFloorsCommission:
         not a single constant."""
         now = datetime.now(timezone.utc)
         _insert(repo, realized_pnl=10, commission=Decimal("0"),
-                exit_time=now - timedelta(minutes=10), symbol="MESM6")
+                exit_time=now - timedelta(minutes=10), symbol="MESU6")
         # MES floor 1.24. net = 10 - 1.24 = 8.76
         assert repo.sum_realized_pnl_last_hours(24.0) == Decimal("8.76")
 
@@ -165,6 +165,6 @@ class TestSumRealizedPnlFloorsCommission:
         bot_trade creation and the first commissionReport landing."""
         now = datetime.now(timezone.utc)
         _insert(repo, realized_pnl=8, commission=None,
-                exit_time=now - timedelta(minutes=10), symbol="MNQM6")
+                exit_time=now - timedelta(minutes=10), symbol="MNQU6")
         # MNQ floor 1.24. net = 8 - 1.24 = 6.76
         assert repo.sum_realized_pnl_last_hours(24.0) == Decimal("6.76")

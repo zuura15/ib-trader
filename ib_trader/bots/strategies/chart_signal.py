@@ -1188,7 +1188,7 @@ class ChartSignalStrategy:
                 # back to 1.0 for unknown symbols. ATR is in price
                 # units, so divide commission by multiplier to compare.
                 round_trip_default = {
-                    "MGCM6": 1.94, "MESM6": 1.24, "MNQM6": 1.24,
+                    "MGCQ6": 1.94, "MESU6": 1.24, "MNQU6": 1.24,
                 }.get(str(self.config.get("symbol", "")), 1.0)
                 round_trip_comm_rg = float(self.config.get(
                     "regime_round_trip_commission", round_trip_default,
@@ -2050,15 +2050,40 @@ class ChartSignalStrategy:
             ))
             cap = trail_dist * mult
             line_at = chosen.intercept + chosen.slope * last_idx
-            gap = abs(entry_price - pivot_close)
+            # Slope-compensated pivot reference (2026-05-18 fix).
+            # Raw |entry − pivot_close| ignored the line's natural
+            # per-bar drift. On a steep up-sloping support
+            # (+$1.22/bar on MGC), the line itself rises by that
+            # amount per bar — the eval bar's close is expected to
+            # be ~$1.22 above the pivot just from the line rising,
+            # before any actual price motion. Pivot-based gap with
+            # no compensation rejected touch entries on steep lines
+            # for normal bar-to-bar drift.
+            #
+            # Now: project the pivot's "natural" position one bar
+            # forward by the line slope, and measure the gap from
+            # THAT. For touch entries (pivot on line),
+            # ``expected_pivot_pos == line_at_eval_bar`` so this is
+            # geometrically identical to the original line-based
+            # FFP. For accel entries (pivot beyond line),
+            # ``expected_pivot_pos`` stays close to pivot_close,
+            # so the filter still catches "fire bar drifted too far
+            # from the overshoot pivot" (the MNQ 14:54 case).
+            bars_offset = last_idx - (last_idx - 1)  # = 1 in normal flow
+            expected_pivot_pos = (
+                pivot_close + chosen.slope * bars_offset
+            )
+            gap = abs(entry_price - expected_pivot_pos)
             if gap > cap:
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
                         f"{FILTER_FAR_FROM_PIVOT} filter ({direction.upper()}) — "
-                        f"fire bar drifted ${gap:.4f} from pivot's "
-                        f"close (cap ${cap:.4f} = {mult:.1f}× trail). "
-                        f"pivot @ {pivot_close:.4f}, entry @ "
+                        f"fire bar drifted ${gap:.4f} past pivot's "
+                        f"expected position (cap ${cap:.4f} = "
+                        f"{mult:.1f}× trail). pivot @ "
+                        f"{pivot_close:.4f} + slope×{bars_offset} = "
+                        f"{expected_pivot_pos:.4f}, entry @ "
                         f"{entry_price:.4f}, line @ {line_at:.4f}"
                     ),
                     payload={
@@ -2068,6 +2093,7 @@ class ChartSignalStrategy:
                         "direction": direction,
                         "entry_price": round(entry_price, 4),
                         "pivot_close": round(pivot_close, 4),
+                        "expected_pivot_pos": round(expected_pivot_pos, 4),
                         "line_value": round(line_at, 4),
                         "gap": round(gap, 4),
                         "cap": round(cap, 4),

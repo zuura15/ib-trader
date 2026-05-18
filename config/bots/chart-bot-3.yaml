@@ -9,14 +9,18 @@ config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
   ref_id: chart-bot-3-mes
-  # MES = Micro E-mini S&P 500. M6 = June 2026.
-  symbol: MESM6
+  # MES = Micro E-mini S&P 500. U6 = Sep 2026 (rolled from M6
+  # on 2026-05-18). E-minis trade quarterly only (H/M/U/Z).
+  symbol: MESU6
   sec_type: FUT
   # Micro E-mini S&P: $5/point. Used by P/L math + trail target.
   contract_multiplier: 5
   # Trailing dip: 0.03% × 7,420 pts × $5 ≈ $11.13 per contract per move.
   trail_width_pct: 0.0003
+  # 3 contracts per fire (operator setting 2026-05-18). Override
+  # of strategy yaml's qty_default: 1.
+  qty_default: 3
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MESM6
+- MESU6

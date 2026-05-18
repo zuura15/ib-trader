@@ -428,8 +428,9 @@ class TestEntryDistanceFilter:
     @pytest.mark.asyncio
     async def test_rejects_when_gap_exceeds_cap(self):
         # ZIGZAG bar 8 closes at 14.0; pivot at idx 7 closes at 12.0.
-        # gap = |14.0 - 12.0| = 2.0. Cap = 14 * 0.0003 * 2 = 0.0084.
-        # Gap 2.0 >> cap → reject.
+        # Line slope +0.5/bar → expected_pivot_pos = 12.0 + 0.5 = 12.5.
+        # gap = |14.0 - 12.5| = 1.5. Cap = 14 * 0.0003 * 2 = 0.0084.
+        # Gap 1.5 >> cap → reject.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
@@ -444,17 +445,18 @@ class TestEntryDistanceFilter:
         assert p["filter"] == "far_from_pivot"
         assert p["direction"] == "long"
         assert p["gap"] > p["cap"]
-        # gap is pivot-based now: |14.0 - 12.0| = 2.0
-        assert p["gap"] == pytest.approx(2.0)
+        # Slope-compensated gap: |entry 14.0 - (pivot 12.0 + slope 0.5)| = 1.5
+        assert p["gap"] == pytest.approx(1.5)
         assert p["pivot_close"] == pytest.approx(12.0)
+        assert p["expected_pivot_pos"] == pytest.approx(12.5)
 
     @pytest.mark.asyncio
     async def test_allows_when_gap_within_cap(self):
-        # gap = 2.0 (pivot-based). Cap needs to be ≥ 2.0.
-        # trail_pct = 0.08 → trail_dist = 14 * 0.08 = 1.12 → cap = 2.24.
+        # Slope-compensated gap = 1.5 (entry 14 - expected 12.5).
+        # Need cap ≥ 1.5. trail_pct 0.06 → trail_dist 0.84 → cap 1.68 ≥ 1.5 → pass.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = True
-        cfg["trail_width_pct"] = 0.08
+        cfg["trail_width_pct"] = 0.06
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
@@ -484,11 +486,13 @@ class TestEntryDistanceFilter:
         p = skips[0].payload
         assert p["entry_price"] == pytest.approx(14.0)
         assert p["pivot_close"] == pytest.approx(12.0)
-        # line_value still surfaced for diagnostics, even though
-        # the decision uses pivot_close.
+        # Slope-compensated reference: pivot + slope × 1 = 12 + 0.5 = 12.5.
+        # Coincides with line_at_eval for touch entries (line passes
+        # through pivot, so 1-bar projection equals line value at eval).
+        assert p["expected_pivot_pos"] == pytest.approx(12.5)
         assert p["line_value"] == pytest.approx(12.5)
-        # gap is now |entry - pivot| = 2.0
-        assert p["gap"] == pytest.approx(2.0)
+        # gap = |entry - expected_pivot_pos| = |14 - 12.5| = 1.5
+        assert p["gap"] == pytest.approx(1.5)
         assert p["mult"] == 2.0
         # cap = 14 * 0.0003 * 2 = 0.0084
         assert p["cap"] == pytest.approx(0.0084, abs=1e-6)

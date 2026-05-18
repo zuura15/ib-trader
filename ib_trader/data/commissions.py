@@ -25,11 +25,11 @@ from decimal import Decimal
 # Round-trip commission per contract — entry leg + exit leg combined.
 ROUND_TRIP_MIN: dict[str, Decimal] = {
     # Micro Gold @ ~$0.97/side.
-    "MGCM6": Decimal("1.94"),
+    "MGCQ6": Decimal("1.94"),
     # Micro S&P 500 @ ~$0.62/side.
-    "MESM6": Decimal("1.24"),
+    "MESU6": Decimal("1.24"),
     # Micro Nasdaq @ ~$0.62/side.
-    "MNQM6": Decimal("1.24"),
+    "MNQU6": Decimal("1.24"),
 }
 
 

@@ -52,7 +52,7 @@ def txn_repo(session_factory):
     return TransactionRepository(session_factory)
 
 
-def _insert_trade(repo, *, symbol="MGCM6", commission=Decimal("0"),
+def _insert_trade(repo, *, symbol="MGCQ6", commission=Decimal("0"),
                    exit_time=None, entry_serial=None, exit_serial=None,
                    bot_id="chart-bot-1"):
     s = repo._session()
@@ -87,7 +87,7 @@ def _insert_txn(txn_repo, *, ib_order_id, trade_serial, commission,
     evt = TransactionEvent(
         ib_order_id=ib_order_id,
         action=TransactionAction.FILLED,
-        symbol="MGCM6",
+        symbol="MGCQ6",
         side="BUY",
         order_type="LIMIT",
         quantity=Decimal("1"),
@@ -103,17 +103,17 @@ def _insert_txn(txn_repo, *, ib_order_id, trade_serial, commission,
 class TestFindUndercommissioned:
     def test_returns_rows_below_per_symbol_floor(self, repo):
         # MGC floor is $1.94 — a row at $0 is undercommissioned.
-        _insert_trade(repo, symbol="MGCM6", commission=Decimal("0"))
+        _insert_trade(repo, symbol="MGCQ6", commission=Decimal("0"))
         # MES floor is $1.24 — $1.94 is OVER the MES floor, no candidate.
-        _insert_trade(repo, symbol="MESM6", commission=Decimal("1.94"))
+        _insert_trade(repo, symbol="MESU6", commission=Decimal("1.94"))
         candidates = repo.find_undercommissioned_trades(24.0)
         assert len(candidates) == 1
-        assert candidates[0].symbol == "MGCM6"
+        assert candidates[0].symbol == "MGCQ6"
 
     def test_skips_bots_in_active_state(self, repo):
-        _insert_trade(repo, symbol="MGCM6", commission=Decimal("0"),
+        _insert_trade(repo, symbol="MGCQ6", commission=Decimal("0"),
                        bot_id="chart-bot-1")
-        _insert_trade(repo, symbol="MGCM6", commission=Decimal("0"),
+        _insert_trade(repo, symbol="MGCQ6", commission=Decimal("0"),
                        bot_id="chart-bot-2")
         result = repo.find_undercommissioned_trades(
             24.0, skip_bot_ids={"chart-bot-1"},
@@ -130,7 +130,7 @@ class TestFindUndercommissioned:
 
     def test_excludes_rows_outside_window(self, repo):
         old = _now() - timedelta(hours=48)
-        _insert_trade(repo, symbol="MGCM6", commission=Decimal("0"),
+        _insert_trade(repo, symbol="MGCQ6", commission=Decimal("0"),
                        exit_time=old)
         assert repo.find_undercommissioned_trades(24.0) == []
 
@@ -175,7 +175,7 @@ class TestRunCommissionReconciliation:
     ):
         from ib_trader.daemon.reconciler import run_commission_reconciliation
         row = _insert_trade(
-            repo, symbol="MGCM6", commission=Decimal("0"),
+            repo, symbol="MGCQ6", commission=Decimal("0"),
             entry_serial=100, exit_serial=101,
         )
         _insert_txn(txn_repo, ib_order_id=9000, trade_serial=100,
@@ -215,7 +215,7 @@ class TestRunCommissionReconciliation:
         from ib_trader.daemon.reconciler import run_commission_reconciliation
         old = _now() - timedelta(hours=30)
         _insert_trade(
-            repo, symbol="MGCM6", commission=Decimal("0"),
+            repo, symbol="MGCQ6", commission=Decimal("0"),
             entry_serial=200, exit_serial=201,
             exit_time=old,
         )

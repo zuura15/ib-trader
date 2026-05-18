@@ -9,8 +9,9 @@ config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
   ref_id: chart-bot-4-mnq
-  # MNQ = Micro E-mini Nasdaq-100. M6 = June 2026.
-  symbol: MNQM6
+  # MNQ = Micro E-mini Nasdaq-100. U6 = Sep 2026 (rolled from M6
+  # on 2026-05-18). E-minis trade quarterly only (H/M/U/Z).
+  symbol: MNQU6
   sec_type: FUT
   # Micro Nasdaq: $2/point. Used by P/L math + trail target.
   contract_multiplier: 2
@@ -19,4 +20,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MNQM6
+- MNQU6
