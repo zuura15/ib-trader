@@ -1204,7 +1204,13 @@ class StrategyBotRunner(BotBase):
                 else:
                     realized_pnl = Decimal("0")
                 # Snapshot fields needed for the bot-trade record before
-                # clear_position_fields() wipes them.
+                # clear_position_fields() wipes them. exit_reason and
+                # entry_line both live in the doc — entry_line carries
+                # ``entry_path`` (touch/accel) and ``marginal_filters``
+                # (list of filters that were bypassed). Without snapshotting
+                # them here the audit row would render ``CLOSED·DIR·unknown``
+                # and the operator would lose the entry-classification
+                # info ("was this a clean trade or a marginal bypass?").
                 record_close_args = {
                     "realized_pnl": str(realized_pnl),
                     "serial": doc.get("serial"),
@@ -1221,6 +1227,8 @@ class StrategyBotRunner(BotBase):
                     "exit_serial": doc.get("serial"),
                     "entry_ib_order_id": doc.get("entry_ib_order_id"),
                     "exit_ib_order_id": doc.get("ib_order_id"),
+                    "exit_reason": doc.get("exit_reason"),
+                    "entry_line": doc.get("entry_line"),
                 }
                 stop_on_exit = bool(
                     self.strategy_config.get("stop_on_exit", True),
@@ -1929,6 +1937,27 @@ class StrategyBotRunner(BotBase):
                 net_pnl = pnl - comm_for_audit
                 exit_reason = str(args.get("exit_reason") or "unknown")
                 direction = str(args.get("direction", "LONG")).upper()
+                # Entry classification — pulled from the entry_line
+                # snapshot taken above (doc.get("entry_line") at the
+                # moment of close, before clear_position_fields).
+                # entry_path: "touch" (clean) | "accel" (continuation).
+                # marginal_filters: list of filters whose normal-mode
+                # rejection was bypassed by allow_marginal_entries.
+                # The headline reads "clean" when no filters bypassed
+                # and entry_path is touch; "accel" when path is accel;
+                # else the FIRST marginal_filter name. Body carries the
+                # full list. Per operator ask 2026-05-18.
+                entry_line_doc = args.get("entry_line") or {}
+                entry_path = str(entry_line_doc.get("entry_path") or "touch")
+                marginal_filters = list(
+                    entry_line_doc.get("marginal_filters") or []
+                )
+                if marginal_filters:
+                    entry_tag = str(marginal_filters[0])
+                elif entry_path == "accel":
+                    entry_tag = "accel"
+                else:
+                    entry_tag = "clean"
                 close_payload = {
                     "direction": direction,
                     "entry_price": entry_price_str,
@@ -1952,12 +1981,17 @@ class StrategyBotRunner(BotBase):
                     "bot_name": (
                         self.name if hasattr(self, "name") else None
                     ),
+                    "entry_path": entry_path,
+                    "marginal_filters": marginal_filters,
+                    "entry_tag": entry_tag,
                 }
                 self._audit_repo.insert_trade_closed(
                     bot_id=self.bot_id,
                     symbol=symbol,
                     event_ts_utc=exit_time_dt,
-                    decision=f"CLOSED·{direction}·{exit_reason}",
+                    decision=(
+                        f"CLOSED·{direction}·{exit_reason}·{entry_tag}"
+                    ),
                     pnl_net=net_pnl,
                     payload=close_payload,
                 )

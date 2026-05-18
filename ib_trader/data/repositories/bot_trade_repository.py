@@ -72,37 +72,49 @@ class BotTradeRepository:
         )
 
     def sum_realized_pnl_last_hours(self, hours: float = 24.0) -> Decimal:
-        """Return SUM(realized_pnl - commission) for trades closed in
-        the last ``hours`` (rolling window). The header "Realized P&L"
-        reads this and must match what IB reports — gross P&L drifts
-        ~$1-3 per round-trip on micro futures, which on a busy day
-        adds up to a visible $15-30 inflation vs IB.
+        """Return SUM(realized_pnl - max(commission, symbol_floor)) for
+        trades closed in the last ``hours`` (rolling window). The header
+        "Realized P&L" reads this and must match what IB reports.
 
-        Commission is summed per-trade across both legs (entry + exit)
-        in ``bot_trades.commission`` and is populated asynchronously
-        by ``add_commission_by_serial`` when IB delivers
-        ``commissionReport``. ``COALESCE`` defends against rows whose
-        commission backfill hasn't landed yet — those will undercount
-        until the report arrives but never error.
+        Per-row commission is floored at the symbol's expected
+        round-trip cost (``ib_trader.data.commissions.ROUND_TRIP_MIN``).
+        This defends against the case where IB's ``commissionReport``
+        delivery lags on one of the two legs — the bot_trade row
+        stores only the side that landed (e.g. $0.97 instead of $1.94
+        on MGC), and a naive sum would over-state net P&L by the
+        missing leg's commission until the reconciler eventually
+        backfills it.
+
+        Storing the actual transactions sum stays the policy (we don't
+        write the floor into the row — that's a display concern only),
+        so the reconciler still has the real picture and the
+        delivery-gap WARNING still fires on stragglers. The rollup
+        just chooses ``max(stored, floor)`` for the display number.
         """
+        from ib_trader.data.commissions import expected_min
+
         since = _now_utc() - timedelta(hours=hours)
-        result = (
+        rows = (
             self._session()
-            .query(func.coalesce(
-                func.sum(
-                    BotTrade.realized_pnl
-                    - func.coalesce(BotTrade.commission, 0)
-                ),
-                0,
-            ))
+            .query(
+                BotTrade.symbol,
+                BotTrade.realized_pnl,
+                BotTrade.commission,
+            )
             .filter(BotTrade.exit_time >= since)
-            .scalar()
+            .all()
         )
-        if result is None:
-            return Decimal("0")
-        if isinstance(result, Decimal):
-            return result
-        return Decimal(str(result))
+        total = Decimal("0")
+        for sym, gross, comm in rows:
+            if gross is None:
+                continue
+            stored = comm or Decimal("0")
+            floor = expected_min(str(sym))
+            net = Decimal(str(gross)) - (
+                stored if stored >= floor else floor
+            )
+            total += net
+        return total
 
     def find_undercommissioned_trades(
         self, hours: float = 24.0,

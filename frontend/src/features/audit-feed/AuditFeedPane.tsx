@@ -274,14 +274,28 @@ function TradeClosedRow({ r }: { r: AuditRow }) {
   const p = r.payload as Record<string, unknown> | null;
   const duration = (p?.duration_seconds as number | undefined)
     ?? (r.payload as AuditPayload | null)?.duration_seconds;
-  const direction = r.decision.split('·')[1] || '';
-  const reason = r.decision.split('·').slice(2).join('·');
-  // Headline carries entry → exit prices alongside P&L per operator
-  // ask 2026-05-18: "add the entry, exit prices along with the P/L".
-  // Falls back gracefully when the audit row predates the payload
-  // expansion (older rows have only direction/qty/realized_pnl).
+  // Decision = ``CLOSED·DIR·exit_reason·entry_tag`` post 2026-05-18.
+  // Legacy rows (4-element decision missing) gracefully degrade.
+  const parts = r.decision.split('·');
+  const direction = parts[1] || '';
+  const reason = parts[2] || '';
+  // entry_tag is "clean" | "accel" | <first_marginal_filter>. Prefer
+  // payload over decision parse so the chip is always present even
+  // on legacy rows that have entry_tag in payload but not in the
+  // decision string.
+  const entryTag = (p?.entry_tag as string | undefined)
+    ?? parts[3]
+    ?? null;
   const entryPx = p?.entry_price as string | number | undefined;
   const exitPx = p?.exit_price as string | number | undefined;
+  // Entry-tag color: green = clean, orange = accel, amber = marginal
+  // (anything else implies a marginal-bypassed filter name).
+  const entryTagStyle = (() => {
+    if (entryTag === 'clean') return { fg: '#16a34a', bg: 'rgba(34,197,94,0.15)' };
+    if (entryTag === 'accel') return { fg: '#ea580c', bg: 'rgba(249,115,22,0.18)' };
+    if (entryTag) return { fg: '#b45309', bg: 'rgba(245,158,11,0.18)' };
+    return null;
+  })();
   return (
     <div style={{
       display: 'flex', gap: 8, alignItems: 'center',
@@ -294,6 +308,18 @@ function TradeClosedRow({ r }: { r: AuditRow }) {
       <span style={{ color: tone.fg, fontWeight: 600 }}>{direction}</span>
       {reason && (
         <span style={{ color: tone.fg, fontSize: 10 }}>· {reason}</span>
+      )}
+      {entryTagStyle && entryTag && (
+        <Chip
+          text={entryTag}
+          fg={entryTagStyle.fg}
+          bg={entryTagStyle.bg}
+          title={
+            entryTag === 'clean' ? 'no entry filter bypassed' :
+            entryTag === 'accel' ? 'acceleration-continuation entry' :
+            `marginal entry bypassed: ${entryTag} (see expanded for full list)`
+          }
+        />
       )}
       <span style={{ color: pnlColor, fontWeight: 600 }}>
         {star} {_fmtMoney(r.pnl_net)}
@@ -553,6 +579,34 @@ function ExpandedTradeClosed({ row, onShowRaw }: {
             {String(get('trail_reset_count') ?? 0)} resets
           </div>
         </div>
+        {(() => {
+          // Entry classification block — entry_path + full filter list.
+          // Always rendered for new rows (always have entry_path);
+          // omitted on legacy rows that pre-date this payload extension.
+          const ep = getStr('entry_path');
+          if (!ep) return null;
+          const filters = (p?.marginal_filters as string[] | undefined) ?? [];
+          let label = 'Entry';
+          let primary: string;
+          let secondary: string | null = null;
+          if (filters.length > 0) {
+            primary = `marginal · ${ep}`;
+            secondary = `bypassed: ${filters.join(', ')}`;
+          } else if (ep === 'accel') {
+            primary = 'accel';
+            secondary = 'acceleration-continuation';
+          } else {
+            primary = 'clean';
+            secondary = 'no filters bypassed';
+          }
+          return (
+            <div>
+              <div style={labelStyle}>{label}</div>
+              <div style={valueStyle}>{primary}</div>
+              {secondary && <div style={metaStyle}>{secondary}</div>}
+            </div>
+          );
+        })()}
         {getStr('bot_name') && (
           <div>
             <div style={labelStyle}>Bot</div>
