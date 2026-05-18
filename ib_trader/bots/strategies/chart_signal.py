@@ -1146,10 +1146,22 @@ class ChartSignalStrategy:
               2. closes[new_pivot] is strictly outside the line in
                  the favorable direction beyond ``near_tol`` — i.e.
                  above the support / below the resistance.
-              3. The implied slope from line.anchor_b_idx (P) to
+              3. The implied slope from the LATEST RECENT STRICT
+                 TOUCH (within ``entry_max_q_age_hours``) to
                  new_pivot has the same sign as line.slope and is
                  at least ``min_slope_ratio`` × steeper. Price is
                  accelerating in the trend's direction.
+
+            Reference-pivot rule (2026-05-18 operator fix): the
+            implied-slope reference must be a SUBSEQUENT pivot on
+            the line within the recent window — NOT
+            ``line.anchor_b_idx`` (the line's 2nd construction
+            pivot). Using anchor_b_idx averages over multiple days
+            of unrelated price action, so on a 3-day-old downtrending
+            resistance, a current uptrend's pivots can trip an
+            artificial "acceleration" check. By requiring the
+            reference to be a recent strict touch, accel becomes a
+            measure of LOCAL momentum, not weeks-long averages.
             """
             if near_tol is None:
                 return False
@@ -1169,9 +1181,40 @@ class ChartSignalStrategy:
                 # New pivot must be BELOW the resistance line.
                 if delta >= -near_tol:
                     return False
-            P_idx = line.anchor_b_idx
-            if P_idx <= 0 or P_idx >= new_pivot_idx:
+
+            # Locate the most-recent strict touch on the line, scoped
+            # to ``entry_max_q_age_hours`` bars from last_idx. The
+            # line.anchor_b_idx fallback that used to live here is
+            # intentionally removed — see docstring.
+            max_q_age_hours_local = float(self.config.get(
+                "entry_max_q_age_hours", 24.0,
+            ))
+            window_bars_local = int(
+                max_q_age_hours_local * 3600.0 / self.bar_seconds
+            )
+            window_start_idx_local = max(
+                line.anchor_b_idx + 1,
+                last_idx - window_bars_local,
+            )
+            to_idx_local = (
+                line.break_idx if line.break_idx is not None
+                else last_idx
+            )
+            P_idx = -1
+            for piv in side_pivots:
+                if piv >= new_pivot_idx or piv > to_idx_local:
+                    continue
+                if piv < window_start_idx_local:
+                    continue
+                line_val_at_piv = line.intercept + line.slope * piv
+                if abs(closes[piv] - line_val_at_piv) <= touch_tol:
+                    if piv > P_idx:
+                        P_idx = piv
+            if P_idx < 0:
+                # No recent strict touch — no valid local reference,
+                # so accel can't claim "subsequent acceleration."
                 return False
+
             span = new_pivot_idx - P_idx
             if span <= 0:
                 return False
