@@ -171,6 +171,14 @@ class ChartSignalStrategy:
                 # zones sit on the FAVORABLE side of price.
                 "tight_zones": "list|null",
                 "tight_touch": "dict|null",
+                # Marginal SL touch+hold timer. ``{"start_ts": iso}``
+                # when mid first crossed ``active_stop`` in the bad
+                # direction; cleared on retrace. The exit fires only
+                # when elapsed >= ``sl_linger_seconds`` (default 5s)
+                # AND mid is STILL past the stop — gives a brief
+                # forgiveness window for tick-spike overshoots that
+                # immediately recover.
+                "sl_touch": "dict|null",
             },
             version="1.0",
             supported_sec_types=("STK", "ETF", "FUT", "FOP"),
@@ -2325,23 +2333,55 @@ class ChartSignalStrategy:
             state_patch[wm_field] = str(new_wm)
             state_patch["active_stop"] = str(active_stop)
 
-            # (1) IMMEDIATE SL — fire the exit the moment mid is past
-            # the stop in the unfavorable direction. No 10 s hold,
-            # because the stop level is computed by the bot (not a
-            # market line price might legitimately revisit). Operator
-            # spec 2026-05-15: "SL has to kick in every tick."
+            # SL touch+hold — fire only when mid is past active_stop
+            # in the unfavorable direction for AT LEAST
+            # ``sl_linger_seconds`` (default 5s) of continuous touch.
+            # Replaces the prior immediate-fire (operator spec
+            # 2026-05-18): tick-spike overshoots that recovered within
+            # a few seconds were clipping winners on MGC; 5s gives a
+            # tight forgiveness window without giving up the
+            # tick-time reactivity. Clears on retrace so a spike that
+            # re-breaches later restarts the timer fresh.
             sl_breached = (
                 (mid_d <= active_stop) if direction == "long"
                 else (mid_d >= active_stop)
             )
+            sl_linger_s = float(self.config.get("sl_linger_seconds", 5.0))
+            now_utc = datetime.now(timezone.utc)
+            sl_touch_doc = ctx.state.get("sl_touch")
+            elapsed_s: float | None = None
             if sl_breached:
+                if not sl_touch_doc or not isinstance(sl_touch_doc, dict):
+                    # First tick past the stop — start the timer.
+                    state_patch["sl_touch"] = {
+                        "start_ts": now_utc.isoformat(),
+                    }
+                else:
+                    start_ts = _parse_ts(sl_touch_doc.get("start_ts"))
+                    if start_ts is not None:
+                        elapsed_s = (now_utc - start_ts).total_seconds()
+            elif sl_touch_doc:
+                # Retraced back to the safe side — clear the timer so
+                # the next breach gets a fresh 5s window. Without
+                # this, a 4.9-second-old touch that briefly retraced
+                # and re-breached would fire on the SECOND breach's
+                # first tick.
+                state_patch["sl_touch"] = None
+                ctx.state["sl_touch"] = None  # mirror into ctx so the
+                # ``_check_tight_zones_exit`` call below sees the same
+                # cleared state without re-reading from the patch.
+
+            if sl_breached and elapsed_s is not None \
+                    and elapsed_s >= sl_linger_s:
                 detail = (
                     f"mid {float(mid_d):.4f} "
                     + ("<= " if direction == "long" else ">= ")
                     + f"active_stop {float(active_stop):.4f} "
-                    f"(trail_only, tick-time, marginal)"
+                    f"after {elapsed_s:.1f}s touch+hold "
+                    f"(linger={sl_linger_s:.0f}s, marginal)"
                 )
                 state_patch["exit_reason"] = "trail_stop"
+                state_patch["sl_touch"] = None
                 actions.append(LogSignal(
                     event_type=LogEventType.EXIT_CHECK,
                     message=f"TRAILING_STOP [{direction}]: {detail}",
@@ -2350,6 +2390,8 @@ class ChartSignalStrategy:
                         "direction": direction,
                         "mid": float(mid_d),
                         "active_stop": float(active_stop),
+                        "elapsed_s": elapsed_s,
+                        "linger_s": sl_linger_s,
                         "marginal_trade": True,
                     },
                 ))

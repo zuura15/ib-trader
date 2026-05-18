@@ -181,6 +181,11 @@ def clear_position_fields() -> dict:
         "counter_touch": None,
         "tight_zones": [],
         "tight_touch": None,
+        # Touch+hold timer for the marginal-trade SL fire (post
+        # 2026-05-18: was immediate-fire, now 5s linger per
+        # ``sl_linger_seconds`` config). Cleared on every position
+        # close so the next round starts with a fresh slate.
+        "sl_touch": None,
     }
 
 

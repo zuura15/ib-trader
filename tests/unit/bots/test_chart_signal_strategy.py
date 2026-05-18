@@ -1387,3 +1387,141 @@ class TestQuoteUpdates:
             last=Decimal("12.50"), timestamp=datetime.now(timezone.utc),
         )
         assert await s.on_event(q, ctx) == []
+
+
+class TestMarginalSLLinger:
+    """Operator spec 2026-05-18: the marginal trade's SL fires only
+    after ``sl_linger_seconds`` of continuous touch past
+    ``active_stop`` (default 5s). Tick-spike overshoots that recover
+    inside the window are absorbed; only sustained breaches cut the
+    trade. The 4 cases below pin the touch+hold semantics."""
+
+    def _long_holding_ctx(self, *, sl_touch=None):
+        # MGC trail_width_pct default 0.0003. Entry at 100.0, HWM 110.0,
+        # trail = 110 * (1 - 0.0003) = 109.967.
+        # active_stop = max(line, trail). With line below 109.967,
+        # active_stop = trail = 109.967.
+        cfg = _default_config()
+        cfg["sl_linger_seconds"] = 5.0
+        cfg["trail_width_pct"] = 0.0003
+        return _make_ctx(
+            state={
+                "armed": False,
+                "qty": "1",
+                "entry_price": "100.0",
+                "high_water_mark": "110.0",
+                "entry_line": {"direction": "long", "marginal": True},
+                "tight_zones": [{"value": 90.0, "kind": "trigger"}],
+                "sl_touch": sl_touch,
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+            config=cfg,
+        )
+
+    def _quote(self, mid: float) -> QuoteUpdate:
+        # bid/ask centered on mid (1-tick spread) — _on_quote reads
+        # event.mid which is (bid + ask) / 2.
+        half = 0.05
+        return QuoteUpdate(
+            symbol="MGCM6",
+            bid=Decimal(str(mid - half)),
+            ask=Decimal(str(mid + half)),
+            last=Decimal(str(mid)),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_breach_starts_timer_no_exit(self):
+        """Mid crosses below active_stop for the first time → sl_touch
+        gets a start_ts, NO PlaceOrder fired this tick."""
+        s = ChartSignalStrategy(_default_config())
+        ctx = self._long_holding_ctx(sl_touch=None)
+        # mid 109.96 < trail 109.967 → breached.
+        actions = await s.on_event(self._quote(109.95), ctx)
+        # No exit order on the first breach tick.
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        assert ups
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        touch = merged.get("sl_touch")
+        assert touch is not None and "start_ts" in touch
+
+    @pytest.mark.asyncio
+    async def test_retrace_within_linger_clears_timer(self):
+        """Touch started 2s ago, mid retraces back above active_stop →
+        sl_touch is set to None on the same tick."""
+        s = ChartSignalStrategy(_default_config())
+        old_start = (datetime.now(timezone.utc)
+                     - timedelta(seconds=2)).isoformat()
+        ctx = self._long_holding_ctx(
+            sl_touch={"start_ts": old_start},
+        )
+        # mid 110.00 > trail 109.967 → not breached.
+        actions = await s.on_event(self._quote(110.00), ctx)
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        # Touch cleared.
+        assert merged.get("sl_touch") is None
+        # No exit fired.
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+
+    @pytest.mark.asyncio
+    async def test_sustained_breach_past_linger_fires_exit(self):
+        """Touch is 6s old AND mid still breached → exit fires this
+        tick. PlaceOrder emitted, exit_reason recorded."""
+        s = ChartSignalStrategy(_default_config())
+        old_start = (datetime.now(timezone.utc)
+                     - timedelta(seconds=6)).isoformat()
+        ctx = self._long_holding_ctx(
+            sl_touch={"start_ts": old_start},
+        )
+        # mid 109.95 still below trail 109.967.
+        actions = await s.on_event(self._quote(109.95), ctx)
+        # Exit order fires.
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert sells, f"expected SELL PlaceOrder, got {actions}"
+        # Touch cleared on the fire.
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        assert merged.get("sl_touch") is None
+        assert merged.get("exit_reason") == "trail_stop"
+
+    @pytest.mark.asyncio
+    async def test_short_direction_breach_timer(self):
+        """SHORT side: breached when mid >= active_stop. Same
+        touch+hold semantics, opposite geometry."""
+        cfg = _default_config()
+        cfg["sl_linger_seconds"] = 5.0
+        cfg["trail_width_pct"] = 0.0003
+        ctx = _make_ctx(
+            state={
+                "armed": False,
+                "qty": "1",
+                "entry_price": "100.0",
+                "low_water_mark": "90.0",
+                # SHORT trail = LWM * (1 + 0.0003) = 90.027.
+                "entry_line": {"direction": "short", "marginal": True},
+                "tight_zones": [{"value": 110.0, "kind": "trigger"}],
+                "sl_touch": None,
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+            config=cfg,
+        )
+        s = ChartSignalStrategy(cfg)
+        # mid 90.05 > trail 90.027 → breached.
+        actions = await s.on_event(self._quote(90.05), ctx)
+        # First breach: no exit, timer starts.
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        assert merged.get("sl_touch") is not None
+        assert "start_ts" in merged["sl_touch"]
