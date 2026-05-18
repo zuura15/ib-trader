@@ -113,7 +113,7 @@ export function GlobalHeader() {
         <div className="rounded border px-3 py-1.5" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
           <div
             style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}
-            title="Sum of realized P&L on closed bot trades in the last 24 hours (rolling window)"
+            title="Sum of NET realized P&L on closed bot trades in the last 24 hours (rolling window) — realized_pnl minus commission per trade. Commission backfills asynchronously after IB's commissionReport, so this can briefly inflate until the report lands."
           >
             Realized P&L · 24h
           </div>

@@ -72,14 +72,29 @@ class BotTradeRepository:
         )
 
     def sum_realized_pnl_last_hours(self, hours: float = 24.0) -> Decimal:
-        """Return sum of realized_pnl for trades closed in the last
-        ``hours`` (rolling window). Header "Realized P&L" reads this
-        so summing the Bot Trades panel rows matches the header.
+        """Return SUM(realized_pnl - commission) for trades closed in
+        the last ``hours`` (rolling window). The header "Realized P&L"
+        reads this and must match what IB reports — gross P&L drifts
+        ~$1-3 per round-trip on micro futures, which on a busy day
+        adds up to a visible $15-30 inflation vs IB.
+
+        Commission is summed per-trade across both legs (entry + exit)
+        in ``bot_trades.commission`` and is populated asynchronously
+        by ``add_commission_by_serial`` when IB delivers
+        ``commissionReport``. ``COALESCE`` defends against rows whose
+        commission backfill hasn't landed yet — those will undercount
+        until the report arrives but never error.
         """
         since = _now_utc() - timedelta(hours=hours)
         result = (
             self._session()
-            .query(func.coalesce(func.sum(BotTrade.realized_pnl), 0))
+            .query(func.coalesce(
+                func.sum(
+                    BotTrade.realized_pnl
+                    - func.coalesce(BotTrade.commission, 0)
+                ),
+                0,
+            ))
             .filter(BotTrade.exit_time >= since)
             .scalar()
         )
