@@ -523,15 +523,35 @@ function ExpandedBarEval({ row, onShowRaw }: {
       borderLeft: '2px solid var(--border-default)',
     }}>
       <div ref={detailsRef}>
-        <DetailLine label="prior close" value={_fmtPrice(a.prior_bar_close ?? null)} />
-        <DetailLine
-          label="next close"
-          value={evalClose !== null
-            ? `${_fmtPrice(evalClose)}  (eval @ ${evalAt})`
-            : nextClose === 'pending' ? '…'
-            : nextClose === null ? '— (bar not closed yet)'
-            : _fmtPrice(nextClose)}
-        />
+        {/* Common to all BAR_EVAL rows: the three closes that
+            sandwich the pivot. prior = bar before pivot, current
+            = pivot bar itself, next = eval bar (where the bot
+            decides). Single line so the price context is at a
+            glance. */}
+        {(() => {
+          const barPayload = ((row.payload as AuditPayload | null)?.bar
+            ?? {}) as Record<string, unknown>;
+          const pivotCloseRaw = barPayload.pivot_bar_close;
+          const pivotClose = typeof pivotCloseRaw === 'number'
+            ? pivotCloseRaw : null;
+          const prior = a.prior_bar_close ?? null;
+          let nextPart: string;
+          if (evalClose !== null) {
+            nextPart = `${_fmtPrice(evalClose)}  (eval @ ${evalAt})`;
+          } else if (nextClose === 'pending') {
+            nextPart = '…';
+          } else if (nextClose === null) {
+            nextPart = '— (bar not closed yet)';
+          } else {
+            nextPart = _fmtPrice(nextClose);
+          }
+          return (
+            <DetailLine
+              label="prior, pivot, next"
+              value={`${_fmtPrice(prior)},  ${_fmtPrice(pivotClose)},  ${nextPart}`}
+            />
+          );
+        })()}
         <DetailLine
           label="filter"
           value={
@@ -544,6 +564,36 @@ function ExpandedBarEval({ row, onShowRaw }: {
               : '— (passed all filters)'
           }
         />
+        {/* Filter-specific structured row (far_from_pivot only for
+            now). Format: "price at: $X, needs to be below/above:
+            $Y". Threshold derived from expected_pivot_pos ± cap;
+            comparator is "below" when the drift was upward,
+            "above" when downward. */}
+        {a.filter_name === 'far_from_pivot' && (() => {
+          const skip = ((row.payload as AuditPayload | null)?.skip
+            ?? {}) as Record<string, unknown>;
+          const entry = typeof skip?.entry_price === 'number'
+            ? skip.entry_price : null;
+          const expected = typeof skip?.expected_pivot_pos === 'number'
+            ? skip.expected_pivot_pos
+            : (typeof skip?.pivot_close === 'number'
+              ? skip.pivot_close : null);
+          const cap = typeof skip?.cap === 'number' ? skip.cap : null;
+          if (entry === null || expected === null || cap === null) {
+            return null;
+          }
+          const drift = entry - expected;
+          const comparator = drift > 0 ? 'below' : 'above';
+          const threshold = drift > 0 ? expected + cap : expected - cap;
+          return (
+            <DetailLine
+              label="far_from_pivot"
+              value={(
+                <>price at: <b>{_fmtPrice(entry)}</b>, needs to be {comparator}: <b>{_fmtPrice(threshold)}</b></>
+              )}
+            />
+          );
+        })()}
         {lineEntries}
         <DetailLine label="outcome" value={
           a.outcome === 'B' ? 'BUY · entry order placed'
