@@ -1168,7 +1168,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       badge.style.background = bg;
       badge.style.color = fg;
-      const mark = (b: boolean) => (b ? '✓' : '○');
+      // For fired indicators, show the V-bottom time (the impulse
+      // extreme) instead of a tick mark. The bottom is the same
+      // moment for all three indicators by definition — repeating
+      // the time is intentional so the operator can see at a
+      // glance which indicators agree on "the V happened here."
+      // "—" for indicators that haven't fired.
+      let extremeLabel = '—';
+      if (v.impulse_extreme_time) {
+        try {
+          const dt = new Date(v.impulse_extreme_time);
+          if (!Number.isNaN(dt.getTime())) {
+            // Local time, HH:MM in 24h — matches operator's PT clock.
+            const hh = dt.getHours().toString().padStart(2, '0');
+            const mm = dt.getMinutes().toString().padStart(2, '0');
+            extremeLabel = `${hh}:${mm}`;
+          }
+        } catch { /* fall back to "—" */ }
+      }
+      const mark = (b: boolean) => (b ? extremeLabel : '—');
       const dirLabel = v.direction === 'v_up'
         ? 'V·UP'
         : v.direction === 'v_down'

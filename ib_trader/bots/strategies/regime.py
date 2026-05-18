@@ -214,6 +214,7 @@ class VState:
     detected: bool
     direction: str | None  # "v_up" | "v_down" | None
     impulse_extreme_idx: int | None
+    impulse_extreme_time: str | None  # ISO timestamp of the bar
     impulse_extreme_price: float | None
     impulse_magnitude: float | None
     impulse_atr_mult: float | None
@@ -231,7 +232,8 @@ class VState:
             "trigger_b_fired": self.trigger_b_fired,
             "bos_confirmed": self.bos_confirmed,
         }
-        for k in ("impulse_extreme_idx", "impulse_extreme_price",
+        for k in ("impulse_extreme_idx", "impulse_extreme_time",
+                  "impulse_extreme_price",
                   "impulse_magnitude", "impulse_atr_mult",
                   "retrace_pct", "bars_since_extreme"):
             v = getattr(self, k)
@@ -245,6 +247,7 @@ def _v_state_none(reason: str | None = None) -> VState:
         detected=False,
         direction=None,
         impulse_extreme_idx=None,
+        impulse_extreme_time=None,
         impulse_extreme_price=None,
         impulse_magnitude=None,
         impulse_atr_mult=None,
@@ -393,10 +396,24 @@ def detect_v_state(
 
     detected = trigger_a_fired or trigger_b_fired or bos_confirmed
 
+    # Look up the bar timestamp at the impulse extreme. Bars from
+    # /engine/history carry the timestamp under "ts" (ISO string);
+    # event.window-style bars use "timestamp_utc" (datetime). Try
+    # both and stringify whatever's there.
+    extreme_bar = bars[impulse_extreme_idx]
+    raw_ts = extreme_bar.get("ts") or extreme_bar.get("timestamp_utc")
+    if raw_ts is None:
+        extreme_time = None
+    elif hasattr(raw_ts, "isoformat"):
+        extreme_time = raw_ts.isoformat()
+    else:
+        extreme_time = str(raw_ts)
+
     return VState(
         detected=detected,
         direction=chosen_direction,
         impulse_extreme_idx=impulse_extreme_idx,
+        impulse_extreme_time=extreme_time,
         impulse_extreme_price=impulse_extreme_price_val,
         impulse_magnitude=impulse_mag_val,
         impulse_atr_mult=(

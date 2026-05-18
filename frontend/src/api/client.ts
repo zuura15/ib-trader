@@ -333,6 +333,7 @@ export interface VState {
   detected: boolean;
   direction: 'v_up' | 'v_down' | null;
   impulse_extreme_idx?: number;
+  impulse_extreme_time?: string;
   impulse_extreme_price?: number;
   impulse_magnitude?: number;
   impulse_atr_mult?: number;
