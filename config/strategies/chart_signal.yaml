@@ -149,7 +149,15 @@ sl_linger_marginal_seconds: 10
 #   20 ≤ ADX ≤ 25:
 #     uncertain → same as flat (conservative).
 regime_filter_enabled: true
-adx_period: 14
+# ADX period dropped from 14 to 7 (2026-05-18) — Wilder smoothing
+# on 14 bars (~42 min of 3-min bars) lagged V recoveries by 15-25
+# minutes; ADX stayed pinned to the prior trend while the market
+# had already turned. 7 bars (~21 min) is roughly 2× as responsive
+# to regime transitions. Trade-off: more "uncertain" reads during
+# minor pullbacks in steady trends; that's acceptable because
+# uncertain → flat-conservative gates still apply (extreme +
+# amplitude), they're just not the trending-side hard reject.
+adx_period: 7
 atr_period: 14
 donchian_period: 20
 adx_trending_threshold: 25.0
@@ -163,7 +171,14 @@ regime_typical_bars_in_trade: 5.0
 regime_min_edge_mult: 2.0
 # Donchian extreme tol multiplier. tol = touch_tol × this. Larger
 # values are more permissive (pivot can be further from the band).
-regime_extreme_tol_mult: 1.0
+# Donchian extreme tolerance multiplier. tol = touch_tol × mult.
+# Bumped from 1.0 → 2.0 (2026-05-18) — the strict "within 1×
+# touch_tol of DCU/DCL" was rejecting pivots that were
+# operator-judgment "at the extreme" but missing the band by a
+# tick. Doubling roughly halves the filter's strictness. Raise
+# further (3-4) to relax more; drop back to 1 for the original
+# strict gate.
+regime_extreme_tol_mult: 2.0
 # DI-lean override (flat/uncertain regime). When the regime is not
 # trending (ADX below trending_threshold) but DI dominance toward
 # the entry direction is at least this many points, skip the
