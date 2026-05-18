@@ -52,6 +52,38 @@ class TransactionRepository:
         s.add(event)
         s.commit()
 
+    def sum_commission_for_trade_serial(self, trade_serial: int) -> Decimal:
+        """Return the total commission across all FILLED/PARTIAL_FILL
+        rows for ``trade_serial``. Used by ``BotTrade`` creation so the
+        commission written to the round-trip row reflects whatever
+        ``commissionReport`` events have already landed in transactions
+        by then — closes a race where the report arrived BEFORE the
+        bot_trade row existed, in which case ``add_commission_by_serial``
+        had nothing to match against and the commission was effectively
+        lost. The late-arrival path (``add_commission_by_serial``)
+        still handles reports that land AFTER bot_trade creation.
+        """
+        from sqlalchemy import func
+        result = (
+            self._session()
+            .query(func.coalesce(
+                func.sum(TransactionEvent.commission), 0,
+            ))
+            .filter(
+                TransactionEvent.trade_serial == trade_serial,
+                TransactionEvent.action.in_([
+                    TransactionAction.FILLED,
+                    TransactionAction.PARTIAL_FILL,
+                ]),
+            )
+            .scalar()
+        )
+        if result is None:
+            return Decimal("0")
+        if isinstance(result, Decimal):
+            return result
+        return Decimal(str(result))
+
     def add_commission(self, ib_order_id: int, delta: Decimal) -> int:
         """Add ``delta`` to the commission of every FILLED/PARTIAL_FILL row
         matching ``ib_order_id``. Returns the number of rows updated.

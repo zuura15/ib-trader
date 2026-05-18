@@ -1833,6 +1833,45 @@ class StrategyBotRunner(BotBase):
                 args.get("exit_ib_order_id")
             ) or args.get("exit_serial")
 
+            # Commission seed: sum ``transactions.commission`` for both
+            # legs (entry_serial + exit_serial). Transactions are the
+            # authoritative source — every commission path (inline at
+            # execDetails AND late commissionReport) writes there. The
+            # exit-fill event's ``args["commission"]`` is intentionally
+            # NOT used: it carries the EXIT leg's commission, which
+            # ``record_fill`` already wrote to transactions, so adding
+            # it would double-count one side. Observed 2026-05-17:
+            #
+            #   - Old bug 1 (single-side capture): only args["commission"]
+            #     was used → bot_trade had exit leg only (~$1 short
+            #     per round-trip).
+            #   - Old bug 2 (race-induced loss): when commissionReport
+            #     fired BEFORE bot_trade existed, ``add_commission_by_serial``
+            #     hit 0 rows and the value was dropped entirely.
+            #
+            # Both close here by reading the latest transactions snapshot
+            # at creation time. The async backfill path
+            # (``add_commission_by_serial``) still applies for commission
+            # reports that arrive AFTER bot_trade creation.
+            seeded_commission = Decimal("0")
+            try:
+                from ib_trader.data.repositories.transaction_repository import (
+                    TransactionRepository,
+                )
+                txn_repo = TransactionRepository(self._session_factory)
+                if entry_serial is not None:
+                    seeded_commission += txn_repo.sum_commission_for_trade_serial(
+                        int(entry_serial),
+                    )
+                if exit_serial is not None:
+                    seeded_commission += txn_repo.sum_commission_for_trade_serial(
+                        int(exit_serial),
+                    )
+            except Exception:
+                logger.debug(
+                    "txn commission seed failed", exc_info=True,
+                )
+
             from ib_trader.data.models import BotTrade
             row = BotTrade(
                 bot_id=self.bot_id,
@@ -1846,7 +1885,7 @@ class StrategyBotRunner(BotBase):
                 exit_qty=Decimal(args.get("exit_qty") or "0"),
                 exit_time=exit_time_dt,
                 realized_pnl=pnl,
-                commission=Decimal(args.get("commission") or "0"),
+                commission=seeded_commission,
                 trail_reset_count=int(args.get("trail_reset_count") or 0),
                 duration_seconds=duration,
                 entry_serial=entry_serial,

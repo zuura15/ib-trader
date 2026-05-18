@@ -168,3 +168,73 @@ class TestGetByIBOrderId:
         rows = txn_repo.get_by_ib_order_id(7000)
         assert len(rows) == 1
         assert rows[0].ib_order_id == 7000
+
+
+class TestSumCommissionForTradeSerial:
+    """Used by ``BotTrade`` creation to seed the round-trip commission
+    from transactions at the moment the row is written — closes the
+    race where IB delivered a ``commissionReport`` before the bot_trade
+    existed (in which case ``add_commission_by_serial`` updated 0 rows
+    and the commission was effectively lost)."""
+
+    def test_sums_filled_rows_for_serial(self, txn_repo):
+        txn_repo.insert(_make_event(
+            ib_order_id=8000, action=TransactionAction.FILLED,
+            trade_serial=42, commission=Decimal("0.62"),
+        ))
+        # PARTIAL_FILL for the same serial also counts (multi-leg).
+        txn_repo.insert(_make_event(
+            ib_order_id=8001, action=TransactionAction.PARTIAL_FILL,
+            trade_serial=42, commission=Decimal("0.35"),
+        ))
+        assert (txn_repo.sum_commission_for_trade_serial(42)
+                == Decimal("0.97"))
+
+    def test_ignores_non_fill_actions(self, txn_repo):
+        """PLACE_ATTEMPT / PLACE_ACCEPTED / AMENDED rows don't carry
+        commission and must not be summed."""
+        txn_repo.insert(_make_event(
+            ib_order_id=8100, action=TransactionAction.PLACE_ATTEMPT,
+            trade_serial=43, commission=Decimal("999"),
+        ))
+        txn_repo.insert(_make_event(
+            ib_order_id=8100, action=TransactionAction.PLACE_ACCEPTED,
+            trade_serial=43, commission=Decimal("999"),
+        ))
+        txn_repo.insert(_make_event(
+            ib_order_id=8100, action=TransactionAction.FILLED,
+            trade_serial=43, commission=Decimal("1.50"),
+        ))
+        assert (txn_repo.sum_commission_for_trade_serial(43)
+                == Decimal("1.50"))
+
+    def test_unknown_serial_returns_zero(self, txn_repo):
+        assert (txn_repo.sum_commission_for_trade_serial(99999)
+                == Decimal("0"))
+
+    def test_null_commission_treated_as_zero(self, txn_repo):
+        """A FILLED row whose commission backfill hasn't landed yet
+        has commission=NULL. Sum must remain numeric, not None."""
+        txn_repo.insert(_make_event(
+            ib_order_id=8200, action=TransactionAction.FILLED,
+            trade_serial=44, commission=None,
+        ))
+        assert (txn_repo.sum_commission_for_trade_serial(44)
+                == Decimal("0"))
+
+    def test_isolates_serials(self, txn_repo):
+        """Sum for serial X must not include rows for serial Y, even
+        if they share the same ib_order_id (rare but possible across
+        re-uses)."""
+        txn_repo.insert(_make_event(
+            ib_order_id=8300, action=TransactionAction.FILLED,
+            trade_serial=45, commission=Decimal("1.00"),
+        ))
+        txn_repo.insert(_make_event(
+            ib_order_id=8300, action=TransactionAction.FILLED,
+            trade_serial=46, commission=Decimal("2.00"),
+        ))
+        assert (txn_repo.sum_commission_for_trade_serial(45)
+                == Decimal("1.00"))
+        assert (txn_repo.sum_commission_for_trade_serial(46)
+                == Decimal("2.00"))
