@@ -322,7 +322,11 @@ class TestEntry:
 
 
 class TestEntryDistanceFilter:
-    """FILTER_FAR_FROM_PIVOT: reject when entry-to-line gap > 2× trail_dist."""
+    """FILTER_FAR_FROM_PIVOT: reject when the fire bar's close has
+    drifted from the just-confirmed pivot's close by more than
+    ``mult × trail_dist`` (default 2). Measured pivot-to-entry, not
+    line-to-entry — same geometry-agnostic check applies to both
+    touch and accel detection paths."""
 
     def _bar_event_at(self, idx: int) -> BarCompleted:
         bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES[: idx + 1])
@@ -332,10 +336,9 @@ class TestEntryDistanceFilter:
 
     @pytest.mark.asyncio
     async def test_rejects_when_gap_exceeds_cap(self):
-        # ZIGZAG bar 8 closes at 14.0; support line projects to 12.5
-        # at this bar (slope 0.5 from anchor 12.0 at idx 7) → gap 1.5.
-        # With trail_pct = 0.0003 (default) and 2× mult: cap = 0.0084.
-        # Gap 1.5 >> cap → reject.
+        # ZIGZAG bar 8 closes at 14.0; pivot at idx 7 closes at 12.0.
+        # gap = |14.0 - 12.0| = 2.0. Cap = 14 * 0.0003 * 2 = 0.0084.
+        # Gap 2.0 >> cap → reject.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = True
         s = ChartSignalStrategy(cfg)
@@ -350,14 +353,17 @@ class TestEntryDistanceFilter:
         assert p["filter"] == "far_from_pivot"
         assert p["direction"] == "long"
         assert p["gap"] > p["cap"]
+        # gap is pivot-based now: |14.0 - 12.0| = 2.0
+        assert p["gap"] == pytest.approx(2.0)
+        assert p["pivot_close"] == pytest.approx(12.0)
 
     @pytest.mark.asyncio
     async def test_allows_when_gap_within_cap(self):
-        # Same fixture, but bump trail_pct so 2× × 14 ≥ 1.5 → cap ≥ 1.5.
-        # trail_pct = 0.06 → trail_dist 0.84 → cap 1.68 ≥ 1.5 → pass.
+        # gap = 2.0 (pivot-based). Cap needs to be ≥ 2.0.
+        # trail_pct = 0.08 → trail_dist = 14 * 0.08 = 1.12 → cap = 2.24.
         cfg = _default_config()
         cfg["far_from_pivot_filter_enabled"] = True
-        cfg["trail_width_pct"] = 0.06
+        cfg["trail_width_pct"] = 0.08
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
@@ -386,9 +392,12 @@ class TestEntryDistanceFilter:
                  and (a.payload or {}).get("filter") == "far_from_pivot"]
         p = skips[0].payload
         assert p["entry_price"] == pytest.approx(14.0)
+        assert p["pivot_close"] == pytest.approx(12.0)
+        # line_value still surfaced for diagnostics, even though
+        # the decision uses pivot_close.
         assert p["line_value"] == pytest.approx(12.5)
-        assert p["gap"] == pytest.approx(1.5)
-        # mult default = 2.0
+        # gap is now |entry - pivot| = 2.0
+        assert p["gap"] == pytest.approx(2.0)
         assert p["mult"] == 2.0
         # cap = 14 * 0.0003 * 2 = 0.0084
         assert p["cap"] == pytest.approx(0.0084, abs=1e-6)

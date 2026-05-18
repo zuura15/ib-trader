@@ -1981,14 +1981,23 @@ class ChartSignalStrategy:
         # us" argument doesn't apply when the entry is already past
         # the exit threshold.
         #
-        # 2026-05-18: removed the acceleration-entry exemption.
-        # Earlier rationale was "accel ALREADY entered beyond the
-        # line by intent." But far_from_pivot acts *from the pivot
-        # back to the line* — it doesn't care how the pivot was
-        # detected (touch vs accel). On MNQ 14:54 an accel SHORT
-        # fired with the pivot $122 past the line; the entry was
-        # chasing a move that had already played out. Same gate
-        # applies to both paths now.
+        # 2026-05-18: removed the acceleration-entry exemption AND
+        # changed the reference point from the LINE to the just-
+        # confirmed PIVOT itself. The filter's name was always "far
+        # from pivot" but the math was ``|entry - line_at_fire_bar|``,
+        # which for touch entries (pivot on line) is approximately
+        # the same number but for accel entries (pivot beyond line by
+        # design) measured the overshoot itself and rejected every
+        # accel.
+        #
+        # Now: ``gap = |entry_price - pivot_close|`` — the drift
+        # between the just-confirmed pivot bar's close and the fire
+        # bar's close. Same intent ("did the rejection play out on a
+        # prior bar?") applied uniformly to both detection paths. A
+        # touch pivot followed by a tight fire bar passes. An accel
+        # pivot followed by a tight fire bar also passes. A late
+        # fire bar (drifted from the pivot) gets rejected regardless
+        # of how the pivot was detected.
         #
         # Cap = trail_dist × ``far_from_pivot_max_trail_mult`` (default
         # 2.0). MGC trail $0.93 → cap $1.86; MES $2.26 → $4.52;
@@ -2000,6 +2009,7 @@ class ChartSignalStrategy:
         ))
         if ffp_enabled:
             entry_price = closes[last_idx]
+            pivot_close = closes[last_idx - 1]
             trail_pct = float(self.config.get("trail_width_pct", 0.0003))
             trail_dist = abs(entry_price) * trail_pct
             mult = float(self.config.get(
@@ -2008,19 +2018,16 @@ class ChartSignalStrategy:
             ))
             cap = trail_dist * mult
             line_at = chosen.intercept + chosen.slope * last_idx
-            gap = abs(entry_price - line_at)
+            gap = abs(entry_price - pivot_close)
             if gap > cap:
-                # Direction-aware wording: pivot HIGH (SHORT) → bar
-                # closed BELOW the resistance; pivot LOW (LONG) → bar
-                # closed ABOVE the support. Either way, the bar
-                # OVERSHOT the pivot's rejection point.
                 actions.append(LogSignal(
                     event_type=LogEventType.SKIP,
                     message=(
                         f"{FILTER_FAR_FROM_PIVOT} filter ({direction.upper()}) — "
-                        f"fire bar overshot pivot's {kind} line by "
-                        f"${gap:.4f} (cap ${cap:.4f} = {mult:.1f}× trail). "
-                        f"line @ {line_at:.4f}, entry @ {entry_price:.4f}"
+                        f"fire bar drifted ${gap:.4f} from pivot's "
+                        f"close (cap ${cap:.4f} = {mult:.1f}× trail). "
+                        f"pivot @ {pivot_close:.4f}, entry @ "
+                        f"{entry_price:.4f}, line @ {line_at:.4f}"
                     ),
                     payload={
                         "filter": FILTER_FAR_FROM_PIVOT,
@@ -2028,6 +2035,7 @@ class ChartSignalStrategy:
                         "marginal": False,
                         "direction": direction,
                         "entry_price": round(entry_price, 4),
+                        "pivot_close": round(pivot_close, 4),
                         "line_value": round(line_at, 4),
                         "gap": round(gap, 4),
                         "cap": round(cap, 4),
