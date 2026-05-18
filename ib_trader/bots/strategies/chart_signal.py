@@ -1085,7 +1085,17 @@ class ChartSignalStrategy:
                 compute_regime, passes_amplitude, at_donchian_extreme,
             )
             side_in_play = "short" if is_pivot_high_rg else "long"
-            entry_close_rg = closes[last_idx]
+            # Donchian-extreme check uses the PIVOT bar's close, not
+            # the eval bar's close. The pivot is what defines the
+            # signal — checking the eval bar (one bar later) biases
+            # toward rejection because price has already moved off
+            # the rejection point by then. For SHORTs after a pivot
+            # HIGH the eval close is typically below DCU; for LONGs
+            # after a pivot LOW it's typically above DCL. Fixed
+            # 2026-05-18 after a MNQ SHORT was rejected at 29116
+            # while the pivot itself sat right at DCU (29139 vs
+            # DCU 29143 within $5.84 tol).
+            entry_close_rg = closes[np_idx_rg]
             reading = compute_regime(
                 window,
                 adx_period=int(self.config.get("adx_period", 14)),
