@@ -100,3 +100,60 @@ entry_counter_trend_filter_enabled: true
 # Stale-line: require ≥ 2 strict touches on the chosen line in the
 # last 24 hours. Hard-reject — not bypassable in marginal mode.
 entry_min_recent_strict_touches: 2
+
+# Tick-time SL. Two different mechanics by entry confidence:
+#   - clean:    periodic poll every ``sl_check_clean_seconds`` (60s
+#               default). The SL is sampled on the first tick after
+#               each interval boundary; if breached, fires
+#               immediately. Between samples, ticks are ignored.
+#               3× tighter than the prior 3-min bar-close check
+#               without giving up to tick-spike noise.
+#   - marginal: touch+hold linger of ``sl_linger_marginal_seconds``
+#               (10s default). Continuous breach for the full
+#               window fires; a retrace clears the timer so a
+#               re-breach starts a fresh window. Tight because
+#               marginal entries are lower-conviction.
+sl_check_clean_seconds: 60
+sl_linger_marginal_seconds: 10
+
+# Local-regime filter (ADX + ATR + Donchian via pandas-ta).
+# Runs AFTER pivot detection and BEFORE the entry-filter chain.
+# Bar-level gates — hard-reject, not bypassable in marginal mode
+# (these classify the market, not the entry quality):
+#   - adx_regime         (direction conflicts with trending regime)
+#   - flat_amplitude     (flat regime + expected swing < cost floor)
+#   - flat_extreme       (flat regime + pivot not at Donchian extreme)
+#   - insufficient_bars_for_regime  (warm-up not complete; falls
+#                                    through to flat-conservative gates,
+#                                    surfaced as a RISK row when an
+#                                    entry IS let through)
+#
+# Decision tree:
+#   ADX > adx_trending_threshold (25):
+#     +DI > −DI  → up-trend  → block SHORT
+#     +DI < −DI  → down-trend → block LONG
+#   ADX < adx_ranging_threshold (20):
+#     flat regime → require (a) ATR × typical_bars ≥ edge_mult × costs,
+#                            (b) pivot near Donchian extreme.
+#   20 ≤ ADX ≤ 25:
+#     uncertain → same as flat (conservative).
+regime_filter_enabled: true
+adx_period: 14
+atr_period: 14
+donchian_period: 20
+adx_trending_threshold: 25.0
+adx_ranging_threshold: 20.0
+# Flat-regime amplitude check: expected_swing = ATR × N where N =
+# regime_typical_bars_in_trade. Skip when expected_swing <
+# regime_min_edge_mult × cost_floor (round_trip_comm/multiplier +
+# 2× touch_tol). Defaults give roughly: MGC needs ~$0.40/bar ATR to
+# pass at 5 bars × 2 edge = $4 expected vs ~$2 cost.
+regime_typical_bars_in_trade: 5.0
+regime_min_edge_mult: 2.0
+# Donchian extreme tol multiplier. tol = touch_tol × this. Larger
+# values are more permissive (pivot can be further from the band).
+regime_extreme_tol_mult: 1.0
+# Per-symbol round-trip commission used as cost floor. Falls back
+# to the in-code default {MGCM6: 1.94, MESM6: 1.24, MNQM6: 1.24}
+# when unset; override here for non-default symbols.
+# regime_round_trip_commission: 1.94

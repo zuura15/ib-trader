@@ -179,13 +179,12 @@ def clear_position_fields() -> dict:
         "counter_lines_cache": [],
         "counter_lines_tol": 0.0,
         "counter_touch": None,
-        "tight_zones": [],
-        "tight_touch": None,
-        # Touch+hold timer for the marginal-trade SL fire (post
-        # 2026-05-18: was immediate-fire, now 5s linger per
-        # ``sl_linger_seconds`` config). Cleared on every position
-        # close so the next round starts with a fresh slate.
+        # SL state — marginal uses ``sl_touch`` touch+hold (10s
+        # default linger); clean uses ``sl_last_check_ts`` periodic
+        # poll (60s default cadence). Both cleared on every
+        # position close so the next round starts fresh.
         "sl_touch": None,
+        "sl_last_check_ts": None,
     }
 
 

@@ -96,6 +96,21 @@ FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
 # bot mirrors that default here. Bypassable in marginal mode.
 FILTER_COUNTER_TREND = "counter_trend"
 
+# Local-regime gates (2026-05-17). Bar-level, run AFTER pivot
+# detection and BEFORE 3-touch line search. Each is hard-reject —
+# these are market-regime decisions, not entry-quality bypasses.
+#   adx_regime        — direction conflicts with the trending regime
+#                       (ADX > 25 + +DI/−DI sign).
+#   flat_amplitude    — flat regime + ATR × N-bars < edge-mult × costs.
+#   flat_extreme      — flat regime + pivot not at the Donchian
+#                       N-bar extreme (within tol).
+#   insufficient_bars — bar window too small to derive a regime;
+#                       falls through to flat-conservative gates.
+FILTER_ADX_REGIME = "adx_regime"
+FILTER_FLAT_AMPLITUDE = "flat_amplitude"
+FILTER_FLAT_EXTREME = "flat_extreme"
+FILTER_INSUFFICIENT_BARS_FOR_REGIME = "insufficient_bars_for_regime"
+
 # Named exit triggers (alongside the bar-close line_breach / trail_stop).
 #   counter_line  — tick-time touch-and-hold: mid touches an opposing
 #                   trendline (2+ touches, unbroken) and price hasn't
@@ -103,17 +118,6 @@ FILTER_COUNTER_TREND = "counter_trend"
 #                   (default 10) → immediate close.
 EXIT_COUNTER_LINE = "counter_line"
 EXIT_TIGHT_COUNTER_LINE = "tight_counter_line"
-# Trigger-line retest exit (touch+hold against the entry trendline
-# itself, NOT against an opposing line). The trigger line for a
-# SHORT is the resistance the bot faded to enter; for a LONG it's
-# the support it bounced off. When price retraces back to that line
-# and HOLDS within tol for ``counter_exit_hold_seconds``, the
-# original entry rejection is considered failed → exit.
-# This was previously labelled ``tight_counter_line`` (same constant
-# as the opposing-line marginal exit) which was operator-confusing —
-# the audit feed read "counter_line at 7386" but there was no
-# counter line at 7386, only the trigger line. Renamed 2026-05-18.
-EXIT_TRIGGER_LINE_RETEST = "trigger_retest"
 
 
 def _parse_ts(ts: Any) -> datetime | None:
@@ -182,21 +186,18 @@ class ChartSignalStrategy:
                 "counter_lines_cache": "list|null",
                 "counter_lines_tol": "decimal|null",
                 "counter_touch": "dict|null",
-                # Tight-exit zones (marginal trades only). Trigger
-                # line value + active_stop at the last closed bar.
-                # ``_on_quote`` runs the same touch+hold rule as
-                # counter-lines but with flipped geometry — these
-                # zones sit on the FAVORABLE side of price.
-                "tight_zones": "list|null",
-                "tight_touch": "dict|null",
-                # Marginal SL touch+hold timer. ``{"start_ts": iso}``
-                # when mid first crossed ``active_stop`` in the bad
-                # direction; cleared on retrace. The exit fires only
-                # when elapsed >= ``sl_linger_seconds`` (default 5s)
-                # AND mid is STILL past the stop — gives a brief
-                # forgiveness window for tick-spike overshoots that
-                # immediately recover.
+                # SL touch+hold timer — MARGINAL trades only.
+                # ``{"start_ts": iso}`` when mid first crossed
+                # ``active_stop`` in the bad direction; cleared on
+                # retrace. Fires when elapsed >=
+                # ``sl_linger_marginal_seconds`` (default 10).
                 "sl_touch": "dict|null",
+                # SL periodic-poll timestamp — CLEAN trades only.
+                # ``_on_quote`` re-evaluates the SL once every
+                # ``sl_check_clean_seconds`` (default 60); if the
+                # sample is breached, fires immediately. Updated on
+                # each sample; None at entry (first tick samples).
+                "sl_last_check_ts": "str|null",
             },
             version="1.0",
             supported_sec_types=("STK", "ETF", "FUT", "FOP"),
@@ -1060,6 +1061,198 @@ class ChartSignalStrategy:
                 "pivot_touching_lines": pivot_touching_lines,
             },
         ))
+        # ----------------------------------------------------------
+        # Local-regime gate (2026-05-17). Bar-level filter applied
+        # AFTER the BAR audit row (so the audit feed always carries
+        # the bar's geometric context) and BEFORE the entry-filter
+        # chain (so we save the per-line filter work on regime
+        # rejection and keep the rejection reason as a single clean
+        # SKIP row).
+        #
+        # The line search itself runs unconditionally so the BAR
+        # audit's top_supports/top_resistances payload is always
+        # complete for operator review. The few-ms saving from
+        # gating detect_lines isn't worth losing that visibility.
+        # ----------------------------------------------------------
+        np_idx_rg = last_idx - 1
+        is_pivot_high_rg = np_idx_rg in resistance_pivots
+        is_pivot_low_rg = np_idx_rg in support_pivots
+        if (
+            self.config.get("regime_filter_enabled", True)
+            and (is_pivot_high_rg or is_pivot_low_rg)
+        ):
+            from .regime import (
+                compute_regime, passes_amplitude, at_donchian_extreme,
+            )
+            side_in_play = "short" if is_pivot_high_rg else "long"
+            entry_close_rg = closes[last_idx]
+            reading = compute_regime(
+                window,
+                adx_period=int(self.config.get("adx_period", 14)),
+                atr_period=int(self.config.get("atr_period", 14)),
+                donchian_period=int(self.config.get("donchian_period", 20)),
+                trending_threshold=float(self.config.get(
+                    "adx_trending_threshold", 25.0,
+                )),
+                ranging_threshold=float(self.config.get(
+                    "adx_ranging_threshold", 20.0,
+                )),
+            )
+
+            # 1) Trending regime — reject anti-direction outright.
+            if reading.regime == "up" and side_in_play == "short":
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_ADX_REGIME} (SHORT) — local regime UP "
+                        f"(ADX={reading.adx:.1f}, "
+                        f"+DI={reading.dmp:.1f} > −DI={reading.dmn:.1f})"
+                    ),
+                    payload={
+                        "filter": FILTER_ADX_REGIME,
+                        "marginal": False,
+                        "direction": "short",
+                        **reading.to_audit_payload(),
+                    },
+                ))
+                return actions
+            if reading.regime == "down" and side_in_play == "long":
+                actions.append(LogSignal(
+                    event_type=LogEventType.SKIP,
+                    message=(
+                        f"{FILTER_ADX_REGIME} (LONG) — local regime DOWN "
+                        f"(ADX={reading.adx:.1f}, "
+                        f"−DI={reading.dmn:.1f} > +DI={reading.dmp:.1f})"
+                    ),
+                    payload={
+                        "filter": FILTER_ADX_REGIME,
+                        "marginal": False,
+                        "direction": "long",
+                        **reading.to_audit_payload(),
+                    },
+                ))
+                return actions
+
+            # 2) Insufficient bars (cold-start / test) — surface a
+            # RISK row but DON'T gate. Pre-2024-fetch in real prod
+            # we always have 24h = 480 bars so this branch rarely
+            # fires; in unit tests with synthetic short windows it's
+            # the common path. The existing per-line filters still
+            # apply downstream.
+            if reading.regime == "insufficient":
+                actions.append(LogSignal(
+                    event_type=LogEventType.RISK,
+                    message=(
+                        f"{FILTER_INSUFFICIENT_BARS_FOR_REGIME} — only "
+                        f"{reading.n_bars} bars; regime gate skipped"
+                    ),
+                    payload={
+                        "filter": FILTER_INSUFFICIENT_BARS_FOR_REGIME,
+                        "marginal": False,
+                        "direction": side_in_play,
+                        **reading.to_audit_payload(),
+                    },
+                ))
+            # 3) Flat / uncertain (sufficient bars) — apply
+            # amplitude and Donchian-extreme gates. Pivot must sit
+            # at the extreme of the recent N-bar range AND recent
+            # ATR must give enough room to clear costs.
+            elif reading.regime in ("flat", "uncertain"):
+                TOUCH_FRAC_RG = float(self.config.get(
+                    "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
+                ))
+                avg_close_rg = sum(closes) / max(1, len(closes))
+                touch_tol_rg = max(1e-6, avg_close_rg * TOUCH_FRAC_RG)
+                mult_rg = float(self.config.get("contract_multiplier", 1.0))
+                # Symbol-specific round-trip commission default; falls
+                # back to 1.0 for unknown symbols. ATR is in price
+                # units, so divide commission by multiplier to compare.
+                round_trip_default = {
+                    "MGCM6": 1.94, "MESM6": 1.24, "MNQM6": 1.24,
+                }.get(str(self.config.get("symbol", "")), 1.0)
+                round_trip_comm_rg = float(self.config.get(
+                    "regime_round_trip_commission", round_trip_default,
+                ))
+                cost_floor_rg = (
+                    (round_trip_comm_rg / max(mult_rg, 1e-6))
+                    + (2.0 * touch_tol_rg)
+                )
+                typ_bars_rg = float(self.config.get(
+                    "regime_typical_bars_in_trade", 5.0,
+                ))
+                edge_mult_rg = float(self.config.get(
+                    "regime_min_edge_mult", 2.0,
+                ))
+
+                # 2a) Amplitude — expected swing vs cost floor.
+                if not passes_amplitude(
+                    reading,
+                    cost_floor=cost_floor_rg,
+                    typical_bars_in_trade=typ_bars_rg,
+                    min_edge_mult=edge_mult_rg,
+                ):
+                    expected_swing_rg = (reading.atr or 0.0) * typ_bars_rg
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"{FILTER_FLAT_AMPLITUDE} ({side_in_play.upper()}) "
+                            f"— flat regime, expected swing "
+                            f"${expected_swing_rg:.4f} < required "
+                            f"${cost_floor_rg * edge_mult_rg:.4f}"
+                        ),
+                        payload={
+                            "filter": FILTER_FLAT_AMPLITUDE,
+                            "marginal": False,
+                            "direction": side_in_play,
+                            "expected_swing": round(expected_swing_rg, 4),
+                            "cost_floor": round(cost_floor_rg, 4),
+                            "min_edge_mult": edge_mult_rg,
+                            "typical_bars_in_trade": typ_bars_rg,
+                            **reading.to_audit_payload(),
+                        },
+                    ))
+                    return actions
+
+                # 2b) Donchian extreme — pivot must be near the
+                # regime-side band.
+                ext_tol_rg = touch_tol_rg * float(self.config.get(
+                    "regime_extreme_tol_mult", 1.0,
+                ))
+                if not at_donchian_extreme(
+                    reading, price=entry_close_rg,
+                    side=side_in_play, tol=ext_tol_rg,
+                ):
+                    band_val = (
+                        reading.dcu if side_in_play == "short"
+                        else reading.dcl
+                    )
+                    actions.append(LogSignal(
+                        event_type=LogEventType.SKIP,
+                        message=(
+                            f"{FILTER_FLAT_EXTREME} ({side_in_play.upper()}) "
+                            f"— flat regime, entry @ "
+                            f"{entry_close_rg:.4f} not at Donchian "
+                            f"{'upper' if side_in_play == 'short' else 'lower'} "
+                            f"band {band_val:.4f} (tol ${ext_tol_rg:.4f})"
+                        ),
+                        payload={
+                            "filter": FILTER_FLAT_EXTREME,
+                            "marginal": False,
+                            "direction": side_in_play,
+                            "entry_price": round(entry_close_rg, 4),
+                            "band_value": (
+                                round(band_val, 4)
+                                if band_val is not None else None
+                            ),
+                            "tol": round(ext_tol_rg, 4),
+                            **reading.to_audit_payload(),
+                        },
+                    ))
+                    return actions
+
+        # ----------------------------------------------------------
+        # End regime gate.
+        # ----------------------------------------------------------
         # Freshness gates — two guards, both must pass.
         #
         # Guard 1: TOUCH COUNT INCREASED ON THIS BAR.
@@ -2166,12 +2359,9 @@ class ChartSignalStrategy:
         # ``breach_line`` only fires on bar close when bar_close is
         # CLEARLY past the line on the unfavorable side — beyond a
         # ``touch_tolerance_fraction`` band. A near-miss (bar close
-        # within tol of the line) is deferred to the 10 s tick-time
-        # touch+hold on ``tight_zones[trigger]`` so brief retests
-        # don't fire an immediate exit. Operator call 2026-05-15:
-        # "ensure the exit doesnt trigger when the price meets the
-        # original line from the entry side. even then it has to
-        # linger for 10s."
+        # within tol of the line) defers to the tick-time SL
+        # touch+hold in ``_on_quote`` (the entry line is the floor of
+        # ``active_stop``, so the SL linger handles the retest).
         entry_path = str(entry_line.get("entry_path", "touch"))
         breach_tol_frac = float(self.config.get(
             "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
@@ -2232,21 +2422,6 @@ class ChartSignalStrategy:
                 await self._refresh_counter_lines_cache(direction, ctx)
             )
 
-        # Refresh the trigger-line snapshot for the tick-time
-        # touch+hold check. Populated for BOTH clean and marginal
-        # trades so a near-miss bar close (within touch_tol of the
-        # line) triggers the 10 s linger instead of an immediate
-        # bar-close line_breach — operator call 2026-05-15.
-        # The hard ``breach_line`` gate above still fires immediately
-        # when bar_close is CLEARLY past the line beyond tol.
-        # The SL is NOT included here: marginal trades exit on the
-        # immediate-tick SL path in ``_on_quote``; clean trades exit
-        # on the bar-close trail check above.
-        actions.append(UpdateState({
-            "tight_zones": [
-                {"value": float(line_value_d), "kind": "trigger"},
-            ],
-        }))
         return actions
 
     async def _refresh_counter_lines_cache(
@@ -2383,88 +2558,114 @@ class ChartSignalStrategy:
                 if isinstance(a, PlaceOrder):
                     return actions
 
-        # Tick-time exit checks for marginal trades. Two paths:
-        #   (1) IMMEDIATE SL — every tick we ratchet the trail (HWM/LWM
-        #       moves on tick instead of every 3 min) and exit the
-        #       moment mid breaches ``active_stop``. No linger; lingers
-        #       only apply to LINES that price can hover near.
-        #   (2) Tight-zone touch+hold — trigger trendline only. The
-        #       opposing-line linger is handled separately by
-        #       ``_check_counter_line_exit`` above.
-        if bool(entry_line.get("marginal", False)):
-            try:
-                trail_pct = Decimal(str(
-                    self.config.get("trail_width_pct", "0.0003")
+        # Tick-time SL for BOTH clean and marginal trades (2026-05-17
+        # operator spec). The trigger-line linger was removed entirely:
+        # a SHORT entered AT the trigger line is by definition close
+        # to that line, so a symmetric tol-band on the SAME line
+        # armed immediately and exited within a few seconds. The
+        # opposing line (counter-line) handles "did the entry idea
+        # fail" via ``_check_counter_line_exit`` above; the SL
+        # handles "price moved against us past the trail" here.
+        #
+        # ALWAYS PER TICK (no gating): ratchet HWM/LWM, re-project
+        # the entry line via ``slope_per_sec``, compute
+        # ``active_stop = max/min(line, trail)``, evaluate
+        # ``sl_breached``. The trail is always current; the
+        # marginal/clean split controls only WHEN to fire on a
+        # breach (see below).
+        #
+        # FIRE DECISION — two different mechanics by entry confidence:
+        #   - marginal (unchanged): touch+hold linger
+        #     ``sl_linger_marginal_seconds`` (default 10s). First
+        #     breach starts ``sl_touch.start_ts``; continuous breach
+        #     for the full window fires; a retrace clears the timer
+        #     so a re-breach starts a fresh window.
+        #   - clean (new): periodic poll every
+        #     ``sl_check_clean_seconds`` (default 60s). At each
+        #     interval boundary, sample the current breach state;
+        #     if breached → fire. Between samples, ticks are ignored
+        #     by the fire decision (but HWM/active_stop still update
+        #     above).
+        try:
+            trail_pct = Decimal(str(
+                self.config.get("trail_width_pct", "0.0003")
+            ))
+        except Exception:  # noqa: BLE001
+            trail_pct = Decimal("0.0003")
+        mid_d = Decimal(str(last))
+        wm_field = (
+            "high_water_mark" if direction == "long"
+            else "low_water_mark"
+        )
+        wm_raw = ctx.state.get(wm_field)
+        try:
+            cur_wm = (
+                Decimal(str(wm_raw))
+                if wm_raw not in (None, "")
+                else mid_d
+            )
+        except Exception:  # noqa: BLE001
+            cur_wm = mid_d
+        new_wm = (
+            max(cur_wm, mid_d) if direction == "long"
+            else min(cur_wm, mid_d)
+        )
+        trail_stop = (
+            new_wm * (Decimal("1") - trail_pct)
+            if direction == "long"
+            else new_wm * (Decimal("1") + trail_pct)
+        )
+        # Re-project the entry line value at this tick. Anchor +
+        # slope_per_sec × elapsed gives the current line; fall back
+        # to the fill-time snapshot if the anchor data is missing.
+        anchor_t_q = _parse_ts(entry_line.get("anchor_time"))
+        anchor_p_q = entry_line.get("anchor_price")
+        slope_per_sec_q = entry_line.get("slope_per_sec")
+        now_utc = datetime.now(timezone.utc)
+        line_val_d: Decimal | None = None
+        try:
+            if (anchor_t_q is not None and anchor_p_q is not None
+                    and slope_per_sec_q is not None):
+                elapsed_q = (now_utc - anchor_t_q).total_seconds()
+                line_val_d = Decimal(str(
+                    float(anchor_p_q)
+                    + float(slope_per_sec_q) * elapsed_q
                 ))
-            except Exception:  # noqa: BLE001
-                trail_pct = Decimal("0.0003")
-            mid_d = Decimal(str(last))
-            wm_field = (
-                "high_water_mark" if direction == "long"
-                else "low_water_mark"
-            )
-            wm_raw = ctx.state.get(wm_field)
-            try:
-                cur_wm = (
-                    Decimal(str(wm_raw))
-                    if wm_raw not in (None, "")
-                    else mid_d
-                )
-            except Exception:  # noqa: BLE001
-                cur_wm = mid_d
-            new_wm = (
-                max(cur_wm, mid_d) if direction == "long"
-                else min(cur_wm, mid_d)
-            )
-            trail_stop = (
-                new_wm * (Decimal("1") - trail_pct)
-                if direction == "long"
-                else new_wm * (Decimal("1") + trail_pct)
-            )
-            # ``active_stop = max/min(line, trail)`` mirrors the
-            # bar-close formula. We use the last bar-close line value
-            # (frozen on tight_zones[kind=trigger]) instead of
-            # re-deriving — line drift over 3 min is small and the
-            # bar-close path reconverges.
-            zones = list(ctx.state.get("tight_zones") or [])
-            line_val_d: Decimal | None = None
-            for z in zones:
-                if z.get("kind") == "trigger":
-                    try:
-                        line_val_d = Decimal(str(z["value"]))
-                    except Exception:  # noqa: BLE001
-                        line_val_d = None
-                    break
-            if line_val_d is not None:
-                active_stop = (
-                    max(line_val_d, trail_stop) if direction == "long"
-                    else min(line_val_d, trail_stop)
-                )
             else:
-                active_stop = trail_stop
-            state_patch[wm_field] = str(new_wm)
-            state_patch["active_stop"] = str(active_stop)
-
-            # SL touch+hold — fire only when mid is past active_stop
-            # in the unfavorable direction for AT LEAST
-            # ``sl_linger_seconds`` (default 5s) of continuous touch.
-            # Replaces the prior immediate-fire (operator spec
-            # 2026-05-18): tick-spike overshoots that recovered within
-            # a few seconds were clipping winners on MGC; 5s gives a
-            # tight forgiveness window without giving up the
-            # tick-time reactivity. Clears on retrace so a spike that
-            # re-breaches later restarts the timer fresh.
-            sl_breached = (
-                (mid_d <= active_stop) if direction == "long"
-                else (mid_d >= active_stop)
+                lv_at_entry = entry_line.get("line_value_at_entry")
+                if lv_at_entry is not None:
+                    line_val_d = Decimal(str(lv_at_entry))
+        except Exception:  # noqa: BLE001
+            line_val_d = None
+        if line_val_d is not None:
+            active_stop = (
+                max(line_val_d, trail_stop) if direction == "long"
+                else min(line_val_d, trail_stop)
             )
-            sl_linger_s = float(self.config.get("sl_linger_seconds", 5.0))
-            now_utc = datetime.now(timezone.utc)
+        else:
+            active_stop = trail_stop
+        state_patch[wm_field] = str(new_wm)
+        state_patch["active_stop"] = str(active_stop)
+
+        sl_breached = (
+            (mid_d <= active_stop) if direction == "long"
+            else (mid_d >= active_stop)
+        )
+        is_marginal = bool(entry_line.get("marginal", False))
+
+        fire = False
+        detail = ""
+        elapsed_log: float | None = None
+        linger_log: float | None = None
+
+        if is_marginal:
+            linger_log = float(self.config.get(
+                "sl_linger_marginal_seconds", 10.0,
+            ))
             sl_touch_doc = ctx.state.get("sl_touch")
             elapsed_s: float | None = None
             if sl_breached:
                 if not sl_touch_doc or not isinstance(sl_touch_doc, dict):
-                    # First tick past the stop — start the timer.
                     state_patch["sl_touch"] = {
                         "start_ts": now_utc.isoformat(),
                     }
@@ -2473,64 +2674,68 @@ class ChartSignalStrategy:
                     if start_ts is not None:
                         elapsed_s = (now_utc - start_ts).total_seconds()
             elif sl_touch_doc:
-                # Retraced back to the safe side — clear the timer so
-                # the next breach gets a fresh 5s window. Without
-                # this, a 4.9-second-old touch that briefly retraced
-                # and re-breached would fire on the SECOND breach's
-                # first tick.
                 state_patch["sl_touch"] = None
-                ctx.state["sl_touch"] = None  # mirror into ctx so the
-                # ``_check_tight_zones_exit`` call below sees the same
-                # cleared state without re-reading from the patch.
+                ctx.state["sl_touch"] = None
 
             if sl_breached and elapsed_s is not None \
-                    and elapsed_s >= sl_linger_s:
+                    and elapsed_s >= linger_log:
+                fire = True
+                elapsed_log = elapsed_s
                 detail = (
                     f"mid {float(mid_d):.4f} "
                     + ("<= " if direction == "long" else ">= ")
                     + f"active_stop {float(active_stop):.4f} "
                     f"after {elapsed_s:.1f}s touch+hold "
-                    f"(linger={sl_linger_s:.0f}s, marginal)"
+                    f"(linger={linger_log:.0f}s, marginal)"
                 )
-                state_patch["exit_reason"] = "trail_stop"
                 state_patch["sl_touch"] = None
-                actions.append(LogSignal(
-                    event_type=LogEventType.EXIT_CHECK,
-                    message=f"TRAILING_STOP [{direction}]: {detail}",
-                    payload={
-                        "exit_type": ExitType.TRAILING_STOP.value,
-                        "direction": direction,
-                        "mid": float(mid_d),
-                        "active_stop": float(active_stop),
-                        "elapsed_s": elapsed_s,
-                        "linger_s": sl_linger_s,
-                        "marginal_trade": True,
-                    },
-                ))
-                actions.append(UpdateState(state_patch))
-                actions.extend(self.build_exit_actions(
-                    ctx, ExitType.TRAILING_STOP, detail,
-                ))
-                return actions
+        else:
+            # Clean: poll every N seconds. Sample only when the
+            # interval has elapsed since the last sample.
+            interval_s = float(self.config.get(
+                "sl_check_clean_seconds", 60.0,
+            ))
+            linger_log = interval_s
+            last_check_iso = ctx.state.get("sl_last_check_ts")
+            last_check = _parse_ts(last_check_iso) if last_check_iso else None
+            since_last = (
+                (now_utc - last_check).total_seconds()
+                if last_check is not None
+                else interval_s  # first tick — sample now
+            )
+            if since_last >= interval_s:
+                state_patch["sl_last_check_ts"] = now_utc.isoformat()
+                if sl_breached:
+                    fire = True
+                    elapsed_log = since_last
+                    detail = (
+                        f"mid {float(mid_d):.4f} "
+                        + ("<= " if direction == "long" else ">= ")
+                        + f"active_stop {float(active_stop):.4f} "
+                        f"at {interval_s:.0f}s poll "
+                        f"(interval={interval_s:.0f}s, clean)"
+                    )
 
-            # Strip any stale "stop" entries; only "trigger" lingers.
-            trigger_zones = [z for z in zones if z.get("kind") == "trigger"]
-            state_patch["tight_zones"] = trigger_zones
-            ctx.state["tight_zones"] = trigger_zones
-
-        # Trigger-line touch+hold runs for BOTH clean and marginal
-        # trades. The bar-close ``line_breach`` now only fires on a
-        # CLEAR overshoot (beyond touch_tol of the line); a
-        # near-miss bar close defers to this 10 s linger so a brief
-        # retest doesn't immediately knife a clean trade. Operator
-        # call 2026-05-15.
-        tight_actions = self._check_tight_zones_exit(
-            ctx, float(last), direction, state_patch,
-        )
-        actions.extend(tight_actions)
-        for a in tight_actions:
-            if isinstance(a, PlaceOrder):
-                return actions
+        if fire:
+            state_patch["exit_reason"] = "trail_stop"
+            actions.append(LogSignal(
+                event_type=LogEventType.EXIT_CHECK,
+                message=f"TRAILING_STOP [{direction}]: {detail}",
+                payload={
+                    "exit_type": ExitType.TRAILING_STOP.value,
+                    "direction": direction,
+                    "mid": float(mid_d),
+                    "active_stop": float(active_stop),
+                    "elapsed_s": elapsed_log,
+                    "linger_s": linger_log,
+                    "marginal_trade": is_marginal,
+                },
+            ))
+            actions.append(UpdateState(state_patch))
+            actions.extend(self.build_exit_actions(
+                ctx, ExitType.TRAILING_STOP, detail,
+            ))
+            return actions
 
         actions.append(UpdateState(state_patch))
         return actions
@@ -2693,154 +2898,6 @@ class ChartSignalStrategy:
         ))
         return actions
 
-    def _check_tight_zones_exit(
-        self, ctx: StrategyContext, mid: float, direction: str,
-        state_patch: dict,
-    ) -> list[Action]:
-        """Tick-time touch-and-hold against the TRIGGER LINE (the line
-        the entry was based on). Runs for BOTH clean and marginal
-        trades (post f352330).
-
-        For a SHORT, the trigger line is the RESISTANCE the bot
-        faded; for a LONG it's the SUPPORT it bounced off. If price
-        retraces back to within ``tol`` of that line and holds for
-        ``counter_exit_hold_seconds``, the original entry rejection
-        is considered failed → exit.
-
-        Geometry is flipped vs the opposing-line check: the trigger
-        line sits on the FAVORABLE side of price (above for SHORT,
-        below for LONG), so a touch means price has retraced *back*
-        to the line.
-
-        Exit reason logged as ``trigger_retest`` (not
-        ``tight_counter_line`` — the latter is reserved for the
-        marginal opposing-line case in ``_check_counter_line_exit``).
-        """
-        zones = ctx.state.get("tight_zones") or []
-        tol = float(ctx.state.get("counter_lines_tol", 0.0))
-        if not zones or tol <= 0:
-            return []
-        hold_secs = float(self.config.get("counter_exit_hold_seconds", 10))
-        now = datetime.now(timezone.utc)
-        cur_touch = ctx.state.get("tight_touch")
-
-        def _touched(lv: float, kind: str) -> bool:
-            # ``stop`` is one-sided — touched only when mid has crossed
-            # to the BAD side of the stop. The trail-only seed sits just
-            # $tol away from entry, so the original symmetric tol-band
-            # put entry price itself inside the touch zone and armed on
-            # the first tick. Observed on MGC 2026-05-15 11:36 SHORT:
-            # SL @ 4560.21 fired at mid 4559.80 (BELOW stop, favorable
-            # side) after 11.5 s.
-            #
-            # ``trigger`` (and any other line kind) keeps the symmetric
-            # tol-band: a trigger line is something price leaves at
-            # entry and may retrace to from either side, so lingering
-            # near it is the failure signal.
-            if kind == "stop":
-                # LONG stop sits BELOW entry; bad = mid at or below it.
-                # SHORT stop sits ABOVE entry; bad = mid at or above it.
-                return (mid <= lv) if direction == "long" else (mid >= lv)
-            # Symmetric tol-band — mid within tol of the line.
-            return abs(mid - lv) <= tol
-
-        def _cleared(lv: float, kind: str) -> bool:
-            # The trade has clearly retreated to the favorable side of
-            # the zone by > tol — touch state should reset rather than
-            # fire an exit. Direction-specific: favorable for LONG is
-            # UP, favorable for SHORT is DOWN.
-            if direction == "long":
-                # Stop sits below entry: favorable = mid back UP past
-                # stop. Line: favorable = mid back UP past line.
-                return mid > lv + tol
-            # SHORT
-            return mid < lv - tol
-
-        if cur_touch is None:
-            for z in zones:
-                lv = float(z["value"])
-                kind = str(z.get("kind", "?"))
-                if _touched(lv, kind):
-                    state_patch["tight_touch"] = {
-                        "started_at": now.isoformat(),
-                        "zone_value": lv,
-                        "zone_kind": kind,
-                    }
-                    return [LogSignal(
-                        event_type=LogEventType.EXIT_CHECK,
-                        message=(
-                            f"{EXIT_TRIGGER_LINE_RETEST} armed "
-                            f"({z.get('kind', '?')}) — line {lv:.4f} "
-                            f"touched (mid={mid:.4f}); hold "
-                            f"{hold_secs:.0f}s for failure confirm"
-                        ),
-                        payload={
-                            "exit_trigger_armed": EXIT_TRIGGER_LINE_RETEST,
-                            "zone_value": lv,
-                            "zone_kind": z.get("kind", "?"),
-                            "mid": mid,
-                            "hold_seconds": hold_secs,
-                        },
-                    )]
-            return []
-
-        started = _parse_ts(cur_touch.get("started_at"))
-        if started is None:
-            state_patch["tight_touch"] = None
-            return []
-        lv = float(cur_touch["zone_value"])
-        zone_kind = str(cur_touch.get("zone_kind", "?"))
-        elapsed = (now - started).total_seconds()
-        if elapsed < hold_secs:
-            return []
-        # At hold-elapsed, decide on the CURRENT touch state, not on
-        # a one-sided "breakout" — for SHORTs the old logic counted
-        # mid being favorable-side of the line as "still touched"
-        # (only ``mid > lv + tol`` cleared), so MGC 11:36 SHORT fired
-        # at mid 4559.80 while the stop sat at 4560.21 above it.
-        # Clearing now requires mid to be clearly on the favorable
-        # side of the zone by > tol.
-        if _cleared(lv, zone_kind):
-            state_patch["tight_touch"] = None
-            return [LogSignal(
-                event_type=LogEventType.EXIT_CHECK,
-                message=(
-                    f"{EXIT_TRIGGER_LINE_RETEST} cleared ({zone_kind}) — "
-                    f"mid {mid:.4f} on favorable side of line {lv:.4f}; "
-                    f"resetting"
-                ),
-                payload={
-                    "exit_trigger_cleared": EXIT_TRIGGER_LINE_RETEST,
-                    "zone_value": lv,
-                    "zone_kind": zone_kind,
-                    "mid": mid,
-                    "elapsed_seconds": round(elapsed, 2),
-                },
-            )]
-        detail = (
-            f"{EXIT_TRIGGER_LINE_RETEST} ({zone_kind}) held "
-            f"{elapsed:.1f}s at {lv:.4f} (mid={mid:.4f})"
-        )
-        state_patch["tight_touch"] = None
-        state_patch["exit_reason"] = EXIT_TRIGGER_LINE_RETEST
-        return [
-            LogSignal(
-                event_type=LogEventType.EXIT_CHECK,
-                message=f"{EXIT_TRIGGER_LINE_RETEST} exit — {detail}",
-                payload={
-                    "exit_trigger": EXIT_TRIGGER_LINE_RETEST,
-                    "zone_value": lv,
-                    "zone_kind": zone_kind,
-                    "mid": mid,
-                    "elapsed_seconds": round(elapsed, 2),
-                    "hold_seconds": hold_secs,
-                },
-            ),
-            UpdateState(state_patch),
-        ] + list(self.build_exit_actions(
-            ctx, ExitType.TRAILING_STOP, detail,
-        ))
-
     # ------------------------------------------------------------------
     # Fills / Rejects
     # ------------------------------------------------------------------
@@ -2939,19 +2996,8 @@ class ChartSignalStrategy:
                         )))
                     ),
                     "counter_touch": None,
-                    # Tight-exit zones — seed for ALL trades with the
-                    # trigger line value so the 10 s touch+hold check
-                    # is armed from the first tick. The SL is handled
-                    # by the bar-close trail (clean) or the immediate
-                    # tick-time path (marginal), neither of which
-                    # belongs in tight_zones.
-                    "tight_zones": [
-                        {"value": float(
-                            entry_line.get("line_value_at_entry")
-                            or event.fill_price
-                        ), "kind": "trigger"},
-                    ],
-                    "tight_touch": None,
+                    "sl_touch": None,
+                    "sl_last_check_ts": None,
                 }),
             ])
         elif is_exit_leg:
@@ -3041,8 +3087,8 @@ class ChartSignalStrategy:
                     "counter_touch": None,
                     "counter_lines_cache": [],
                     "counter_lines_tol": 0.0,
-                    "tight_zones": [],
-                    "tight_touch": None,
+                    "sl_touch": None,
+                    "sl_last_check_ts": None,
                 }),
             ])
         return actions

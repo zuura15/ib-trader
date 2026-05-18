@@ -1453,20 +1453,25 @@ class TestQuoteUpdates:
         assert await s.on_event(q, ctx) == []
 
 
-class TestMarginalSLLinger:
-    """Operator spec 2026-05-18: the marginal trade's SL fires only
-    after ``sl_linger_seconds`` of continuous touch past
-    ``active_stop`` (default 5s). Tick-spike overshoots that recover
-    inside the window are absorbed; only sustained breaches cut the
-    trade. The 4 cases below pin the touch+hold semantics."""
+class TestSLLinger:
+    """Two SL paths:
+      - MARGINAL: touch+hold linger (``sl_linger_marginal_seconds``,
+        default 10s). Continuous breach for the full window fires; a
+        retrace clears the timer.
+      - CLEAN:    periodic poll (``sl_check_clean_seconds``, default
+        60s). Sample on each interval boundary; fire if breached at
+        the sample. Between samples ticks are ignored.
 
-    def _long_holding_ctx(self, *, sl_touch=None):
+    Runs for BOTH clean and marginal trades post-2026-05-17."""
+
+    def _long_holding_ctx(self, *, sl_touch=None, marginal=True,
+                           linger_marginal=5.0):
         # MGC trail_width_pct default 0.0003. Entry at 100.0, HWM 110.0,
         # trail = 110 * (1 - 0.0003) = 109.967.
         # active_stop = max(line, trail). With line below 109.967,
         # active_stop = trail = 109.967.
         cfg = _default_config()
-        cfg["sl_linger_seconds"] = 5.0
+        cfg["sl_linger_marginal_seconds"] = linger_marginal
         cfg["trail_width_pct"] = 0.0003
         return _make_ctx(
             state={
@@ -1474,8 +1479,10 @@ class TestMarginalSLLinger:
                 "qty": "1",
                 "entry_price": "100.0",
                 "high_water_mark": "110.0",
-                "entry_line": {"direction": "long", "marginal": True},
-                "tight_zones": [{"value": 90.0, "kind": "trigger"}],
+                "entry_line": {
+                    "direction": "long", "marginal": marginal,
+                    # No anchor data — falls back to trail-only stop.
+                },
                 "sl_touch": sl_touch,
             },
             fsm_state=BotState.AWAITING_EXIT_TRIGGER,
@@ -1498,8 +1505,8 @@ class TestMarginalSLLinger:
     async def test_first_breach_starts_timer_no_exit(self):
         """Mid crosses below active_stop for the first time → sl_touch
         gets a start_ts, NO PlaceOrder fired this tick."""
-        s = ChartSignalStrategy(_default_config())
         ctx = self._long_holding_ctx(sl_touch=None)
+        s = ChartSignalStrategy(ctx.config)
         # mid 109.96 < trail 109.967 → breached.
         actions = await s.on_event(self._quote(109.95), ctx)
         # No exit order on the first breach tick.
@@ -1516,12 +1523,12 @@ class TestMarginalSLLinger:
     async def test_retrace_within_linger_clears_timer(self):
         """Touch started 2s ago, mid retraces back above active_stop →
         sl_touch is set to None on the same tick."""
-        s = ChartSignalStrategy(_default_config())
         old_start = (datetime.now(timezone.utc)
                      - timedelta(seconds=2)).isoformat()
         ctx = self._long_holding_ctx(
             sl_touch={"start_ts": old_start},
         )
+        s = ChartSignalStrategy(ctx.config)
         # mid 110.00 > trail 109.967 → not breached.
         actions = await s.on_event(self._quote(110.00), ctx)
         ups = [a for a in actions if isinstance(a, UpdateState)]
@@ -1537,12 +1544,12 @@ class TestMarginalSLLinger:
     async def test_sustained_breach_past_linger_fires_exit(self):
         """Touch is 6s old AND mid still breached → exit fires this
         tick. PlaceOrder emitted, exit_reason recorded."""
-        s = ChartSignalStrategy(_default_config())
         old_start = (datetime.now(timezone.utc)
                      - timedelta(seconds=6)).isoformat()
         ctx = self._long_holding_ctx(
             sl_touch={"start_ts": old_start},
         )
+        s = ChartSignalStrategy(ctx.config)
         # mid 109.95 still below trail 109.967.
         actions = await s.on_event(self._quote(109.95), ctx)
         # Exit order fires.
@@ -1562,7 +1569,7 @@ class TestMarginalSLLinger:
         """SHORT side: breached when mid >= active_stop. Same
         touch+hold semantics, opposite geometry."""
         cfg = _default_config()
-        cfg["sl_linger_seconds"] = 5.0
+        cfg["sl_linger_marginal_seconds"] = 5.0
         cfg["trail_width_pct"] = 0.0003
         ctx = _make_ctx(
             state={
@@ -1572,7 +1579,6 @@ class TestMarginalSLLinger:
                 "low_water_mark": "90.0",
                 # SHORT trail = LWM * (1 + 0.0003) = 90.027.
                 "entry_line": {"direction": "short", "marginal": True},
-                "tight_zones": [{"value": 110.0, "kind": "trigger"}],
                 "sl_touch": None,
             },
             fsm_state=BotState.AWAITING_EXIT_TRIGGER,
@@ -1589,3 +1595,273 @@ class TestMarginalSLLinger:
             merged.update(u.state)
         assert merged.get("sl_touch") is not None
         assert "start_ts" in merged["sl_touch"]
+
+    def _clean_holding_ctx(self, *, sl_last_check_ts=None,
+                             interval_s=60.0):
+        cfg = _default_config()
+        cfg["sl_check_clean_seconds"] = interval_s
+        cfg["trail_width_pct"] = 0.0003
+        return _make_ctx(
+            state={
+                "armed": False,
+                "qty": "1",
+                "entry_price": "100.0",
+                "high_water_mark": "110.0",
+                "entry_line": {"direction": "long", "marginal": False},
+                "sl_last_check_ts": sl_last_check_ts,
+            },
+            fsm_state=BotState.AWAITING_EXIT_TRIGGER,
+            config=cfg,
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_first_tick_samples_immediately(self):
+        """Clean trade with no prior sample: the first tick samples
+        the SL. If breached at that sample, fires immediately."""
+        ctx = self._clean_holding_ctx(sl_last_check_ts=None)
+        s = ChartSignalStrategy(ctx.config)
+        # mid 109.95 < trail 109.967 → breached at first sample.
+        actions = await s.on_event(self._quote(109.95), ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert sells, f"expected SELL on first-tick sample, got {actions}"
+
+    @pytest.mark.asyncio
+    async def test_clean_skips_check_within_interval(self):
+        """Clean trade that just sampled 10s ago: a breached tick
+        inside the 60s interval is IGNORED. No fire, no state update
+        to sl_last_check_ts."""
+        recent = (datetime.now(timezone.utc)
+                  - timedelta(seconds=10)).isoformat()
+        ctx = self._clean_holding_ctx(sl_last_check_ts=recent)
+        s = ChartSignalStrategy(ctx.config)
+        actions = await s.on_event(self._quote(109.95), ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert not sells, "clean trade fired before interval elapsed"
+        # sl_last_check_ts not touched.
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        assert "sl_last_check_ts" not in merged
+
+    @pytest.mark.asyncio
+    async def test_clean_samples_after_interval_breached_fires(self):
+        """65s since last sample: re-evaluate at this tick. Breached
+        → fire."""
+        old = (datetime.now(timezone.utc)
+               - timedelta(seconds=65)).isoformat()
+        ctx = self._clean_holding_ctx(sl_last_check_ts=old)
+        s = ChartSignalStrategy(ctx.config)
+        actions = await s.on_event(self._quote(109.95), ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert sells, "clean trade did not fire on poll-interval sample"
+
+    @pytest.mark.asyncio
+    async def test_clean_samples_after_interval_not_breached_records(self):
+        """65s since last sample: re-evaluate. Not breached → no
+        fire, BUT sl_last_check_ts advances so the next sample is
+        another 60s out."""
+        old = (datetime.now(timezone.utc)
+               - timedelta(seconds=65)).isoformat()
+        ctx = self._clean_holding_ctx(sl_last_check_ts=old)
+        s = ChartSignalStrategy(ctx.config)
+        # mid 110.00 > trail 109.967 → not breached.
+        actions = await s.on_event(self._quote(110.00), ctx)
+        sells = [a for a in actions if isinstance(a, PlaceOrder)
+                 and a.side == "SELL"]
+        assert not sells
+        ups = [a for a in actions if isinstance(a, UpdateState)]
+        merged: dict = {}
+        for u in ups:
+            merged.update(u.state)
+        assert merged.get("sl_last_check_ts") is not None
+
+
+class TestRegimeGate:
+    """Bar-level regime gate fires after pivot detection. The gate
+    rejects (a) anti-direction in trending regimes, (b) flat+amplitude
+    fail, (c) flat+extreme fail. Insufficient bars surfaces a RISK
+    warning but does not gate."""
+
+    def _build_window(self, closes: list[float]) -> list[dict]:
+        bars: list[dict] = []
+        for i, c in enumerate(closes):
+            t = START_UTC + timedelta(seconds=i * BAR_SECONDS)
+            bars.append({
+                "timestamp_utc": t.isoformat(),
+                "open": c, "high": c + 0.1, "low": c - 0.1,
+                "close": c, "volume": 100,
+            })
+        return bars
+
+    def _bar_event(self, bars: list[dict]) -> BarCompleted:
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    def _uptrend_with_pivot_high_at_end(self) -> list[float]:
+        """30 strongly-uptrending bars ending in [bar-3 < bar-2 > bar-1]
+        so the just-confirmed pivot at last_idx-1 is a HIGH (SHORT
+        candidate). Slope steep enough that ADX > 25 with +DI > −DI."""
+        base = [100.0 + i * 1.5 for i in range(27)]
+        # Last three: dip-peak-dip so idx-2 is a clear pivot HIGH.
+        peak = base[-1] + 3.0
+        base.append(peak)        # last_idx - 1: peak
+        base.append(peak - 2.0)  # last_idx:     drops after peak
+        return base
+
+    def _downtrend_with_pivot_low_at_end(self) -> list[float]:
+        """Symmetric — 30 downtrending bars ending in a pivot LOW
+        (LONG candidate). ADX > 25, −DI > +DI."""
+        base = [150.0 - i * 1.5 for i in range(27)]
+        trough = base[-1] - 3.0
+        base.append(trough)
+        base.append(trough + 2.0)
+        return base
+
+    def _uptrend_with_pivot_low_at_end(self) -> list[float]:
+        """Uptrend (regime=up) ending in a pivot LOW (LONG candidate).
+        LONG is pro-regime — should NOT be gated."""
+        base = [100.0 + i * 1.5 for i in range(27)]
+        # Last three: peak-dip-peak so idx-2 is a pivot LOW.
+        dip = base[-1] - 1.0
+        base.append(dip)
+        base.append(dip + 2.5)
+        return base
+
+    def _flat_with_pivot_high_at_extreme(self) -> list[float]:
+        """30 bars of tight zigzag (range ~0.2) ending in a natural
+        pivot HIGH that sits inside the zigzag range — no extra
+        spike. ADX stays below 20 (symmetric +DM / −DM) so regime
+        classifies as flat. ATR ~0.1 → 5-bar swing 0.5 → far under
+        the cost floor (~$2 round-trip)."""
+        # Pure two-step zigzag so +DM ≈ −DM → low DX → low ADX.
+        # Final three bars: low-high-low → natural pivot HIGH at idx-2.
+        base = []
+        for i in range(28):
+            base.append(100.0 if i % 2 == 0 else 100.1)
+        # Last bar drops below the alternating low to confirm the
+        # pivot HIGH at idx-2 (the 100.1 just placed).
+        base.append(99.9)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_up_regime_blocks_short(self):
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._uptrend_with_pivot_high_at_end())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter") == "adx_regime"]
+        assert skips, f"expected adx_regime SKIP, got {actions}"
+        s_payload = skips[0].payload
+        assert s_payload["direction"] == "short"
+        assert s_payload["regime"] == "up"
+        # No PlaceOrder fired.
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+
+    @pytest.mark.asyncio
+    async def test_down_regime_blocks_long(self):
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._downtrend_with_pivot_low_at_end())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter") == "adx_regime"]
+        assert skips, f"expected adx_regime SKIP, got {actions}"
+        s_payload = skips[0].payload
+        assert s_payload["direction"] == "long"
+        assert s_payload["regime"] == "down"
+
+    @pytest.mark.asyncio
+    async def test_pro_regime_long_not_blocked_by_regime(self):
+        """Up regime + LONG candidate — should NOT trip the adx_regime
+        gate. Other filters may still reject but regime stays out."""
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._uptrend_with_pivot_low_at_end())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        adx_skips = [a for a in actions if isinstance(a, LogSignal)
+                     and a.event_type == LogEventType.SKIP
+                     and (a.payload or {}).get("filter") == "adx_regime"]
+        assert not adx_skips, (
+            f"adx_regime should not fire on pro-regime direction, "
+            f"got {adx_skips}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_flat_amplitude_blocks_entry(self):
+        """Flat regime with tight range → ATR too small → amplitude
+        gate fires. Thresholds bumped high so the synthetic zigzag
+        deterministically classifies as flat regardless of the exact
+        ADX reading pandas-ta produces."""
+        cfg = _default_config()
+        # Force every ADX reading below trending → flat regime.
+        cfg["adx_trending_threshold"] = 100.0
+        cfg["adx_ranging_threshold"] = 100.0
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._flat_with_pivot_high_at_extreme())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter") == "flat_amplitude"]
+        assert skips, f"expected flat_amplitude SKIP, got {actions}"
+        p = skips[0].payload
+        assert p["direction"] == "short"
+        assert p["expected_swing"] < p["cost_floor"] * p["min_edge_mult"]
+
+    @pytest.mark.asyncio
+    async def test_insufficient_bars_warns_does_not_block(self):
+        """9-bar fixture: regime falls to 'insufficient'. Surface a
+        RISK row but do NOT gate the entry."""
+        cfg = _default_config()
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = _zigzag_bars(START_UTC, ZIGZAG_CLOSES)
+        ev = BarCompleted(symbol="MGCM6", bar=bars[-1], window=bars,
+                          bar_count=len(bars))
+        actions = await s.on_event(ev, ctx)
+        # RISK warning emitted.
+        risks = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.RISK
+                 and (a.payload or {}).get("filter")
+                 == "insufficient_bars_for_regime"]
+        assert risks, f"expected insufficient_bars RISK, got {actions}"
+        # No regime-driven SKIP — gate did not block.
+        regime_skips = [a for a in actions if isinstance(a, LogSignal)
+                        and a.event_type == LogEventType.SKIP
+                        and (a.payload or {}).get("filter") in (
+                            "adx_regime", "flat_amplitude", "flat_extreme",
+                        )]
+        assert not regime_skips, (
+            f"insufficient bars should not gate, got {regime_skips}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_flag_bypasses_gate(self):
+        """regime_filter_enabled=False short-circuits the whole gate.
+        Even an anti-direction trending setup passes through."""
+        cfg = _default_config()
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._uptrend_with_pivot_high_at_end())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        # No regime-driven SKIP because the gate didn't run.
+        regime_skips = [a for a in actions if isinstance(a, LogSignal)
+                        and a.event_type == LogEventType.SKIP
+                        and (a.payload or {}).get("filter") in (
+                            "adx_regime", "flat_amplitude", "flat_extreme",
+                        )]
+        assert not regime_skips, (
+            f"disabled regime gate should not fire, got {regime_skips}"
+        )
