@@ -72,8 +72,10 @@ min_slope_ratio: 1.5
 #                          past the rejection point. Was bypassable
 #                          briefly; moved to hard-reject 2026-05-18
 #                          after a MGC SHORT fired with the entry
-#                          $7.45 below the resistance, $5.63 over
-#                          the cap.)
+#                          $7.45 below the resistance. Acceleration
+#                          entries are NOT exempt (2026-05-18) —
+#                          FFP acts from the pivot, regardless of
+#                          how the pivot was detected.)
 #   - stale_line          (line has fewer than
 #                          ``entry_min_recent_strict_touches``
 #                          (default 2) strict touches in the last

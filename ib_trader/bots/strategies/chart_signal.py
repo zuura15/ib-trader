@@ -1972,25 +1972,33 @@ class ChartSignalStrategy:
                     return actions
 
         # Far-from-pivot filter (FILTER_FAR_FROM_PIVOT).
-        # Hard-reject (NOT bypassable, regardless of allow_marginal —
-        # operator decision 2026-05-18). A fire-bar close that's
-        # multiple-trail-widths past the line means the rejection
-        # already played out on a prior bar; entering now is
-        # structurally "into thin air" and the trail-stop will breach
-        # on any normal reversal. The "tight exit will save us"
-        # argument doesn't apply when the entry is already past the
-        # exit threshold.
+        # Hard-reject (NOT bypassable, regardless of allow_marginal
+        # or entry_path — operator decisions 2026-05-18). A fire-bar
+        # close that's multiple-trail-widths past the line means the
+        # rejection already played out on a prior bar; entering now
+        # is structurally "into thin air" and the trail-stop will
+        # breach on any normal reversal. The "tight exit will save
+        # us" argument doesn't apply when the entry is already past
+        # the exit threshold.
+        #
+        # 2026-05-18: removed the acceleration-entry exemption.
+        # Earlier rationale was "accel ALREADY entered beyond the
+        # line by intent." But far_from_pivot acts *from the pivot
+        # back to the line* — it doesn't care how the pivot was
+        # detected (touch vs accel). On MNQ 14:54 an accel SHORT
+        # fired with the pivot $122 past the line; the entry was
+        # chasing a move that had already played out. Same gate
+        # applies to both paths now.
         #
         # Cap = trail_dist × ``far_from_pivot_max_trail_mult`` (default
         # 2.0). MGC trail $0.93 → cap $1.86; MES $2.26 → $4.52;
-        # MNQ $5.94 → $11.88. Acceleration-entry path is exempt by
-        # design — accel ALREADY entered beyond the line by intent.
+        # MNQ $5.94 → $11.88.
         ffp_enabled = bool(self.config.get(
             "far_from_pivot_filter_enabled",
             # Back-compat with the old config key name.
             self.config.get("entry_distance_filter_enabled", True),
         ))
-        if ffp_enabled and not is_acceleration_entry:
+        if ffp_enabled:
             entry_price = closes[last_idx]
             trail_pct = float(self.config.get("trail_width_pct", 0.0003))
             trail_dist = abs(entry_price) * trail_pct
