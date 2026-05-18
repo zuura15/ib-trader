@@ -123,7 +123,8 @@ class StrategyBotRunner(BotBase):
         # so a single strategy yaml can back differently-multiplied
         # contracts without forking.
         for k in ("contract_multiplier", "trail_width_pct",
-                  "stop_on_exit", "cooldown_seconds"):
+                  "stop_on_exit", "cooldown_seconds",
+                  "qty_default"):
             if k in config:
                 self.strategy_config[k] = config[k]
 
