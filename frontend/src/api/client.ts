@@ -329,6 +329,20 @@ export function getHistory(opts: {
 
 // --- Regime (ADX/ATR/Donchian — chart top-left badge) ---
 
+export interface VState {
+  detected: boolean;
+  direction: 'v_up' | 'v_down' | null;
+  impulse_extreme_idx?: number;
+  impulse_extreme_price?: number;
+  impulse_magnitude?: number;
+  impulse_atr_mult?: number;
+  trigger_a_fired: boolean;
+  trigger_b_fired: boolean;
+  bos_confirmed: boolean;
+  retrace_pct?: number;
+  bars_since_extreme?: number;
+}
+
 export interface RegimeReading {
   regime: 'up' | 'down' | 'flat' | 'uncertain' | 'insufficient';
   n_bars: number;
@@ -340,6 +354,7 @@ export interface RegimeReading {
   atr?: number;
   dcu?: number;  // Donchian upper
   dcl?: number;  // Donchian lower
+  v_state?: VState;
 }
 
 export function getRegime(opts: {

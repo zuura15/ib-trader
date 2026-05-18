@@ -1101,60 +1101,42 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       });
     };
 
-    // Two-line apex badge: top row = backend (/api/sr) wedges, bottom
-    // row = frontend's local computation. Both surfaced so visual
-    // drift is immediately obvious; either side returning ``∞`` while
-    // the other shows a number means the two implementations have
-    // diverged on this dataset.
+    // SR apex (△) badge and ADX/DI regime (◇) badge removed
+    // 2026-05-18 — operator decision. Replaced with a single V-
+    // detection badge at top-left that's display-only (does NOT
+    // gate entries; regime gate continues to filter using ADX/DI
+    // internally on the backend). Painters retained as no-ops to
+    // keep the surrounding wiring intact.
     paintApexBadgeRef.current = () => {
-      let badge = srApexBadgeRef.current;
-      if (!badge && el) {
-        badge = document.createElement('div');
-        // Keep ``pointer-events`` ON so the native ``title``
-        // tooltip pops on hover, but keep the cursor as the
-        // default arrow (cursor:help reads as "click for info"
-        // which this isn't — it's just a tooltip).
-        badge.setAttribute(
-          'style',
-          'position:absolute;top:6px;left:8px;z-index:11;'
-          + 'font-family:ui-monospace,Menlo,monospace;font-size:14px;'
-          + 'padding:2px 8px;border-radius:4px;line-height:1.25;'
-          + 'background:rgba(255,160,60,0.15);color:rgba(180,90,0,0.9);'
-          + 'user-select:none;letter-spacing:0.3px;'
-          + 'font-weight:600;white-space:pre;cursor:default;',
-        );
-        el.appendChild(badge);
-        srApexBadgeRef.current = badge;
+      // Empty — apex badge intentionally hidden.
+      const stale = srApexBadgeRef.current;
+      if (stale && stale.parentNode) {
+        stale.parentNode.removeChild(stale);
       }
-      if (!badge) return;
-      const list = srBackendApexRef.current;
-      if (list === null) {
-        badge.textContent = '△ …';
-      } else if (list.length === 0) {
-        badge.textContent = '△ ∞';
-      } else {
-        badge.textContent = `△ ${list.join(',')}`;
-      }
-      // ``title`` is the native browser tooltip. Multi-line text
-      // works in Chrome/Safari/Firefox via embedded ``\n``.
-      badge.title = srBackendTooltipRef.current || '';
+      srApexBadgeRef.current = null;
     };
 
-    // Regime badge — single-line ADX/+DI/−DI/ATR/Donchian summary,
-    // colored by regime classification. Sits directly under the SR
-    // apex badge (top: 28px) so both readings are visible at a
-    // glance. Hover for full numbers + n_bars + last_ts.
+    // V-detection badge — top-left, replaces the prior apex (△)
+    // and ADX (◇) badges. Shows three trigger flags:
+    //   BOS  break of structure (price closed past pre-impulse
+    //        extreme)
+    //   A    impulse-retrace (≥30% of impulse within retrace
+    //        window)
+    //   B    impulse-exhaustion (≥10 bars without a new extreme)
+    // ``detected = A OR B OR BOS``. Direction is "v_up" (V
+    // recovery) or "v_down" (inverted V). Display only — does
+    // not affect entry gating.
     paintRegimeBadgeRef.current = () => {
       let badge = regimeBadgeRef.current;
       if (!badge && el) {
         badge = document.createElement('div');
         badge.setAttribute(
           'style',
-          'position:absolute;top:28px;left:8px;z-index:11;'
+          'position:absolute;top:6px;left:8px;z-index:11;'
           + 'font-family:ui-monospace,Menlo,monospace;font-size:11px;'
-          + 'padding:1px 6px;border-radius:4px;line-height:1.25;'
+          + 'padding:2px 8px;border-radius:4px;line-height:1.25;'
           + 'background:rgba(120,120,120,0.12);color:rgba(80,80,80,0.85);'
-          + 'user-select:none;letter-spacing:0.3px;font-weight:500;'
+          + 'user-select:none;letter-spacing:0.3px;font-weight:600;'
           + 'white-space:pre;cursor:default;',
         );
         el.appendChild(badge);
@@ -1162,50 +1144,68 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       if (!badge) return;
       const r = regimeReadingRef.current;
-      if (r === null) {
-        badge.textContent = '◇ …';
-        badge.title = '';
+      const v = r?.v_state ?? null;
+      if (r === null || v === null) {
+        badge.textContent = 'V: …';
+        badge.title = 'waiting for first regime fetch';
+        badge.style.background = 'rgba(120,120,120,0.12)';
+        badge.style.color = 'rgba(80,80,80,0.85)';
         return;
       }
-      const regimeLabel = r.regime.toUpperCase();
-      // Color by regime: up=green, down=red, flat/uncertain=amber,
-      // insufficient=gray.
-      let bg = 'rgba(120,120,120,0.12)';
+      // Color by detection state:
+      //   detected (any trigger) → green-ish (real signal)
+      //   no impulse / nothing fired → gray.
+      let bg = 'rgba(120,120,120,0.10)';
       let fg = 'rgba(80,80,80,0.85)';
-      if (r.regime === 'up') {
-        bg = 'rgba(34,139,75,0.15)';
-        fg = 'rgba(20,100,55,0.95)';
-      } else if (r.regime === 'down') {
-        bg = 'rgba(200,60,60,0.15)';
-        fg = 'rgba(150,30,30,0.95)';
-      } else if (r.regime === 'flat' || r.regime === 'uncertain') {
-        bg = 'rgba(220,160,40,0.15)';
-        fg = 'rgba(160,100,20,0.95)';
+      if (v.detected) {
+        if (v.direction === 'v_up') {
+          bg = 'rgba(34,139,75,0.15)';   // green for V recovery
+          fg = 'rgba(20,100,55,0.95)';
+        } else {
+          bg = 'rgba(200,60,60,0.15)';   // red for inverted V
+          fg = 'rgba(150,30,30,0.95)';
+        }
       }
       badge.style.background = bg;
       badge.style.color = fg;
-      const fmt = (v: number | undefined, d = 1): string =>
-        v == null || !Number.isFinite(v) ? '—' : v.toFixed(d);
-      const adxPart = r.adx != null
-        ? `ADX ${fmt(r.adx, 1)} +DI ${fmt(r.dmp, 1)} −DI ${fmt(r.dmn, 1)}`
-        : `n=${r.n_bars}`;
-      const atrPart = r.atr != null ? `ATR ${fmt(r.atr, 4)}` : '';
-      const dcPart = (r.dcl != null && r.dcu != null)
-        ? `DC ${fmt(r.dcl, 2)}/${fmt(r.dcu, 2)}` : '';
-      const parts = [`◇ ${regimeLabel}`, adxPart, atrPart, dcPart]
-        .filter(Boolean);
-      badge.textContent = parts.join(' · ');
+      const mark = (b: boolean) => (b ? '✓' : '○');
+      const dirLabel = v.direction === 'v_up'
+        ? 'V·UP'
+        : v.direction === 'v_down'
+        ? 'V·DOWN'
+        : 'V·—';
+      badge.textContent = (
+        `${dirLabel}  BOS:${mark(v.bos_confirmed)} `
+        + `A:${mark(v.trigger_a_fired)} `
+        + `B:${mark(v.trigger_b_fired)}`
+      );
+      // Tooltip with full diagnostic.
+      const fmt = (x: number | null | undefined, d = 4) =>
+        x == null || !Number.isFinite(x) ? '—' : x.toFixed(d);
       const tip: string[] = [
-        `regime: ${r.regime}`,
-        `n_bars: ${r.n_bars}`,
+        `direction: ${v.direction ?? 'none'}`,
+        `detected: ${v.detected}`,
+        `BOS (break-of-structure): ${v.bos_confirmed}`,
+        `A (retrace ≥ 30%): ${v.trigger_a_fired}`,
+        `B (exhaustion ≥ 10 bars): ${v.trigger_b_fired}`,
       ];
-      if (r.adx != null) tip.push(`ADX: ${fmt(r.adx, 2)}`);
-      if (r.dmp != null) tip.push(`+DI: ${fmt(r.dmp, 2)}`);
-      if (r.dmn != null) tip.push(`−DI: ${fmt(r.dmn, 2)}`);
-      if (r.atr != null) tip.push(`ATR: ${fmt(r.atr, 4)}`);
-      if (r.dcu != null) tip.push(`DCU: ${fmt(r.dcu, 4)}`);
-      if (r.dcl != null) tip.push(`DCL: ${fmt(r.dcl, 4)}`);
-      if (r.last_ts) tip.push(`last bar: ${r.last_ts}`);
+      if (v.impulse_extreme_price != null) {
+        tip.push(`impulse extreme @ ${fmt(v.impulse_extreme_price, 2)}`);
+      }
+      if (v.impulse_magnitude != null) {
+        tip.push(`impulse magnitude: ${fmt(v.impulse_magnitude, 2)}`);
+      }
+      if (v.impulse_atr_mult != null) {
+        tip.push(`impulse / ATR: ${fmt(v.impulse_atr_mult, 2)}×`);
+      }
+      if (v.retrace_pct != null) {
+        tip.push(`retrace: ${(v.retrace_pct * 100).toFixed(1)}%`);
+      }
+      if (v.bars_since_extreme != null) {
+        tip.push(`bars since extreme: ${v.bars_since_extreme}`);
+      }
+      tip.push('');
+      tip.push('Display-only — does not gate entries.');
       badge.title = tip.join('\n');
     };
 

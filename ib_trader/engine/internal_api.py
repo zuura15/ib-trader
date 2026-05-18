@@ -819,7 +819,9 @@ async def get_regime(
     if not bars_raw:
         return {"regime": "insufficient", "n_bars": 0, "last_ts": None}
 
-    from ib_trader.bots.strategies.regime import compute_regime
+    from ib_trader.bots.strategies.regime import (
+        compute_regime, detect_v_state,
+    )
     reading = compute_regime(
         bars_raw,
         adx_period=adx_period,
@@ -831,6 +833,16 @@ async def get_regime(
     payload = reading.to_audit_payload()
     payload["last_ts"] = bars_raw[-1].get("ts") if bars_raw else None
     payload["sufficient_bars"] = reading.sufficient_bars
+
+    # V-recovery detector (display-only — does NOT gate entries).
+    # Uses the same ATR that fed the regime classifier. Three
+    # triggers (BOS / retrace / exhaustion) evaluated in parallel;
+    # frontend renders the state in a top-left badge.
+    v_state = detect_v_state(
+        bars_raw,
+        atr=(reading.atr or 0.0),
+    )
+    payload["v_state"] = v_state.to_audit_payload()
     return payload
 
 

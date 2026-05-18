@@ -188,3 +188,223 @@ def at_donchian_extreme(
     if reading.dcl is None:
         return False
     return price <= reading.dcl + tol
+
+
+@dataclass(frozen=True)
+class VState:
+    """V-recovery / inverted-V detection state. Display-only —
+    does NOT gate entries (yet).
+
+    Three triggers, all symmetric for V (down then up) vs
+    inverted-V (up then down):
+
+      - BOS  (option 1, "break of structure"): price has closed
+        past the pre-impulse extreme on the recovery side. Latest
+        but most defensible "yes, the V is real" signal.
+      - A    (impulse-reversal): retrace_pct ≥ retrace_pct_threshold
+        within retrace_max_bars of the impulse extreme. Catches
+        sharp V-bottoms early.
+      - B    (impulse-exhaustion): impulse extreme has held for
+        ≥ exhaustion_bars without a new extreme. Catches "L"
+        patterns where the recovery is shallow but the down-leg
+        has clearly stopped.
+
+    ``detected = trigger_a OR trigger_b OR bos``.
+    """
+    detected: bool
+    direction: str | None  # "v_up" | "v_down" | None
+    impulse_extreme_idx: int | None
+    impulse_extreme_price: float | None
+    impulse_magnitude: float | None
+    impulse_atr_mult: float | None
+    trigger_a_fired: bool
+    trigger_b_fired: bool
+    bos_confirmed: bool
+    retrace_pct: float | None
+    bars_since_extreme: int | None
+
+    def to_audit_payload(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "detected": self.detected,
+            "direction": self.direction,
+            "trigger_a_fired": self.trigger_a_fired,
+            "trigger_b_fired": self.trigger_b_fired,
+            "bos_confirmed": self.bos_confirmed,
+        }
+        for k in ("impulse_extreme_idx", "impulse_extreme_price",
+                  "impulse_magnitude", "impulse_atr_mult",
+                  "retrace_pct", "bars_since_extreme"):
+            v = getattr(self, k)
+            if v is not None:
+                out[k] = round(v, 4) if isinstance(v, float) else v
+        return out
+
+
+def _v_state_none(reason: str | None = None) -> VState:
+    return VState(
+        detected=False,
+        direction=None,
+        impulse_extreme_idx=None,
+        impulse_extreme_price=None,
+        impulse_magnitude=None,
+        impulse_atr_mult=None,
+        trigger_a_fired=False,
+        trigger_b_fired=False,
+        bos_confirmed=False,
+        retrace_pct=None,
+        bars_since_extreme=None,
+    )
+
+
+def detect_v_state(
+    bars: list[dict],
+    *,
+    atr: float,
+    impulse_lookback_bars: int = 20,
+    impulse_atr_mult: float = 5.0,
+    retrace_pct_threshold: float = 0.30,
+    retrace_max_bars: int = 12,
+    exhaustion_bars: int = 10,
+) -> VState:
+    """Detect V-recovery / inverted-V patterns.
+
+    Looks at the last ``impulse_lookback_bars`` of closes. Finds
+    both directional candidates (lowest close = V-bottom candidate,
+    highest close = inverted-V-top candidate). For each, checks if
+    the move FROM the pre-extreme opposite point TO the extreme is
+    ≥ ``impulse_atr_mult × atr`` — that's a real impulse.
+
+    When two impulses are present (rare in 20 bars), the one with
+    the LARGER magnitude wins. Returns the V state for that
+    direction with all three trigger flags evaluated.
+
+    Display-only — does NOT gate entries.
+    """
+    if not bars or atr is None or atr <= 0:
+        return _v_state_none()
+    if len(bars) < max(3, impulse_lookback_bars // 2):
+        return _v_state_none()
+
+    try:
+        closes = [float(b.get("close", 0.0) or 0.0) for b in bars]
+    except (TypeError, ValueError):
+        return _v_state_none()
+
+    last_idx = len(closes) - 1
+    window_start = max(0, last_idx - impulse_lookback_bars + 1)
+    window_closes = closes[window_start:last_idx + 1]
+    if len(window_closes) < 3:
+        return _v_state_none()
+
+    # Find the lowest and highest closes in the window.
+    low_offset = window_closes.index(min(window_closes))
+    high_offset = window_closes.index(max(window_closes))
+    low_idx = window_start + low_offset
+    high_idx = window_start + high_offset
+    window_low = closes[low_idx]
+    window_high = closes[high_idx]
+
+    # Candidate V (down-impulse then recovery):
+    #   pre-impulse high (somewhere before low_idx) → low at low_idx.
+    # Require the low to be strictly BEFORE last_idx so there's at
+    # least one bar of post-extreme action to evaluate retrace /
+    # exhaustion against. If the low is the most recent bar, the
+    # impulse is still in progress and we can't yet say a V is
+    # forming.
+    v_up_magnitude = None
+    v_up_pre_idx = None
+    if low_idx > window_start and low_idx < last_idx:
+        pre_window = closes[window_start:low_idx]
+        pre_high = max(pre_window)
+        v_up_pre_idx = window_start + pre_window.index(pre_high)
+        v_up_magnitude = pre_high - window_low
+
+    # Candidate inverted-V (up-impulse then drop):
+    #   pre-impulse low (somewhere before high_idx) → high at high_idx.
+    # Same "extreme not at last_idx" requirement.
+    v_down_magnitude = None
+    v_down_pre_idx = None
+    if high_idx > window_start and high_idx < last_idx:
+        pre_window = closes[window_start:high_idx]
+        pre_low = min(pre_window)
+        v_down_pre_idx = window_start + pre_window.index(pre_low)
+        v_down_magnitude = window_high - pre_low
+
+    # Pick the stronger candidate (largest impulse in ATR units).
+    chosen_direction: str | None = None
+    impulse_extreme_idx: int | None = None
+    impulse_extreme_price: float | None = None
+    impulse_magnitude: float | None = None
+    pre_impulse_extreme: float | None = None  # opposite-side extreme
+
+    up_mult = (v_up_magnitude / atr) if v_up_magnitude else 0
+    down_mult = (v_down_magnitude / atr) if v_down_magnitude else 0
+
+    if (up_mult >= impulse_atr_mult and up_mult >= down_mult
+            and v_up_magnitude is not None):
+        chosen_direction = "v_up"
+        impulse_extreme_idx = low_idx
+        impulse_extreme_price = window_low
+        impulse_magnitude = v_up_magnitude
+        pre_impulse_extreme = closes[v_up_pre_idx] if v_up_pre_idx is not None else None
+    elif (down_mult >= impulse_atr_mult and down_mult > up_mult
+            and v_down_magnitude is not None):
+        chosen_direction = "v_down"
+        impulse_extreme_idx = high_idx
+        impulse_extreme_price = window_high
+        impulse_magnitude = v_down_magnitude
+        pre_impulse_extreme = closes[v_down_pre_idx] if v_down_pre_idx is not None else None
+
+    if chosen_direction is None or impulse_extreme_idx is None:
+        return _v_state_none()
+
+    impulse_mag_val: float = impulse_magnitude or 0.0
+    impulse_extreme_price_val: float = impulse_extreme_price or 0.0
+
+    bars_since_extreme = last_idx - impulse_extreme_idx
+
+    # Trigger A — retrace.
+    post = closes[impulse_extreme_idx:last_idx + 1]
+    if chosen_direction == "v_up":
+        retrace = max(post) - impulse_extreme_price_val
+    else:
+        retrace = impulse_extreme_price_val - min(post)
+    retrace_pct = (
+        retrace / impulse_mag_val if impulse_mag_val > 0 else 0.0
+    )
+    trigger_a_fired = (
+        retrace_pct >= retrace_pct_threshold
+        and bars_since_extreme <= retrace_max_bars
+        and bars_since_extreme >= 1
+    )
+
+    # Trigger B — exhaustion.
+    trigger_b_fired = bars_since_extreme >= exhaustion_bars
+
+    # BOS — break of structure past the pre-impulse extreme.
+    bos_confirmed = False
+    if pre_impulse_extreme is not None and impulse_extreme_idx < last_idx:
+        post_recovery = closes[impulse_extreme_idx + 1:last_idx + 1]
+        if post_recovery:
+            if chosen_direction == "v_up":
+                bos_confirmed = max(post_recovery) > pre_impulse_extreme
+            else:
+                bos_confirmed = min(post_recovery) < pre_impulse_extreme
+
+    detected = trigger_a_fired or trigger_b_fired or bos_confirmed
+
+    return VState(
+        detected=detected,
+        direction=chosen_direction,
+        impulse_extreme_idx=impulse_extreme_idx,
+        impulse_extreme_price=impulse_extreme_price_val,
+        impulse_magnitude=impulse_mag_val,
+        impulse_atr_mult=(
+            up_mult if chosen_direction == "v_up" else down_mult
+        ),
+        trigger_a_fired=trigger_a_fired,
+        trigger_b_fired=trigger_b_fired,
+        bos_confirmed=bos_confirmed,
+        retrace_pct=retrace_pct,
+        bars_since_extreme=bars_since_extreme,
+    )
