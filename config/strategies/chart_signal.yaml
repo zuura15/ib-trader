@@ -126,6 +126,18 @@ entry_min_recent_strict_touches: 2
 sl_check_clean_seconds: 60
 sl_linger_marginal_seconds: 10
 
+# Counter-line exit proximity rule (2026-05-18). When the
+# counter-line (opposing-side line) is touched and the linger
+# elapses, the trade exits only if the trigger line (entry's
+# support / resistance) is NEARBY. "Nearby" = |mid − trigger| ≤
+# this multiplier × ATR (rolling avg high-low over last 14 bars,
+# refreshed at every bar close while in position). When the
+# trigger is FAR, a counter-line rejection has no structural
+# support to bounce off — exit on linger (legacy behavior).
+# When the trigger is NEARBY, the trade has backing — only exit
+# when the trigger itself breaches.
+counter_exit_trigger_nearby_atr_mult: 1.0
+
 # Local-regime filter (ADX + ATR + Donchian via pandas-ta).
 # Runs AFTER pivot detection and BEFORE the entry-filter chain.
 # Bar-level gates — hard-reject, not bypassable in marginal mode

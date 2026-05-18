@@ -179,6 +179,10 @@ def clear_position_fields() -> dict:
         "counter_lines_cache": [],
         "counter_lines_tol": 0.0,
         "counter_touch": None,
+        # Per-trade ATR snapshot (avg high-low over last 14 bars at
+        # the most recent bar-close refresh). Used by the counter-
+        # line exit's proximity check.
+        "trade_atr": None,
         # SL state — marginal uses ``sl_touch`` touch+hold (10s
         # default linger); clean uses ``sl_last_check_ts`` periodic
         # poll (60s default cadence). Both cleared on every

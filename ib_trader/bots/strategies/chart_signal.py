@@ -191,6 +191,10 @@ class ChartSignalStrategy:
                 "counter_lines_cache": "list|null",
                 "counter_lines_tol": "decimal|null",
                 "counter_touch": "dict|null",
+                # Per-trade ATR snapshot for the counter-line exit's
+                # proximity check. Refreshed at every bar close while
+                # in position. ``None`` until the first refresh.
+                "trade_atr": "decimal|null",
                 # SL touch+hold timer — MARGINAL trades only.
                 # ``{"start_ts": iso}`` when mid first crossed
                 # ``active_stop`` in the bad direction; cleared on
@@ -2643,9 +2647,29 @@ class ChartSignalStrategy:
             "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
         ))
         tol = max(1e-6, avg_close * touch_frac)
+
+        # Cache a simple ATR (avg high-low over last 14 bars) so the
+        # tick-time counter-line exit can do a proximity check
+        # against the trigger line. Operator rule 2026-05-18: if
+        # the trigger is within 1× ATR of current price, tolerate
+        # counter-line touches (the trade has structural backing).
+        # If the trigger is FAR (> 1× ATR), counter-line touches
+        # are a real failure signal — exit on linger as before.
+        recent = fetched[-14:] if len(fetched) >= 14 else fetched
+        ranges: list[float] = []
+        for b in recent:
+            hi, lo = b.get("high"), b.get("low")
+            if hi is not None and lo is not None:
+                try:
+                    ranges.append(float(hi) - float(lo))
+                except (TypeError, ValueError):
+                    pass
+        trade_atr = sum(ranges) / len(ranges) if ranges else None
         return [UpdateState({
             "counter_lines_cache": cache,
             "counter_lines_tol": round(tol, 6),
+            "trade_atr": (round(trade_atr, 6)
+                          if trade_atr is not None else None),
         })]
 
     # ------------------------------------------------------------------
@@ -3006,17 +3030,23 @@ class ChartSignalStrategy:
                     "elapsed_seconds": round(elapsed, 2),
                 },
             )]
-        # Counter touch persisted through linger. By itself this is
-        # NOT an exit — operator decision 2026-05-18. The exit
-        # condition is now: counter-line touch AND trigger-line
-        # (entry line) breach. Bouncing off the opposing line back
-        # toward the trigger is normal wedge behavior; only treat
-        # it as a real failure when the trigger has ALSO failed.
-        # Compute the trigger line value at the current tick and
-        # check whether mid is on the wrong side beyond breach_tol.
+        # Counter touch persisted through linger. By itself NOT an
+        # exit — operator rule 2026-05-18:
+        #
+        #   - If the trigger line (entry's support for LONG /
+        #     resistance for SHORT) is NEARBY (|mid − trigger| ≤
+        #     1× ATR), tolerate the counter touch — the trade has
+        #     nearby structural backing and price can bounce off
+        #     the counter and breach it on a second test. ONLY
+        #     exit when the trigger itself ALSO fails.
+        #   - If the trigger is FAR (> 1× ATR away), there's no
+        #     nearby support to lean on. A counter rejection here
+        #     means price will likely keep moving against us —
+        #     exit on linger as before.
         entry_line = ctx.state.get("entry_line") or {}
         is_marginal = bool(entry_line.get("marginal", False))
-        trigger_breached = False
+
+        # Compute the trigger line value at the current tick.
         trigger_value: float | None = None
         try:
             anchor_t = _parse_ts(entry_line.get("anchor_time"))
@@ -3034,6 +3064,32 @@ class ChartSignalStrategy:
                     trigger_value = float(lv_at_entry)
         except Exception:  # noqa: BLE001
             trigger_value = None
+
+        # Proximity check — is trigger nearby?
+        trade_atr_raw = ctx.state.get("trade_atr")
+        try:
+            trade_atr = (
+                float(trade_atr_raw)
+                if trade_atr_raw not in (None, "")
+                else None
+            )
+        except (TypeError, ValueError):
+            trade_atr = None
+        atr_mult = float(self.config.get(
+            "counter_exit_trigger_nearby_atr_mult", 1.0,
+        ))
+        trigger_distance = (
+            abs(mid - trigger_value)
+            if trigger_value is not None else None
+        )
+        trigger_nearby = (
+            trade_atr is not None
+            and trigger_distance is not None
+            and trigger_distance <= atr_mult * trade_atr
+        )
+
+        # Check whether the trigger is currently breached.
+        trigger_breached = False
         if trigger_value is not None:
             breach_tol_frac = float(self.config.get(
                 "touch_tolerance_fraction", TOUCH_TOLERANCE_FRACTION,
@@ -3044,32 +3100,36 @@ class ChartSignalStrategy:
             else:
                 trigger_breached = mid > (trigger_value + breach_tol)
 
-        if not trigger_breached:
-            # Counter touch lingered but the trigger line still holds
-            # — bouncing off the opposing line back toward the trigger
-            # is normal. Clear the counter_touch state and keep the
-            # trade.
+        # Decision tree:
+        #   NEARBY  + trigger holds   → clear, keep trade
+        #   NEARBY  + trigger breached → exit
+        #   FAR     + (regardless)    → exit (legacy behavior)
+        if trigger_nearby and not trigger_breached:
             state_patch["counter_touch"] = None
             return [LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
                 message=(
-                    f"{EXIT_COUNTER_LINE} touched but trigger holds — "
-                    f"counter @ {line_value:.4f}, mid {mid:.4f}, "
-                    f"trigger @ "
-                    f"{trigger_value if trigger_value is not None else 'N/A'}; "
+                    f"{EXIT_COUNTER_LINE} touched + trigger nearby "
+                    f"and holding — counter @ {line_value:.4f}, "
+                    f"mid {mid:.4f}, trigger @ "
+                    f"{trigger_value:.4f}, distance "
+                    f"{trigger_distance:.4f} ≤ "
+                    f"{atr_mult:.1f}× ATR ({trade_atr:.4f}); "
                     f"clearing touch, keeping trade"
                 ),
                 payload={
                     "exit_trigger_cleared": EXIT_COUNTER_LINE,
-                    "reason": "trigger_holds",
+                    "reason": "trigger_nearby_and_holds",
                     "line_value": line_value,
                     "mid": mid,
                     "trigger_value": trigger_value,
+                    "trigger_distance": trigger_distance,
+                    "trade_atr": trade_atr,
                     "elapsed_seconds": round(elapsed, 2),
                 },
             )]
 
-        # Trigger ALSO breached — rejection confirmed. Reason flavor
+        # FAR from trigger OR trigger breached — exit. Reason flavor
         # depends on whether the trade was tagged marginal at entry.
         exit_label = (EXIT_TIGHT_COUNTER_LINE if is_marginal
                        else EXIT_COUNTER_LINE)
@@ -3200,6 +3260,7 @@ class ChartSignalStrategy:
                         )))
                     ),
                     "counter_touch": None,
+                    "trade_atr": None,
                     "sl_touch": None,
                     "sl_last_check_ts": None,
                 }),
@@ -3291,6 +3352,7 @@ class ChartSignalStrategy:
                     "counter_touch": None,
                     "counter_lines_cache": [],
                     "counter_lines_tol": 0.0,
+                    "trade_atr": None,
                     "sl_touch": None,
                     "sl_last_check_ts": None,
                 }),
