@@ -451,6 +451,9 @@ function ExpandedBarEval({ row, onShowRaw }: {
   row: AuditRow; onShowRaw: () => void;
 }) {
   const a = (row.payload as AuditPayload | null)?.audit ?? {};
+  const signalEntryLine = (row.payload as AuditPayload | null)
+    ?.signal?.entry_line;
+  const isAccel = signalEntryLine?.entry_path === 'accel';
   const [nextClose, setNextClose] = useState<number | null | 'pending'>('pending');
   const detailsRef = useRef<HTMLDivElement | null>(null);
   const [copied, setCopied] = useState(false);
@@ -466,19 +469,47 @@ function ExpandedBarEval({ row, onShowRaw }: {
 
   // List one line per trendline this pivot touched. Each line shows
   // its identity (kind · N-touch · slope) and vertices (Q anchor /
-  // P anchor with timestamps and prices). When N=0, show "—".
+  // P anchor with timestamps and prices). When the pivot didn't
+  // touch anything but an ACCEL signal fired, surface the accel
+  // line instead (the bot's entry was based on it, even though the
+  // pivot is past the line, not on it).
   const touchedLines = a.touch?.lines ?? [];
-  const lineEntries = touchedLines.length === 0 ? [
-    <DetailLine key="none" label="lines" value="—" />
-  ] : touchedLines.map((ln, i) => {
-    const summary = `${ln.kind ?? '?'} · ${ln.touches ?? '?'}-touch · `
-      + `slope/bar=${(ln.slope_per_bar ?? 0).toFixed(4)} · `
-      + `Q@${_fmtPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
-      + `P@${_fmtPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
-    return (
-      <DetailLine key={i} label={`line ${i + 1}`} value={summary} />
-    );
-  });
+  let lineEntries: React.ReactNode[];
+  if (touchedLines.length > 0) {
+    lineEntries = touchedLines.map((ln, i) => {
+      const summary = `${ln.kind ?? '?'} · ${ln.touches ?? '?'}-touch · `
+        + `slope/bar=${(ln.slope_per_bar ?? 0).toFixed(4)} · `
+        + `Q@${_fmtPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
+        + `P@${_fmtPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
+      return (
+        <DetailLine key={i} label={`line ${i + 1}`} value={summary} />
+      );
+    });
+  } else if (isAccel && signalEntryLine) {
+    const sel = signalEntryLine as Record<string, unknown>;
+    const kind = typeof sel.kind === 'string' ? sel.kind : '?';
+    const touches = typeof sel.touches === 'number' ? sel.touches : '?';
+    const slope = typeof sel.slope_per_bar === 'number'
+      ? sel.slope_per_bar : 0;
+    const fromTime = typeof sel.from_time === 'string'
+      ? sel.from_time : null;
+    const anchorTime = typeof sel.anchor_time === 'string'
+      ? sel.anchor_time : null;
+    const anchorPrice = typeof sel.anchor_price === 'number'
+      ? sel.anchor_price : null;
+    const lineValAtEntry = typeof sel.line_value_at_entry === 'number'
+      ? sel.line_value_at_entry : null;
+    const summary = `${kind} · ${touches}-touch · `
+      + `slope/bar=${slope.toFixed(4)} · `
+      + `Q@${_fmtPT(fromTime)} · `
+      + `P@${_fmtPT(anchorTime)} (${_fmtPrice(anchorPrice)}) · `
+      + `line@entry=${_fmtPrice(lineValAtEntry)}`;
+    lineEntries = [
+      <DetailLine key="accel" label="accel line" value={summary} />,
+    ];
+  } else {
+    lineEntries = [<DetailLine key="none" label="lines" value="—" />];
+  }
 
   // Eval bar close from the BAR payload directly — the chart-tick
   // 3 min after the pivot bar's tick.
@@ -504,7 +535,9 @@ function ExpandedBarEval({ row, onShowRaw }: {
         <DetailLine
           label="filter"
           value={
-            !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
+            isAccel
+              ? '— (acceleration entry — line overshot, far_from_pivot exempt)'
+              : !(a.touch?.lines ?? []).some((ln) => (ln.touches ?? 0) >= 3)
               ? 'N/A — no current-session 3+touch candidate'
               : a.filter_name
               ? _fmtFilter(a.filter_name, a.filter_detail ?? '')
