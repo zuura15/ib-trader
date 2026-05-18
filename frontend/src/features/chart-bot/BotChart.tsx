@@ -213,6 +213,14 @@ export function BotChart({
         const cutoff = Date.now() - HORIZON_MS;
         const out: { barTime: string; side: 'long' | 'short'; price: number }[] = [];
         for (const t of trades) {
+          // Filter by current chart symbol — after a contract roll
+          // (MGCM6 → MGCQ6, etc.) the bot's historical trades still
+          // carry the old symbol with old price levels. Without
+          // this filter, those B/S badges render at the old price
+          // levels on the new contract's bars and appear visibly
+          // misplaced. Operator clarification 2026-05-18 after the
+          // MGCM6→MGCQ6 roll.
+          if (symbol && t.symbol && t.symbol !== symbol) continue;
           if (!t.entry_time) continue;
           // /api/bot-trades serialises entry_time as a naive ISO
           // string (no ``Z``/offset). JS would parse that as local
@@ -262,7 +270,7 @@ export function BotChart({
     tick();
     const id = window.setInterval(tick, 30_000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [botId]);
+  }, [botId, symbol]);
 
   const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
   const target: ChartTarget | null = symbol

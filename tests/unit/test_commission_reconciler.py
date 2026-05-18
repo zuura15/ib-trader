@@ -105,7 +105,7 @@ class TestFindUndercommissioned:
         # MGC floor is $1.94 — a row at $0 is undercommissioned.
         _insert_trade(repo, symbol="MGCQ6", commission=Decimal("0"))
         # MES floor is $1.24 — $1.94 is OVER the MES floor, no candidate.
-        _insert_trade(repo, symbol="MESU6", commission=Decimal("1.94"))
+        _insert_trade(repo, symbol="MESM6", commission=Decimal("1.94"))
         candidates = repo.find_undercommissioned_trades(24.0)
         assert len(candidates) == 1
         assert candidates[0].symbol == "MGCQ6"

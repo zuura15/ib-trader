@@ -1188,7 +1188,7 @@ class ChartSignalStrategy:
                 # back to 1.0 for unknown symbols. ATR is in price
                 # units, so divide commission by multiplier to compare.
                 round_trip_default = {
-                    "MGCQ6": 1.94, "MESU6": 1.24, "MNQU6": 1.24,
+                    "MGCQ6": 1.94, "MESM6": 1.24, "MNQM6": 1.24,
                 }.get(str(self.config.get("symbol", "")), 1.0)
                 round_trip_comm_rg = float(self.config.get(
                     "regime_round_trip_commission", round_trip_default,

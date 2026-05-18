@@ -190,6 +190,6 @@ regime_extreme_tol_mult: 2.0
 # observed in MES sell-offs) from "noise" (1-5 in chop).
 regime_di_lean_threshold: 7.0
 # Per-symbol round-trip commission used as cost floor. Falls back
-# to the in-code default {MGCQ6: 1.94, MESU6: 1.24, MNQU6: 1.24}
+# to the in-code default {MGCQ6: 1.94, MESM6: 1.24, MNQM6: 1.24}
 # when unset; override here for non-default symbols.
 # regime_round_trip_commission: 1.94

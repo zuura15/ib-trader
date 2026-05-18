@@ -27,9 +27,9 @@ ROUND_TRIP_MIN: dict[str, Decimal] = {
     # Micro Gold @ ~$0.97/side.
     "MGCQ6": Decimal("1.94"),
     # Micro S&P 500 @ ~$0.62/side.
-    "MESU6": Decimal("1.24"),
+    "MESM6": Decimal("1.24"),
     # Micro Nasdaq @ ~$0.62/side.
-    "MNQU6": Decimal("1.24"),
+    "MNQM6": Decimal("1.24"),
 }
 
 

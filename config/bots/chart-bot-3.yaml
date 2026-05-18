@@ -9,9 +9,12 @@ config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
   ref_id: chart-bot-3-mes
-  # MES = Micro E-mini S&P 500. U6 = Sep 2026 (rolled from M6
-  # on 2026-05-18). E-minis trade quarterly only (H/M/U/Z).
-  symbol: MESU6
+  # MES = Micro E-mini S&P 500. M6 = June 2026.
+  # E-minis trade quarterly only (H/M/U/Z). Industry roll to U6
+  # is ~June 11, 2026 (~8 days before expiry on June 19). Roll
+  # then, not earlier — U6 is back-month until rollover and has
+  # ~5-10% of M6's volume so spreads are wider.
+  symbol: MESM6
   sec_type: FUT
   # Micro E-mini S&P: $5/point. Used by P/L math + trail target.
   contract_multiplier: 5
@@ -23,4 +26,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MESU6
+- MESM6
