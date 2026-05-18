@@ -1773,26 +1773,9 @@ class ChartSignalStrategy:
         # Line-validity gate (hard-reject; not bypassable in marginal
         # mode — operator clarification 2026-05-18).
         #
-        # Rule (post 2026-05-18 evening): require AT LEAST
-        # ``entry_min_recent_strict_clusters`` (default 3) DISTINCT
-        # CLUSTERS of strict touches on the chosen line within the
-        # last ``entry_max_q_age_hours`` (default 24h) of bars,
-        # where a cluster = strict touches within
-        # ``entry_strict_cluster_bars`` (default 60 bars = 3h) of
-        # each other.
-        #
-        # The earlier "≥ 2 strict touches in 24h" rule still let
-        # through lines whose strict touches were CLUSTERED at the
-        # line's construction endpoints — observed today on MGC
-        # 04:54: a line with 5 strict touches in 24h that turned out
-        # to be 2 from the original construction cluster (May 15
-        # morning) + 3 from a fresh cluster TODAY (12-min window
-        # right before fire) with a 70-hour dead zone in between.
-        # Geometric coincidence, not real respect. Counting
-        # CLUSTERS instead of individual touches forces the strict
-        # touches to be spread across the line's lifespan — a real
-        # respected line has touches at multiple times, not just at
-        # its endpoints.
+        # Rule: require AT LEAST ``entry_min_recent_strict_touches``
+        # (default 2) strict touches on the chosen line within the
+        # last ``entry_max_q_age_hours`` (default 24h) of bars.
         sl_enabled = bool(self.config.get(
             "entry_stale_line_filter_enabled",
             # Back-compat with old key name.
@@ -1801,11 +1784,8 @@ class ChartSignalStrategy:
         max_q_age_hours = float(self.config.get(
             "entry_max_q_age_hours", 24.0,
         ))
-        min_recent_clusters = int(self.config.get(
-            "entry_min_recent_strict_clusters", 3,
-        ))
-        cluster_bars = int(self.config.get(
-            "entry_strict_cluster_bars", 60,
+        min_recent_strict = int(self.config.get(
+            "entry_min_recent_strict_touches", 2,
         ))
         if sl_enabled:
             side_pivots = (
@@ -1816,15 +1796,12 @@ class ChartSignalStrategy:
                 chosen.break_idx if chosen.break_idx is not None
                 else last_idx
             )
-            # Window start in bar-index space: ``last_idx`` minus the
-            # number of bars covering ``max_q_age_hours``. Bar duration
-            # comes from ``self.bar_seconds`` (3-min default).
             window_bars = int(
                 max_q_age_hours * 3600.0 / self.bar_seconds
             )
             window_start_idx = max(0, last_idx - window_bars)
-            # Collect strict-touch indices in window, sorted ascending.
-            strict_indices: list[int] = []
+            recent_strict = 0
+            latest_touch_idx = -1
             for piv in side_pivots:
                 if piv < window_start_idx or piv > to_idx:
                     continue
@@ -1832,24 +1809,10 @@ class ChartSignalStrategy:
                     chosen.intercept + chosen.slope * piv
                 )
                 if abs(closes[piv] - line_val_at_piv) <= touch_tol:
-                    strict_indices.append(piv)
-            strict_indices.sort()
-            # Cluster them: a touch joins the current cluster if it's
-            # within ``cluster_bars`` of the previous touch in the
-            # cluster; otherwise starts a new cluster.
-            cluster_count = 0
-            last_cluster_idx: int | None = None
-            for idx in strict_indices:
-                if (last_cluster_idx is None
-                        or idx - last_cluster_idx > cluster_bars):
-                    cluster_count += 1
-                last_cluster_idx = idx
-            if cluster_count < min_recent_clusters:
-                # Translate latest strict-touch idx → wallclock for
-                # the SKIP payload's diagnostic.
-                latest_touch_idx = (
-                    strict_indices[-1] if strict_indices else -1
-                )
+                    recent_strict += 1
+                    if piv > latest_touch_idx:
+                        latest_touch_idx = piv
+            if recent_strict < min_recent_strict:
                 lt_time_iso = None
                 if 0 <= latest_touch_idx < len(window):
                     wlt = window[latest_touch_idx]
@@ -1862,22 +1825,17 @@ class ChartSignalStrategy:
                     event_type=LogEventType.SKIP,
                     message=(
                         f"{FILTER_STALE_LINE} filter ({direction.upper()})"
-                        f" — only {cluster_count} strict-touch cluster(s) "
-                        f"in the last {max_q_age_hours:.0f}h "
-                        f"({len(strict_indices)} strict touches, "
-                        f"cluster_bars={cluster_bars}; "
-                        f"need ≥ {min_recent_clusters} clusters); "
-                        f"line lacks distributed respect"
+                        f" — only {recent_strict} strict touch(es) in "
+                        f"the last {max_q_age_hours:.0f}h (need "
+                        f"≥ {min_recent_strict}); line is stale "
+                        f"relative to current price action"
                     ),
                     payload={
                         "filter": FILTER_STALE_LINE,
-                        # Line-validity gate — not marginal-bypassable.
                         "marginal": False,
                         "direction": direction,
-                        "recent_strict_touches": len(strict_indices),
-                        "recent_strict_clusters": cluster_count,
-                        "min_recent_strict_clusters": min_recent_clusters,
-                        "cluster_bars": cluster_bars,
+                        "recent_strict_touches": recent_strict,
+                        "min_recent_strict": min_recent_strict,
                         "max_age_hours": max_q_age_hours,
                         "latest_strict_touch_time": lt_time_iso,
                         "entry_decision": decision_diag,

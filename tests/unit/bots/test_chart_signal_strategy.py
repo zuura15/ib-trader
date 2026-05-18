@@ -570,13 +570,8 @@ class TestSynthesizeBarEvalSkipChain:
 
 class TestStaleLineFilter:
     """FILTER_STALE_LINE: reject when the chosen line has fewer than
-    ``entry_min_recent_strict_clusters`` (default 3) DISTINCT clusters
-    of strict touches in the last ``entry_max_q_age_hours`` (default
-    24h), where a cluster = strict touches within
-    ``entry_strict_cluster_bars`` (default 60 bars = 3h) of each
-    other. Counting clusters prevents lines whose strict touches are
-    piled at the construction endpoints from passing — the
-    2026-05-18 MGC 04:54 SHORT pattern."""
+    ``entry_min_recent_strict_touches`` (default 2) strict touches in
+    the last ``entry_max_q_age_hours`` (default 24h). Hard-reject."""
 
     def _make_bar_event(self, bars):
         return BarCompleted(
@@ -584,17 +579,11 @@ class TestStaleLineFilter:
         )
 
     @pytest.mark.asyncio
-    async def test_rejects_when_cluster_count_below_threshold(self):
-        # Use the same V-shape fixture as the prior test; whatever
-        # line the algo picks won't have 3 distinct strict-touch
-        # clusters in the (small) window, so when stale_line fires
-        # the payload reflects the cluster-count threshold.
+    async def test_rejects_when_recent_strict_count_below_threshold(self):
         cfg = _default_config()
         cfg["entry_stale_line_filter_enabled"] = True
         cfg["entry_max_q_age_hours"] = 4.0
-        cfg["entry_min_recent_strict_clusters"] = 3
-        cfg["entry_strict_cluster_bars"] = 60
-        # Disable other filters that might preempt.
+        cfg["entry_min_recent_strict_touches"] = 2
         cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
         s = ChartSignalStrategy(cfg)
@@ -617,47 +606,10 @@ class TestStaleLineFilter:
                  and (a.payload or {}).get("filter") == "stale_line"]
         if skips:
             p = skips[0].payload
-            # New payload shape: cluster count is the trip wire.
-            assert p["recent_strict_clusters"] < p["min_recent_strict_clusters"]
-            assert p["min_recent_strict_clusters"] == 3
-            assert p["cluster_bars"] == 60
+            assert p["recent_strict_touches"] < p["min_recent_strict"]
+            assert p["min_recent_strict"] == 2
             assert p["max_age_hours"] == 4.0
-            # Hard-reject: marginal=False.
             assert p["marginal"] is False
-
-    def test_cluster_counting_invariant(self):
-        """Direct unit test for the cluster-count algorithm.
-
-        Given strict-touch indices sorted ascending, the cluster count
-        increments only when the gap from the previous touch exceeds
-        ``cluster_bars``. The MGC 04:54 SHORT case had 5 strict
-        touches at indices [144, 186, 581, 583, 585] with
-        cluster_bars=60 → 2 clusters (construction era + recent),
-        which falls short of the default ``min_recent_strict_clusters=3``
-        and rejects."""
-
-        def _count_clusters(indices, cluster_bars):
-            cluster_count = 0
-            last_cluster_idx = None
-            for idx in indices:
-                if (last_cluster_idx is None
-                        or idx - last_cluster_idx > cluster_bars):
-                    cluster_count += 1
-                last_cluster_idx = idx
-            return cluster_count
-
-        # 2026-05-18 MGC 04:54 SHORT regression: 5 strict touches,
-        # 2 clusters → must reject when threshold is 3.
-        assert _count_clusters([144, 186, 581, 583, 585], 60) == 2
-        # Spread-out touches: 4 distinct clusters → passes 3-threshold.
-        assert _count_clusters([100, 200, 300, 400], 60) == 4
-        # All clustered: 1 cluster.
-        assert _count_clusters([100, 105, 110, 115], 60) == 1
-        # Boundary: exactly at cluster_bars → same cluster (gap MUST
-        # EXCEED cluster_bars to start a new cluster).
-        assert _count_clusters([100, 160], 60) == 1
-        # Boundary: one bar past cluster_bars → new cluster.
-        assert _count_clusters([100, 161], 60) == 2
 
 
 class TestOpposingDominanceFilter:

@@ -75,17 +75,10 @@ min_slope_ratio: 1.5
 #                          $7.45 below the resistance, $5.63 over
 #                          the cap.)
 #   - stale_line          (line has fewer than
-#                          ``entry_min_recent_strict_clusters``
-#                          (default 3) DISTINCT clusters of strict
-#                          touches in the last
-#                          ``entry_max_q_age_hours`` (default 24h),
-#                          where a cluster = strict touches within
-#                          ``entry_strict_cluster_bars`` (default 60
-#                          = 3h) of each other. Counting clusters
-#                          rather than raw touches forces the strict
-#                          touches to be DISTRIBUTED across the
-#                          line's lifespan, not piled at the
-#                          construction endpoints. Validity gate.)
+#                          ``entry_min_recent_strict_touches``
+#                          (default 2) strict touches in the last
+#                          ``entry_max_q_age_hours`` (default 24h).
+#                          Validity gate.)
 #   - broken lines        (line.break_idx is not None — the market
 #                          already chose to violate this line. Hard
 #                          gate in the entry-candidate iteration
@@ -104,12 +97,6 @@ allow_marginal_entries: true
 # marginal mode (entry-quality, not line-validity).
 entry_counter_trend_filter_enabled: true
 
-# Stale-line: require ≥ 3 DISTINCT clusters of strict touches in the
-# last 24h on the chosen line. Cluster = touches within 60 bars (3h)
-# of each other. Replaces the earlier "≥ 2 strict touches in 24h"
-# rule which still let through lines whose touches were piled at the
-# construction endpoints (MGC 04:54 SHORT 2026-05-18 had 5 strict
-# touches but in only 2 distinct clusters — construction era + a
-# 12-min fresh cluster, with a 70-hour dead zone in between).
-entry_min_recent_strict_clusters: 3
-entry_strict_cluster_bars: 60
+# Stale-line: require ≥ 2 strict touches on the chosen line in the
+# last 24 hours. Hard-reject — not bypassable in marginal mode.
+entry_min_recent_strict_touches: 2
