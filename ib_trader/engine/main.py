@@ -1449,8 +1449,18 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
             # dedup against here.
 
             if symbol not in writers:
+                # 50k entries ≈ 50-80 min of tick retention on a busy
+                # futures contract (~10-15 ticks/sec during US session),
+                # 2-4 hours on stocks. Up from 5k (≈ 8 min) — that
+                # window was too short for any retrospective analysis
+                # (linger-vs-immediate-fire replay against earlier trades
+                # all timed out because their ticks had already been
+                # trimmed). Approximate trimming keeps the XADD cost
+                # essentially flat regardless of the cap. Memory cost
+                # ≈ 7-10 MB per symbol × 14 tickers ≈ 100-140 MB total
+                # — comfortable on the prod box.
                 writers[symbol] = StreamWriter(
-                    redis, StreamNames.quote(symbol), maxlen=5000,
+                    redis, StreamNames.quote(symbol), maxlen=50000,
                 )
 
             close = data.get("close")
