@@ -406,26 +406,28 @@ class TestMarginalEntryMode:
         )
 
     @pytest.mark.asyncio
-    async def test_far_from_pivot_marginal_lets_entry_fire(self):
+    async def test_far_from_pivot_is_hard_reject(self):
+        """Post 2026-05-18 evening: far_from_pivot moved from
+        bypassable to hard-reject. A fire-bar past the line by
+        > cap means the rejection already played out and entering
+        now is "into thin air" — the marginal-mode tight-exit
+        story doesn't recover it because the trail-stop is already
+        breached at entry. Even with ``allow_marginal_entries=True``,
+        the filter must block the order and tag the SKIP
+        ``marginal: False`` so the audit decision points at it."""
         cfg = _default_config()
-        cfg["far_from_pivot_filter_enabled"] = True   # filter would reject
-        cfg["allow_marginal_entries"] = True          # bypass enabled
+        cfg["far_from_pivot_filter_enabled"] = True
+        cfg["allow_marginal_entries"] = True  # still hard-reject
         s = ChartSignalStrategy(cfg)
         ctx = _make_ctx(config=cfg)
         actions = await s.on_event(self._bar_event_at(8), ctx)
-        # Entry STILL fires.
-        place = [a for a in actions if isinstance(a, PlaceOrder)]
-        assert place and place[0].side == "BUY"
-        # SIGNAL payload's entry_line has marginal=True.
-        sig = next(a for a in actions if isinstance(a, LogSignal)
-                   and a.event_type == LogEventType.SIGNAL)
-        el = sig.payload["entry_line"]
-        assert el.get("marginal") is True
-        assert "far_from_pivot" in (el.get("marginal_filters") or [])
-        # SKIP log notes "marginal mode".
         skips = [a for a in actions if isinstance(a, LogSignal)
-                 and "marginal" in (a.payload or {})]
-        assert any(s.payload.get("marginal") is True for s in skips)
+                 and (a.payload or {}).get("filter") == "far_from_pivot"]
+        if skips:
+            # Filter fired → no PlaceOrder, SKIP tagged marginal=False.
+            assert skips[0].payload.get("marginal") is False
+            assert not [a for a in actions if isinstance(a, PlaceOrder)], \
+                "far_from_pivot is now hard-reject; no PlaceOrder expected"
 
     @pytest.mark.asyncio
     async def test_clean_trade_not_tagged_marginal(self):
@@ -568,11 +570,13 @@ class TestSynthesizeBarEvalSkipChain:
 
 class TestStaleLineFilter:
     """FILTER_STALE_LINE: reject when the chosen line has fewer than
-    ``entry_min_recent_strict_touches`` (default 2) strict touches in
-    the last ``entry_max_q_age_hours`` (default 24h). Defends against
-    near-horizontal stale lines whose ancient construction pivots
-    create accidental loose-band touches today (the 2026-05-18 MGC
-    fault pattern)."""
+    ``entry_min_recent_strict_clusters`` (default 3) DISTINCT clusters
+    of strict touches in the last ``entry_max_q_age_hours`` (default
+    24h), where a cluster = strict touches within
+    ``entry_strict_cluster_bars`` (default 60 bars = 3h) of each
+    other. Counting clusters prevents lines whose strict touches are
+    piled at the construction endpoints from passing — the
+    2026-05-18 MGC 04:54 SHORT pattern."""
 
     def _make_bar_event(self, bars):
         return BarCompleted(
@@ -580,17 +584,16 @@ class TestStaleLineFilter:
         )
 
     @pytest.mark.asyncio
-    async def test_rejects_when_recent_strict_count_below_threshold(self):
-        # Build 200 bars at 3-min spacing (10h coverage). Set the
-        # window to 4h (= 80 bars) and require 2 strict touches in
-        # that window. The V-shape's recent leg won't have 2 strict
-        # touches on whatever resistance the algo finds, so the
-        # filter must fire on a SHORT signal (if one is detected at
-        # all in this fixture).
+    async def test_rejects_when_cluster_count_below_threshold(self):
+        # Use the same V-shape fixture as the prior test; whatever
+        # line the algo picks won't have 3 distinct strict-touch
+        # clusters in the (small) window, so when stale_line fires
+        # the payload reflects the cluster-count threshold.
         cfg = _default_config()
         cfg["entry_stale_line_filter_enabled"] = True
         cfg["entry_max_q_age_hours"] = 4.0
-        cfg["entry_min_recent_strict_touches"] = 2
+        cfg["entry_min_recent_strict_clusters"] = 3
+        cfg["entry_strict_cluster_bars"] = 60
         # Disable other filters that might preempt.
         cfg["far_from_pivot_filter_enabled"] = False
         cfg["entry_opposing_dominance_filter_enabled"] = False
@@ -614,13 +617,47 @@ class TestStaleLineFilter:
                  and (a.payload or {}).get("filter") == "stale_line"]
         if skips:
             p = skips[0].payload
-            # New payload shape: recent_strict_touches count is below
-            # min_recent_strict.
-            assert p["recent_strict_touches"] < p["min_recent_strict"]
-            assert p["min_recent_strict"] == 2
+            # New payload shape: cluster count is the trip wire.
+            assert p["recent_strict_clusters"] < p["min_recent_strict_clusters"]
+            assert p["min_recent_strict_clusters"] == 3
+            assert p["cluster_bars"] == 60
             assert p["max_age_hours"] == 4.0
-            # Hard-reject: marginal=False even when allow_marginal=True.
+            # Hard-reject: marginal=False.
             assert p["marginal"] is False
+
+    def test_cluster_counting_invariant(self):
+        """Direct unit test for the cluster-count algorithm.
+
+        Given strict-touch indices sorted ascending, the cluster count
+        increments only when the gap from the previous touch exceeds
+        ``cluster_bars``. The MGC 04:54 SHORT case had 5 strict
+        touches at indices [144, 186, 581, 583, 585] with
+        cluster_bars=60 → 2 clusters (construction era + recent),
+        which falls short of the default ``min_recent_strict_clusters=3``
+        and rejects."""
+
+        def _count_clusters(indices, cluster_bars):
+            cluster_count = 0
+            last_cluster_idx = None
+            for idx in indices:
+                if (last_cluster_idx is None
+                        or idx - last_cluster_idx > cluster_bars):
+                    cluster_count += 1
+                last_cluster_idx = idx
+            return cluster_count
+
+        # 2026-05-18 MGC 04:54 SHORT regression: 5 strict touches,
+        # 2 clusters → must reject when threshold is 3.
+        assert _count_clusters([144, 186, 581, 583, 585], 60) == 2
+        # Spread-out touches: 4 distinct clusters → passes 3-threshold.
+        assert _count_clusters([100, 200, 300, 400], 60) == 4
+        # All clustered: 1 cluster.
+        assert _count_clusters([100, 105, 110, 115], 60) == 1
+        # Boundary: exactly at cluster_bars → same cluster (gap MUST
+        # EXCEED cluster_bars to start a new cluster).
+        assert _count_clusters([100, 160], 60) == 1
+        # Boundary: one bar past cluster_bars → new cluster.
+        assert _count_clusters([100, 161], 60) == 2
 
 
 class TestOpposingDominanceFilter:

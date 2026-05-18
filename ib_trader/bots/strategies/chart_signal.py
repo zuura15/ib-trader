@@ -1710,18 +1710,20 @@ class ChartSignalStrategy:
                 else:
                     return actions
 
-        # Far-from-pivot filter (FILTER_FAR_FROM_PIVOT). Rejects
-        # entries where the fire bar's close has overshot the pivot's
-        # rejection point on the trigger line by more than the
-        # configured stop band. The pivot landed on the line; if the
-        # next bar drifts too far past that line, the rejection has
-        # already played out and we'd be entering "into thin air"
-        # with most of the trade's R:R consumed before fill.
+        # Far-from-pivot filter (FILTER_FAR_FROM_PIVOT).
+        # Hard-reject (NOT bypassable, regardless of allow_marginal —
+        # operator decision 2026-05-18). A fire-bar close that's
+        # multiple-trail-widths past the line means the rejection
+        # already played out on a prior bar; entering now is
+        # structurally "into thin air" and the trail-stop will breach
+        # on any normal reversal. The "tight exit will save us"
+        # argument doesn't apply when the entry is already past the
+        # exit threshold.
         #
         # Cap = trail_dist × ``far_from_pivot_max_trail_mult`` (default
         # 2.0). MGC trail $0.93 → cap $1.86; MES $2.26 → $4.52;
         # MNQ $5.94 → $11.88. Acceleration-entry path is exempt by
-        # design — accel ALREADY entered beyond the line.
+        # design — accel ALREADY entered beyond the line by intent.
         ffp_enabled = bool(self.config.get(
             "far_from_pivot_filter_enabled",
             # Back-compat with the old config key name.
@@ -1750,11 +1752,11 @@ class ChartSignalStrategy:
                         f"fire bar overshot pivot's {kind} line by "
                         f"${gap:.4f} (cap ${cap:.4f} = {mult:.1f}× trail). "
                         f"line @ {line_at:.4f}, entry @ {entry_price:.4f}"
-                        + (" [marginal mode]" if allow_marginal else "")
                     ),
                     payload={
                         "filter": FILTER_FAR_FROM_PIVOT,
-                        "marginal": allow_marginal,
+                        # Hard-reject — not marginal-bypassable.
+                        "marginal": False,
                         "direction": direction,
                         "entry_price": round(entry_price, 4),
                         "line_value": round(line_at, 4),
@@ -1765,34 +1767,32 @@ class ChartSignalStrategy:
                         "entry_decision": decision_diag,
                     },
                 ))
-                if allow_marginal:
-                    # Tag the chosen direction as marginal and proceed.
-                    if direction == "long":
-                        marginal_filters_long.append(FILTER_FAR_FROM_PIVOT)
-                    else:
-                        marginal_filters_short.append(FILTER_FAR_FROM_PIVOT)
-                else:
-                    return actions
+                return actions
 
         # Stale-line filter (FILTER_STALE_LINE).
         # Line-validity gate (hard-reject; not bypassable in marginal
         # mode — operator clarification 2026-05-18).
         #
-        # Rule (post 2026-05-18): require AT LEAST
-        # ``entry_min_recent_strict_touches`` (default 2) strict
-        # touches on the chosen line within the last
-        # ``entry_max_q_age_hours`` (default 24h) of bars.
+        # Rule (post 2026-05-18 evening): require AT LEAST
+        # ``entry_min_recent_strict_clusters`` (default 3) DISTINCT
+        # CLUSTERS of strict touches on the chosen line within the
+        # last ``entry_max_q_age_hours`` (default 24h) of bars,
+        # where a cluster = strict touches within
+        # ``entry_strict_cluster_bars`` (default 60 bars = 3h) of
+        # each other.
         #
-        # The earlier "latest strict touch within 24h" rule passed any
-        # line whose newest touch happened to land inside the window —
-        # but a near-horizontal line that only got ONE accidental
-        # strict touch in 24h (and otherwise hasn't been respected
-        # since construction days ago) was still firing entries. Today
-        # on MGC, the bot fired ~15 phantom shorts on a May-15 line
-        # with only one strict touch in the recent window, dominated
-        # by loose-band coincidences. Requiring ≥ 2 RECENT strict
-        # touches forces a line to demonstrate ongoing relevance —
-        # the construction P-anchor alone isn't enough.
+        # The earlier "≥ 2 strict touches in 24h" rule still let
+        # through lines whose strict touches were CLUSTERED at the
+        # line's construction endpoints — observed today on MGC
+        # 04:54: a line with 5 strict touches in 24h that turned out
+        # to be 2 from the original construction cluster (May 15
+        # morning) + 3 from a fresh cluster TODAY (12-min window
+        # right before fire) with a 70-hour dead zone in between.
+        # Geometric coincidence, not real respect. Counting
+        # CLUSTERS instead of individual touches forces the strict
+        # touches to be spread across the line's lifespan — a real
+        # respected line has touches at multiple times, not just at
+        # its endpoints.
         sl_enabled = bool(self.config.get(
             "entry_stale_line_filter_enabled",
             # Back-compat with old key name.
@@ -1801,8 +1801,11 @@ class ChartSignalStrategy:
         max_q_age_hours = float(self.config.get(
             "entry_max_q_age_hours", 24.0,
         ))
-        min_recent_strict = int(self.config.get(
-            "entry_min_recent_strict_touches", 2,
+        min_recent_clusters = int(self.config.get(
+            "entry_min_recent_strict_clusters", 3,
+        ))
+        cluster_bars = int(self.config.get(
+            "entry_strict_cluster_bars", 60,
         ))
         if sl_enabled:
             side_pivots = (
@@ -1820,8 +1823,8 @@ class ChartSignalStrategy:
                 max_q_age_hours * 3600.0 / self.bar_seconds
             )
             window_start_idx = max(0, last_idx - window_bars)
-            recent_strict = 0
-            latest_touch_idx = -1
+            # Collect strict-touch indices in window, sorted ascending.
+            strict_indices: list[int] = []
             for piv in side_pivots:
                 if piv < window_start_idx or piv > to_idx:
                     continue
@@ -1829,14 +1832,24 @@ class ChartSignalStrategy:
                     chosen.intercept + chosen.slope * piv
                 )
                 if abs(closes[piv] - line_val_at_piv) <= touch_tol:
-                    recent_strict += 1
-                    if piv > latest_touch_idx:
-                        latest_touch_idx = piv
-            if recent_strict < min_recent_strict:
-                # Translate latest_touch_idx → wallclock time for the
-                # SKIP payload's diagnostic (operator wants to see how
-                # old the most recent strict touch was, even when the
-                # COUNT is what tripped the reject).
+                    strict_indices.append(piv)
+            strict_indices.sort()
+            # Cluster them: a touch joins the current cluster if it's
+            # within ``cluster_bars`` of the previous touch in the
+            # cluster; otherwise starts a new cluster.
+            cluster_count = 0
+            last_cluster_idx: int | None = None
+            for idx in strict_indices:
+                if (last_cluster_idx is None
+                        or idx - last_cluster_idx > cluster_bars):
+                    cluster_count += 1
+                last_cluster_idx = idx
+            if cluster_count < min_recent_clusters:
+                # Translate latest strict-touch idx → wallclock for
+                # the SKIP payload's diagnostic.
+                latest_touch_idx = (
+                    strict_indices[-1] if strict_indices else -1
+                )
                 lt_time_iso = None
                 if 0 <= latest_touch_idx < len(window):
                     wlt = window[latest_touch_idx]
@@ -1849,18 +1862,22 @@ class ChartSignalStrategy:
                     event_type=LogEventType.SKIP,
                     message=(
                         f"{FILTER_STALE_LINE} filter ({direction.upper()})"
-                        f" — only {recent_strict} strict touch(es) in "
-                        f"the last {max_q_age_hours:.0f}h (need "
-                        f"≥ {min_recent_strict}); line is stale "
-                        f"relative to current price action"
+                        f" — only {cluster_count} strict-touch cluster(s) "
+                        f"in the last {max_q_age_hours:.0f}h "
+                        f"({len(strict_indices)} strict touches, "
+                        f"cluster_bars={cluster_bars}; "
+                        f"need ≥ {min_recent_clusters} clusters); "
+                        f"line lacks distributed respect"
                     ),
                     payload={
                         "filter": FILTER_STALE_LINE,
                         # Line-validity gate — not marginal-bypassable.
                         "marginal": False,
                         "direction": direction,
-                        "recent_strict_touches": recent_strict,
-                        "min_recent_strict": min_recent_strict,
+                        "recent_strict_touches": len(strict_indices),
+                        "recent_strict_clusters": cluster_count,
+                        "min_recent_strict_clusters": min_recent_clusters,
+                        "cluster_bars": cluster_bars,
                         "max_age_hours": max_q_age_hours,
                         "latest_strict_touch_time": lt_time_iso,
                         "entry_decision": decision_diag,
