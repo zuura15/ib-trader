@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 def main(db: str, env: str, settings_path: str, host: str, port: int):
     """IB Trader API Server — REST API for the trading platform."""
     setup_logging()
+    # Mirror trade-relevant JSON events into the log_events SQLite
+    # table on a background thread. See ib_trader/logging_/db_sink.py.
+    from ib_trader.logging_.db_sink import install_db_sink
+    install_db_sink(db)
 
     # Load configuration
     load_env(env)

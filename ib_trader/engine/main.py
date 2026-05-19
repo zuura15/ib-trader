@@ -79,6 +79,10 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
          force_mode: str | None):
     """IB Trader Engine Service — central command execution loop."""
     setup_logging()
+    # Mirror trade-relevant JSON events into the log_events SQLite
+    # table on a background thread. See ib_trader/logging_/db_sink.py.
+    from ib_trader.logging_.db_sink import install_db_sink
+    install_db_sink(db)
 
     # Load configuration (same pattern as REPL and daemon)
     env_vars = load_env(env)

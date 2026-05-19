@@ -17,6 +17,7 @@ import click
 from dotenv import load_dotenv
 
 from ib_trader.config.loader import load_settings, check_file_permissions
+from ib_trader.logging_.db_sink import install_db_sink
 from ib_trader.data.repository import create_db_engine, create_session_factory, init_db
 from ib_trader.data.repository import HeartbeatRepository
 from ib_trader.logging_.logger import setup_logging
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 def main(db: str, settings_path: str):
     """IB Trader Bot Runner — manages bot lifecycle."""
     setup_logging()
+    # Mirror trade-relevant JSON log events into the log_events
+    # SQLite table on a background thread (48 h retention,
+    # fire-and-forget). Makes post-trade investigations queryable
+    # via SQL instead of grep'ing ib_trader.log.
+    install_db_sink(db)
     # Load .env into os.environ so notification config (EMAIL_*),
     # alert channels, and anything else env-driven works regardless
     # of whether the launching shell sourced it. Restarts done from
