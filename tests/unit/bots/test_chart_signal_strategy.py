@@ -2168,6 +2168,46 @@ class TestInterTouchSpacing:
         assert skips[0].payload["direction"] == "short"
 
     @pytest.mark.asyncio
+    async def test_tight_cluster_projection_rejected(self):
+        """Inverse asymmetric case (Direction B). T_{n-2} and T_{n-1}
+        near-adjacent (3 bars apart), new pivot 15 bars after T_{n-1}.
+        Old asymmetric rule (g_prev/g_new only) passed with ratio 0.2.
+        Symmetric rule rejects with max/min = 15/3 = 5 > 3.
+
+        Mirrors live MNQ 2026-05-19 00:33 — Q at idx 272, intermediate
+        strict at idx 275 (3 bars after Q), new pivot at idx 478
+        (203 bars after intermediate). Ratio under symmetric rule:
+        203/3 ≈ 68.
+        """
+        # 3 pivot LOWs on a rising support line:
+        #   idx 2 (Q, 4500), idx 5 (intermediate strict, 4503),
+        #   idx 20 (new, 4518).  Line slope = +1.0/bar.
+        c = [4520.0, 4510.0,
+             4500.0,                                     # 2  Q LOW
+             4502.0, 4504.0,
+             4503.0,                                     # 5  intermediate LOW
+             4505.0, 4506.0, 4507.0, 4508.0, 4509.0,     # 6..10
+             4510.0, 4511.0, 4512.0, 4513.0, 4514.0,     # 11..15
+             4515.0, 4516.0, 4517.0, 4519.0,             # 16..19 (idx19 above new)
+             4518.0,                                     # 20 new LOW
+             4525.0]                                     # 21 eval
+        cfg = _default_config()
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(c)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert not place, (
+            f"tight-cluster + far projection should not fire; "
+            f"got skips={skips}, place={place}"
+        )
+
+    @pytest.mark.asyncio
     async def test_accel_path_gated_by_spacing(self):
         """2-pivot accel: Q and P with long gap, new pivot is the
         3rd point right after P. Spacing rule rejects the synthetic

@@ -1425,15 +1425,29 @@ class ChartSignalStrategy:
             return strict_old >= MIN_TOUCHES
 
         # Inter-touch spacing gate (FILTER_INTER_TOUCH_SPACING).
-        # Rejects a candidate line when the new pivot lands "right
-        # after" the previous strict touch on a line that took much
-        # longer to build. The long line's projected tol band catches
-        # near-misses by mathematical coincidence rather than real
-        # structural respect.
+        # Rejects a candidate line whose spacing between the last two
+        # strict touches and the new pivot is grossly asymmetric in
+        # either direction — both directions are degenerate geometry,
+        # not just one.
         #
-        # Rule: g_prev = T_{n-1} - T_{n-2} (bars between the last
-        # two strict touches before new_pivot), g_new = new_pivot -
-        # T_{n-1}. Reject when g_prev / g_new > max_ratio (default 3).
+        # Rule (symmetric, tightened 2026-05-19):
+        #   g_prev = T_{n-1} - T_{n-2}  (bars between the last two
+        #                                 strict touches before new_pivot)
+        #   g_new  = new_pivot - T_{n-1}
+        #   ratio  = max(g_prev, g_new) / min(g_prev, g_new)
+        # Reject when ratio > max_ratio (default 3).
+        #
+        # Direction A — "mountain attack on valley" (g_prev >> g_new):
+        #   long line + new touch lands right after the previous one.
+        #   Long line's wide projected band catches the near-miss by
+        #   coincidence, not respect.
+        # Direction B — "tight-cluster projection" (g_new >> g_prev):
+        #   T_{n-2} and T_{n-1} are near-adjacent (e.g. 3 bars apart).
+        #   The line is anchored on noise and projected forward 100+
+        #   bars to catch a coincidence pivot. Observed live on MNQ
+        #   2026-05-19 00:33 — Q at idx 272, T_{n-1} at idx 275 (3
+        #   bars later), new pivot at idx 478 (203 bars later). The
+        #   original asymmetric rule passed this with ratio 0.015.
         #
         # For a freshly-built Q→P line with no other strict touches,
         # T_{n-2} = from_idx (Q), T_{n-1} = anchor_b_idx (P). For
@@ -1471,7 +1485,7 @@ class ChartSignalStrategy:
             g_new = new_pivot_idx - t_prev
             if g_prev <= 0 or g_new <= 0:
                 return True, {"reason": "degenerate_gaps"}
-            ratio = g_prev / max(g_new, 1)
+            ratio = max(g_prev, g_new) / max(min(g_prev, g_new), 1)
             passes = ratio <= spacing_max_ratio
             return passes, {
                 "g_prev": g_prev,
@@ -1726,8 +1740,9 @@ class ChartSignalStrategy:
                     f"{p.get('g_prev', '?')} bars vs new gap "
                     f"{p.get('g_new', '?')} bars (ratio "
                     f"{p.get('ratio', '?')} > "
-                    f"{p.get('max_ratio', '?')}); new touch lands "
-                    f"too soon after prior touch on long-built line"
+                    f"{p.get('max_ratio', '?')}); spacing too "
+                    f"asymmetric — line is either tolerance-attacked "
+                    f"or anchored on a tight cluster projected forward"
                 ),
                 payload={
                     "filter": FILTER_INTER_TOUCH_SPACING,
