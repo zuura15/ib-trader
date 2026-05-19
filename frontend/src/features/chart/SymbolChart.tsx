@@ -1726,7 +1726,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           supports: renderedLines.filter((l) => l.type === 'support').length,
           resistances: renderedLines.filter((l) => l.type === 'resistance').length,
         },
-        sliceLast,
+        sliceLast: stash.sliceTo,
       };
       void fetch('/api/debug/log/sr-debug', {
         method: 'POST',
