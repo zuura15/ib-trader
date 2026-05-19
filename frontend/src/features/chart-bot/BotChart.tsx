@@ -29,6 +29,11 @@ interface Props {
   /** Layout chrome — set false to drop the panel header entirely
    *  (mobile uses the tab strip as the title). Defaults true. */
   showHeader?: boolean;
+  /** Layer-2 testbed: when true, overlays RANSAC fuzzy lines from
+   *  ``/api/sr/fuzzy`` (cyan support / magenta resistance, dashed,
+   *  width by inlier count) on top of the canonical SR fan. Used by
+   *  the fuzzytrader layout's slot 5 pane. Defaults false. */
+  showFuzzyOverlay?: boolean;
 }
 
 /**
@@ -54,6 +59,7 @@ interface Props {
 export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
+  showFuzzyOverlay = false,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -574,6 +580,7 @@ export function BotChart({
           paneBackground={inPosition ? ACTIVE_TINT : null}
           suppressAutoSignals
           historicalFires={historicalFires}
+          showFuzzyOverlay={showFuzzyOverlay}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

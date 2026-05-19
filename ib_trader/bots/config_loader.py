@@ -113,7 +113,7 @@ def load_all_bots(bots_dir: Path | str = DEFAULT_BOTS_DIR) -> list[BotDefinition
     seen_ids: dict[str, str] = {}
     seen_names: dict[str, str] = {}
     seen_refs: dict[str, str] = {}
-    seen_targets: dict[tuple[str, str], str] = {}
+    seen_targets: dict[tuple[str, str], tuple[str, bool]] = {}
 
     for path in sorted(base.glob("*.y*ml")):
         if path.name.startswith(("_", ".")):
@@ -149,21 +149,33 @@ def load_all_bots(bots_dir: Path | str = DEFAULT_BOTS_DIR) -> list[BotDefinition
         # Only enforce (symbol, sec_type) uniqueness when both fields
         # are present in the config. Strategies that don't pin a single
         # symbol (multi-symbol bots) are exempt.
+        #
+        # Manual-entry-only pairs are also exempt from the conflict:
+        # the whole purpose of this guard is to stop two auto-firing
+        # bots from racing on the same contract, and a manual-only
+        # bot can't generate auto entries by definition. We still
+        # track the slot so a later non-manual bot on the same target
+        # IS caught — only the "both sides manual" case is allowed.
         cfg = bot.config if isinstance(bot.config, dict) else {}
         symbol = cfg.get("symbol")
         sec_type = cfg.get("sec_type")
         if symbol and sec_type:
             target = (str(symbol).upper(), str(sec_type).upper())
-            if target in seen_targets:
-                raise BotConfigError(
-                    f"{path}: duplicate target {target} "
-                    f"(also in {seen_targets[target]}). Two bots on the "
-                    f"same symbol+sec_type fire the same 3-touch signal "
-                    f"twice and one bot's force-quit cancels every open "
-                    f"order on the symbol, taking the other bot's working "
-                    f"order with it."
-                )
-            seen_targets[target] = str(path)
+            existing = seen_targets.get(target)
+            if existing is not None:
+                existing_path, existing_manual = existing
+                if not (bot.manual_entry_only and existing_manual):
+                    raise BotConfigError(
+                        f"{path}: duplicate target {target} "
+                        f"(also in {existing_path}). Two auto-firing "
+                        f"bots on the same symbol+sec_type fire the "
+                        f"same 3-touch signal twice and one bot's "
+                        f"force-quit cancels every open order on the "
+                        f"symbol, taking the other bot's working "
+                        f"order with it. (Two manual-entry-only bots "
+                        f"are permitted — neither can auto-fire.)"
+                    )
+            seen_targets[target] = (str(path), bot.manual_entry_only)
 
         seen_ids[bot.id] = str(path)
         seen_names[bot.name] = str(path)

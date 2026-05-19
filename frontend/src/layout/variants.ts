@@ -106,8 +106,12 @@ export const variantA: IJsonModel = {
   },
 };
 
-// Variant B — Modern Control Center
-// Cleaner, fewer panes visible, contextual drawers, more hierarchy
+// Variant B — fuzzytrader (Layer-2 indicator testbed)
+// Full-screen MNQ chart-bot pane (slot 5 = chart-bot-5, fuzzy_signal
+// strategy) on top, Console / Errors / Logs tabset on bottom for
+// indicator-tuning and audit. Other panes (Bots, Orders, Trades, etc.)
+// live in the bottom border drawer so they're reachable but not
+// competing for chart real estate.
 export const variantB: IJsonModel = {
   global: globalConfig,
   borders: [
@@ -116,11 +120,11 @@ export const variantB: IJsonModel = {
       location: 'bottom',
       size: 200,
       children: [
-        { type: 'tab', name: 'Logs', component: 'logs' },
-        { type: 'tab', name: 'Errors', component: 'errors' },
-        { type: 'tab', name: 'Bot Log', component: 'bot-log' },
-        { type: 'tab', name: 'Bot Activity', component: 'bot-activity' },
-        { type: 'tab', name: 'Console', component: 'console' },
+        { type: 'tab', name: 'Bots', component: 'bots' },
+        { type: 'tab', name: 'Orders', component: 'orders', config: { compact: true } },
+        { type: 'tab', name: 'Bot Trades', component: 'bot-trades', config: { compact: true } },
+        { type: 'tab', name: 'Positions', component: 'positions', config: { compact: true } },
+        { type: 'tab', name: 'Alerts', component: 'alerts' },
         { type: 'tab', name: 'Help', component: 'help' },
       ],
     },
@@ -129,35 +133,27 @@ export const variantB: IJsonModel = {
     type: 'row',
     weight: 100,
     children: [
+      // Single column — chart-bot fills the top, dev tabset on bottom.
       {
         type: 'row',
-        weight: 70,
+        weight: 100,
         children: [
           {
             type: 'tabset',
-            weight: 60,
+            weight: 75,
             children: [
-              { type: 'tab', name: 'Positions', component: 'positions' },
-              { type: 'tab', name: 'Watchlist', component: 'watchlist' },
-              { type: 'tab', name: 'Orders', component: 'orders' },
-              { type: 'tab', name: 'Trades', component: 'trades' },
-              { type: 'tab', name: 'Bot Trades', component: 'bot-trades' },
+              { type: 'tab', name: 'Fuzzy · Micro Nasdaq', component: 'chart-bot', config: { slot: 5 } },
             ],
           },
           {
             type: 'tabset',
-            weight: 40,
+            weight: 25,
             children: [
-              { type: 'tab', name: 'Alerts', component: 'alerts' },
+              { type: 'tab', name: 'Console', component: 'console' },
+              { type: 'tab', name: 'Errors', component: 'errors' },
+              { type: 'tab', name: 'Logs', component: 'logs' },
             ],
           },
-        ],
-      },
-      {
-        type: 'tabset',
-        weight: 30,
-        children: [
-          { type: 'tab', name: 'Bots', component: 'bots', config: { large: true } },
         ],
       },
     ],

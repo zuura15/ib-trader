@@ -1,0 +1,29 @@
+id: chart-bot-5
+name: "Chart Bot Fuzzy · MNQ"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+# Layer-2 testbed (2026-05-19). Bot is structurally identical to
+# chart-bot-4 (chart_signal strategy) but uses the fuzzy_signal clone
+# as its starting point so we can layer RANSAC-line / channel /
+# prominence-pivot logic on top without touching the live chart_signal.
+#
+# manual_entry_only stays TRUE while we tune indicators. The bot will
+# evaluate bars and emit signal-driven entries to the action stream,
+# but ManualEntryMiddleware drops them with a MANUAL_ENTRY_ONLY
+# breadcrumb. Only operator force-LONG / force-SHORT and exits flow.
+manual_entry_only: true
+auto_start: false
+config:
+  strategy_name: fuzzy_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-5-mnq
+  # MNQ = Micro E-mini Nasdaq-100. M6 = June 2026.
+  symbol: MNQM6
+  sec_type: FUT
+  contract_multiplier: 2
+  trail_width_pct: 0.0002
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- MNQM6

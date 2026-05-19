@@ -353,6 +353,7 @@ export function ChartBotPane({ slot }: Props) {
           symbol={symbol}
           secType={secType}
           renderHeader={renderRight}
+          showFuzzyOverlay={slot === 5}
         />
       </div>
     </div>

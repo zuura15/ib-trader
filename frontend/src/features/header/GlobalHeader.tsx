@@ -14,7 +14,7 @@ const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
 
 const variantLabels: Record<LayoutVariant, string> = {
   A: 'Classic',
-  B: 'Modern',
+  B: 'fuzzytrader',
   C: 'Command',
   D: 'Bots',
   T: 'Trader',

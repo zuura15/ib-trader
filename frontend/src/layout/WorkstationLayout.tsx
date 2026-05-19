@@ -19,6 +19,12 @@ const LAYOUT_VERSION: Partial<Record<LayoutVariant, number>> = {
   //       PanelShell header removed (gives chart panes their full
   //       vertical space back). Stale v3 layouts get discarded.
   T: 4,
+  // B v2: Modern Control Center → fuzzytrader. Replaced with a
+  // chart-bot pane (slot 5 = chart-bot-5, fuzzy_signal strategy)
+  // plus a Console/Errors/Logs tabset on the bottom. Stale
+  // v1 layouts get discarded so persisted Positions/Watchlist tabs
+  // don't shadow the new chart pane.
+  B: 2,
 };
 const VERSION_PREFIX = 'ib-layout-ver-';
 

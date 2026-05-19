@@ -3891,6 +3891,9 @@ def _create_strategy(name: str, config: dict) -> Strategy | None:
     if name == "chart_signal":
         from ib_trader.bots.strategies.chart_signal import ChartSignalStrategy
         return ChartSignalStrategy(config)
+    if name == "fuzzy_signal":
+        from ib_trader.bots.strategies.fuzzy_signal import FuzzySignalStrategy
+        return FuzzySignalStrategy(config)
     return None
 
 

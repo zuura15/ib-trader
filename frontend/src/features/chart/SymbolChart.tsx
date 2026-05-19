@@ -18,6 +18,10 @@ import {
   fetchBackendSr, backendLineToSRLine, backendTsToChartTime,
   type BackendSrPayload,
 } from './srBackend';
+import {
+  fetchFuzzy, fuzzyLineToChartLine,
+  type FuzzyPayload,
+} from './fuzzyBackend';
 import type { ChartTarget } from '../../data/store';
 import { useUserSetting } from '../../data/userSettings';
 
@@ -158,6 +162,13 @@ interface Props {
    *  operator a 24 h record of where it fired, even after the
    *  active entry has exited. */
   historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
+  /** Layer-2 testbed overlay. When true, fetches ``/api/sr/fuzzy``
+   *  on a 30s poll and renders RANSAC-fitted lines + scored pivots
+   *  as additional series in distinct colors (cyan for support,
+   *  magenta for resistance). Channels render as ribbons. Does NOT
+   *  affect the canonical SR fan rendering — they coexist so the
+   *  operator can A/B them on the same chart. */
+  showFuzzyOverlay?: boolean;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -179,6 +190,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     paneBackground = null,
     suppressAutoSignals = false,
     historicalFires,
+    showFuzzyOverlay = false,
   }: Props,
   ref,
 ) {
@@ -220,6 +232,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // every refresh; `srHiddenRef` lets the user dismiss them for the
   // current target via the Clear-SR button (re-shows on target switch).
   const srSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  // Layer-2 fuzzy overlay: RANSAC lines + channel ribbons rendered
+  // on a separate series set so the canonical SR recompute doesn't
+  // wipe them. Owned by the fuzzy-fetch effect below.
+  const fuzzySeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  const fuzzyPayloadRef = useRef<FuzzyPayload | null>(null);
   // Bot-mode: the chart_signal strategy's frozen entry line. Lives on
   // its own series so the SR recompute (which wipes ``srSeriesRef``)
   // doesn't erase it on every pan/zoom. Created/torn down with the
@@ -2402,6 +2419,87 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       window.clearInterval(id);
     };
   }, [target?.conId, target?.symbol, target?.secType]);
+
+  // -------- Layer-2 fuzzy SR overlay --------
+  // Fetch /api/sr/fuzzy on a 15s cadence whenever ``showFuzzyOverlay``
+  // is true, then render lines as additional LineSeries with distinct
+  // colors (cyan support, magenta resistance). The canonical SR fan
+  // stays drawn beneath — operators eyeball both side by side.
+  // Series are stored in ``fuzzySeriesRef`` so the canonical SR
+  // recompute (which wipes ``srSeriesRef``) doesn't touch them.
+  useEffect(() => {
+    if (!target || !showFuzzyOverlay) {
+      // Clean up any existing fuzzy series when the toggle flips off
+      // or the target clears.
+      const ch = chartRef.current;
+      if (ch) {
+        for (const s of fuzzySeriesRef.current) {
+          try { ch.removeSeries(s); } catch { /* torn down */ }
+        }
+      }
+      fuzzySeriesRef.current = [];
+      fuzzyPayloadRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const doFetch = async () => {
+      const payload = await fetchFuzzy(target, 8, '3 mins');
+      if (cancelled) return;
+      if (payload !== null) {
+        fuzzyPayloadRef.current = payload;
+        renderFuzzy();
+      }
+    };
+    const renderFuzzy = () => {
+      const ch = chartRef.current;
+      const bars = barsRef.current;
+      const payload = fuzzyPayloadRef.current;
+      if (!ch || !bars.length || !payload) return;
+      // Clear prior fuzzy series before redrawing the new set.
+      for (const s of fuzzySeriesRef.current) {
+        try { ch.removeSeries(s); } catch { /* torn down */ }
+      }
+      fuzzySeriesRef.current = [];
+      // Support cyan, resistance magenta. Opacity scales with score
+      // so a 0.4-score line is faint and a 0.9-score line is bold.
+      for (const fl of payload.lines) {
+        const mapped = fuzzyLineToChartLine(fl, bars);
+        if (!mapped) continue;
+        const color = mapped.type === 'support' ? '#22d3ee' : '#e879f9';
+        // Width scales 1..3 with inlier count.
+        const width = Math.min(3, Math.max(1, Math.round(mapped.inlierCount / 2)));
+        try {
+          const series = ch.addSeries(LineSeries, {
+            color,
+            lineWidth: width as 1 | 2 | 3,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            autoscaleInfoProvider: () => null,
+            // dashed so they're visually distinct from the strict-SR
+            // solid lines.
+            lineStyle: 1 as 1,
+          });
+          const fromTime = bars[mapped.fromIdx].time;
+          const toTime = bars[Math.min(mapped.toIdx, bars.length - 1)].time;
+          series.setData([
+            { time: fromTime, value: mapped.fromPrice },
+            { time: toTime, value: mapped.toPrice },
+          ]);
+          fuzzySeriesRef.current.push(series);
+        } catch {
+          // chart torn down between fetch and render
+        }
+      }
+    };
+    doFetch();
+    const id = window.setInterval(doFetch, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [target?.conId, target?.symbol, target?.secType, showFuzzyOverlay,
+      chartVersion]);
 
   // Regime fetch — one ADX/ATR/Donchian reading per chart, refreshed
   // on the same 15s cadence as SR. ``insufficient`` regimes still
