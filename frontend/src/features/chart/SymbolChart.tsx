@@ -1409,10 +1409,23 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // history), not the visible slice. Read from allBars so a
         // line anchored to a bar outside the current zoom still
         // renders correctly when the operator pans back.
+        //
+        // Pure visual projection to the in-progress bar: for live
+        // (un-broken) lines, extend the right edge to the latest bar
+        // in allBars — the live-tick handler keeps that bar's close
+        // current, so the line stays glued to "now" instead of
+        // stopping at the previous fully-closed bar. Broken lines
+        // are archived and keep their original ``toIdx`` so the dashed
+        // segment terminates where the break actually happened.
+        // Touch counting / break detection still uses ``line.toIdx`` —
+        // we only override the rendering endpoint.
+        const projToIdx = isBroken
+          ? line.toIdx
+          : Math.max(line.toIdx, allBars.length - 1);
         const startTime = allBars[line.fromIdx].time;
-        const endTime = allBars[line.toIdx].time;
+        const endTime = allBars[projToIdx].time;
         const startPrice = line.slope * line.fromIdx + line.intercept;
-        const endPrice = line.slope * line.toIdx + line.intercept;
+        const endPrice = line.slope * projToIdx + line.intercept;
         const lineStyleVal = isBroken ? 2 : confirmed ? 0 : 1;
         const baseOpts = {
           color,
