@@ -781,19 +781,20 @@ class ChartSignalStrategy:
         # (slope > 0); short candidates from downtrending resistance
         # (slope < 0). Both filtered to 3-touch, not broken.
         #
-        # ``near_touch_tolerance_fraction`` (optional, default 5× of
-        # the strict 0.0002 = 0.001): once a line accumulates the
-        # first three strict touches, further pivots within this
-        # wider band count as 4th/5th/… touches. This recovers entries
-        # on lines that are visually-established but where the new
-        # pivot's strict tol misses by a hair — the kind of pivot the
-        # operator's eye reads as "on the line" but the math doesn't.
-        # Set to ``None`` to disable (= legacy strict behavior).
-        near_frac = self.config.get(
-            "near_touch_tolerance_fraction", 5 * TOUCH_TOLERANCE_FRACTION,
-        )
-        if near_frac is not None:
-            near_frac = float(near_frac)
+        # Strict-only touch counting (2026-05-19 — operator removed
+        # the 4th-loose touch concept entirely). Every touch the bot
+        # uses for line validity or entry confirmation must lie within
+        # ``touch_tol`` of the line. The accel path retains an
+        # ``overshoot`` threshold (the new pivot must lie strictly
+        # outside the base line by more than 5× touch_tol) — that's a
+        # different concept from "touch within tolerance" and lives
+        # under its own variable name below.
+        #
+        # near_touch_tolerance_fraction is intentionally NOT passed
+        # to detect_lines below — the 4th-loose touch concept was
+        # removed 2026-05-19. The legacy config option is still read
+        # for the accel overshoot threshold (see ``accel_overshoot_tol``
+        # below); it no longer affects strict-touch counting.
         # ``break_stale_bars`` extends the lifetime of broken lines in
         # the detect output. Default 480 bars = 24 h of 3-min bars,
         # so a line that briefly "breaks" at a session-rollover gap
@@ -808,12 +809,10 @@ class ChartSignalStrategy:
         ))
         supports = detect_lines(
             closes, up_to=last_idx, type_="support",
-            near_touch_tolerance_fraction=near_frac,
             break_stale_bars=break_stale_bars,
         )
         resistances = detect_lines(
             closes, up_to=last_idx, type_="resistance",
-            near_touch_tolerance_fraction=near_frac,
             break_stale_bars=break_stale_bars,
         )
         # Note: ``break_idx`` is no longer a hard gate here. The
@@ -844,39 +843,19 @@ class ChartSignalStrategy:
         ))
         avg_close_early = sum(closes) / max(1, len(closes))
         touch_tol_early = max(1e-6, avg_close_early * TOUCH_FRAC_EARLY)
-        near_tol_early: float | None = None
-        if near_frac is not None and near_frac > TOUCH_FRAC_EARLY:
-            near_tol_early = max(touch_tol_early,
-                                  avg_close_early * near_frac)
         np_idx = last_idx - 1
 
         def _strict_new_touch(line, side_pivots) -> bool:
-            """``_has_new_touch`` minus the 4th-loose path — used by
-            the audit row to determine whether THIS bar's pivot
-            actually landed on the line. Same gate the entry uses;
-            cached to avoid duplicate work at line 805."""
+            """Whether this bar's pivot lies within ``touch_tol`` of
+            the line. Strict-only — 4th-loose touch removed
+            2026-05-19."""
             if line is None:
                 return False
             if np_idx < 0 or np_idx not in side_pivots:
                 return False
             line_at = line.intercept + line.slope * np_idx
             delta = abs(closes[np_idx] - line_at)
-            if delta <= touch_tol_early:
-                return True
-            if near_tol_early is None or delta > near_tol_early:
-                return False
-            # 4th+ near touch — line must already hold MIN_TOUCHES
-            # strict touches from older pivots.
-            strict_old = 0
-            for piv in side_pivots:
-                if piv == np_idx or piv < line.from_idx:
-                    continue
-                if piv > last_idx:
-                    continue
-                if abs(closes[piv]
-                       - (line.intercept + line.slope * piv)) <= touch_tol_early:
-                    strict_old += 1
-            return strict_old >= MIN_TOUCHES
+            return delta <= touch_tol_early
 
         long_has_new_touch = _strict_new_touch(long_line, support_pivots)
         short_has_new_touch = _strict_new_touch(short_line, resistance_pivots)
@@ -922,23 +901,10 @@ class ChartSignalStrategy:
                     line_at = ln.intercept + ln.slope * np_idx
                     delta = abs(pivot_close - line_at)
                     if delta > touch_tol_early:
-                        # Allow near-touch only if line already holds
-                        # MIN_TOUCHES strict from older pivots — same
-                        # rule as ``_has_new_touch``.
-                        if (near_tol_early is None
-                                or delta > near_tol_early):
-                            continue
-                        strict_old = 0
-                        for piv in side_pivots:
-                            if (piv == np_idx or piv < ln.from_idx
-                                    or piv > last_idx):
-                                continue
-                            d = abs(closes[piv]
-                                    - (ln.intercept + ln.slope * piv))
-                            if d <= touch_tol_early:
-                                strict_old += 1
-                        if strict_old < MIN_TOUCHES:
-                            continue
+                        # Strict-only (4th-loose touch removed
+                        # 2026-05-19): the pivot must lie within
+                        # touch_tol of the line.
+                        continue
                     # Stale-line gate: the line's MOST RECENT strict
                     # touch must be within ``max_q_age_hours`` of the
                     # fire bar (same rule as the entry filter). Lines
@@ -1414,13 +1380,20 @@ class ChartSignalStrategy:
         ))
         avg_close = sum(closes) / max(1, len(closes))
         touch_tol = max(1e-6, avg_close * TOUCH_FRAC)
-        # Loose band for 4th+ touches — only applied when the line
-        # already has MIN_TOUCHES strict touches from OLDER pivots
-        # (i.e. the just-confirmed pivot is a follow-up confirmation
-        # on a line the prior bars already established).
-        near_tol: float | None = None
-        if near_frac is not None and near_frac > TOUCH_FRAC:
-            near_tol = max(touch_tol, avg_close * near_frac)
+        # Acceleration-path overshoot threshold (NOT a touch
+        # tolerance). The accel entry path requires the new pivot to
+        # lie strictly OUTSIDE the Q→P base line by more than this
+        # multiple of touch_tol. Different concept from "loose touch"
+        # (which was removed 2026-05-19) — accel cares about how far
+        # past the line the new pivot is, not about catching pivots
+        # close to the line. Default 5× strict_tol preserves the
+        # previous accel threshold; tune via
+        # ``accel_overshoot_fraction`` if needed.
+        ACCEL_OVERSHOOT_FRAC = float(self.config.get(
+            "accel_overshoot_fraction",
+            5 * TOUCH_TOLERANCE_FRACTION,
+        ))
+        accel_overshoot_tol = max(touch_tol, avg_close * ACCEL_OVERSHOOT_FRAC)
         # support_pivots / resistance_pivots already computed earlier
         # for the BAR audit row; reuse them here.
         new_pivot_idx = last_idx - 1   # the just-confirmed pivot
@@ -1439,30 +1412,14 @@ class ChartSignalStrategy:
         min_slope_ratio = float(self.config.get("min_slope_ratio", 1.5))
 
         def _has_new_touch(line, side_pivots) -> bool:
+            """Strict-only (2026-05-19 — 4th-loose touch removed).
+            The just-confirmed pivot must lie within ``touch_tol`` of
+            the line."""
             if new_pivot_idx < 0 or new_pivot_idx not in side_pivots:
                 return False
             line_at = line.intercept + line.slope * new_pivot_idx
             delta = abs(closes[new_pivot_idx] - line_at)
-            if delta <= touch_tol:
-                return True
-            if near_tol is None or delta > near_tol:
-                return False
-            # 4th+ near touch — accept only if the line already holds
-            # MIN_TOUCHES strict touches from pivots OTHER than the
-            # new one. ``line.touches`` already includes loose-counted
-            # pivots when ``near_touch_tolerance_fraction`` is in
-            # effect, so we recount strict-old here to enforce the
-            # "first three must be strict" rule.
-            strict_old = 0
-            for piv in side_pivots:
-                if piv == new_pivot_idx or piv < line.from_idx:
-                    continue
-                if piv > last_idx:
-                    continue
-                if abs(closes[piv]
-                       - (line.intercept + line.slope * piv)) <= touch_tol:
-                    strict_old += 1
-            return strict_old >= MIN_TOUCHES
+            return delta <= touch_tol
 
         # Inter-touch spacing gate (FILTER_INTER_TOUCH_SPACING).
         # Rejects a candidate line whose spacing between the last two
@@ -1561,7 +1518,8 @@ class ChartSignalStrategy:
               3. Q→P slope has the right sign: positive for support,
                  negative for resistance.
               4. closes[new_pivot] is strictly outside the Q→P line
-                 in the favorable direction beyond ``near_tol``.
+                 in the favorable direction beyond
+                 ``accel_overshoot_tol``.
               5. Implied slope P→new_pivot is at least
                  ``min_slope_ratio`` × steeper than the Q→P slope
                  in the same direction.
@@ -1569,8 +1527,6 @@ class ChartSignalStrategy:
             Returns (synthetic_line, direction_str) on hit, None
             otherwise.
             """
-            if near_tol is None:
-                return None
             if new_pivot_idx < 0:
                 return None
             if new_pivot_idx in support_pivots:
@@ -1622,10 +1578,10 @@ class ChartSignalStrategy:
             line_at_new = base_intercept + base_slope * new_pivot_idx
             delta = closes[new_pivot_idx] - line_at_new
             if direction_str == "long":
-                if delta <= near_tol:
+                if delta <= accel_overshoot_tol:
                     return None
             else:
-                if delta >= -near_tol:
+                if delta >= -accel_overshoot_tol:
                     return None
 
             # Implied-slope check (P → new_pivot).
@@ -1850,7 +1806,7 @@ class ChartSignalStrategy:
                 if 0 <= last_idx < len(closes) else None
             ),
             "touch_tol": round(touch_tol, 4),
-            "near_tol": round(near_tol, 4) if near_tol is not None else None,
+            "accel_overshoot_tol": round(accel_overshoot_tol, 4),
             "long_path_pre_filter": long_path,
             "short_path_pre_filter": short_path,
             "candidate_long": _line_diag(long_line, "LONG"),
@@ -2870,12 +2826,6 @@ class ChartSignalStrategy:
         last_idx = len(closes) - 1
         bar_close = closes[last_idx]
         avg_close = sum(closes) / len(closes)
-        near_frac = self.config.get(
-            "near_touch_tolerance_fraction",
-            5 * TOUCH_TOLERANCE_FRACTION,
-        )
-        if near_frac is not None:
-            near_frac = float(near_frac)
         # Counter-line cache = OPPOSING-side 3+touch unbroken lines
         # on the right side of price. Same shape for clean and
         # marginal trades — the marginal-vs-clean distinction lives
@@ -2893,7 +2843,6 @@ class ChartSignalStrategy:
         ))
         scanned = detect_lines(
             closes, up_to=last_idx, type_=opp_type,
-            near_touch_tolerance_fraction=near_frac,
             break_stale_bars=break_stale_bars,
         )
 
