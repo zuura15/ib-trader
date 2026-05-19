@@ -2776,7 +2776,6 @@ class ChartSignalStrategy:
                 reason = "trail_stop"
             else:
                 reason = "line_breach"
-            actions.append(UpdateState({"exit_reason": reason}))
             verb = "support" if direction == "long" else "resistance"
             cmp = "<" if direction == "long" else ">"
             detail = (
@@ -2786,6 +2785,10 @@ class ChartSignalStrategy:
                    else f"entry {verb} {line_value:.4f}")
                 + f" [{reason}]"
             )
+            actions.append(UpdateState({
+                "exit_reason": reason,
+                "exit_detail": detail,
+            }))
             return actions + self.build_exit_actions(
                 ctx, ExitType.TRAILING_STOP, detail,
             )
@@ -3120,6 +3123,14 @@ class ChartSignalStrategy:
 
         if fire:
             state_patch["exit_reason"] = "trail_stop"
+            # ``exit_detail`` carries the human-readable fire message
+            # ("mid X >= active_stop Y after Zs touch+hold (linger=…
+            # marginal)") so the TRADE_CLOSED audit row can surface
+            # the timer cadence. The hidden ORDER·*·exit row had
+            # this in ``exit_context.trail_message`` — moving it onto
+            # the close row directly so we don't lose visibility
+            # after consolidating the feed.
+            state_patch["exit_detail"] = detail
             # Persist the tick-time SL fire to ib_trader.log so we can
             # answer "did the configured linger actually apply?"
             # post-hoc. The EXIT_CHECK LogSignal goes through the
@@ -3391,6 +3402,7 @@ class ChartSignalStrategy:
         )
         state_patch["counter_touch"] = None
         state_patch["exit_reason"] = exit_label
+        state_patch["exit_detail"] = detail
         actions: list[Action] = [
             LogSignal(
                 event_type=LogEventType.EXIT_CHECK,

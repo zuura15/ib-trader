@@ -167,6 +167,11 @@ def clear_position_fields() -> dict:
         "low_water_mark": None,
         "active_stop": None,
         "exit_reason": None,
+        # exit_detail: human-readable fire message from the strategy
+        # ("mid X >= active_stop Y after Zs touch+hold linger=…"),
+        # surfaced in TRADE_CLOSED audit row. Cleared here so the
+        # next trade starts fresh.
+        "exit_detail": None,
         # Counter-line and tight-zone tick-time caches. Without these
         # in the clear, a prior trade's snapshot leaked into the next
         # round — observed on 2026-05-14 MGC SHORT (-$55) which armed

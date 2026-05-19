@@ -1260,6 +1260,7 @@ class StrategyBotRunner(BotBase):
                     "entry_ib_order_id": doc.get("entry_ib_order_id"),
                     "exit_ib_order_id": doc.get("ib_order_id"),
                     "exit_reason": doc.get("exit_reason"),
+                    "exit_detail": doc.get("exit_detail"),
                     "entry_line": doc.get("entry_line"),
                 }
                 stop_on_exit = bool(
@@ -2004,6 +2005,7 @@ class StrategyBotRunner(BotBase):
                     "commission_source": comm_source,
                     "net_pnl": str(net_pnl),
                     "exit_reason": exit_reason,
+                    "exit_detail": args.get("exit_detail"),
                     "duration_seconds": duration,
                     "trail_reset_count": int(
                         args.get("trail_reset_count") or 0,

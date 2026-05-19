@@ -827,6 +827,19 @@ function ExpandedTradeClosed({ row, onShowRaw }: {
             </div>
           );
         })()}
+        {getStr('exit_detail') && (
+          <div style={{ gridColumn: '1 / -1' }}>
+            <div style={labelStyle}>Exit detail</div>
+            <div style={{
+              ...metaStyle,
+              color: 'var(--text-secondary)',
+              wordBreak: 'break-word',
+              whiteSpace: 'normal',
+            }}>
+              {getStr('exit_detail')}
+            </div>
+          </div>
+        )}
         {getStr('bot_name') && (
           <div>
             <div style={labelStyle}>Bot</div>
