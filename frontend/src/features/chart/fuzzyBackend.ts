@@ -46,11 +46,27 @@ export interface FuzzyChannel {
   score: number;
 }
 
+export interface FuzzyCurvePoint {
+  ts: string;
+  value: number;
+}
+
+export interface FuzzyCurve {
+  degree: number;
+  window_bars: number;
+  start_idx: number;
+  end_idx: number;
+  points: FuzzyCurvePoint[];
+  r_squared: number;
+  coeffs: number[];
+}
+
 export interface FuzzyPayload {
   bars_count: number;
   pivots: FuzzyPivot[];
   lines: FuzzyLine[];
   channels: FuzzyChannel[];
+  curve: FuzzyCurve | null;
   config: Record<string, number>;
   warning?: string;
 }

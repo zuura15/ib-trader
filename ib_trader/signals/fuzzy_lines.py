@@ -75,6 +75,12 @@ CHANNEL_SLOPE_TOLERANCE = 0.25  # 25% of the larger slope
 # tiny coincidental parallels).
 CHANNEL_MIN_SPAN_BARS = 15
 
+# Polynomial fit ("trajectory curve") — degree 2 = parabolic, degree 3 =
+# cubic. Window is the number of trailing bars to fit over (30 bars ×
+# 3-min = 90 min default).
+CURVE_DEGREE = 2
+CURVE_WINDOW_BARS = 30
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses — what the chart / bot consumes.
@@ -122,11 +128,30 @@ class Channel:
 
 
 @dataclass
+class TrajectoryCurve:
+    """Polynomial fit through the last N bars of close prices.
+
+    ``values[i]`` is the fitted price at bar index ``start_idx + i``.
+    Frontend renders the (start_idx + i, values[i]) pairs as a polyline
+    overlay so the operator sees the underlying trajectory the price has
+    actually taken, ignoring tick noise.
+    """
+    degree: int                  # 2 = parabolic, 3 = cubic, …
+    window_bars: int             # number of trailing bars in the fit
+    start_idx: int               # first bar in fit (== last - window + 1)
+    end_idx: int                 # last bar in fit (inclusive)
+    values: list[float]          # fitted value per bar in the window
+    coeffs: list[float]          # numpy.polyfit coefficients, highest-degree-first
+    r_squared: float             # coefficient of determination, 0..1
+
+
+@dataclass
 class FuzzyDetection:
     """Top-level container returned by the entrypoint."""
     pivots: list[ScoredPivot] = field(default_factory=list)
     lines: list[FuzzyLine] = field(default_factory=list)
     channels: list[Channel] = field(default_factory=list)
+    curve: TrajectoryCurve | None = None
     config: dict = field(default_factory=dict)
 
 
@@ -362,6 +387,48 @@ def find_parallel_channels(
 # Top-level entrypoint.
 # ---------------------------------------------------------------------------
 
+def fit_trajectory_curve(
+    closes: Sequence[float],
+    *,
+    degree: int = CURVE_DEGREE,
+    window_bars: int = CURVE_WINDOW_BARS,
+) -> TrajectoryCurve | None:
+    """Polynomial fit through the last ``window_bars`` closes.
+
+    Returns a TrajectoryCurve with fitted values per bar in the window
+    plus the fit coefficients and R². ``None`` when the input is too
+    short (need ``degree + 1`` points minimum for a well-posed fit).
+
+    Uses ``numpy.polyfit`` on (bar_idx, close) — pure least-squares,
+    no robust-fitting (the SR lines are where we want RANSAC robustness;
+    the trajectory curve is a smoother of the actual path the price
+    took, so outliers are part of the signal).
+    """
+    arr = np.asarray(closes, dtype=float)
+    n = len(arr)
+    if n < degree + 1:
+        return None
+    w = min(window_bars, n)
+    start_idx = n - w
+    end_idx = n - 1
+    x = np.arange(start_idx, end_idx + 1, dtype=float)
+    y = arr[start_idx:end_idx + 1]
+    coeffs = np.polyfit(x, y, deg=degree)
+    fitted = np.polyval(coeffs, x)
+    ss_res = float(((y - fitted) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return TrajectoryCurve(
+        degree=int(degree),
+        window_bars=int(w),
+        start_idx=int(start_idx),
+        end_idx=int(end_idx),
+        values=[float(v) for v in fitted],
+        coeffs=[float(c) for c in coeffs],
+        r_squared=float(r_squared),
+    )
+
+
 def detect_fuzzy(
     closes: Sequence[float],
     *,
@@ -372,9 +439,11 @@ def detect_fuzzy(
     window_bars: int = RANSAC_WINDOW_BARS,
     slope_tolerance: float = CHANNEL_SLOPE_TOLERANCE,
     min_span_bars: int = CHANNEL_MIN_SPAN_BARS,
+    curve_degree: int = CURVE_DEGREE,
+    curve_window_bars: int = CURVE_WINDOW_BARS,
 ) -> FuzzyDetection:
-    """Run pivot scoring → fuzzy line fit → channel pairing on a single
-    close polyline. Pure function; no side effects."""
+    """Run pivot scoring → fuzzy line fit → channel pairing → trajectory
+    curve fit on a single close polyline. Pure function; no side effects."""
     pivots = find_pivots_scored(
         closes,
         prominence_fraction=prominence_fraction,
@@ -391,8 +460,13 @@ def detect_fuzzy(
         slope_tolerance=slope_tolerance,
         min_span_bars=min_span_bars,
     )
+    curve = fit_trajectory_curve(
+        closes,
+        degree=curve_degree,
+        window_bars=curve_window_bars,
+    )
     return FuzzyDetection(
-        pivots=pivots, lines=lines, channels=channels,
+        pivots=pivots, lines=lines, channels=channels, curve=curve,
         config={
             "prominence_fraction": prominence_fraction,
             "min_distance_bars": min_distance_bars,
@@ -401,6 +475,8 @@ def detect_fuzzy(
             "window_bars": window_bars,
             "slope_tolerance": slope_tolerance,
             "min_span_bars": min_span_bars,
+            "curve_degree": curve_degree,
+            "curve_window_bars": curve_window_bars,
         },
     )
 

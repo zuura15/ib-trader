@@ -2515,6 +2515,45 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
       // eslint-disable-next-line no-console
       console.log('[fuzzy] rendered', { drawn, skipped, total: payload.lines.length });
+
+      // Trajectory curve: polynomial fit through the last N bars of
+      // closes. Render as a single LineSeries in gold; the curve
+      // summarizes the shape the price has actually taken (smoothed
+      // through tick noise) so the operator can see the underlying
+      // trajectory without the wiggle.
+      if (payload.curve && payload.curve.points.length >= 2) {
+        try {
+          const curveSeries = ch.addSeries(LineSeries, {
+            color: '#facc15',  // tailwind amber-400; distinct from SR fan
+            lineWidth: 2 as 1 | 2 | 3,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+            autoscaleInfoProvider: () => null,
+            lineStyle: 0 as 0,
+          });
+          // Each backend point carries its slot-start ISO; map through
+          // backendTsToChartTime (slot-end-labeled chart time) to
+          // line up with the price series.
+          const data = payload.curve.points
+            .map((p) => {
+              const t = backendTsToChartTime(p.ts);
+              return { time: t as UTCTimestamp, value: p.value };
+            })
+            .filter((d) => Number.isFinite(d.time) && d.time > 0);
+          curveSeries.setData(data);
+          fuzzySeriesRef.current.push(curveSeries);
+          // eslint-disable-next-line no-console
+          console.log('[fuzzy] curve rendered',
+            { degree: payload.curve.degree,
+              window: payload.curve.window_bars,
+              r2: payload.curve.r_squared.toFixed(3),
+              points: data.length });
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('[fuzzy] curve render failed', e);
+        }
+      }
     };
     doFetch();
     const id = window.setInterval(doFetch, 15000);

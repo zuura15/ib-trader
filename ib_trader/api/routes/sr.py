@@ -91,6 +91,8 @@ async def get_sr_fuzzy(
     residual_fraction: float | None = None,
     min_inliers: int | None = None,
     window_bars: int | None = None,
+    curve_degree: int | None = None,
+    curve_window_bars: int | None = None,
 ):
     """Layer-2 fuzzy SR detection.
 
@@ -160,6 +162,10 @@ async def get_sr_fuzzy(
         kwargs["min_inliers"] = int(min_inliers)
     if window_bars is not None:
         kwargs["window_bars"] = int(window_bars)
+    if curve_degree is not None:
+        kwargs["curve_degree"] = int(curve_degree)
+    if curve_window_bars is not None:
+        kwargs["curve_window_bars"] = int(curve_window_bars)
     det = detect_fuzzy(closes, **kwargs)
 
     def _line_json(L) -> dict:
@@ -209,6 +215,27 @@ async def get_sr_fuzzy(
                 }
                 for c in det.channels
             ],
+            "curve": (
+                {
+                    "degree": det.curve.degree,
+                    "window_bars": det.curve.window_bars,
+                    "start_idx": det.curve.start_idx,
+                    "end_idx": det.curve.end_idx,
+                    # ts for each fitted point so the frontend can plot
+                    # the curve without knowing the bar-index space.
+                    "points": [
+                        {"ts": timestamps[i], "value": v}
+                        for i, v in zip(
+                            range(det.curve.start_idx, det.curve.end_idx + 1),
+                            det.curve.values,
+                        )
+                        if 0 <= i < len(timestamps)
+                    ],
+                    "r_squared": det.curve.r_squared,
+                    "coeffs": det.curve.coeffs,
+                }
+                if det.curve is not None else None
+            ),
             "config": det.config,
         },
         headers={"Cache-Control": "no-store, max-age=0"},

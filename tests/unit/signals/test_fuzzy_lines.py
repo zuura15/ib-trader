@@ -122,3 +122,34 @@ class TestDetectFuzzy:
     def test_short_input(self):
         det = detect_fuzzy([29000.0, 29001.0, 29000.5])
         assert det.lines == []
+
+
+class TestTrajectoryCurve:
+    def test_fits_curve_on_long_enough_series(self, converging_channel):
+        det = detect_fuzzy(converging_channel)
+        assert det.curve is not None
+        assert det.curve.degree == 2
+        assert len(det.curve.values) == det.curve.window_bars
+        assert det.curve.end_idx == len(converging_channel) - 1
+        # R² is in [0, 1] (could be exactly 1 on perfect fit, but
+        # converging_channel has noise so should be < 1).
+        assert 0.0 <= det.curve.r_squared <= 1.0
+
+    def test_window_clamped_to_series_length(self):
+        from ib_trader.signals.fuzzy_lines import fit_trajectory_curve
+        prices = [29000.0 + i * 0.5 for i in range(10)]
+        curve = fit_trajectory_curve(prices, degree=2, window_bars=50)
+        assert curve is not None
+        assert curve.window_bars == 10
+        assert len(curve.values) == 10
+
+    def test_too_short_returns_none(self):
+        from ib_trader.signals.fuzzy_lines import fit_trajectory_curve
+        assert fit_trajectory_curve([29000.0], degree=2) is None
+        assert fit_trajectory_curve([29000.0, 29001.0], degree=2) is None
+
+    def test_custom_degree_passes_through_detect_fuzzy(self, converging_channel):
+        det = detect_fuzzy(converging_channel, curve_degree=3)
+        assert det.curve is not None
+        assert det.curve.degree == 3
+        assert len(det.curve.coeffs) == 4  # cubic has 4 coeffs
