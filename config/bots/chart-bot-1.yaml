@@ -21,8 +21,11 @@ config:
   sec_type: FUT
   # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
   contract_multiplier: 10
-  # Trailing dip: 0.02% × $4,741 × 10 ≈ $9.48 per contract per move.
-  trail_width_pct: 0.0002
+  # Trailing dip: bumped 0.0002 → 0.0005 (2026-05-19) after a $17
+  # premature exit at MGC 21:18 PT on a 0.92-pt trail that lost to
+  # late-hour bid/ask spread chop. New band ≈ 2.3 pts at $4,578.
+  # Per-contract dollar move: 0.05% × $4,578 × 10 ≈ $22.90.
+  trail_width_pct: 0.0005
   # After a round-trip, transition back to AWAITING_ENTRY_TRIGGER
   # (not OFF) and respect a one-bar cool-off before re-entering.
   # Operator turns the bot on once and it lives through round-trips.
