@@ -125,10 +125,19 @@ export function fuzzyLineToChartLine(
   };
 }
 
+export interface FuzzyFetchOptions {
+  /** Polynomial degree for the trajectory curve (2 = parabolic). */
+  curveDegree?: number;
+  /** Trailing-bar window for the trajectory curve (default 30 backend-side,
+   *  override here per pane). */
+  curveWindowBars?: number;
+}
+
 export async function fetchFuzzy(
   target: { conId: number | null; symbol: string; secType: string },
   hours: number = 8,
   barSize: string = '3 mins',
+  opts: FuzzyFetchOptions = {},
 ): Promise<FuzzyPayload | null> {
   const params = new URLSearchParams({
     hours: String(Math.max(1, Math.min(72, Math.ceil(hours)))),
@@ -139,6 +148,12 @@ export async function fetchFuzzy(
   } else {
     params.set('symbol', target.symbol);
     params.set('sec_type', target.secType);
+  }
+  if (opts.curveDegree != null && Number.isFinite(opts.curveDegree)) {
+    params.set('curve_degree', String(opts.curveDegree));
+  }
+  if (opts.curveWindowBars != null && Number.isFinite(opts.curveWindowBars)) {
+    params.set('curve_window_bars', String(opts.curveWindowBars));
   }
   try {
     const r = await fetch(`/api/sr/fuzzy?${params.toString()}`);

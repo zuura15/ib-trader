@@ -151,6 +151,10 @@ export function BotChart({
   const [showCounterResistance, setShowCounterResistance] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  // Trajectory-curve window in BARS. 3-min cadence → 60 bars = 3 h
+  // (default). Operator-tunable from the chart toolbar; only relevant
+  // when ``showFuzzyOverlay`` is on (fuzzytrader slot).
+  const [curveWindowBars, setCurveWindowBars] = useState(60);
 
   // Esc closes fullscreen and the filter popover (matches ChartPane).
   useEffect(() => {
@@ -495,6 +499,42 @@ export function BotChart({
         )}
       </div>
       <BarCloseCountdown />
+      {showFuzzyOverlay && (
+        <label
+          style={{
+            display: 'flex', alignItems: 'center', gap: 4,
+            fontSize: 11, color: 'var(--text-secondary)',
+          }}
+          title="Trajectory-curve window in bars (3-min bars; 60 = 3 h)"
+        >
+          Curve
+          <input
+            type="number"
+            min={5}
+            max={480}
+            step={5}
+            value={curveWindowBars}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              if (Number.isFinite(n)) {
+                setCurveWindowBars(Math.max(5, Math.min(480, n)));
+              }
+            }}
+            style={{
+              width: 52, fontSize: 11,
+              padding: '1px 3px',
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              background: 'var(--panel-bg, #fff)',
+              color: 'var(--text-primary)',
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          />
+          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            bars ({(curveWindowBars * 3 / 60).toFixed(curveWindowBars * 3 % 60 ? 1 : 0)}h)
+          </span>
+        </label>
+      )}
       <button
         onClick={captureToClipboard}
         disabled={shotBusy}
@@ -581,6 +621,7 @@ export function BotChart({
           suppressAutoSignals
           historicalFires={historicalFires}
           showFuzzyOverlay={showFuzzyOverlay}
+          fuzzyCurveWindowBars={curveWindowBars}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

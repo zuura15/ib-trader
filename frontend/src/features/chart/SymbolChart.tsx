@@ -169,6 +169,11 @@ interface Props {
    *  affect the canonical SR fan rendering — they coexist so the
    *  operator can A/B them on the same chart. */
   showFuzzyOverlay?: boolean;
+  /** Operator-tuned trajectory-curve window in bars. Default 60
+   *  (≈ 3 h at 3-min cadence). Forwarded to ``/api/sr/fuzzy`` as
+   *  ``curve_window_bars``. Only effective when ``showFuzzyOverlay``
+   *  is true. */
+  fuzzyCurveWindowBars?: number;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -191,6 +196,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     suppressAutoSignals = false,
     historicalFires,
     showFuzzyOverlay = false,
+    fuzzyCurveWindowBars,
   }: Props,
   ref,
 ) {
@@ -2443,7 +2449,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
     let cancelled = false;
     const doFetch = async () => {
-      const payload = await fetchFuzzy(target, 8, '3 mins');
+      const payload = await fetchFuzzy(target, 8, '3 mins', {
+        curveWindowBars: fuzzyCurveWindowBars,
+      });
       if (cancelled) return;
       // eslint-disable-next-line no-console
       console.log('[fuzzy] fetched', {
@@ -2562,7 +2570,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       window.clearInterval(id);
     };
   }, [target?.conId, target?.symbol, target?.secType, showFuzzyOverlay,
-      chartVersion]);
+      fuzzyCurveWindowBars, chartVersion]);
 
   // Regime fetch — one ADX/ATR/Donchian reading per chart, refreshed
   // on the same 15s cadence as SR. ``insufficient`` regimes still
