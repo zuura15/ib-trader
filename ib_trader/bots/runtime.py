@@ -1913,6 +1913,16 @@ class StrategyBotRunner(BotBase):
                     "txn commission seed failed", exc_info=True,
                 )
 
+            # Entry/exit classification — resolved up here so the bot_trade
+            # row (below) and the TRADE_CLOSED audit row (further down)
+            # share the same values. Used to be assigned only inside the
+            # audit block, which left these unbound for the row insert
+            # and crashed every close with UnboundLocalError after the
+            # 2026-05-19 entry_path/exit_reason columns landed.
+            entry_line_doc = args.get("entry_line") or {}
+            entry_path = str(entry_line_doc.get("entry_path") or "touch")
+            exit_reason = str(args.get("exit_reason") or "unknown")
+
             from ib_trader.data.models import BotTrade
             row = BotTrade(
                 bot_id=self.bot_id,
@@ -1976,20 +1986,13 @@ class StrategyBotRunner(BotBase):
                     comm_for_audit = floor
                     comm_source = "fallback_standard"
                 net_pnl = pnl - comm_for_audit
-                exit_reason = str(args.get("exit_reason") or "unknown")
                 direction = str(args.get("direction", "LONG")).upper()
-                # Entry classification — pulled from the entry_line
-                # snapshot taken above (doc.get("entry_line") at the
-                # moment of close, before clear_position_fields).
-                # entry_path: "touch" (clean) | "accel" (continuation).
-                # marginal_filters: list of filters whose normal-mode
-                # rejection was bypassed by allow_marginal_entries.
-                # The headline reads "clean" when no filters bypassed
-                # and entry_path is touch; "accel" when path is accel;
-                # else the FIRST marginal_filter name. Body carries the
-                # full list. Per operator ask 2026-05-18.
-                entry_line_doc = args.get("entry_line") or {}
-                entry_path = str(entry_line_doc.get("entry_path") or "touch")
+                # Entry classification — entry_path + exit_reason were
+                # resolved above. marginal_filters comes from the same
+                # entry_line snapshot. The headline reads "clean" when
+                # no filters bypassed and entry_path is touch; "accel"
+                # when path is accel; "force" for operator-forced;
+                # else the FIRST marginal_filter name.
                 marginal_filters = list(
                     entry_line_doc.get("marginal_filters") or []
                 )
