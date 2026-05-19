@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 
 from ib_trader.config.loader import load_settings, check_file_permissions
 from ib_trader.data.repository import create_db_engine, create_session_factory, init_db
@@ -30,6 +31,13 @@ logger = logging.getLogger(__name__)
 def main(db: str, settings_path: str):
     """IB Trader Bot Runner — manages bot lifecycle."""
     setup_logging()
+    # Load .env into os.environ so notification config (EMAIL_*),
+    # alert channels, and anything else env-driven works regardless
+    # of whether the launching shell sourced it. Restarts done from
+    # a fresh shell were silently disabling email notifications
+    # (notifier reads os.environ, not the dotenv dict from
+    # ``config/loader.load_env``).
+    load_dotenv(override=False)
     load_settings(settings_path)
 
     # Check DB permissions
