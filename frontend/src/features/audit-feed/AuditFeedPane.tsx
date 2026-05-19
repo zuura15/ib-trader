@@ -495,7 +495,25 @@ function ExpandedBarEval({ row, onShowRaw }: {
   // touch anything but an ACCEL signal fired, surface the accel
   // line instead (the bot's entry was based on it, even though the
   // pivot is past the line, not on it).
-  const touchedLines = a.touch?.lines ?? [];
+  const allTouchedLines = a.touch?.lines ?? [];
+  // When an entry fired, only render the line that was actually
+  // chosen — match by (from_idx, anchor_b_idx). Other candidates
+  // were considered but rejected and showing them mixed in with the
+  // winner is confusing in retrospect. For SKIP rows (no entry
+  // fired) keep the full list so the operator can see what was on
+  // the table.
+  const sel = signalEntryLine as Record<string, unknown> | null;
+  const firedFromIdx = typeof sel?.from_idx === 'number'
+    ? sel.from_idx : null;
+  const firedAnchorBIdx = typeof sel?.anchor_b_idx === 'number'
+    ? sel.anchor_b_idx : null;
+  const entryFired = firedFromIdx != null && firedAnchorBIdx != null;
+  const touchedLines = entryFired
+    ? allTouchedLines.filter((ln) => (
+        ln.from_idx === firedFromIdx
+        && ln.anchor_b_idx === firedAnchorBIdx
+      ))
+    : allTouchedLines;
   let lineEntries: React.ReactNode[];
   if (touchedLines.length > 0) {
     lineEntries = touchedLines.map((ln, i) => {
@@ -1085,9 +1103,20 @@ export function AuditFeedPane() {
         {!error && rows.length === 0 && (
           <div style={{ padding: 12, color: 'var(--text-muted)' }}>No events yet.</div>
         )}
-        {rows.map((r) => (
-          <FeedRow key={r.id} row={r} onShowRaw={setRawRow} />
-        ))}
+        {rows
+          // Suppress exit ORDER_PLACED rows — the subsequent
+          // TRADE_CLOSED row carries direction, prices, reason and
+          // P&L, so the standalone "ORDER·*·exit" line was just
+          // visual noise. Entry orders stay (they precede a
+          // TRADE_CLOSED on a separate trade lifecycle).
+          .filter((r) => {
+            if (r.event_type !== 'ORDER_PLACED') return true;
+            const origin = (r.payload as { origin?: string } | null)?.origin;
+            return origin !== 'exit';
+          })
+          .map((r) => (
+            <FeedRow key={r.id} row={r} onShowRaw={setRawRow} />
+          ))}
       </div>
 
       {rawRow && (
