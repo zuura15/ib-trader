@@ -3098,7 +3098,12 @@ class ChartSignalStrategy:
             since_last = (
                 (now_utc - last_check).total_seconds()
                 if last_check is not None
-                else interval_s  # first tick — sample now
+                # Legacy state path (pre-2026-05-19 fix that seeded
+                # sl_last_check_ts to fill-time on entry). Sample now
+                # so a position carried across the deploy boundary
+                # isn't left unprotected. New trades won't take this
+                # branch.
+                else interval_s
             )
             if since_last >= interval_s:
                 state_patch["sl_last_check_ts"] = now_utc.isoformat()
@@ -3489,7 +3494,19 @@ class ChartSignalStrategy:
                     "counter_touch": None,
                     "trade_atr": None,
                     "sl_touch": None,
-                    "sl_last_check_ts": None,
+                    # Seed sl_last_check_ts at fill time so the clean
+                    # 60s SL poll waits the full interval after entry
+                    # before its first sample. Otherwise the fallback
+                    # at _evaluate_exit's clean branch
+                    # (``since_last = interval_s if last_check is None``)
+                    # makes the first tick after entry satisfy
+                    # ``since_last >= interval_s`` immediately, firing
+                    # the SL on tick #1. Burned the MNQ 2026-05-19
+                    # 20:51 PT SHORT — clean entry, trail 5.8 pts above
+                    # entry, first tick mid spiked above trail and the
+                    # trade closed 7s after entry instead of holding
+                    # for the 60s clean cadence.
+                    "sl_last_check_ts": datetime.now(timezone.utc).isoformat(),
                 }),
             ])
         elif is_exit_leg:
