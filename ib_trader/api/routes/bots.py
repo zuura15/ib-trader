@@ -449,6 +449,30 @@ async def force_buy(bot_id: str, redis=Depends(get_redis)):
         ) from e
 
 
+@router.post("/{bot_id}/force-short", status_code=202)
+async def force_short(bot_id: str, redis=Depends(get_redis)):
+    """Force-short entry — proxies to the runner. Symmetric to
+    force-buy. Only valid when the bot is AWAITING_ENTRY_TRIGGER —
+    the runner returns 409 otherwise. Seeds ``entry_line`` so the
+    bot's clean 60s SL trail and bar-close line-breach exit logic
+    govern the position after fill."""
+    _get_defn_or_404(bot_id)
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=260) as c:
+            resp = await c.post(f"{_runner_url()}/bots/{bot_id}/force-short")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail="Bot runner unavailable") from e
+    except httpx.ReadTimeout as e:
+        raise HTTPException(
+            status_code=504,
+            detail="Bot runner did not respond within 260s; the order may still be in flight — check the positions and orders panes before retrying.",
+        ) from e
+
+
 @router.post("/{bot_id}/force-sell", status_code=202)
 async def force_sell(bot_id: str, redis=Depends(get_redis)):
     """Force-sell — proxies to the runner.

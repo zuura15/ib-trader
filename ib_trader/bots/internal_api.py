@@ -283,6 +283,34 @@ async def force_buy(bot_id: str):
     return {"bot_id": bot_id, "state": "ENTRY_ORDER_PLACED", **result}
 
 
+@app.post("/bots/{bot_id}/force-short")
+async def force_short(bot_id: str):
+    """Force a SHORT entry, bypassing entry conditions. Symmetric to
+    force-buy. Only valid in AWAITING_ENTRY_TRIGGER — refuses when
+    the bot is already in a position."""
+    state = _get_state()
+    bot_instances = state["bot_instances"]
+
+    bot = bot_instances.get(bot_id)
+    if bot is None or bot is _RESERVED:
+        raise HTTPException(status_code=409, detail="Bot is not running")
+
+    cur = await bot.current_state()
+    if cur != BotState.AWAITING_ENTRY_TRIGGER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot force-short in state {cur.value}",
+        )
+
+    try:
+        result = await bot.force_short()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    logger.info('{"event": "BOT_FORCE_SHORT_VIA_HTTP", "bot_id": "%s"}', bot_id)
+    return {"bot_id": bot_id, "state": "ENTRY_ORDER_PLACED", **result}
+
+
 @app.post("/bots/{bot_id}/force-sell")
 async def force_sell(bot_id: str):
     state = _get_state()

@@ -30,7 +30,8 @@ function botIdForSlot(slot: number): string {
 
 async function postBotAction(
   botId: string,
-  path: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset',
+  path: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset'
+      | 'force-buy' | 'force-short',
 ): Promise<{ ok: boolean; detail?: string }> {
   try {
     const resp = await fetch(`/api/bots/${botId}/${path}`, { method: 'POST' });
@@ -65,7 +66,8 @@ export function ChartBotPane({ slot }: Props) {
   // FSM gate and surfaced as "Quit failed", even when the first one
   // had already succeeded.
   const [pendingAction, setPendingAction] = useState<
-    'force-quit' | 'rearm' | 'start' | 'stop' | 'reset' | null
+    'force-quit' | 'rearm' | 'start' | 'stop' | 'reset'
+    | 'force-buy' | 'force-short' | null
   >(null);
 
   useEffect(() => {
@@ -104,7 +106,8 @@ export function ChartBotPane({ slot }: Props) {
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
 
   const runAction = async (
-    action: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset',
+    action: 'force-quit' | 'rearm' | 'start' | 'stop' | 'reset'
+          | 'force-buy' | 'force-short',
     pendingMsg: string, okMsg: string, failPrefix: string,
   ) => {
     if (pendingAction) return;
@@ -126,6 +129,10 @@ export function ChartBotPane({ slot }: Props) {
     runAction('start', 'Starting…', 'Started.', 'Start failed');
   const onStop = () =>
     runAction('stop', 'Stopping…', 'Stopped.', 'Stop failed');
+  const onForceLong = () =>
+    runAction('force-buy', 'Force LONG…', 'LONG fired.', 'Force LONG failed');
+  const onForceShort = () =>
+    runAction('force-short', 'Force SHORT…', 'SHORT fired.', 'Force SHORT failed');
   // Reset is the only path out of ERRORED — the runner's ``/start``
   // gate (``is_clean_for_start``) rejects anything but ``state=OFF``,
   // so a Start click on an ERRORED bot would silently 409. Reset
@@ -261,6 +268,40 @@ export function ChartBotPane({ slot }: Props) {
           >
             Re-arm
           </button>
+        )}
+        {fsmState === 'AWAITING_ENTRY_TRIGGER' && (
+          <>
+            <button
+              onClick={onForceLong}
+              disabled={pendingAction !== null}
+              title="Force a LONG entry now, bypassing all entry filters. Exit logic uses the standard clean 60s SL poll + bar-close line-breach gate (entry price becomes the synthetic anchor)."
+              style={{
+                background: 'var(--accent-green)', color: '#fff',
+                border: 'none', borderRadius: 3, padding: '2px 8px',
+                fontSize: 11, fontWeight: 600,
+                cursor: pendingAction ? 'not-allowed' : 'pointer',
+                opacity: pendingAction && pendingAction !== 'force-buy' ? 0.5 : 1,
+              }}
+              data-testid={`bot-force-long-${botId}`}
+            >
+              Force LONG
+            </button>
+            <button
+              onClick={onForceShort}
+              disabled={pendingAction !== null}
+              title="Force a SHORT entry now, bypassing all entry filters. Exit logic uses the standard clean 60s SL poll + bar-close line-breach gate."
+              style={{
+                background: 'var(--accent-red)', color: '#fff',
+                border: 'none', borderRadius: 3, padding: '2px 8px',
+                fontSize: 11, fontWeight: 600,
+                cursor: pendingAction ? 'not-allowed' : 'pointer',
+                opacity: pendingAction && pendingAction !== 'force-short' ? 0.5 : 1,
+              }}
+              data-testid={`bot-force-short-${botId}`}
+            >
+              Force SHORT
+            </button>
+          </>
         )}
         {!isStopped && !hasPosition && (
           <button

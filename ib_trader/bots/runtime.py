@@ -2972,6 +2972,19 @@ class StrategyBotRunner(BotBase):
         await self._execute_force_buy(symbol)
         return {"symbol": symbol, "action": "FORCE_BUY"}
 
+    async def force_short(self) -> dict:
+        """Execute a forced SHORT entry immediately. Mirrors force_buy
+        but enters short instead of long. Seeds ``entry_line`` so the
+        clean exit machinery (60s SL poll, bar-close line breach, etc.)
+        kicks in after the fill.
+        """
+        if not self.strategy or not self.ctx:
+            raise RuntimeError("Bot not initialized")
+        await self._refresh_state()
+        symbol = self.strategy_config["symbol"]
+        await self._execute_force_short(symbol)
+        return {"symbol": symbol, "action": "FORCE_SHORT"}
+
     async def check_force_buy(self) -> None:
         """DEPRECATED — use force_buy() via the runner HTTP API instead.
 
@@ -3275,11 +3288,88 @@ class StrategyBotRunner(BotBase):
                 )
 
     async def _execute_force_buy(self, symbol: str) -> None:
-        """Execute a forced buy, bypassing all entry conditions."""
+        """Execute a forced LONG entry, bypassing all entry conditions.
+
+        Seeds ``entry_line`` in state so chart_signal's exit machinery
+        (clean 60s SL poll, bar-close line-breach check, counter-line
+        cache) treats this trade identically to an organic clean entry.
+        ``line_value_at_entry`` is set to None so the tick-time SL is
+        trail-only (no tight line-stop at the entry price), which is
+        the cleanest "neutral" stop posture for a forced entry with
+        no real line behind it.
+        """
+        await self._seed_forced_entry_line(symbol, direction="long")
+        await self._place_force_entry_order(symbol, side="BUY")
+
+    async def _execute_force_short(self, symbol: str) -> None:
+        """Execute a forced SHORT entry, bypassing all entry conditions.
+
+        Symmetric to ``_execute_force_buy``. Seeds ``entry_line`` with
+        direction=short, marginal=False, entry_path=force so the clean
+        SL cadence applies after the fill.
+        """
+        await self._seed_forced_entry_line(symbol, direction="short")
+        await self._place_force_entry_order(symbol, side="SELL")
+
+    async def _seed_forced_entry_line(
+        self, symbol: str, *, direction: str,
+    ) -> None:
+        """Write a minimal entry_line doc into state for a forced entry.
+
+        chart_signal's exit eval requires anchor_time / anchor_price /
+        direction. With slope=0 the "line" is flat at the entry price,
+        so the bar-close breach gate fires only on a clear move (>
+        touch_tol) past entry. line_value_at_entry=None makes the
+        tick-time SL trail-only.
+        """
+        config = self.strategy_config
+        redis = self.config.get("_redis")
+        anchor_price: Decimal | None = None
+        if redis is not None:
+            from ib_trader.redis.state import StateStore, StateKeys
+            store = StateStore(redis)
+            quote = await store.get(StateKeys.quote_latest(symbol))
+            if quote:
+                last = quote.get("last")
+                if last:
+                    try:
+                        anchor_price = Decimal(str(last))
+                    except (InvalidOperation, ValueError):
+                        anchor_price = None
+
+        now_iso_utc = datetime.now(timezone.utc).isoformat()
+        entry_line = {
+            "kind": "support" if direction == "long" else "resistance",
+            "direction": direction,
+            "slope_per_bar": 0.0,
+            "slope_per_sec": 0.0,
+            "intercept": float(anchor_price) if anchor_price else 0.0,
+            # None → tick-time SL uses trail only; the entry price
+            # itself isn't a structural stop for a forced trade.
+            "line_value_at_entry": None,
+            "anchor_time": now_iso_utc,
+            "anchor_price": float(anchor_price) if anchor_price else 0.0,
+            "anchor_b_idx": 0,
+            "from_idx": 0,
+            "from_time": now_iso_utc,
+            "touches": 0,
+            "entry_path": "force",
+            "marginal": False,
+            "marginal_filters": [],
+        }
+        actions = [UpdateState({
+            "entry_line": entry_line,
+            "position_direction": direction,
+        })]
+        await self._run_pipeline(actions)
+
+    async def _place_force_entry_order(
+        self, symbol: str, *, side: str,
+    ) -> None:
+        """Place the force-entry order. Direction-agnostic — caller
+        passes side ('BUY' for long, 'SELL' for short)."""
         config = self.strategy_config
         close_price = Decimal("0")
-
-        # Get latest price from Redis quote key
         redis = self.config.get("_redis")
         if redis:
             from ib_trader.redis.state import StateStore, StateKeys
@@ -3290,27 +3380,42 @@ class StrategyBotRunner(BotBase):
                 if last:
                     close_price = Decimal(str(last))
 
-        # Calculate quantity
-        max_value = Decimal(str(config.get("max_position_value", "10000")))
-        max_shares = config.get("max_shares", 20)
-        if close_price > 0:
+        # qty: configured default first (chart_signal sets qty_default
+        # explicitly), fall back to max_value / price.
+        qty_default = config.get("qty_default")
+        if qty_default is not None:
+            try:
+                qty = int(qty_default)
+            except (TypeError, ValueError):
+                qty = 1
+        elif close_price > 0:
+            max_value = Decimal(str(config.get("max_position_value", "10000")))
+            max_shares = config.get("max_shares", 20)
             qty = min(int(max_value / close_price), max_shares)
             qty = max(qty, 1)
         else:
             qty = 1
 
         order_strategy = config.get("order_strategy", "mid")
+        action_kind = "BUY" if side == "BUY" else "SHORT"
 
         actions = [
             LogSignal(
                 event_type=LogEventType.SIGNAL,
-                message=f"FORCE BUY (manual override) — {symbol} qty={qty} @ {order_strategy}",
-                payload={"type": "FORCE_BUY", "symbol": symbol,
-                         "qty": qty, "price": str(close_price)},
+                message=(
+                    f"FORCE {action_kind} (manual override) — {symbol} "
+                    f"qty={qty} @ {order_strategy}"
+                ),
+                payload={
+                    "type": f"FORCE_{action_kind}",
+                    "symbol": symbol,
+                    "qty": qty,
+                    "price": str(close_price),
+                },
             ),
             PlaceOrder(
                 symbol=symbol,
-                side="BUY",
+                side=side,
                 qty=Decimal(str(qty)),
                 order_type=order_strategy,
             ),
