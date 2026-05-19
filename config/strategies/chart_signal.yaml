@@ -157,12 +157,18 @@ entry_marginal_max_bypassed_filters: 2
 #               3× tighter than the prior 3-min bar-close check
 #               without giving up to tick-spike noise.
 #   - marginal: touch+hold linger of ``sl_linger_marginal_seconds``
-#               (10s default). Continuous breach for the full
-#               window fires; a retrace clears the timer so a
-#               re-breach starts a fresh window. Tight because
-#               marginal entries are lower-conviction.
+#               (30s default after 2026-05-19 bump; was 10s).
+#               Continuous breach for the full window fires; a
+#               retrace clears the timer so a re-breach starts a
+#               fresh window. Tight because marginal entries are
+#               lower-conviction. 10s was knifing late-hour
+#               marginal trades on wide bid/ask spreads where mid
+#               can pin a fraction below trail for ten seconds
+#               with no real price movement — observed MGC
+#               2026-05-19 21:18 PT LONG closed at −$17 after 45s
+#               on a 0.92-pt-wide trail.
 sl_check_clean_seconds: 60
-sl_linger_marginal_seconds: 10
+sl_linger_marginal_seconds: 30
 
 # Counter-line exit proximity rule (2026-05-18). When the
 # counter-line (opposing-side line) is touched and the linger
