@@ -2508,11 +2508,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             // visually noisy.
             lineStyle: 0 as 0,
           });
+          // Pure visual projection to the in-progress bar (mirrors
+          // commit 8acb80f for the canonical SR fan). The fuzzy
+          // detector's rightmost inlier sits a few bars behind the
+          // live edge because pivots need a confirmed close to count;
+          // extend the rendered line to ``bars.length - 1`` so the
+          // line stays glued to "now" instead of stopping short.
+          // Slope/intercept are unchanged — only the rendering endpoint
+          // moves.
           const fromTime = bars[mapped.fromIdx].time;
-          const toTime = bars[Math.min(mapped.toIdx, bars.length - 1)].time;
+          const projToIdx = Math.max(mapped.toIdx, bars.length - 1);
+          const toTime = bars[projToIdx].time;
+          const toPrice = mapped.slope * projToIdx + mapped.intercept;
           series.setData([
             { time: fromTime, value: mapped.fromPrice },
-            { time: toTime, value: mapped.toPrice },
+            { time: toTime, value: toPrice },
           ]);
           fuzzySeriesRef.current.push(series);
           drawn++;
