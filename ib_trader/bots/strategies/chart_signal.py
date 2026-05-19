@@ -963,6 +963,25 @@ class ChartSignalStrategy:
                             age_h = (fire_dt - latest_dt).total_seconds() / 3600.0
                             if age_h > max_q_age_hours_audit:
                                 continue
+                    # Two prior strict touches that justify the new
+                    # pivot as a 3rd touch (the spacing-helper view).
+                    # When anchor_b_idx == np_idx, detect_lines used
+                    # the firing pivot as P — so the audit's anchor_b
+                    # is misleading as "the second touch." Surface the
+                    # actual last-two strict touches BEFORE np_idx so
+                    # the operator can see what the line really rested
+                    # on at fire time.
+                    prior_strict: list[int] = []
+                    for piv in side_pivots:
+                        if piv >= np_idx:
+                            break
+                        if piv < ln.from_idx:
+                            continue
+                        if abs(closes[piv]
+                               - (ln.intercept + ln.slope * piv)) <= touch_tol_early:
+                            prior_strict.append(piv)
+                    pt1_idx = prior_strict[-2] if len(prior_strict) >= 2 else None
+                    pt2_idx = prior_strict[-1] if len(prior_strict) >= 1 else None
                     out.append({
                         "kind": ln.type,
                         "touches": int(ln.touches),
@@ -980,6 +999,27 @@ class ChartSignalStrategy:
                         ),
                         "anchor_q_close": round(closes[ln.from_idx], 4),
                         "anchor_b_close": round(closes[ln.anchor_b_idx], 4),
+                        "prior_touch_1_idx": pt1_idx,
+                        "prior_touch_2_idx": pt2_idx,
+                        "prior_touch_1_time": (
+                            _bar_dt(pt1_idx).isoformat()
+                            if pt1_idx is not None and _bar_dt(pt1_idx)
+                            else None
+                        ),
+                        "prior_touch_2_time": (
+                            _bar_dt(pt2_idx).isoformat()
+                            if pt2_idx is not None and _bar_dt(pt2_idx)
+                            else None
+                        ),
+                        "prior_touch_1_close": (
+                            round(closes[pt1_idx], 4)
+                            if pt1_idx is not None else None
+                        ),
+                        "prior_touch_2_close": (
+                            round(closes[pt2_idx], 4)
+                            if pt2_idx is not None else None
+                        ),
+                        "prior_strict_count": len(prior_strict),
                     })
                 # Sort by touches desc so the highest-confidence
                 # line lands first in the detail pane.
@@ -2478,6 +2518,33 @@ class ChartSignalStrategy:
         trigger_line_value_at_entry = (
             chosen.intercept + chosen.slope * last_idx
         )
+        # Two prior strict touches (the spacing-helper view) — what
+        # the line actually rested on before the firing pivot.
+        # Distinguishes "Q + P" (line construction) from
+        # "Touch 1 + Touch 2" (last two strict touches before
+        # new_pivot). When anchor_b == new_pivot, the audit's
+        # construction P is the firing pivot itself; surfacing the
+        # real prior touches lets the operator judge line quality.
+        _chosen_side_pivots = (
+            support_pivots if kind == "support" else resistance_pivots
+        )
+        _prior_strict: list[int] = []
+        for _piv in _chosen_side_pivots:
+            if _piv >= new_pivot_idx:
+                break
+            if _piv < chosen.from_idx:
+                continue
+            if abs(closes[_piv]
+                   - (chosen.intercept + chosen.slope * _piv)) <= touch_tol:
+                _prior_strict.append(_piv)
+        _pt1 = _prior_strict[-2] if len(_prior_strict) >= 2 else None
+        _pt2 = _prior_strict[-1] if len(_prior_strict) >= 1 else None
+        _bar_ts_safe = lambda i: (
+            _bar_ts(window[i])
+            if i is not None and 0 <= i < len(window) else None
+        )
+        _pt1_dt = _bar_ts_safe(_pt1)
+        _pt2_dt = _bar_ts_safe(_pt2)
         entry_line_doc = {
             "kind": kind,
             "direction": direction,
@@ -2491,6 +2558,21 @@ class ChartSignalStrategy:
             "from_idx": chosen.from_idx,
             "from_time": (anchor_q_time or anchor_b_time or bar_time).isoformat(),
             "touches": chosen.touches,
+            "prior_touch_1_idx": _pt1,
+            "prior_touch_2_idx": _pt2,
+            "prior_touch_1_time": (
+                _pt1_dt.isoformat() if _pt1_dt is not None else None
+            ),
+            "prior_touch_2_time": (
+                _pt2_dt.isoformat() if _pt2_dt is not None else None
+            ),
+            "prior_touch_1_close": (
+                round(closes[_pt1], 4) if _pt1 is not None else None
+            ),
+            "prior_touch_2_close": (
+                round(closes[_pt2], 4) if _pt2 is not None else None
+            ),
+            "prior_strict_count": len(_prior_strict),
             # Flag the exit path: ``acceleration`` entries skip the
             # line-breach gate (price is far from the line and the
             # line is no longer a useful stop reference).

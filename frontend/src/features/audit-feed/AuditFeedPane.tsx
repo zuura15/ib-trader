@@ -124,6 +124,11 @@ interface TouchingLine {
   anchor_b_time?: string | null;
   anchor_q_close?: number;
   anchor_b_close?: number;
+  prior_touch_1_time?: string | null;
+  prior_touch_2_time?: string | null;
+  prior_touch_1_close?: number | null;
+  prior_touch_2_close?: number | null;
+  prior_strict_count?: number;
 }
 
 interface AuditPayload {
@@ -494,10 +499,27 @@ function ExpandedBarEval({ row, onShowRaw }: {
   let lineEntries: React.ReactNode[];
   if (touchedLines.length > 0) {
     lineEntries = touchedLines.map((ln, i) => {
+      // Prefer the spacing-helper view of the last two strict
+      // touches before the firing pivot. When anchor_b_idx ==
+      // new_pivot_idx (the line was built using the firing pivot
+      // as its P anchor), the construction-side "P" is misleading
+      // as a "previous touch" — it's the firing pivot itself.
+      // Falls back to Q/P when prior-touch metadata is absent
+      // (older audit rows from before the field was added).
+      const hasPriorTouches = ln.prior_touch_1_time != null
+        && ln.prior_touch_2_time != null;
+      const t1Time = hasPriorTouches
+        ? ln.prior_touch_1_time : ln.anchor_q_time ?? null;
+      const t1Close = hasPriorTouches
+        ? ln.prior_touch_1_close : ln.anchor_q_close;
+      const t2Time = hasPriorTouches
+        ? ln.prior_touch_2_time : ln.anchor_b_time ?? null;
+      const t2Close = hasPriorTouches
+        ? ln.prior_touch_2_close : ln.anchor_b_close;
       const summary = `${ln.kind ?? '?'} · ${ln.touches ?? '?'}-touch · `
         + `slope/bar=${(ln.slope_per_bar ?? 0).toFixed(4)} · `
-        + `Q@${_fmtBarPT(ln.anchor_q_time ?? null)} (${_fmtPrice(ln.anchor_q_close)}) · `
-        + `P@${_fmtBarPT(ln.anchor_b_time ?? null)} (${_fmtPrice(ln.anchor_b_close)})`;
+        + `T1@${_fmtBarPT(t1Time ?? null)} (${_fmtPrice(t1Close)}) · `
+        + `T2@${_fmtBarPT(t2Time ?? null)} (${_fmtPrice(t2Close)})`;
       return (
         <DetailLine key={i} label={`line ${i + 1}`} value={summary} />
       );
