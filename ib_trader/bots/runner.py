@@ -192,6 +192,13 @@ async def _create_and_start_bot(
     config["tick_interval_seconds"] = defn.tick_interval_seconds
     config["_redis"] = redis
     config["_engine_url"] = engine_url
+    # Top-level BotDefinition flags that don't live inside ``defn.config``.
+    # Without this thread-through the runtime's ManualEntryMiddleware was
+    # always initialized with manual_entry_only=False regardless of the
+    # YAML, and strategy-emitted entries fired through the gate. Bug
+    # surfaced 2026-05-19 on chart-bot-4 (FIRED·BUY·marginal at 10:36 PT
+    # placed despite manual_entry_only: true in the YAML).
+    config["manual_entry_only"] = defn.manual_entry_only
     # Pull global tunables that apply to every bot — avoids threading a
     # settings dict through every call site for a handful of keys.
     try:

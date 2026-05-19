@@ -2217,10 +2217,10 @@ class StrategyBotRunner(BotBase):
                        "max_position_value": self.strategy_config.get("max_position_value", "10000"),
                        "max_shares": self.strategy_config.get("max_shares", 20)}
 
-        # manual_entry_only comes from the BotDefinition (YAML) once the
-        # runner flip lands (step 5). For now, pull it from the bot's
-        # config dict if present so YAML-defined test bots already get
-        # the gate when runner reads them.
+        # manual_entry_only is threaded in by runner.py from
+        # ``defn.manual_entry_only`` (top-level YAML flag, NOT
+        # ``defn.config``). Reading the wrong key here was a silent
+        # no-op until 2026-05-19.
         manual_entry_only = bool(self.config.get("manual_entry_only", False))
         manual_entry_mw = ManualEntryMiddleware(self.bot_id, manual_entry_only)
 
