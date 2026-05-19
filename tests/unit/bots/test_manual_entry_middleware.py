@@ -1,17 +1,20 @@
 """Tests for ManualEntryMiddleware.
 
-This gate decides which `PlaceOrder(side="BUY")` actions emitted by a
-strategy's `on_event()` reach the execution middleware. The invariants
-the middleware must uphold:
+This gate decides which strategy-emitted ``PlaceOrder`` actions reach
+the execution middleware. The invariants the middleware must uphold:
 
   1. Disabled → pass-through (covers every existing production bot).
-  2. Enabled → drop ONLY `PlaceOrder(side="BUY", origin="strategy")`.
-  3. Enabled → exits (`origin="exit"`) pass, regardless of side.
-  4. Enabled → manual overrides (`origin="manual_override"`) pass.
-  5. Enabled → sells (`side="SELL"`) always pass.
-  6. Enabled → non-PlaceOrder actions (LogSignal, UpdateState, …) pass.
-  7. Blocked entries leave a LogSignal audit trail so bot_events records
-     the intent even though nothing shipped to the broker.
+  2. Enabled → drop ANY ``PlaceOrder(origin="strategy")`` — both
+     LONG entries (BUY) and SHORT entries (SELL).
+  3. Enabled → exits (``origin="exit"``) pass, regardless of side.
+  4. Enabled → manual overrides (``origin="manual_override"``) pass.
+  5. Enabled → non-PlaceOrder actions (LogSignal, UpdateState, …) pass.
+  6. Blocked entries leave a LogSignal audit trail so bot_events
+     records the intent even though nothing shipped to the broker.
+
+Pre-2026-05-19 the middleware only blocked BUYs and let SELL strategy
+entries through, which meant chart_signal SHORTs auto-fired even with
+the flag on. The current invariant gates entries by ``origin`` alone.
 """
 from decimal import Decimal
 
@@ -79,11 +82,27 @@ class TestEnabled:
         out = mw.process([_buy("manual_override")], ctx)
         assert out == [_buy("manual_override")]
 
-    def test_passes_any_sell(self, ctx):
+    def test_blocks_strategy_sell(self, ctx):
+        # Strategy-emitted SELLs are SHORT entries — must be blocked.
         mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
-        for origin in ("strategy", "exit", "manual_override"):
-            out = mw.process([_sell(origin)], ctx)
-            assert out == [_sell(origin)], f"blocked SELL with origin={origin}"
+        out = mw.process([_sell("strategy")], ctx)
+        assert len(out) == 1
+        assert isinstance(out[0], LogSignal)
+        assert out[0].event_type == "MANUAL_ENTRY_ONLY"
+        assert "F" in out[0].message
+        assert "SELL" in out[0].message
+
+    def test_passes_exit_sell(self, ctx):
+        # SELL exits (closing a long) must pass.
+        mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
+        out = mw.process([_sell("exit")], ctx)
+        assert out == [_sell("exit")]
+
+    def test_passes_manual_override_sell(self, ctx):
+        # Force SHORT goes out as SELL origin=manual_override — must pass.
+        mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
+        out = mw.process([_sell("manual_override")], ctx)
+        assert out == [_sell("manual_override")]
 
     def test_passes_non_placeorder(self, ctx):
         mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
@@ -97,20 +116,25 @@ class TestEnabled:
     def test_mixed_batch(self, ctx):
         mw = ManualEntryMiddleware("bot1", manual_entry_only=True)
         actions = [
-            _buy("strategy"),              # dropped
-            _sell("exit"),                 # kept
-            _buy("manual_override"),       # kept
+            _buy("strategy"),              # dropped (LONG entry)
+            _sell("exit"),                 # kept (exit)
+            _buy("manual_override"),       # kept (force LONG)
+            _sell("strategy"),             # dropped (SHORT entry)
             LogSignal(event_type="SIGNAL", message="hi"),  # kept
-            _buy("strategy"),              # dropped
+            _sell("manual_override"),      # kept (force SHORT)
+            _buy("strategy"),              # dropped (LONG entry)
         ]
         out = mw.process(actions, ctx)
-        # Two LogSignals injected for the two dropped entries, plus three
-        # pass-throughs = 5 actions out from 5 in.
-        assert len(out) == 5
-        dropped = [a for a in out if isinstance(a, LogSignal) and a.event_type == "MANUAL_ENTRY_ONLY"]
-        assert len(dropped) == 2
+        # Three LogSignals injected for the three dropped entries,
+        # plus four pass-throughs (one SignalLog + three orders) = 7.
+        assert len(out) == 7
+        dropped = [
+            a for a in out
+            if isinstance(a, LogSignal) and a.event_type == "MANUAL_ENTRY_ONLY"
+        ]
+        assert len(dropped) == 3
         kept_orders = [a for a in out if isinstance(a, PlaceOrder)]
-        assert len(kept_orders) == 2
+        assert len(kept_orders) == 3
         assert {a.origin for a in kept_orders} == {"exit", "manual_override"}
 
 

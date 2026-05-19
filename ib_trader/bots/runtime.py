@@ -3458,6 +3458,9 @@ class StrategyBotRunner(BotBase):
                 side=side,
                 qty=Decimal(str(qty)),
                 order_type=order_strategy,
+                # Operator-initiated — bypasses ManualEntryMiddleware's
+                # auto-entry block (which only filters origin="strategy").
+                origin="manual_override",
             ),
             UpdateState({
                 "entry_time": datetime.now(timezone.utc).isoformat(),

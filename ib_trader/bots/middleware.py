@@ -59,26 +59,37 @@ def _real_utc_now() -> datetime:
 # ---------------------------------------------------------------------------
 
 class ManualEntryMiddleware:
-    """Blocks auto-BUY entries from a bot's strategy signals.
+    """Blocks AUTO entries (both LONG and SHORT) from a bot's
+    strategy signals.
 
     When a bot's YAML has ``manual_entry_only: true`` this middleware
-    filters out ``PlaceOrder(side="BUY", origin="strategy")`` actions —
-    i.e. the normal "my signal says buy" path. Every other action goes
-    through untouched, so the rest of production behaviour is preserved:
+    filters out ``PlaceOrder(origin="strategy")`` entry actions:
 
-      - ``origin="exit"``        — trailing stops, hard stops, time stops,
-                                   strategy-emitted sell-to-close.
-      - ``origin="manual_override"`` — operator FORCE_BUY signal (which
-                                   is routed outside ``on_event`` anyway).
-      - ``side="SELL"``          — never blocked here.
+      - LONG entry  = ``PlaceOrder(side="BUY",  origin="strategy")``
+      - SHORT entry = ``PlaceOrder(side="SELL", origin="strategy")``
 
-    The point is to let a live test bot run the FULL production strategy
+    Every other order goes through untouched so the rest of
+    production behaviour is preserved:
+
+      - ``origin="exit"``            — trailing stops, line-breach
+                                        exits, counter-line exits,
+                                        strategy-emitted close orders.
+      - ``origin="manual_override"`` — operator FORCE LONG / FORCE
+                                        SHORT / FORCE QUIT buttons.
+
+    The point is to let a live bot run the FULL production strategy
     (exits, trailing stop, P&L display, middleware pipeline) while
-    keeping auto-entries off the wire, so the only real BUYs come from
-    a deliberate operator action.
+    keeping signal-driven entries off the wire, so the only real
+    entries come from a deliberate operator action.
 
-    When ``manual_entry_only`` is False (the default), the middleware is
-    a no-op pass-through.
+    When ``manual_entry_only`` is False (the default), the middleware
+    is a no-op pass-through.
+
+    History: pre-2026-05-19 this filter only blocked BUY orders,
+    leaving chart_signal SHORTs (sell-to-open with origin="strategy")
+    to fire as auto entries even with the flag on. Now blocks both
+    sides — distinguishing entries from exits via ``origin``, not
+    via the side.
     """
 
     def __init__(self, bot_id: str, manual_entry_only: bool = False) -> None:
@@ -92,16 +103,15 @@ class ManualEntryMiddleware:
         for action in actions:
             if (
                 isinstance(action, PlaceOrder)
-                and action.side == "BUY"
                 and getattr(action, "origin", "strategy") == "strategy"
             ):
-                # Drop the auto-entry, leave an audit breadcrumb so it's
-                # obvious from bot_events that the bot wanted to buy but
-                # the manual-entry gate stopped it.
+                # origin="strategy" means this came from the strategy's
+                # signal evaluation — drop it. Exits and operator
+                # overrides have non-"strategy" origins and pass through.
                 result.append(LogSignal(
                     event_type=LogEventType.MANUAL_ENTRY_ONLY,
                     message=(
-                        f"Blocked strategy BUY for {action.symbol} "
+                        f"Blocked strategy {action.side} for {action.symbol} "
                         f"qty={action.qty} — manual_entry_only=true"
                     ),
                     payload={

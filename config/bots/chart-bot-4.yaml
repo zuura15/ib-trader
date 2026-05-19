@@ -3,7 +3,13 @@ name: "Chart Bot 4 · Micro Nasdaq"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
-manual_entry_only: false
+# Manual-entry-only mode (2026-05-19). Bot evaluates bars and emits
+# signal-driven entry orders to the action stream, then the runtime's
+# ManualEntryMiddleware drops them with a MANUAL_ENTRY_ONLY breadcrumb
+# in bot_events. Only operator force-LONG / force-SHORT (origin=
+# "manual_override") and strategy-emitted exits (origin="exit") reach
+# the broker. Flip back to false to restore auto entries.
+manual_entry_only: true
 auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
