@@ -3120,6 +3120,25 @@ class ChartSignalStrategy:
 
         if fire:
             state_patch["exit_reason"] = "trail_stop"
+            # Persist the tick-time SL fire to ib_trader.log so we can
+            # answer "did the configured linger actually apply?"
+            # post-hoc. The EXIT_CHECK LogSignal goes through the
+            # action stream but isn't persisted to the audit DB
+            # (the runtime only stores BAR_EVAL / ORDER_PLACED /
+            # TRADE_CLOSED). A single INFO line here gives the
+            # forensic trail without an audit-schema change.
+            logger.info(
+                '{"event": "SL_FIRE", "direction": "%s", '
+                '"mid": %.4f, "active_stop": %.4f, '
+                '"elapsed_s": %s, "linger_s": %s, '
+                '"marginal_trade": %s}',
+                direction,
+                float(mid_d),
+                float(active_stop),
+                f"{elapsed_log:.2f}" if elapsed_log is not None else "null",
+                f"{linger_log:.2f}" if linger_log is not None else "null",
+                "true" if is_marginal else "false",
+            )
             actions.append(LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
                 message=f"TRAILING_STOP [{direction}]: {detail}",
