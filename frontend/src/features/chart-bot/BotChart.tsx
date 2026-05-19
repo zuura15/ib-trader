@@ -154,7 +154,26 @@ export function BotChart({
   // Trajectory-curve window in BARS. 3-min cadence → 60 bars = 3 h
   // (default). Operator-tunable from the chart toolbar; only relevant
   // when ``showFuzzyOverlay`` is on (fuzzytrader slot).
+  //
+  // The buffer (curveInput) holds whatever the user is typing right now
+  // so React's controlled-input clamp doesn't corrupt mid-typing —
+  // e.g. typing "180" used to land as "60"+"1" → "601" → clamped to
+  // 480 instantly. Commit happens on blur or Enter.
   const [curveWindowBars, setCurveWindowBars] = useState(60);
+  const [curveInput, setCurveInput] = useState('60');
+  useEffect(() => {
+    setCurveInput(String(curveWindowBars));
+  }, [curveWindowBars]);
+  const commitCurve = () => {
+    const n = parseInt(curveInput, 10);
+    if (Number.isFinite(n)) {
+      const clamped = Math.max(5, Math.min(480, n));
+      setCurveWindowBars(clamped);
+      setCurveInput(String(clamped));
+    } else {
+      setCurveInput(String(curveWindowBars));  // revert garbage
+    }
+  };
 
   // Esc closes fullscreen and the filter popover (matches ChartPane).
   useEffect(() => {
@@ -505,7 +524,7 @@ export function BotChart({
             display: 'flex', alignItems: 'center', gap: 4,
             fontSize: 11, color: 'var(--text-secondary)',
           }}
-          title="Trajectory-curve window in bars (3-min bars; 60 = 3 h)"
+          title="Trajectory-curve window in bars (3-min bars; 60 = 3 h). Commit on blur or Enter."
         >
           Curve
           <input
@@ -513,11 +532,13 @@ export function BotChart({
             min={5}
             max={480}
             step={5}
-            value={curveWindowBars}
-            onChange={(e) => {
-              const n = parseInt(e.target.value, 10);
-              if (Number.isFinite(n)) {
-                setCurveWindowBars(Math.max(5, Math.min(480, n)));
+            value={curveInput}
+            onChange={(e) => setCurveInput(e.target.value)}
+            onBlur={commitCurve}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                commitCurve();
+                (e.currentTarget as HTMLInputElement).blur();
               }
             }}
             style={{
