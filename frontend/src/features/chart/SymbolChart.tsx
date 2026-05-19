@@ -2445,6 +2445,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     const doFetch = async () => {
       const payload = await fetchFuzzy(target, 8, '3 mins');
       if (cancelled) return;
+      // eslint-disable-next-line no-console
+      console.log('[fuzzy] fetched', {
+        bars_count: payload?.bars_count,
+        lines: payload?.lines?.length,
+        channels: payload?.channels?.length,
+        pivots: payload?.pivots?.length,
+      });
       if (payload !== null) {
         fuzzyPayloadRef.current = payload;
         renderFuzzy();
@@ -2454,31 +2461,44 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const ch = chartRef.current;
       const bars = barsRef.current;
       const payload = fuzzyPayloadRef.current;
-      if (!ch || !bars.length || !payload) return;
+      if (!ch || !bars.length || !payload) {
+        // eslint-disable-next-line no-console
+        console.log('[fuzzy] render skipped',
+          { hasChart: !!ch, bars: bars.length, hasPayload: !!payload });
+        return;
+      }
       // Clear prior fuzzy series before redrawing the new set.
       for (const s of fuzzySeriesRef.current) {
         try { ch.removeSeries(s); } catch { /* torn down */ }
       }
       fuzzySeriesRef.current = [];
-      // Support cyan, resistance magenta. Opacity scales with score
-      // so a 0.4-score line is faint and a 0.9-score line is bold.
+      // Support cyan, resistance magenta. Use bright high-contrast
+      // colors and SOLID strokes so they're unmistakable against the
+      // canonical SR fan (which is the bullish/bearish theme colors).
+      let drawn = 0;
+      let skipped = 0;
       for (const fl of payload.lines) {
         const mapped = fuzzyLineToChartLine(fl, bars);
-        if (!mapped) continue;
+        if (!mapped) {
+          skipped++;
+          continue;
+        }
         const color = mapped.type === 'support' ? '#22d3ee' : '#e879f9';
-        // Width scales 1..3 with inlier count.
-        const width = Math.min(3, Math.max(1, Math.round(mapped.inlierCount / 2)));
+        // Fixed 3px width — visually distinct from the 1-2 px canonical
+        // SR fan lines so the operator can tell which is which at a
+        // glance during testing.
         try {
           const series = ch.addSeries(LineSeries, {
             color,
-            lineWidth: width as 1 | 2 | 3,
+            lineWidth: 3 as 1 | 2 | 3,
             priceLineVisible: false,
             lastValueVisible: false,
             crosshairMarkerVisible: false,
             autoscaleInfoProvider: () => null,
-            // dashed so they're visually distinct from the strict-SR
-            // solid lines.
-            lineStyle: 1 as 1,
+            // Solid stroke — easier to spot during the indicator-tuning
+            // phase. Switch to dashed (lineStyle: 2) later if it gets
+            // visually noisy.
+            lineStyle: 0 as 0,
           });
           const fromTime = bars[mapped.fromIdx].time;
           const toTime = bars[Math.min(mapped.toIdx, bars.length - 1)].time;
@@ -2487,10 +2507,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             { time: toTime, value: mapped.toPrice },
           ]);
           fuzzySeriesRef.current.push(series);
-        } catch {
-          // chart torn down between fetch and render
+          drawn++;
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn('[fuzzy] addSeries failed', e);
         }
       }
+      // eslint-disable-next-line no-console
+      console.log('[fuzzy] rendered', { drawn, skipped, total: payload.lines.length });
     };
     doFetch();
     const id = window.setInterval(doFetch, 15000);
