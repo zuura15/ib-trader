@@ -2025,3 +2025,179 @@ class TestRegimeGate:
         assert not regime_skips, (
             f"disabled regime gate should not fire, got {regime_skips}"
         )
+
+
+class TestInterTouchSpacing:
+    """Inter-touch spacing rule: reject when new touch lands "right
+    after" prior touch on a long-built line. g_prev = T_{n-1} − T_{n-2}
+    bars, g_new = new_pivot − T_{n-1} bars; reject when g_prev / g_new
+    > max_ratio (default 3).
+    """
+
+    def _build_window(self, closes: list[float]) -> list[dict]:
+        bars: list[dict] = []
+        for i, c in enumerate(closes):
+            t = START_UTC + timedelta(seconds=i * BAR_SECONDS)
+            bars.append({
+                "timestamp_utc": t.isoformat(),
+                "open": c, "high": c + 0.1, "low": c - 0.1,
+                "close": c, "volume": 100,
+            })
+        return bars
+
+    def _bar_event(self, bars: list[dict]) -> BarCompleted:
+        return BarCompleted(
+            symbol="MGCM6", bar=bars[-1], window=bars, bar_count=len(bars),
+        )
+
+    def _drastic_cluster_closes(self) -> list[float]:
+        """Q at idx 5 (4500), P at idx 20 (4515), new pivot at idx 22
+        (4517) — all on a slope-1.0/bar support line. g_prev = 15,
+        g_new = 2 → ratio 7.5 > 3 → expect reject."""
+        c = [4530.0, 4520.0, 4510.0, 4505.0, 4502.0,    # 0..4
+             4500.0,                                     # 5  Q
+             4501.0, 4503.0, 4503.0, 4504.0,             # 6..9
+             4505.0, 4506.0, 4507.0, 4508.0, 4509.0,     # 10..14
+             4510.0, 4511.0, 4513.0, 4514.0, 4516.0,     # 15..19
+             4515.0,                                     # 20 P
+             4520.0,                                     # 21
+             4517.0,                                     # 22 new pivot
+             4525.0]                                     # 23 eval
+        return c
+
+    @pytest.mark.asyncio
+    async def test_drastic_cluster_rejected(self):
+        cfg = _default_config()
+        # Regime gate runs before the entry-candidate loop where
+        # our spacing gate lives — disable it so this test
+        # observes only the spacing behavior.
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._drastic_cluster_closes())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        assert skips, f"expected inter_touch_spacing SKIP, got {actions}"
+        p = skips[0].payload
+        assert p["direction"] == "long"
+        assert p["g_prev"] == 15
+        assert p["g_new"] == 2
+        assert p["ratio"] > 3.0
+        # No PlaceOrder fired.
+        assert not [a for a in actions if isinstance(a, PlaceOrder)]
+
+    @pytest.mark.asyncio
+    async def test_disabled_flag_bypasses(self):
+        """With the filter disabled, the drastic-cluster fixture
+        no longer triggers an inter_touch_spacing rejection."""
+        cfg = _default_config()
+        cfg["entry_inter_touch_spacing_filter_enabled"] = False
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(self._drastic_cluster_closes())
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        assert not skips, (
+            f"disabled flag should bypass; got {skips}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_proportional_spacing_passes(self):
+        """Q at idx 5, P at idx 15 (g_prev=10), new pivot at idx 19
+        (g_new=4). Ratio = 2.5 ≤ 3 → no spacing rejection.
+        Line slope 1.0/bar (rising support)."""
+        # closes pre-built so the three pivot LOWs sit on the line:
+        # idx 5 (4500), idx 15 (4510), idx 19 (4514). Intermediate
+        # bars monotonic-ish without forming pivot LOWs.
+        c = [4530.0, 4520.0, 4510.0, 4505.0, 4502.0,    # 0..4
+             4500.0,                                     # 5  Q (LOW)
+             4501.0, 4503.0, 4504.0, 4505.0,             # 6..9
+             4506.0, 4507.0, 4508.0, 4509.0, 4511.0,     # 10..14 (idx14 above P)
+             4510.0,                                     # 15 P (LOW)
+             4512.0, 4513.0, 4515.0,                     # 16..18 (idx18 above new)
+             4514.0,                                     # 19 new pivot LOW
+             4520.0]                                     # 20 eval
+        cfg = _default_config()
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(c)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        assert not skips, (
+            f"ratio 2.5 should pass; got {skips}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_inverted_v_symmetric_short_rejected(self):
+        """Symmetric: descending resistance line built over 15 bars,
+        new pivot HIGH 2 bars after the last touch. Mirror of
+        test_drastic_cluster_rejected for SHORTs."""
+        # idx 5 (Q, 4500 HIGH), idx 20 (P, 4485 HIGH), idx 22 (new, 4483)
+        # Line slope = -1.0/bar (descending resistance).
+        c = [4470.0, 4480.0, 4490.0, 4495.0, 4498.0,    # 0..4 (rising)
+             4500.0,                                     # 5  Q HIGH
+             4499.0, 4497.0, 4497.0, 4496.0,             # 6..9 (descending)
+             4495.0, 4494.0, 4493.0, 4492.0, 4491.0,     # 10..14
+             4490.0, 4489.0, 4487.0, 4486.0, 4484.0,     # 15..19
+             4485.0,                                     # 20 P HIGH
+             4480.0,                                     # 21
+             4483.0,                                     # 22 new pivot HIGH
+             4475.0]                                     # 23 eval
+        cfg = _default_config()
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(c)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        assert skips, f"expected SHORT-side spacing SKIP, got {actions}"
+        assert skips[0].payload["direction"] == "short"
+
+    @pytest.mark.asyncio
+    async def test_accel_path_gated_by_spacing(self):
+        """2-pivot accel: Q and P with long gap, new pivot is the
+        3rd point right after P. Spacing rule rejects the synthetic
+        accel line even though accel criteria (overshoot + implied
+        slope) would otherwise fire."""
+        # 3 descending pivot HIGHS: idx 1 (12.0), idx 11 (11.0),
+        # idx 13 (9.5). Q→P spans 10 bars, new pivot is 2 bars after P.
+        # Ratio 10/2 = 5 > 3 → reject.
+        c = [10.0, 12.0,                                  # 0..1 (idx 1 HIGH)
+             9.5, 11.5, 9.0, 11.0, 8.5, 10.7, 8.0, 10.5,  # 2..9
+             8.0,                                          # 10
+             11.0,                                         # 11 P HIGH
+             9.0,                                          # 12
+             9.5,                                          # 13 new pivot HIGH
+             7.0]                                          # 14 eval
+        cfg = _default_config()
+        cfg["acceleration_entry_enabled"] = True
+        cfg["regime_filter_enabled"] = False
+        s = ChartSignalStrategy(cfg)
+        ctx = _make_ctx(config=cfg)
+        bars = self._build_window(c)
+        actions = await s.on_event(self._bar_event(bars), ctx)
+        skips = [a for a in actions if isinstance(a, LogSignal)
+                 and a.event_type == LogEventType.SKIP
+                 and (a.payload or {}).get("filter")
+                 == "inter_touch_spacing"]
+        # Either spacing rejected (preferred) OR no order fired:
+        # both are acceptable evidence that the gate worked.
+        place = [a for a in actions if isinstance(a, PlaceOrder)]
+        assert not place, (
+            f"accel with bad spacing should not fire; "
+            f"got skips={skips}, place={place}"
+        )

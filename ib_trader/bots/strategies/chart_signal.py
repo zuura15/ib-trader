@@ -88,6 +88,18 @@ FILTER_MIN_TARGET = "min_target"
 FILTER_FAR_FROM_PIVOT = "far_from_pivot"
 FILTER_STALE_LINE = "stale_line"
 FILTER_OPPOSING_DOMINANCE = "opposing_dominance"
+# Inter-touch spacing rule. Rejects the candidate line when the
+# new touch lands "right after" the previous touch on a line that
+# took much longer to build — a structural sign of tolerance-
+# attack rather than real respect (the long line's tol band
+# catches near-misses by mathematical coincidence). Operator rule
+# 2026-05-18. Line-validity gate, NOT bypassable in marginal mode.
+FILTER_INTER_TOUCH_SPACING = "inter_touch_spacing"
+# Marginal-bypass cap. When too many bypassable filters would have
+# rejected the entry, marginal mode is suppressed — entry rejected
+# outright. Operator rule 2026-05-18: 1-2 bypassed = OK; 3+ = too
+# much uncertainty, abandon the entry.
+FILTER_TOO_MANY_MARGINAL_BYPASSES = "too_many_marginal_bypasses"
 # Counter-trend entry filter. Up-sloping resistance shorts and
 # down-sloping support longs fade their own prevailing direction —
 # bad fit during clear trends, especially after a strong move. The
@@ -1412,6 +1424,65 @@ class ChartSignalStrategy:
                     strict_old += 1
             return strict_old >= MIN_TOUCHES
 
+        # Inter-touch spacing gate (FILTER_INTER_TOUCH_SPACING).
+        # Rejects a candidate line when the new pivot lands "right
+        # after" the previous strict touch on a line that took much
+        # longer to build. The long line's projected tol band catches
+        # near-misses by mathematical coincidence rather than real
+        # structural respect.
+        #
+        # Rule: g_prev = T_{n-1} - T_{n-2} (bars between the last
+        # two strict touches before new_pivot), g_new = new_pivot -
+        # T_{n-1}. Reject when g_prev / g_new > max_ratio (default 3).
+        #
+        # For a freshly-built Q→P line with no other strict touches,
+        # T_{n-2} = from_idx (Q), T_{n-1} = anchor_b_idx (P). For
+        # multi-touch lines we find the two most recent strict
+        # touches before new_pivot_idx.
+        spacing_enabled = bool(self.config.get(
+            "entry_inter_touch_spacing_filter_enabled", True,
+        ))
+        spacing_max_ratio = float(self.config.get(
+            "entry_line_max_inter_gap_ratio", 3.0,
+        ))
+
+        def _inter_touch_spacing_ok(line, side_pivots) -> tuple[bool, dict]:
+            """Return (passes, payload). Payload always carries the
+            metrics so the SKIP audit row is self-explaining."""
+            if new_pivot_idx < 0:
+                return True, {"reason": "no_new_pivot"}
+            strict_touches: list[int] = []
+            for piv in side_pivots:
+                if piv >= new_pivot_idx:
+                    break  # side_pivots is ascending
+                if piv < line.from_idx:
+                    continue
+                line_at_piv = line.intercept + line.slope * piv
+                if abs(closes[piv] - line_at_piv) <= touch_tol:
+                    strict_touches.append(piv)
+            if len(strict_touches) < 2:
+                return True, {
+                    "reason": "insufficient_prior_touches",
+                    "prior_strict_count": len(strict_touches),
+                }
+            t_prev = strict_touches[-1]
+            t_prev_prev = strict_touches[-2]
+            g_prev = t_prev - t_prev_prev
+            g_new = new_pivot_idx - t_prev
+            if g_prev <= 0 or g_new <= 0:
+                return True, {"reason": "degenerate_gaps"}
+            ratio = g_prev / max(g_new, 1)
+            passes = ratio <= spacing_max_ratio
+            return passes, {
+                "g_prev": g_prev,
+                "g_new": g_new,
+                "ratio": round(ratio, 3),
+                "max_ratio": spacing_max_ratio,
+                "t_prev_prev_idx": t_prev_prev,
+                "t_prev_idx": t_prev,
+                "new_pivot_idx": new_pivot_idx,
+            }
+
         def _find_2pivot_accel():
             """2-pivot accel: 3 consecutive same-kind pivots, the
             most recent being ``new_pivot_idx``. The older 2 form
@@ -1561,18 +1632,46 @@ class ChartSignalStrategy:
         # and shouldn't trigger entries. Stale_line is enforced
         # downstream in its own filter block; broken-line is gated
         # right here at iteration time.
+        # Collect spacing-rejected candidates so we can emit a SKIP
+        # audit row when the rejection was the reason no entry
+        # fired. Without surfacing this, a stale "mountain attack"
+        # line would just go silently — operator wouldn't know the
+        # bot considered it.
+        spacing_rejections: list[dict] = []
         for cand in longs:
             if cand.break_idx is not None:
                 continue
-            if _has_new_touch(cand, support_pivots):
-                long_line, long_path = cand, "touch"
-                break
+            if not _has_new_touch(cand, support_pivots):
+                continue
+            if spacing_enabled:
+                ok, sp_payload = _inter_touch_spacing_ok(
+                    cand, support_pivots,
+                )
+                if not ok:
+                    spacing_rejections.append({
+                        "dir": "long", "path": "touch",
+                        "payload": sp_payload,
+                    })
+                    continue
+            long_line, long_path = cand, "touch"
+            break
         for cand in shorts:
             if cand.break_idx is not None:
                 continue
-            if _has_new_touch(cand, resistance_pivots):
-                short_line, short_path = cand, "touch"
-                break
+            if not _has_new_touch(cand, resistance_pivots):
+                continue
+            if spacing_enabled:
+                ok, sp_payload = _inter_touch_spacing_ok(
+                    cand, resistance_pivots,
+                )
+                if not ok:
+                    spacing_rejections.append({
+                        "dir": "short", "path": "touch",
+                        "payload": sp_payload,
+                    })
+                    continue
+            short_line, short_path = cand, "touch"
+            break
 
         # Accel path: try the 2-pivot consecutive-peaks pattern when
         # no 3+touch TOUCH candidate was found on the matching side.
@@ -1584,10 +1683,61 @@ class ChartSignalStrategy:
             accel_result = _find_2pivot_accel()
             if accel_result is not None:
                 synth_line, accel_dir = accel_result
-                if accel_dir == "long" and long_line is None:
+                # Apply spacing gate to accel too — the 2-pivot
+                # base (Q→P) is vulnerable to the same tolerance
+                # attack if Q-P is long and new_pivot is right
+                # after P.
+                accel_side_pivots = (
+                    support_pivots if accel_dir == "long"
+                    else resistance_pivots
+                )
+                accel_passes = True
+                accel_sp_payload: dict = {}
+                if spacing_enabled:
+                    accel_passes, accel_sp_payload = (
+                        _inter_touch_spacing_ok(
+                            synth_line, accel_side_pivots,
+                        )
+                    )
+                if not accel_passes:
+                    spacing_rejections.append({
+                        "dir": accel_dir, "path": "accel",
+                        "payload": accel_sp_payload,
+                    })
+                elif accel_dir == "long" and long_line is None:
                     long_line, long_path = synth_line, "accel"
                 elif accel_dir == "short" and short_line is None:
                     short_line, short_path = synth_line, "accel"
+
+        # If no candidate survived AND we have spacing rejections,
+        # emit a single SKIP for the first one so the operator can
+        # see the gate fired. Multiple rejections per bar collapse
+        # into one row; the payload's metrics describe the strongest
+        # rejection (first encountered).
+        if (long_line is None and short_line is None
+                and spacing_rejections):
+            rej = spacing_rejections[0]
+            p = rej["payload"]
+            actions.append(LogSignal(
+                event_type=LogEventType.SKIP,
+                message=(
+                    f"{FILTER_INTER_TOUCH_SPACING} "
+                    f"({rej['dir'].upper()}) — prior gap "
+                    f"{p.get('g_prev', '?')} bars vs new gap "
+                    f"{p.get('g_new', '?')} bars (ratio "
+                    f"{p.get('ratio', '?')} > "
+                    f"{p.get('max_ratio', '?')}); new touch lands "
+                    f"too soon after prior touch on long-built line"
+                ),
+                payload={
+                    "filter": FILTER_INTER_TOUCH_SPACING,
+                    "marginal": False,
+                    "direction": rej["dir"],
+                    "path": rej["path"],
+                    **p,
+                },
+            ))
+            return actions
 
         if long_path is None:
             long_line = None
@@ -2272,6 +2422,37 @@ class ChartSignalStrategy:
             else marginal_filters_short
         )
         is_marginal_entry = bool(chosen_marginal_filters)
+
+        # Marginal-bypass cap (2026-05-18). When too many filters
+        # would have been waved through by allow_marginal_entries,
+        # the entry is structurally too uncertain — reject outright
+        # instead of firing as marginal. Operator rule: 1-2 bypassed
+        # filters acceptable, 3+ is too much uncertainty.
+        marginal_cap = int(self.config.get(
+            "entry_marginal_max_bypassed_filters", 2,
+        ))
+        if (is_marginal_entry
+                and len(chosen_marginal_filters) > marginal_cap):
+            actions.append(LogSignal(
+                event_type=LogEventType.SKIP,
+                message=(
+                    f"{FILTER_TOO_MANY_MARGINAL_BYPASSES} "
+                    f"({direction.upper()}) — "
+                    f"{len(chosen_marginal_filters)} filters would "
+                    f"be bypassed ({', '.join(chosen_marginal_filters)}); "
+                    f"cap is {marginal_cap}, entry rejected"
+                ),
+                payload={
+                    "filter": FILTER_TOO_MANY_MARGINAL_BYPASSES,
+                    "marginal": False,
+                    "direction": direction,
+                    "bypassed_filters": list(chosen_marginal_filters),
+                    "bypass_count": len(chosen_marginal_filters),
+                    "cap": marginal_cap,
+                    "entry_decision": decision_diag,
+                },
+            ))
+            return actions
 
         # Trigger line value at the fire bar (last_idx). Frozen here
         # so ``_on_fill`` can seed the marginal-mode tight-zones cache
