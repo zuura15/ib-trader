@@ -549,19 +549,16 @@ export function BotChart({
     </div>
   );
 
-  // OFF / unknown bot — desaturate the chart + strip so the operator
-  // can tell at a glance which bots are dormant. Toolbar header stays
-  // crisp so Start / Force-quit remain prominent. Live live-tick
-  // ingestion continues underneath; the grey-out is purely visual.
-  const isInactive = !fsmState
-    || fsmState === 'OFF'
-    || fsmState === 'UNKNOWN';
-  const inactiveStyle: React.CSSProperties = isInactive
-    ? { filter: 'grayscale(0.85) opacity(0.55)' }
-    : {};
+  // Chart colors stay fully saturated regardless of bot status
+  // (2026-05-19 operator preference). Previously OFF/UNKNOWN bots
+  // grayed the chart at 85% grayscale + 55% opacity to signal dormancy;
+  // the toolbar banner ("OFF" / "ERRORED") already communicates state,
+  // and the gray-out made it harder to read SR + price action while
+  // deciding whether to force an entry. The in-position blue tint
+  // (paneBackground={ACTIVE_TINT} when inPosition) is preserved.
   const chartBody = (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
-      <div className="flex-1" style={{ minHeight: 0, ...inactiveStyle }}>
+      <div className="flex-1" style={{ minHeight: 0 }}>
         <SymbolChart
           ref={chartRef}
           target={target}

@@ -353,6 +353,37 @@ export function BotTradesPanel({ compact = false }: { compact?: boolean }) {
                             <div style={labelStyle}>Trail resets</div>
                             <div style={valueStyle}>{t.trail_reset_count}</div>
                           </div>
+                          {t.entry_path && (() => {
+                            // Color-code the entry-path chip to match
+                            // the audit-feed convention: green=clean,
+                            // orange=accel, purple=force, amber=marginal.
+                            const path = t.entry_path;
+                            const tone = (
+                              path === 'clean' ? { fg: '#16a34a', bg: 'rgba(34,197,94,0.15)' } :
+                              path === 'accel' ? { fg: '#ea580c', bg: 'rgba(249,115,22,0.18)' } :
+                              path === 'force' ? { fg: '#9333ea', bg: 'rgba(168,85,247,0.18)' } :
+                              { fg: '#b45309', bg: 'rgba(245,158,11,0.18)' }
+                            );
+                            return (
+                              <div>
+                                <div style={labelStyle}>Entry path</div>
+                                <span style={{
+                                  fontSize: 12, fontWeight: 600,
+                                  padding: '2px 8px', borderRadius: 3,
+                                  background: tone.bg, color: tone.fg,
+                                  fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                                }}>
+                                  {path}
+                                </span>
+                              </div>
+                            );
+                          })()}
+                          {t.exit_reason && (
+                            <div>
+                              <div style={labelStyle}>Exit reason</div>
+                              <div style={valueStyle}>{t.exit_reason}</div>
+                            </div>
+                          )}
                           {t.bot_name && (
                             <div>
                               <div style={labelStyle}>Bot</div>

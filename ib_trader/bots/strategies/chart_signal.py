@@ -3657,7 +3657,18 @@ class ChartSignalStrategy:
         entry_line = ctx.state.get("entry_line") or {}
         direction = str(entry_line.get("direction", "long")).lower()
         close_side = "SELL" if direction == "long" else "BUY"
-        return [
+        actions: list[Action] = []
+        # For operator-triggered force-quit, stamp exit_reason in state
+        # so the TRADE_CLOSED audit row + bot_trades.exit_reason column
+        # show "force_quit" instead of whatever stale natural-exit
+        # value was sitting there (commonly "unknown" on a freshly
+        # entered position that never reached an organic exit path).
+        if exit_type == ExitType.FORCE_EXIT:
+            actions.append(UpdateState({
+                "exit_reason": "force_quit",
+                "exit_detail": f"force-quit: {detail}",
+            }))
+        actions.extend([
             LogSignal(
                 event_type=LogEventType.EXIT_CHECK,
                 message=f"{exit_type.value} [{direction}]: {detail}",
@@ -3670,4 +3681,5 @@ class ChartSignalStrategy:
                 order_type=order_strategy,
                 origin="exit",
             ),
-        ]
+        ])
+        return actions

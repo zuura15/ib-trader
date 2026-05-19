@@ -380,6 +380,15 @@ class BotTrade(Base):
     duration_seconds   = Column(Integer, nullable=True)       # exit_time - entry_time, seconds
     entry_serial       = Column(Integer, nullable=True)       # trade_group.serial_number of entry
     exit_serial        = Column(Integer, nullable=True)       # trade_group.serial_number of exit
+    # Entry classification — "touch" | "accel" | "force" | <marginal-filter-name>.
+    # Distinguishes organic entries from operator-forced ones for
+    # analytics (force vs auto win-rate, P&L per path, etc.).
+    entry_path         = Column(String(32), nullable=True)
+    # Exit trigger — "trail_stop" | "line_breach" | "counter_line" |
+    # "tight_counter_line" | "force_quit" | "shoulder" | ... .
+    # Same field that's in the TRADE_CLOSED audit payload, persisted
+    # here for SQL-side analytics without joining audit_log.
+    exit_reason        = Column(String(32), nullable=True)
     created_at         = Column(DateTime, nullable=False)
 
 

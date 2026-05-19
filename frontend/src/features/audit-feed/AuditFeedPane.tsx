@@ -316,11 +316,12 @@ function TradeClosedRow({ r }: { r: AuditRow }) {
     ?? null;
   const entryPx = p?.entry_price as string | number | undefined;
   const exitPx = p?.exit_price as string | number | undefined;
-  // Entry-tag color: green = clean, orange = accel, amber = marginal
-  // (anything else implies a marginal-bypassed filter name).
+  // Entry-tag color: green = clean, orange = accel, purple = force
+  // (operator override), amber = marginal-bypassed-filter name.
   const entryTagStyle = (() => {
     if (entryTag === 'clean') return { fg: '#16a34a', bg: 'rgba(34,197,94,0.15)' };
     if (entryTag === 'accel') return { fg: '#ea580c', bg: 'rgba(249,115,22,0.18)' };
+    if (entryTag === 'force') return { fg: '#9333ea', bg: 'rgba(168,85,247,0.18)' };
     if (entryTag) return { fg: '#b45309', bg: 'rgba(245,158,11,0.18)' };
     return null;
   })();

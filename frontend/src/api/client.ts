@@ -109,6 +109,8 @@ export interface BotTradeResponse {
   duration_seconds: number | null;
   entry_serial: number | null;
   exit_serial: number | null;
+  entry_path: string | null;   // touch | accel | force | <marginal-filter>
+  exit_reason: string | null;  // trail_stop | line_breach | counter_line | force_quit | ...
   created_at: string;
 }
 

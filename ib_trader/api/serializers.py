@@ -84,6 +84,8 @@ class BotTradeResponse(BaseModel):
     duration_seconds: int | None = None
     entry_serial: int | None = None
     exit_serial: int | None = None
+    entry_path: str | None = None
+    exit_reason: str | None = None
     created_at: datetime
 
 

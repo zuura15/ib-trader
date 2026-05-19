@@ -32,6 +32,8 @@ def _serialize(t) -> BotTradeResponse:
         duration_seconds=int(t.duration_seconds) if t.duration_seconds is not None else None,
         entry_serial=t.entry_serial,
         exit_serial=t.exit_serial,
+        entry_path=t.entry_path,
+        exit_reason=t.exit_reason,
         created_at=t.created_at,
     )
 

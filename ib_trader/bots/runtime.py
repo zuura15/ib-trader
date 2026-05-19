@@ -1931,6 +1931,14 @@ class StrategyBotRunner(BotBase):
                 duration_seconds=duration,
                 entry_serial=entry_serial,
                 exit_serial=exit_serial,
+                # Analytics fields: organic vs forced entry, trigger
+                # that closed the trade. Populated from the entry_line
+                # (entry_path) and the strategy's exit state
+                # (exit_reason). Force-quit sets exit_reason="force_quit"
+                # in build_exit_actions; force entries set
+                # entry_path="force" in _seed_forced_entry_line.
+                entry_path=entry_path,
+                exit_reason=exit_reason,
                 created_at=exit_time_dt,
             )
             self._bot_trades_repo.create(row)
@@ -1989,6 +1997,12 @@ class StrategyBotRunner(BotBase):
                     entry_tag = str(marginal_filters[0])
                 elif entry_path == "accel":
                     entry_tag = "accel"
+                elif entry_path == "force":
+                    # Operator-forced entry — distinct from clean (no
+                    # filter bypass) and accel (organic structural
+                    # entry past the line). The audit chip renders
+                    # this in its own color.
+                    entry_tag = "force"
                 else:
                     entry_tag = "clean"
                 close_payload = {
@@ -3367,7 +3381,14 @@ class StrategyBotRunner(BotBase):
         self, symbol: str, *, side: str,
     ) -> None:
         """Place the force-entry order. Direction-agnostic — caller
-        passes side ('BUY' for long, 'SELL' for short)."""
+        passes side ('BUY' for long, 'SELL' for short).
+
+        Also emits a BAR_EVAL audit row tagged with ``·force`` so the
+        operator's audit feed visually distinguishes forced entries
+        from organic FIRED·BUY / FIRED·SELL rows. The trade-closed
+        row downstream will already carry entry_path='force' from
+        the seeded entry_line (see _seed_forced_entry_line).
+        """
         config = self.strategy_config
         close_price = Decimal("0")
         redis = self.config.get("_redis")
@@ -3398,6 +3419,13 @@ class StrategyBotRunner(BotBase):
 
         order_strategy = config.get("order_strategy", "mid")
         action_kind = "BUY" if side == "BUY" else "SHORT"
+        # Audit-feed decision tag — parallels organic FIRED·BUY /
+        # FIRED·SELL but with the ·force suffix so the row reads as
+        # an operator override at a glance.
+        bar_decision = (
+            "FIRED·BUY·force" if side == "BUY" else "FIRED·SELL·force"
+        )
+        from ib_trader.bots.strategy import EmitAudit  # local import
 
         actions = [
             LogSignal(
@@ -3411,6 +3439,18 @@ class StrategyBotRunner(BotBase):
                     "symbol": symbol,
                     "qty": qty,
                     "price": str(close_price),
+                },
+            ),
+            EmitAudit(
+                event_type="BAR_EVAL",
+                decision=bar_decision,
+                symbol=symbol,
+                payload={
+                    "force": True,
+                    "side": side,
+                    "qty": qty,
+                    "price": str(close_price) if close_price else None,
+                    "order_strategy": order_strategy,
                 },
             ),
             PlaceOrder(
