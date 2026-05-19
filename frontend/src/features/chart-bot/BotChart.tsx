@@ -577,7 +577,7 @@ export function BotChart({
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
-      <div style={inactiveStyle}>
+      <div>
         <PositionStrip
           state={state}
           fsmState={fsmState}
