@@ -29,11 +29,6 @@ interface Props {
   /** Layout chrome — set false to drop the panel header entirely
    *  (mobile uses the tab strip as the title). Defaults true. */
   showHeader?: boolean;
-  /** Layer-2 testbed: when true, overlays RANSAC fuzzy lines from
-   *  ``/api/sr/fuzzy`` (cyan support / magenta resistance, dashed,
-   *  width by inlier count) on top of the canonical SR fan. Used by
-   *  the fuzzytrader layout's slot 5 pane. Defaults false. */
-  showFuzzyOverlay?: boolean;
 }
 
 /**
@@ -59,7 +54,6 @@ interface Props {
 export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
-  showFuzzyOverlay = false,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -151,9 +145,17 @@ export function BotChart({
   const [showCounterResistance, setShowCounterResistance] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  // Layer-2 fuzzy overlays — both default OFF after 2026-05-20 operator
+  // feedback that the cyan/magenta lines are visually noisy and don't
+  // add much over the canonical SR fan in normal use. Toggles live in
+  // the SR filters popover so they're discoverable but out of the way.
+  // The fetch only fires when at least one is enabled, so OFF state has
+  // zero IB-pacing impact.
+  const [showFuzzyLines, setShowFuzzyLines] = useState(false);
+  const [showFuzzyCurve, setShowFuzzyCurve] = useState(false);
   // Trajectory-curve window in BARS. 3-min cadence → 60 bars = 3 h
-  // (default). Operator-tunable from the chart toolbar; only relevant
-  // when ``showFuzzyOverlay`` is on (fuzzytrader slot).
+  // (default). Operator-tunable from the SR filters popover, only
+  // relevant when ``showFuzzyCurve`` is on.
   //
   // The buffer (curveInput) holds whatever the user is typing right now
   // so React's controlled-input clamp doesn't corrupt mid-typing —
@@ -214,7 +216,11 @@ export function BotChart({
     // operator knows the popover holds a non-default setting even
     // when they leave it closed.
     + (srHidden ? 1 : 0)
-    + (srSourceMode === 'fe' ? 1 : 0);
+    + (srSourceMode === 'fe' ? 1 : 0)
+    // Layer-2 overlays (fuzzy RANSAC lines + trajectory curve) live in
+    // the same popover and contribute to the chip count when on.
+    + (showFuzzyLines ? 1 : 0)
+    + (showFuzzyCurve ? 1 : 0);
 
   useBotState(symbol ?? '', botRef ?? botId, {
     subscribeBot: true,
@@ -514,48 +520,87 @@ export function BotChart({
                 <span>{label}</span>
               </label>
             ))}
+            {/* ── Layer-2 overlays ──────────────────────────────────
+                Off by default — the operator can toggle on per pane
+                without affecting any other chart. Both toggles
+                control whether ``/api/sr/fuzzy`` is fetched, so the
+                IB-pacing cost is zero when both are off. */}
+            <div
+              style={{
+                marginTop: 6, paddingTop: 6,
+                borderTop: '1px solid var(--border-default)',
+                fontSize: 10, color: 'var(--text-muted)',
+              }}
+            >
+              Layer-2 (experimental):
+            </div>
+            <label
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '3px 0', cursor: 'pointer',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showFuzzyLines}
+                onChange={(e) => setShowFuzzyLines(e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>Fuzzy SR lines (RANSAC, cyan / magenta)</span>
+            </label>
+            <label
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '3px 0', cursor: 'pointer',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showFuzzyCurve}
+                onChange={(e) => setShowFuzzyCurve(e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span style={{ flex: 1 }}>Trajectory curve (amber)</span>
+              <input
+                type="number"
+                min={5}
+                max={480}
+                step={5}
+                value={curveInput}
+                disabled={!showFuzzyCurve}
+                onChange={(e) => setCurveInput(e.target.value)}
+                onBlur={commitCurve}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    commitCurve();
+                    (e.currentTarget as HTMLInputElement).blur();
+                  }
+                }}
+                onClick={(e) => e.stopPropagation()}
+                title="Trajectory-curve window in bars (3-min bars; 60 = 3 h). Commit on blur or Enter."
+                style={{
+                  width: 56, fontSize: 11,
+                  padding: '1px 3px',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 3,
+                  background: showFuzzyCurve ? 'var(--panel-bg, #fff)' : 'transparent',
+                  color: showFuzzyCurve ? 'var(--text-primary)' : 'var(--text-muted)',
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              />
+              <span
+                style={{
+                  fontSize: 10,
+                  color: showFuzzyCurve ? 'var(--text-secondary)' : 'var(--text-muted)',
+                }}
+              >
+                bars ({(curveWindowBars * 3 / 60).toFixed(curveWindowBars * 3 % 60 ? 1 : 0)}h)
+              </span>
+            </label>
           </div>
         )}
       </div>
       <BarCloseCountdown />
-      {showFuzzyOverlay && (
-        <label
-          style={{
-            display: 'flex', alignItems: 'center', gap: 4,
-            fontSize: 11, color: 'var(--text-secondary)',
-          }}
-          title="Trajectory-curve window in bars (3-min bars; 60 = 3 h). Commit on blur or Enter."
-        >
-          Curve
-          <input
-            type="number"
-            min={5}
-            max={480}
-            step={5}
-            value={curveInput}
-            onChange={(e) => setCurveInput(e.target.value)}
-            onBlur={commitCurve}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                commitCurve();
-                (e.currentTarget as HTMLInputElement).blur();
-              }
-            }}
-            style={{
-              width: 52, fontSize: 11,
-              padding: '1px 3px',
-              border: '1px solid var(--border-default)',
-              borderRadius: 3,
-              background: 'var(--panel-bg, #fff)',
-              color: 'var(--text-primary)',
-              fontVariantNumeric: 'tabular-nums',
-            }}
-          />
-          <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-            bars ({(curveWindowBars * 3 / 60).toFixed(curveWindowBars * 3 % 60 ? 1 : 0)}h)
-          </span>
-        </label>
-      )}
       <button
         onClick={captureToClipboard}
         disabled={shotBusy}
@@ -641,7 +686,8 @@ export function BotChart({
           paneBackground={inPosition ? ACTIVE_TINT : null}
           suppressAutoSignals
           historicalFires={historicalFires}
-          showFuzzyOverlay={showFuzzyOverlay}
+          showFuzzyLines={showFuzzyLines}
+          showFuzzyCurve={showFuzzyCurve}
           fuzzyCurveWindowBars={curveWindowBars}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />

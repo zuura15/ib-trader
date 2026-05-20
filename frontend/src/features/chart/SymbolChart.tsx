@@ -162,16 +162,18 @@ interface Props {
    *  operator a 24 h record of where it fired, even after the
    *  active entry has exited. */
   historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
-  /** Layer-2 testbed overlay. When true, fetches ``/api/sr/fuzzy``
-   *  on a 30s poll and renders RANSAC-fitted lines + scored pivots
-   *  as additional series in distinct colors (cyan for support,
-   *  magenta for resistance). Channels render as ribbons. Does NOT
-   *  affect the canonical SR fan rendering — they coexist so the
-   *  operator can A/B them on the same chart. */
-  showFuzzyOverlay?: boolean;
+  /** Layer-2 overlay A — RANSAC fuzzy SR lines (cyan / magenta).
+   *  When true, fetches ``/api/sr/fuzzy`` and renders the line set
+   *  as additional LineSeries. Operator-toggled per pane from the
+   *  SR filters popover; default false. */
+  showFuzzyLines?: boolean;
+  /** Layer-2 overlay B — polynomial trajectory curve (amber).
+   *  Independent toggle so the operator can show one without the
+   *  other. Default false. */
+  showFuzzyCurve?: boolean;
   /** Operator-tuned trajectory-curve window in bars. Default 60
    *  (≈ 3 h at 3-min cadence). Forwarded to ``/api/sr/fuzzy`` as
-   *  ``curve_window_bars``. Only effective when ``showFuzzyOverlay``
+   *  ``curve_window_bars``. Only effective when ``showFuzzyCurve``
    *  is true. */
   fuzzyCurveWindowBars?: number;
 }
@@ -195,7 +197,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     paneBackground = null,
     suppressAutoSignals = false,
     historicalFires,
-    showFuzzyOverlay = false,
+    showFuzzyLines = false,
+    showFuzzyCurve = false,
     fuzzyCurveWindowBars,
   }: Props,
   ref,
@@ -2427,15 +2430,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   }, [target?.conId, target?.symbol, target?.secType]);
 
   // -------- Layer-2 fuzzy SR overlay --------
-  // Fetch /api/sr/fuzzy on a 15s cadence whenever ``showFuzzyOverlay``
-  // is true, then render lines as additional LineSeries with distinct
-  // colors (cyan support, magenta resistance). The canonical SR fan
-  // stays drawn beneath — operators eyeball both side by side.
-  // Series are stored in ``fuzzySeriesRef`` so the canonical SR
-  // recompute (which wipes ``srSeriesRef``) doesn't touch them.
+  // Fetch /api/sr/fuzzy on a 15s cadence whenever EITHER fuzzy toggle
+  // is on, then render lines or curve (or both) conditionally. The
+  // canonical SR fan stays drawn beneath — operators eyeball them
+  // side by side. Series are stored in ``fuzzySeriesRef`` so the
+  // canonical SR recompute (which wipes ``srSeriesRef``) doesn't
+  // touch them.
+  const fuzzyEnabled = showFuzzyLines || showFuzzyCurve;
   useEffect(() => {
-    if (!target || !showFuzzyOverlay) {
-      // Clean up any existing fuzzy series when the toggle flips off
+    if (!target || !fuzzyEnabled) {
+      // Clean up any existing fuzzy series when both toggles flip off
       // or the target clears.
       const ch = chartRef.current;
       if (ch) {
@@ -2483,9 +2487,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Support cyan, resistance magenta. Use bright high-contrast
       // colors and SOLID strokes so they're unmistakable against the
       // canonical SR fan (which is the bullish/bearish theme colors).
+      // Skip the entire lines pass when the toggle is off — the
+      // curve toggle can still draw below.
       let drawn = 0;
       let skipped = 0;
-      for (const fl of payload.lines) {
+      const linesToRender = showFuzzyLines ? payload.lines : [];
+      for (const fl of linesToRender) {
         const mapped = fuzzyLineToChartLine(fl, bars);
         if (!mapped) {
           skipped++;
@@ -2539,7 +2546,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // summarizes the shape the price has actually taken (smoothed
       // through tick noise) so the operator can see the underlying
       // trajectory without the wiggle.
-      if (payload.curve && payload.curve.points.length >= 2) {
+      if (showFuzzyCurve
+          && payload.curve && payload.curve.points.length >= 2) {
         try {
           const curveSeries = ch.addSeries(LineSeries, {
             color: '#facc15',  // tailwind amber-400; distinct from SR fan
@@ -2579,7 +2587,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [target?.conId, target?.symbol, target?.secType, showFuzzyOverlay,
+  }, [target?.conId, target?.symbol, target?.secType,
+      showFuzzyLines, showFuzzyCurve, fuzzyEnabled,
       fuzzyCurveWindowBars, chartVersion]);
 
   // Regime fetch — one ADX/ATR/Donchian reading per chart, refreshed
