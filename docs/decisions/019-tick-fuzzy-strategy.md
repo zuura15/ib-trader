@@ -46,8 +46,10 @@ per-bot in YAML if a contract warrants a wider stop.
 | Param                       | Value      | MES (mult=$5, tick=0.25) | MNQ (mult=$2, tick=0.25) |
 |-----------------------------|-----------:|-------------------------:|-------------------------:|
 | Initial SL                  | $10        | 8 ticks                  | 20 ticks                 |
-| Trail activation threshold  | $20        | 16 ticks (4 pts)         | 40 ticks (10 pts)        |
+| Trail activation threshold  | $15        | 12 ticks (3 pts)         | 30 ticks (7.5 pts)       |
 | Trail give-back             | $5         | 4 ticks (1 pt)           | 10 ticks (2.5 pts)       |
+
+(Trail activation lowered $20 → $15 on 2026-05-20 — faster lock-in of small wins. Initial trail-stop at activation = HWM − $5 = +$10, vs +$15 previously.)
 
 Entry-side timing:
 
@@ -138,9 +140,9 @@ pseudo-code, runs on every tick:
         + unrealized_at_current_tick
   hwm  = max(hwm_so_far, pnl)
 
-  if not trail_active and hwm >= +$20:
+  if not trail_active and hwm >= +$15:
      trail_active = True
-     trail_stop_pnl = hwm - $5   # +$15 at activation
+     trail_stop_pnl = hwm - $5   # +$10 at activation
 
   if trail_active:
      trail_stop_pnl = max(trail_stop_pnl, hwm - $5)
@@ -192,7 +194,7 @@ entry_hold_seconds: 10
 entry_bounce_ticks: 5
 mid_fill_timeout_seconds: 10
 initial_sl_dollars: 10
-trail_activation_dollars: 20
+trail_activation_dollars: 15
 trail_giveback_dollars: 5
 # Line selection — final shape TBD pending live-chart observation
 # (ADR open question). Conservative defaults below; expect to tune

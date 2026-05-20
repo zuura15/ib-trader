@@ -16,7 +16,7 @@
 
 # === Exit dollar thresholds ===
 initial_sl_dollars: 10           # hard stop before trail activates
-trail_activation_dollars: 20     # HWM threshold to switch into trail mode
+trail_activation_dollars: 15     # HWM threshold to switch into trail mode (lowered 20→15 on 2026-05-20: faster lock-in of small wins, initial trail stop = +$10)
 trail_giveback_dollars: 5        # trail width = HWM − giveback, ratchet up only
 
 # === Exit order ===
