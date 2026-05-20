@@ -122,6 +122,51 @@ def _safe_int(val) -> int | None:
         return None
 
 
+async def _fresh_prices(
+    ctx: AppContext, con_id: int, symbol: str | None = None,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return (bid, ask, last) — Redis-cache-first, snapshot fallback.
+
+    Order placement (mid / bid-ask / market / smart_market) used to read
+    bid/ask from ``ctx.ib.get_market_snapshot``, which carries a 60-second
+    in-process cache to keep the reprice loop from polling IB every step.
+    On a SECOND order issued within that 60s window the cached snapshot
+    came back unchanged — so the displayed bid/ask, AND the computed
+    limit price, both used 1-minute-stale data while the market had
+    moved. IB fills at the better side of the stale limit (which can
+    look like "lucky fills"), but in a fast-moving market this also
+    means the limit sits at a price that no longer reflects reality.
+
+    Redis carries the live tick stream (pushed by the engine's
+    ``pendingTickersEvent`` handler) — the same source the reprice loop
+    already prefers — so the placement path now reads from there first.
+    Snapshot fallback covers the case where Redis hasn't seen a tick
+    yet for this symbol (cold start, brand-new watchlist add).
+
+    Pure function on the read side; no caching here.
+    """
+    redis = getattr(ctx, "redis", None)
+    if redis is not None and symbol:
+        from ib_trader.redis.state import StateStore, StateKeys
+        store = StateStore(redis)
+        try:
+            q = await store.get(StateKeys.quote_latest(symbol))
+        except Exception:  # noqa: BLE001 — redis errors fall back to snapshot
+            q = None
+        if q:
+            def _d(v):
+                if v in (None, "", 0, "0"):
+                    return Decimal("0")
+                return Decimal(str(v))
+            b = _d(q.get("bid"))
+            a = _d(q.get("ask"))
+            l = _d(q.get("last"))
+            if b > 0 or a > 0 or l > 0:
+                return b, a, l
+    snap = await ctx.ib.get_market_snapshot(con_id)
+    return snap["bid"], snap["ask"], snap["last"]
+
+
 def _write_txn(
     ctx: AppContext,
     action: TransactionAction,
@@ -270,8 +315,8 @@ async def execute_order(
             return
 
     if cmd.dollars is not None:
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        mid = calc_mid(snapshot["bid"], snapshot["ask"], tick_size=tick_size)
+        bid, ask, _ = await _fresh_prices(ctx, con_id, cmd.symbol)
+        mid = calc_mid(bid, ask, tick_size=tick_size)
         qty = calc_shares_from_dollars(
             cmd.dollars, mid, settings["max_order_size_shares"]
         )
@@ -604,8 +649,7 @@ async def _execute_mid_order(
     settings = ctx.settings
     total_steps = int(settings.get("reprice_steps", 10))
 
-    snapshot = await ctx.ib.get_market_snapshot(con_id)
-    bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+    bid, ask, last = await _fresh_prices(ctx, con_id, cmd.symbol)
 
     if bid == 0 and ask == 0:
         if last == 0:
@@ -1035,8 +1079,7 @@ async def _execute_bid_ask_order(
     The order is GTC. If it does not fill within 30 seconds the REPL moves on
     and the daemon reconciler will catch the eventual fill.
     """
-    snapshot = await ctx.ib.get_market_snapshot(con_id)
-    bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+    bid, ask, last = await _fresh_prices(ctx, con_id, cmd.symbol)
 
     if bid == 0 and ask == 0:
         if last == 0:
@@ -1515,8 +1558,7 @@ async def _execute_smart_market_order(
     rth_duration = float(settings.get("smart_market_rth_duration_seconds", 10))
     max_slip = Decimal(str(settings.get("smart_market_eth_max_slippage_pct", 0.005)))
 
-    snapshot = await ctx.ib.get_market_snapshot(con_id)
-    bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+    bid, ask, last = await _fresh_prices(ctx, con_id, cmd.symbol)
     if bid == 0 and ask == 0:
         if last == 0:
             raise ValueError(
@@ -1765,10 +1807,9 @@ async def _execute_market_order(
     """
     if is_outside_rth():
         # Outside RTH: exchanges reject market orders — convert to aggressive limit
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        bid, ask = snapshot["bid"], snapshot["ask"]
+        bid, ask, last = await _fresh_prices(ctx, con_id, cmd.symbol)
         if bid == 0 and ask == 0:
-            bid = ask = snapshot["last"]
+            bid = ask = last
         aggressive_price = ask if side == "BUY" else bid
         if aggressive_price == 0:
             raise ValueError(
@@ -2830,8 +2871,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             event="CLOSE_ORDER_PLACED",
         )
     elif cmd.strategy == Strategy.MID:
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+        bid, ask, last = await _fresh_prices(ctx, con_id, entry_symbol)
         if bid == 0 and ask == 0:
             if last == 0:
                 raise ValueError(
@@ -2860,8 +2900,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             event="CLOSE_ORDER_PLACED",
         )
     elif cmd.strategy in (Strategy.BID, Strategy.ASK):
-        snapshot = await ctx.ib.get_market_snapshot(con_id)
-        bid, ask, last = snapshot["bid"], snapshot["ask"], snapshot["last"]
+        bid, ask, last = await _fresh_prices(ctx, con_id, entry_symbol)
         if bid == 0 and ask == 0:
             if last == 0:
                 raise ValueError(
@@ -2894,10 +2933,9 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         # During overnight session, Blue Ocean ATS rejects market orders.
         # Convert to aggressive limit at the bid (SELL) or ask (BUY).
         if is_outside_rth():
-            snapshot = await ctx.ib.get_market_snapshot(con_id)
-            bid, ask = snapshot["bid"], snapshot["ask"]
+            bid, ask, last = await _fresh_prices(ctx, con_id, entry_symbol)
             if bid == 0 and ask == 0:
-                bid = ask = snapshot["last"]
+                bid = ask = last
             initial_price = bid if close_side == "SELL" else ask
             if initial_price == 0:
                 raise ValueError(
