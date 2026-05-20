@@ -3,7 +3,7 @@ name: "Chart Bot 3 · Micro SPX"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
-manual_entry_only: false
+manual_entry_only: true   # flipped 2026-05-20 so chart-bot-5 (tick_fuzzy) can share MESM6 — both bots can coexist when both are manual-only
 auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
