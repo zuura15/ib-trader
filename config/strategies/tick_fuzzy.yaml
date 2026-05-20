@@ -1,0 +1,27 @@
+# tick_fuzzy strategy parameters (ADR 019, v0.1).
+#
+# All thresholds are dollars-per-contract. The values are designed
+# around MNQ (multiplier $2/pt) as a per-contract MINIMUM; smaller-
+# value contracts use the same dollar floors rather than proportional
+# scaling. Operator can override at the bot level.
+#
+# Exit behaviour (tick-evaluated):
+#   * trail not active and pnl ≤ -initial_sl_dollars      → fire hard SL
+#   * HWM ≥ trail_activation_dollars                      → activate trail
+#   * trail active and pnl ≤ HWM − trail_giveback_dollars → fire trail stop
+#
+# Entry is operator-driven via Force LONG / Force SHORT in v0.1
+# (bot config has manual_entry_only: true). Automated entry on
+# fuzzy-line bounces is the next iteration (ADR 019 §"Entry FSM").
+
+# === Exit dollar thresholds ===
+initial_sl_dollars: 10           # hard stop before trail activates
+trail_activation_dollars: 20     # HWM threshold to switch into trail mode
+trail_giveback_dollars: 5        # trail width = HWM − giveback, ratchet up only
+
+# === Exit order ===
+exit_order_strategy: mid         # walking-mid (existing aggressive behaviour)
+
+# === Bar context ===
+bar_size_seconds: 180            # 3-min bars (audit-feed context only)
+lookback_bars: 60

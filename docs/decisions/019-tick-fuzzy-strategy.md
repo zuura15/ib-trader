@@ -1,7 +1,10 @@
 # ADR 019: Tick-driven fuzzy-line strategy ("tick_fuzzy")
 
 Date: 2026-05-19
-Status: Proposed
+Status: **v0.1 implemented** — exit-first scope on branch
+`feature/fuzzy-trader`. Entry FSM deferred to next iteration; bot
+stays `manual_entry_only: true` and operator force-enters to exercise
+the exit lifecycle.
 
 ## Context
 
@@ -33,10 +36,12 @@ EXISTING code paths untouched: `chart_signal`, `fuzzy_signal`,
 
 ## Locked parameters
 
-All thresholds in dollars per contract so the same config works
-across MES / MNQ / MGC without per-symbol tunable trees. The strategy
-converts $ → ticks once at the engine boundary using
-`contract_multiplier × tick_size`.
+All thresholds in dollars per contract. Values are per-contract
+MINIMUMS designed around MNQ (multiplier $2/pt). Smaller-value
+contracts (e.g. anything with a smaller $/tick than MNQ) use the
+same dollar floors rather than proportional scaling. Larger contracts
+(MES, MGC, MCL) inherit the same floor too — operator can tune up
+per-bot in YAML if a contract warrants a wider stop.
 
 | Param                       | Value      | MES (mult=$5, tick=0.25) | MNQ (mult=$2, tick=0.25) |
 |-----------------------------|-----------:|-------------------------:|-------------------------:|
