@@ -463,7 +463,25 @@ async def refresh_position(symbol: str):
 
 
 _HISTORY_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
-_HISTORY_TTL_SECONDS = 30.0
+# 5-minute TTL. Was 30 s, but the chart pane's parallel fetch pattern
+# (/api/sr + /api/sr/fuzzy + /api/regime + /api/history, each with a
+# different ``(hours, bar_size, include_partial)`` tuple = different
+# cache key) drove 4-5 unique IB historical-data requests per pane
+# every 15 s. With multiple panes per box and TWO boxes (dev + prod)
+# sharing one IB login, this regularly exceeded IB's 60-requests-per-
+# 10-minute pacing limit, surfacing as ``IB_ERROR code=162`` and 502s
+# back to the chart. Bars are 3-min cadence so 5-min stale history is
+# visually invisible; the live tick stream still drives the chart's
+# in-progress bar from a separate WS path.
+_HISTORY_TTL_SECONDS = 300.0
+# How long to serve STALE cache after an IB fetch fails. When IB error
+# 162 (pacing) fires, we'd rather paint slightly older bars than
+# blank the chart with a 502 — the pacing window clears within a
+# minute or two and the next successful fetch refreshes. Without this
+# fallback the chart stayed broken until the operator manually
+# refreshed AFTER pacing cleared, which is exactly the experience the
+# user reported 2026-05-19 / 2026-05-20.
+_HISTORY_STALE_FALLBACK_SECONDS = 1800.0  # 30 min
 
 
 @app.get("/engine/history")
@@ -566,6 +584,25 @@ async def get_history(
             format_date=2,
         )
     except Exception as e:
+        # Stale-cache fallback. The most common failure mode is IB
+        # error 162 (historical-data pacing limit) — usually clears in
+        # 1-2 minutes. Serving the last good bars (up to
+        # ``_HISTORY_STALE_FALLBACK_SECONDS`` old) keeps the chart
+        # alive instead of returning 502 on every poll until pacing
+        # clears. Stale data is preferable to a broken chart for a
+        # 3-min-bar timeframe. ``cached`` was looked up at the top of
+        # this function but rejected for being past the fresh TTL;
+        # we now revisit it as a degraded-quality fallback.
+        if cached is not None:
+            stale_age = now - cached[0]
+            if stale_age < _HISTORY_STALE_FALLBACK_SECONDS:
+                logger.warning(
+                    '{"event": "HISTORY_FETCH_STALE_FALLBACK", '
+                    '"con_id": %d, "stale_age_s": %.1f, '
+                    '"reason": "%s"}',
+                    con_id, stale_age, type(e).__name__,
+                )
+                return cached[1]
         logger.exception('{"event": "HISTORY_FETCH_FAILED", "con_id": %d}', con_id)
         raise HTTPException(status_code=502, detail=f"historical data failed: {e}") from e
 
@@ -604,10 +641,13 @@ async def get_history(
         })
 
     _HISTORY_CACHE[cache_key] = (now, out)
-    # Drop stale cache entries opportunistically so the dict doesn't grow
-    # unbounded across the daemon's lifetime.
-    if len(_HISTORY_CACHE) > 256:
-        for k in [k for k, (t, _) in _HISTORY_CACHE.items() if (now - t) > _HISTORY_TTL_SECONDS]:
+    # Drop entries older than the stale-fallback horizon (NOT the fresh
+    # TTL) so the stale-on-IB-error fallback above still has data to
+    # serve. Past the fallback horizon the entry would be too old to
+    # be useful anyway.
+    if len(_HISTORY_CACHE) > 512:
+        for k in [k for k, (t, _) in _HISTORY_CACHE.items()
+                  if (now - t) > _HISTORY_STALE_FALLBACK_SECONDS]:
             _HISTORY_CACHE.pop(k, None)
     return out
 
