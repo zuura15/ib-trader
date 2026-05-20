@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 
 from ib_trader.data.models import AuditLog
 
@@ -82,7 +83,7 @@ class AuditLogRepository:
         )
         s = self._session()
         s.add(row)
-        s.commit()
+        safe_commit(s)
         return row
 
     def insert_order_placed(
@@ -116,7 +117,7 @@ class AuditLogRepository:
         )
         s = self._session()
         s.add(row)
-        s.commit()
+        safe_commit(s)
         return row
 
     def insert_trade_closed(
@@ -151,7 +152,7 @@ class AuditLogRepository:
         )
         s = self._session()
         s.add(row)
-        s.commit()
+        safe_commit(s)
         return row
 
     def list_recent(

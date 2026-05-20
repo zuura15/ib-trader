@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 
 from ib_trader.data.base import PendingCommandRepositoryBase
 from ib_trader.data.models import PendingCommand, PendingCommandStatus
@@ -32,7 +33,7 @@ class PendingCommandRepository(PendingCommandRepositoryBase):
         """Persist a new pending command and return it."""
         s = self._session()
         s.add(cmd)
-        s.commit()
+        safe_commit(s)
         return cmd
 
     def get(self, cmd_id: str) -> PendingCommand | None:
@@ -74,7 +75,7 @@ class PendingCommandRepository(PendingCommandRepositoryBase):
         cmd.status = status
         if status == PendingCommandStatus.RUNNING:
             cmd.started_at = _now_utc()
-        s.commit()
+        safe_commit(s)
 
     def complete(self, cmd_id: str, status: PendingCommandStatus,
                  output: str | None = None, error: str | None = None) -> None:
@@ -89,7 +90,7 @@ class PendingCommandRepository(PendingCommandRepositoryBase):
         cmd.output = output
         cmd.error = error
         cmd.completed_at = _now_utc()
-        s.commit()
+        safe_commit(s)
 
     def get_by_source(self, source: str, limit: int = 50) -> list[PendingCommand]:
         """Return recent commands from a given source, newest first."""
