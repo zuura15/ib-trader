@@ -161,7 +161,18 @@ interface Props {
    *  ``suppressAutoSignals`` so the bot pane always shows the
    *  operator a 24 h record of where it fired, even after the
    *  active entry has exited. */
-  historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
+  historicalFires?: Array<{
+    barTime: string;
+    side: 'long' | 'short';
+    price: number;
+    /** Entry classification — "touch" | "accel" | "force" | marginal-filter
+     *  name. Forced entries skip the big B/S badge at the pivot bar
+     *  and rely on the +/− fill marker alone (operator request
+     *  2026-05-20 — the B/S was redundant for force entries since the
+     *  pivot bar wasn't what triggered them). Organic entries keep
+     *  both. */
+    entryPath?: string;
+  }>;
   /** Layer-2 overlay A — RANSAC fuzzy SR lines (cyan / magenta).
    *  When true, fetches ``/api/sr/fuzzy`` and renders the line set
    *  as additional LineSeries. Operator-toggled per pane from the
@@ -351,6 +362,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     pivotPrice: number;
     fillTime: UTCTimestamp;
     fillPrice: number;
+    /** When 'force', the pivot-to-fill segment line is skipped — the
+     *  trigger wasn't a structural pivot, so a leader line from the
+     *  fake pivot bar to the fill is misleading. The +/- marker at
+     *  ``fillTime/fillPrice`` still paints. */
+    entryPath?: string;
   };
   const fillRenderRef = useRef<FillRender[]>([]);
   // lightweight-charts LineSeries handles for the pivot→fill segments.
@@ -468,17 +484,28 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         );
         const pivotClose = pivotBar ? pivotBar.close : f.price;
         const fillT = (pivotT + BAR_SECONDS) as UTCTimestamp;
-        out.push({
-          time: pivotT as UTCTimestamp,
-          price: pivotClose,
-          side: f.side === 'short' ? 'S' : 'B',
-        });
+        // Force entries skip the pivot-anchored B/S badge — the
+        // operator pressed Force LONG / Force SHORT at a moment of
+        // their choosing, NOT because a structural pivot fired. A
+        // bullseye-style "B" two slots back is misleading; the +/−
+        // marker at the actual fill price (still emitted below)
+        // tells the right story. Organic entries (touch / accel /
+        // marginal) still get the badge because the pivot IS the
+        // signal that fired.
+        if (f.entryPath !== 'force') {
+          out.push({
+            time: pivotT as UTCTimestamp,
+            price: pivotClose,
+            side: f.side === 'short' ? 'S' : 'B',
+          });
+        }
         fillOut.push({
           side: f.side,
           pivotTime: pivotT as UTCTimestamp,
           pivotPrice: pivotClose,
           fillTime: fillT,
           fillPrice: f.price,
+          entryPath: f.entryPath,
         });
       }
       historicalFiresRef.current = out;
@@ -492,6 +519,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (chart) {
         const colors = themeColors();
         for (const fr of fillOut) {
+          // Skip the pivot→fill leader line for force entries — there
+          // wasn't a real pivot trigger, so the segment connects two
+          // unrelated points and just adds visual clutter.
+          if (fr.entryPath === 'force') continue;
           const colour = fr.side === 'long' ? colors.bullish : colors.bearish;
           try {
             const ds = chart.addSeries(LineSeries, {

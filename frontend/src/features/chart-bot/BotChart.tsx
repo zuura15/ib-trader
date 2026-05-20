@@ -235,7 +235,12 @@ export function BotChart({
   // ISO from the bot's ``entry_bar_time`` field (= the bar that
   // triggered the entry).
   const [historicalFires, setHistoricalFires] = useState<
-    { barTime: string; side: 'long' | 'short'; price: number }[]
+    {
+      barTime: string;
+      side: 'long' | 'short';
+      price: number;
+      entryPath?: string;  // "touch" | "accel" | "force" | "marginal"
+    }[]
   >([]);
   useEffect(() => {
     if (!botId) return;
@@ -246,7 +251,12 @@ export function BotChart({
         const trades = await getBotTrades(botId, 500);
         if (cancelled) return;
         const cutoff = Date.now() - HORIZON_MS;
-        const out: { barTime: string; side: 'long' | 'short'; price: number }[] = [];
+        const out: {
+          barTime: string;
+          side: 'long' | 'short';
+          price: number;
+          entryPath?: string;
+        }[] = [];
         for (const t of trades) {
           // Filter by current chart symbol — after a contract roll
           // (MGCM6 → MGCQ6, etc.) the bot's historical trades still
@@ -295,6 +305,7 @@ export function BotChart({
             barTime: new Date(slotStart).toISOString(),
             side,
             price,
+            entryPath: t.entry_path ?? undefined,
           });
         }
         setHistoricalFires(out);
