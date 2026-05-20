@@ -271,10 +271,14 @@ export function ChartBotPane({ slot }: Props) {
         )}
         {fsmState === 'AWAITING_ENTRY_TRIGGER' && (
           <>
+            {/* No ``title=`` on the force buttons — the native browser
+                tooltip hovers above the button and obscures the price
+                lines underneath at the right moment the operator is
+                about to click. Button labels are self-explanatory;
+                the help text lives in ADR 019 if needed. */}
             <button
               onClick={onForceLong}
               disabled={pendingAction !== null}
-              title="Force a LONG entry now, bypassing all entry filters. Exit logic uses the standard clean 60s SL poll + bar-close line-breach gate (entry price becomes the synthetic anchor)."
               style={{
                 background: 'var(--accent-green)', color: '#fff',
                 border: 'none', borderRadius: 3, padding: '2px 8px',
@@ -289,7 +293,6 @@ export function ChartBotPane({ slot }: Props) {
             <button
               onClick={onForceShort}
               disabled={pendingAction !== null}
-              title="Force a SHORT entry now, bypassing all entry filters. Exit logic uses the standard clean 60s SL poll + bar-close line-breach gate."
               style={{
                 background: 'var(--accent-red)', color: '#fff',
                 border: 'none', borderRadius: 3, padding: '2px 8px',
