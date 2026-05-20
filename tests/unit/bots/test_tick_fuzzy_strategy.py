@@ -13,7 +13,7 @@ import pytest
 from ib_trader.bots.lifecycle import BotState
 from ib_trader.bots.strategies.tick_fuzzy import TickFuzzyStrategy
 from ib_trader.bots.strategy import (
-    PlaceOrder, QuoteUpdate, StrategyContext, UpdateState,
+    OrderFilled, PlaceOrder, QuoteUpdate, StrategyContext, UpdateState,
 )
 
 
@@ -331,3 +331,63 @@ class TestFullLifecycle:
         assert place.side == "SELL"
         upd = next(a for a in out if isinstance(a, UpdateState))
         assert upd.state["exit_reason"] == "trail_stop"
+
+
+# ---------------------------------------------------------------------------
+# active_stop — the PRICE the bot would exit at, surfaced for the
+# PositionStrip UI. Must be set at entry-fill time AND ratchet up as
+# the trail moves. Operator-visible feedback that "an SL exists".
+# ---------------------------------------------------------------------------
+
+class TestActiveStop:
+    def test_seeded_at_entry_fill_long(self, long_strategy):
+        # LONG entry @ 29000, qty 1, mult 2, SL=$10 → stop_price = 29000 - 5
+        ctx = _ctx({"position_direction": "LONG"})
+        out = long_strategy._on_fill(
+            OrderFilled(trade_serial=1, symbol="MNQM6", side="BUY",
+                        fill_price=Decimal("29000"), qty=Decimal("1"),
+                        commission=Decimal("0"), ib_order_id="1"),
+            ctx,
+        )
+        upd = next(a for a in out if isinstance(a, UpdateState))
+        assert Decimal(upd.state["active_stop"]) == Decimal("28995")
+
+    def test_seeded_at_entry_fill_short(self, long_strategy):
+        # SHORT entry @ 29000 → stop_price = 29000 + 5
+        ctx = _ctx({"position_direction": "SHORT"})
+        out = long_strategy._on_fill(
+            OrderFilled(trade_serial=1, symbol="MNQM6", side="SELL",
+                        fill_price=Decimal("29000"), qty=Decimal("1"),
+                        commission=Decimal("0"), ib_order_id="1"),
+            ctx,
+        )
+        upd = next(a for a in out if isinstance(a, UpdateState))
+        assert Decimal(upd.state["active_stop"]) == Decimal("29005")
+
+    def test_quote_updates_active_stop_before_trail(self, long_strategy):
+        # Trail inactive: active_stop should be the initial SL price.
+        ctx = _ctx({"entry_price": "29000", "qty": "1",
+                    "position_direction": "LONG",
+                    "hwm_pnl_dollars": "8",
+                    "trail_active": False,
+                    "trail_stop_pnl_dollars": "0"})
+        # Tick at 29004 → +$8, no SL/trail trigger.
+        out = long_strategy._on_quote(_quote("MNQM6", Decimal("29004")), ctx)
+        upd = out[0]
+        # active_stop still anchored at initial SL price (28995)
+        assert Decimal(upd.state["active_stop"]) == Decimal("28995")
+
+    def test_active_stop_ratchets_with_trail(self, long_strategy):
+        # Trail just activated with HWM=$25, trail_stop_pnl=$20.
+        # active_stop should be trail_stop in PRICE = entry + 10.
+        ctx = _ctx({"entry_price": "29000", "qty": "1",
+                    "position_direction": "LONG",
+                    "hwm_pnl_dollars": "20",
+                    "trail_active": False,
+                    "trail_stop_pnl_dollars": "0"})
+        # Tick at 29012.5 → +$25 → activates trail, trail_stop_pnl = $20.
+        out = long_strategy._on_quote(_quote("MNQM6", Decimal("29012.5")), ctx)
+        upd = out[0]
+        assert upd.state["trail_active"] is True
+        # active_stop = entry + 20/(1*2) = 29010 (locked profit)
+        assert Decimal(upd.state["active_stop"]) == Decimal("29010")

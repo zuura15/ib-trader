@@ -79,6 +79,30 @@ def _dec(v: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
+def _pnl_to_stop_price(
+    *, entry_price: Decimal, qty: Decimal, mult: Decimal,
+    pnl_dollars: Decimal, direction: str,
+) -> Decimal:
+    """Convert a P&L dollar threshold into the price at which the position
+    crosses that threshold.
+
+    LONG  : pnl = (price − entry) × qty × mult  → price = entry + pnl/(qty*mult)
+    SHORT : pnl = (entry − price) × qty × mult  → price = entry − pnl/(qty*mult)
+
+    For an initial SL of -$10 on a LONG with qty=1 and mult=2, the stop
+    price = entry − 10/2 = entry − 5. The frontend's PositionStrip reads
+    ``state.active_stop`` as a price (not a P&L), so this helper lives
+    here to keep the dollar-denominated trail logic separable from the
+    UI's price-based stop display.
+    """
+    denom = qty * mult
+    if denom <= 0:
+        return entry_price
+    if direction == "LONG":
+        return entry_price + pnl_dollars / denom
+    return entry_price - pnl_dollars / denom
+
+
 class TickFuzzyStrategy:
     """Tick-driven dollar-denominated SL + trail. See module docstring."""
 
@@ -260,12 +284,22 @@ class TickFuzzyStrategy:
         sl_hit = (not trail_active) and pnl <= -initial_sl
         trail_hit = trail_active and pnl <= trail_stop
 
+        # Active stop in PRICE for the PositionStrip UI. Equal to the
+        # initial-SL price before trail activates; switches to the
+        # trail-stop price once trail is on, and ratchets up with HWM.
+        active_stop_pnl = trail_stop if trail_active else -initial_sl
+        active_stop_price = _pnl_to_stop_price(
+            entry_price=entry_price, qty=qty, mult=mult,
+            pnl_dollars=active_stop_pnl, direction=direction,
+        )
+
         state_patch: dict = {
             "last_price": str(last),
             "unrealized_pnl": str(pnl),
             "hwm_pnl_dollars": str(hwm),
             "trail_active": trail_active,
             "trail_stop_pnl_dollars": str(trail_stop),
+            "active_stop": str(active_stop_price),
         }
 
         if sl_hit or trail_hit:
@@ -374,10 +408,26 @@ class TickFuzzyStrategy:
         # qty, position_direction, entry_time) is already populated by
         # ``runtime.on_entry_filled``; we only own the dollar-trail
         # bookkeeping.
+        #
+        # Seed ``active_stop`` (PRICE, not dollars) from the initial SL
+        # so the chart-bot PositionStrip shows a concrete stop level the
+        # instant the fill lands. Without this the stop reads "—" until
+        # the first quote tick fires the trail-recompute, which is
+        # operator-confusing ("is the SL even armed?"). active_stop is
+        # the PRICE at which pnl = -initial_sl_dollars.
+        entry_price = _dec(event.fill_price)
+        qty = _dec(event.qty)
+        mult = _dec(self.config.get("contract_multiplier"), Decimal("1"))
+        initial_sl_price = _pnl_to_stop_price(
+            entry_price=entry_price, qty=qty, mult=mult,
+            pnl_dollars=-self._initial_sl(), direction=direction,
+        )
+
         logger.info(
             '{"event": "TICK_FUZZY_ENTRY_FILLED", "direction": "%s", '
-            '"entry_price": "%s", "qty": "%s"}',
-            direction, event.fill_price, event.qty,
+            '"entry_price": "%s", "qty": "%s", '
+            '"initial_sl_price": "%s"}',
+            direction, event.fill_price, event.qty, initial_sl_price,
         )
         return [
             UpdateState({
@@ -385,6 +435,11 @@ class TickFuzzyStrategy:
                 "trail_active": False,
                 "trail_stop_pnl_dollars": "0",
                 "unrealized_pnl": "0",
+                # active_stop is the operator-facing PRICE the bot would
+                # exit at if pnl hit the current threshold. Starts as
+                # the initial-SL price; the quote handler ratchets this
+                # upward as the trail moves.
+                "active_stop": str(initial_sl_price),
                 "exit_reason": None,
                 "exit_detail": None,
             }),
@@ -392,7 +447,8 @@ class TickFuzzyStrategy:
                 event_type=LogEventType.SIGNAL,
                 message=(
                     f"ENTRY filled {direction} @ ${event.fill_price} "
-                    f"qty={event.qty} — armed: SL=-${self._initial_sl()}, "
+                    f"qty={event.qty} — armed: SL=-${self._initial_sl()} "
+                    f"(stop @ ${initial_sl_price}), "
                     f"trail_activate=+${self._trail_activation()}, "
                     f"trail_giveback=${self._trail_giveback()}"
                 ),
