@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 
 from ib_trader.data.models import Bot, BotEvent, BotStatus
 
@@ -26,7 +27,7 @@ class BotRepository:
         """Insert a new bot and return it."""
         s = self._session()
         s.add(bot)
-        s.commit()
+        safe_commit(s)
         return bot
 
     def get(self, bot_id: str) -> Bot | None:
@@ -59,7 +60,7 @@ class BotRepository:
         if status == BotStatus.ERROR and error_message:
             logger.warning('{"event": "BOT_ERROR", "bot_id": "%s", "error": "%s"}',
                            bot_id, error_message[:200])
-        s.commit()
+        safe_commit(s)
 
     def update_heartbeat(self, bot_id: str) -> None:
         """Update the last_heartbeat timestamp."""
@@ -68,7 +69,7 @@ class BotRepository:
         if bot:
             bot.last_heartbeat = _now_utc()
             bot.updated_at = _now_utc()
-            s.commit()
+            safe_commit(s)
 
     def update_signal(self, bot_id: str, signal: str) -> None:
         """Update the last_signal field."""
@@ -77,7 +78,7 @@ class BotRepository:
         if bot:
             bot.last_signal = signal
             bot.updated_at = _now_utc()
-            s.commit()
+            safe_commit(s)
 
     def update_action(self, bot_id: str, action: str) -> None:
         """Update the last_action field and timestamp."""
@@ -87,7 +88,7 @@ class BotRepository:
             bot.last_action = action
             bot.last_action_at = _now_utc()
             bot.updated_at = _now_utc()
-            s.commit()
+            safe_commit(s)
 
     def update_action_raw(self, bot_id: str, action: str | None) -> None:
         """Set last_action to an arbitrary value (including None) without updating last_action_at."""
@@ -96,7 +97,7 @@ class BotRepository:
         if bot:
             bot.last_action = action
             bot.updated_at = _now_utc()
-            s.commit()
+            safe_commit(s)
 
     def increment_trades(self, bot_id: str) -> None:
         """Atomically increment trades_total and trades_today counters.
@@ -110,7 +111,7 @@ class BotRepository:
             Bot.trades_today: Bot.trades_today + 1,
             Bot.updated_at: _now_utc(),
         })
-        s.commit()
+        safe_commit(s)
 
     def update_pnl(self, bot_id: str, pnl_today) -> None:
         """Update pnl_today."""
@@ -119,7 +120,7 @@ class BotRepository:
         if bot:
             bot.pnl_today = pnl_today
             bot.updated_at = _now_utc()
-            s.commit()
+            safe_commit(s)
 
     def delete(self, bot_id: str) -> None:
         """Delete a bot by ID."""
@@ -127,7 +128,7 @@ class BotRepository:
         bot = s.query(Bot).filter(Bot.id == bot_id).first()
         if bot:
             s.delete(bot)
-            s.commit()
+            safe_commit(s)
 
 
 class BotEventRepository:
@@ -143,7 +144,7 @@ class BotEventRepository:
         """Persist a new bot event."""
         s = self._session()
         s.add(event)
-        s.commit()
+        safe_commit(s)
 
     def get_for_bot(self, bot_id: str, limit: int = 100) -> list[BotEvent]:
         """Return recent events for a bot, newest first."""

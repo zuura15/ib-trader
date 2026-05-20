@@ -11,7 +11,9 @@ import traceback
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import time
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import scoped_session, sessionmaker, Session
 
 from ib_trader.data.base import (
@@ -25,6 +27,70 @@ from ib_trader.data.models import (
 from sqlalchemy import event as sa_event
 
 logger = logging.getLogger(__name__)
+
+
+def safe_commit(session: Session, *, retries: int = 3,
+                backoff_seconds: float = 0.1) -> None:
+    """Commit the session, rolling back on failure to keep it usable.
+
+    Two failure modes this guards against:
+
+    1. **Transient SQLite write-lock contention.** With WAL +
+       ``PRAGMA busy_timeout=5000`` (set in ``create_db_engine``),
+       SQLite already retries internally for 5 s before raising
+       ``OperationalError("database is locked")``. We add an
+       application-level fallback that retries the commit a few more
+       times with a small exponential backoff for the rare cases that
+       still slip through.
+
+    2. **Session poisoning.** When ``commit()`` raises, the SQLAlchemy
+       session transitions to a "pending rollback" state. Every
+       subsequent operation on that session raises
+       ``PendingRollbackError`` until something calls ``rollback()``.
+       Because our repositories hold a ``scoped_session`` that is
+       reused across calls, a single failed commit can silently break
+       every subsequent write — observed 2026-05-19 in the
+       ``BOT_RUNNER`` heartbeat loop where one lock event poisoned
+       the session and every later heartbeat write raised
+       ``PendingRollbackError``.
+
+    This helper always calls ``rollback()`` on failure so the session
+    is left clean for the next caller. If retries are exhausted, the
+    original exception is re-raised so the caller sees the failure.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            session.commit()
+            return
+        except OperationalError as e:
+            # Recover the session so it stays usable for the retry /
+            # the caller's next operation.
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            msg = str(e).lower()
+            if "database is locked" in msg and attempt < retries:
+                # Exponential backoff: 0.1 s, 0.2 s, 0.4 s …
+                wait = backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    '{"event": "SAFE_COMMIT_LOCK_RETRY", '
+                    '"attempt": %d, "wait_seconds": %.3f}',
+                    attempt, wait,
+                )
+                time.sleep(wait)
+                continue
+            # Non-lock OperationalError, or final retry on a lock —
+            # re-raise so the caller sees it. Session is already
+            # rolled back, so it's clean for the next caller.
+            raise
+        except Exception:
+            # Any other exception during commit: roll back and re-raise.
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            raise
 
 
 def create_db_engine(db_url: str):
@@ -51,9 +117,22 @@ def create_db_engine(db_url: str):
     if db_url.startswith("sqlite"):
         @sa_event.listens_for(engine, "connect")
         def set_pragmas(dbapi_conn, _):
-            """Enable WAL mode and foreign key enforcement on every connection."""
+            """Enable WAL mode + foreign keys + a 5-second busy timeout on
+            every connection.
+
+            ``busy_timeout=5000`` is the critical defense against transient
+            "database is locked" errors: SQLite will retry the operation
+            internally for up to 5 s before raising ``OperationalError``,
+            instead of giving up immediately (the default ``busy_timeout=0``).
+            Catches the vast majority of writer-vs-writer contention in our
+            multi-process setup (engine + bots + api + db_sink all writing)
+            without surfacing user-visible errors. The session-poisoning
+            guard in ``safe_commit`` below handles whatever still slips
+            through that 5 s window.
+            """
             dbapi_conn.execute("PRAGMA journal_mode=WAL")
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
+            dbapi_conn.execute("PRAGMA busy_timeout=5000")
 
     # Audit hook — every SQL statement gets logged with its caller so we can
     # hunt down code paths that still reach into SQLite when they shouldn't.
@@ -137,7 +216,7 @@ class TradeRepository(TradeRepositoryBase):
         """Persist a new trade group and return it."""
         s = self._session()
         s.add(trade)
-        s.commit()
+        safe_commit(s)
         s.refresh(trade)
         return trade
 
@@ -185,7 +264,7 @@ class TradeRepository(TradeRepositoryBase):
         trade.status = status
         if status == TradeStatus.CLOSED:
             trade.closed_at = _now_utc()
-        s.commit()
+        safe_commit(s)
 
     def update_pnl(self, trade_id: str, pnl: Decimal | None, commission: Decimal) -> None:
         """Update realized P&L and total commission for a trade group.
@@ -200,7 +279,7 @@ class TradeRepository(TradeRepositoryBase):
         if pnl is not None:
             trade.realized_pnl = pnl
         trade.total_commission = commission
-        s.commit()
+        safe_commit(s)
 
     def add_ib_realized_pnl(self, trade_id: str, pnl_delta: Decimal) -> None:
         """Add an IB ``CommissionReport.realizedPNL`` contribution to a trade.
@@ -214,7 +293,7 @@ class TradeRepository(TradeRepositoryBase):
         trade = s.query(TradeGroup).filter(TradeGroup.id == trade_id).one()
         existing = trade.ib_realized_pnl or Decimal("0")
         trade.ib_realized_pnl = existing + pnl_delta
-        s.commit()
+        safe_commit(s)
 
     def next_serial_number(self) -> int:
         """Return the lowest unused integer serial number in range 0–999.
@@ -248,7 +327,7 @@ class RepriceEventRepository(RepriceEventRepositoryBase):
         s = self._session()
         try:
             s.add(evt)
-            s.commit()
+            safe_commit(s)
             s.refresh(evt)
             return evt
         except Exception:
@@ -270,7 +349,7 @@ class RepriceEventRepository(RepriceEventRepositoryBase):
         s = self._session()
         evt = s.query(RepriceEvent).filter(RepriceEvent.id == event_id).one()
         evt.amendment_confirmed = True
-        s.commit()
+        safe_commit(s)
 
 
 class ContractRepository(ContractRepositoryBase):
@@ -309,13 +388,13 @@ class ContractRepository(ContractRepositoryBase):
             existing.fetched_at = contract.fetched_at
         else:
             s.add(contract)
-        s.commit()
+        safe_commit(s)
 
     def invalidate(self, symbol: str) -> None:
         """Delete the cached contract for the symbol, forcing re-fetch."""
         s = self._session()
         s.query(Contract).filter(Contract.symbol == symbol).delete()
-        s.commit()
+        safe_commit(s)
 
     def is_fresh(self, symbol: str, ttl_seconds: int) -> bool:
         """Return True if the cached contract is within the TTL window."""
@@ -349,7 +428,7 @@ class HeartbeatRepository(HeartbeatRepositoryBase):
             existing.pid = pid
         else:
             s.add(SystemHeartbeat(process=process, last_seen_at=_now_utc(), pid=pid))
-        s.commit()
+        safe_commit(s)
 
     def get(self, process: str) -> SystemHeartbeat | None:
         """Return the heartbeat record for a process, or None."""
@@ -364,7 +443,7 @@ class HeartbeatRepository(HeartbeatRepositoryBase):
         """Delete the heartbeat record for a process (on clean exit)."""
         s = self._session()
         s.query(SystemHeartbeat).filter(SystemHeartbeat.process == process).delete()
-        s.commit()
+        safe_commit(s)
 
 
 class AlertRepository(AlertRepositoryBase):
@@ -381,7 +460,7 @@ class AlertRepository(AlertRepositoryBase):
         """Persist a new system alert and return it."""
         s = self._session()
         s.add(alert)
-        s.commit()
+        safe_commit(s)
         s.refresh(alert)
         return alert
 
@@ -400,4 +479,4 @@ class AlertRepository(AlertRepositoryBase):
         s = self._session()
         alert = s.query(SystemAlert).filter(SystemAlert.id == alert_id).one()
         alert.resolved_at = _now_utc()
-        s.commit()
+        safe_commit(s)

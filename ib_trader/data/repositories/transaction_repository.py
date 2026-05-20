@@ -10,6 +10,7 @@ the source of truth for historical state and trade-group linkage.
 from decimal import Decimal
 
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 from sqlalchemy import func
 
 from ib_trader.data.models import (
@@ -50,7 +51,7 @@ class TransactionRepository:
             event.is_terminal = True
         s = self._session()
         s.add(event)
-        s.commit()
+        safe_commit(s)
 
     def sum_commission_for_trade_serial(self, trade_serial: int) -> Decimal:
         """Return the total commission across all FILLED/PARTIAL_FILL
@@ -115,7 +116,7 @@ class TransactionRepository:
             row.commission = existing + delta
             updated += 1
         if updated:
-            s.commit()
+            safe_commit(s)
         return updated
 
     # -----------------------------------------------------------------------

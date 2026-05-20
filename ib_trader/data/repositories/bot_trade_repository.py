@@ -18,6 +18,7 @@ from typing import Optional
 
 from sqlalchemy import func
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 
 from ib_trader.data.models import BotTrade
 
@@ -43,7 +44,7 @@ class BotTradeRepository:
         if trade.created_at is None:
             trade.created_at = _now_utc()
         s.add(trade)
-        s.commit()
+        safe_commit(s)
         return trade
 
     def get(self, trade_id: str) -> Optional[BotTrade]:
@@ -193,7 +194,7 @@ class BotTradeRepository:
         if new_value <= current:
             return False
         row.commission = new_value
-        s.commit()
+        safe_commit(s)
         return True
 
     def add_commission_by_serial(
@@ -227,5 +228,5 @@ class BotTradeRepository:
             row.commission = existing + delta
             updated += 1
         if updated:
-            s.commit()
+            safe_commit(s)
         return updated

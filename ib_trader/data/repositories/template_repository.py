@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import scoped_session, Session
+from ib_trader.data.repository import safe_commit
 
 from ib_trader.data.models import OrderTemplate
 
@@ -26,7 +27,7 @@ class OrderTemplateRepository:
         """Insert a new template and return it."""
         s = self._session()
         s.add(template)
-        s.commit()
+        safe_commit(s)
         return template
 
     def get(self, template_id: str) -> OrderTemplate | None:
@@ -53,7 +54,7 @@ class OrderTemplateRepository:
         t = s.query(OrderTemplate).filter(OrderTemplate.id == template_id).first()
         if t:
             s.delete(t)
-            s.commit()
+            safe_commit(s)
         else:
             logger.warning('{"event": "TEMPLATE_NOT_FOUND", "template_id": "%s"}',
                            template_id)
