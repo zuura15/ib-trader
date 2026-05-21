@@ -1076,13 +1076,32 @@ class InsyncClient(IBClientBase):
             return None
         return trade.orderStatus.status or None
 
-    async def subscribe_market_data(self, con_id: int, symbol: str) -> None:
-        """Subscribe to streaming market data (ref-counted)."""
+    async def subscribe_market_data(
+        self, con_id: int, symbol: str, *, count_ref: bool = True,
+    ) -> None:
+        """Subscribe to streaming market data.
+
+        ``count_ref=True`` (default): bump the per-symbol ref count.
+        Paired with ``unsubscribe_market_data(con_id)`` from the same
+        caller. Used by the bot start/stop lifecycle which needs
+        multi-bot accounting on the same symbol.
+
+        ``count_ref=False``: idempotent ambient subscription. First
+        call creates the subscription with refs=1; subsequent calls
+        for the same con_id are no-ops (NO refs increment). Used by
+        long-lived subscriptions that have no paired unsubscribe —
+        watchlist startup, ``_refresh_positions_cache`` seed, and
+        ``positionEvent`` handler. Without this flag, positionEvent
+        was bumping refs on every IB position push (every minor
+        avg-cost adjustment), leaking 2700+ refs per session and
+        slowing the chart over hours (2026-05-21 incident).
+        """
         _GENERIC_TICKS = "165"  # Misc Stats: avVolume, 52-week high/low
 
         if con_id in self._streaming:
             entry = self._streaming[con_id]
-            entry["refs"] += 1
+            if count_ref:
+                entry["refs"] += 1
 
             # If the existing subscription was created without enriched ticks
             # (e.g. by position loop before watchlist loop), upgrade it by
@@ -1100,10 +1119,11 @@ class InsyncClient(IBClientBase):
                     con_id, symbol,
                 )
 
-            logger.debug(
-                '{"event": "STREAMING_REF_INC", "con_id": %d, "symbol": "%s", "refs": %d}',
-                con_id, symbol, entry["refs"],
-            )
+            if count_ref:
+                logger.debug(
+                    '{"event": "STREAMING_REF_INC", "con_id": %d, "symbol": "%s", "refs": %d}',
+                    con_id, symbol, entry["refs"],
+                )
             return
 
         await self._throttle()
