@@ -2,7 +2,7 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, HistogramSeries,
+  createChart, ColorType, LineSeries, HistogramSeries, CandlestickSeries,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
 } from 'lightweight-charts';
 import { getHistory, getRegime, type RegimeReading } from '../../api/client';
@@ -245,7 +245,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const divergenceSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
   // Auto-detected support/resistance lines on the price pane. Recreated
@@ -783,16 +783,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       },
       crosshair: { mode: 1 },
     });
-    const series = chart.addSeries(LineSeries, {
-      color: colors.line,
-      lineWidth: 2,
+    // Candlestick price series (2026-05-20: switched from LineSeries
+    // so the operator can see intra-bar high/low/range — closes-only
+    // were missing wicks on fast-tape contracts like MNQ where a 3-min
+    // bar can hide a 5-10 point intra-bar excursion. SR detection
+    // still runs on closes (see ``sr_fan.py``); the candles are a
+    // visual upgrade only. Bullish (close >= open) renders green;
+    // bearish renders red. Tracks the theme's bullish/bearish hues
+    // so the dark/light/mocha themes stay coherent.
+    const series = chart.addSeries(CandlestickSeries, {
+      upColor: colors.bullish,
+      downColor: colors.bearish,
+      borderUpColor: colors.bullish,
+      borderDownColor: colors.bearish,
+      wickUpColor: colors.bullish,
+      wickDownColor: colors.bearish,
       // ``priceLineVisible: true`` draws a horizontal dashed line at
-      // the latest data point's value, with a price label on the
-      // right axis. It floats with every ``series.update()`` call,
-      // so it's the visible "this chart is live and this is the
-      // current price" cue that TradingView shows. Without it the
-      // last point updates in place but the visual delta within the
-      // bar is hard to perceive on a slow-moving instrument.
+      // the latest close, with a price label on the right axis. It
+      // floats with every ``series.update()`` call — the visible
+      // "this chart is live and this is the current price" cue.
       priceLineVisible: true,
       lastValueVisible: true,
     });
@@ -2155,7 +2164,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         retryDelayMs = 1500;
         if (cancelled) return;
         const fullBars = toBars(bars);
-        const points = fullBars.map((b) => ({ time: b.time, value: b.close }));
+        // CandlestickSeries payload — one OHLC quadruple per bar. The
+        // SR detector still reads ``barsRef.current`` (stored below);
+        // it consumes closes for pivots regardless of how the chart
+        // visualises the bars.
+        const points = fullBars.map((b) => ({
+          time: b.time,
+          open: b.open,
+          high: b.high,
+          low: b.low,
+          close: b.close,
+        }));
         // Stash the OHLC-rich bars so SR detection (which needs wick
         // high/low) has access. The lightweight-charts price series
         // only carries close, so we keep this parallel structure.
@@ -2228,7 +2247,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         }
 
         if (rsiSeries && points.length >= RSI_DEFAULTS.period + 1) {
-          const closes = points.map((p) => p.value);
+          // RSI is computed on closes — pull from the candle payload.
+          const closes = points.map((p) => p.close);
           const rsiVals = computeRsi(closes, RSI_DEFAULTS.period);
           const rsiPoints: { time: UTCTimestamp; value: number }[] = [];
           for (let i = 0; i < rsiVals.length; i++) {
@@ -2708,25 +2728,36 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const nowSec = localUtcSeconds(new Date());
           const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
             + BAR_SECONDS;
-          series.update({ time: barSec as UTCTimestamp, value: last });
           lastTickBarSecRef.current = barSec;
-          // Mirror the update into the OHLC bars ref so SR pivot
-          // detection (which reads bar.high / bar.low) sees the live
-          // wick. Within the same 3-min bar: extend high/low and
-          // overwrite close. New bar boundary: append a fresh bar
-          // with all four fields = current tick.
+          // Update the OHLC bars ref FIRST so the candle update below
+          // can pull the canonical open/high/low/close. Within the
+          // same 3-min bar: extend high/low and overwrite close. New
+          // bar boundary: append a fresh bar with all four fields =
+          // current tick (the wick will grow as more ticks land).
           const allBars = barsRef.current;
-          const lastBar = allBars[allBars.length - 1];
+          let lastBar = allBars[allBars.length - 1];
           if (lastBar && lastBar.time === barSec) {
             lastBar.close = last;
             if (last > lastBar.high) lastBar.high = last;
             if (last < lastBar.low) lastBar.low = last;
           } else {
-            allBars.push({
+            lastBar = {
               time: barSec as UTCTimestamp,
               open: last, high: last, low: last, close: last,
-            });
+            };
+            allBars.push(lastBar);
           }
+          // Push the candle for the in-progress bar. ``series.update``
+          // overwrites the bar at this time if it exists, appends a
+          // new one otherwise — matches the OHLC ref's "same time"
+          // vs "new time" split above.
+          series.update({
+            time: barSec as UTCTimestamp,
+            open: lastBar.open,
+            high: lastBar.high,
+            low: lastBar.low,
+            close: lastBar.close,
+          });
           // Trigger SR re-evaluation on every live tick. The throttle
           // inside scheduleSrRecomputeRef caps actual recomputes at
           // 1/sec so fast-tape charts don't churn. This is what
