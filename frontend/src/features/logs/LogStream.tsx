@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../../data/store';
 import { formatTime } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
+import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 const levelColor: Record<string, string> = {
   debug: 'var(--text-muted)',
@@ -73,6 +74,11 @@ export function LogStream({
   const lastTimestamp = useRef<string>('');
   const idCounter = useRef(0);
 
+  // Lifted reopen handle so the visibility-wake listener can kick the
+  // socket when the tab returns from background.
+  const wakeRef = useRef<() => void>(() => {});
+  useVisibilityWake(() => wakeRef.current());
+
   // Live mode: stream logs over the WS (backend tails the structured JSON
   // log file). Entries arrive as {type: "log_batch", data: [...]} and are
   // appended as they're written — no poll cadence, no ?after= cursor.
@@ -130,8 +136,19 @@ export function LogStream({
     };
 
     open();
+    wakeRef.current = () => {
+      if (closed) return;
+      if (retry) { clearTimeout(retry); retry = null; }
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch { /* already closed */ }
+        ws = null;
+      }
+      open();
+    };
     return () => {
       closed = true;
+      wakeRef.current = () => {};
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };

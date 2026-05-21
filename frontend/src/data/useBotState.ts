@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useVisibilityWake } from '../hooks/useVisibilityWake';
 
 // Shared shape of the Redis bot FSM doc as streamed over /ws.
 // Additional fields (e.g. ``armed``, ``entry_line`` for chart_signal) flow
@@ -84,6 +85,11 @@ export function useBotState(
 ): void {
   const optsRef = useRef(opts);
   optsRef.current = opts;
+  // Lifted reopen handle so the visibility-wake listener can force a
+  // reconnect when the tab returns from background. The effect below
+  // sets it on mount and clears it on cleanup.
+  const wakeRef = useRef<() => void>(() => {});
+  useVisibilityWake(() => wakeRef.current());
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -140,8 +146,22 @@ export function useBotState(
     };
 
     connect();
+    wakeRef.current = () => {
+      if (cancelled) return;
+      // Drop the throttled-tab socket and any pending backoff so the
+      // user sees a fresh snapshot immediately on tab return.
+      attempt = 0;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch { /* already closed */ }
+        ws = null;
+      }
+      connect();
+    };
     return () => {
       cancelled = true;
+      wakeRef.current = () => {};
       if (timer) clearTimeout(timer);
       if (ws) ws.close();
     };

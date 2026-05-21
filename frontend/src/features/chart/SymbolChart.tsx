@@ -20,6 +20,7 @@ import {
 } from './srBackend';
 import type { ChartTarget } from '../../data/store';
 import { useUserSetting } from '../../data/userSettings';
+import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 export interface SymbolChartHandle {
   resetZoom: () => void;
@@ -184,6 +185,24 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 ) {
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
+
+  // Visibility-wake plumbing. Each data-source useEffect (historical
+  // load, SR, fuzzy, regime, live-tick WS) pushes a callback onto this
+  // set on mount and removes it on cleanup. When the browser tab
+  // returns to ``visible`` after being throttled / discarded, the
+  // single ``useVisibilityWake`` below fires every registered callback
+  // so the chart catches up immediately instead of waiting for the
+  // next 15-30 s poll cycle or for the WS to detect the dead socket.
+  //
+  // ``useState`` (lazy init) gives us a Set whose identity is stable
+  // across renders without the ref-cleanup lint warning a ``useRef``
+  // would trigger.
+  const [wakeSubs] = useState<Set<() => void>>(() => new Set());
+  useVisibilityWake(() => {
+    for (const fn of wakeSubs) {
+      try { fn(); } catch { /* one subscriber crashing must not block others */ }
+    }
+  });
 
   // Wipe sticky buy/sell signals + cached backend SR payload when
   // the user switches to a different symbol. Without this, MGCM6's
@@ -2318,8 +2337,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
     load();
     const id = setInterval(load, REFRESH_INTERVAL_MS);
+    const wake = () => { if (!cancelled) load(); };
+    wakeSubs.add(wake);
     return () => {
       cancelled = true;
+      wakeSubs.delete(wake);
       clearInterval(id);
       if (retryTimer) clearTimeout(retryTimer);
     };
@@ -2397,8 +2419,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
     doFetch();
     const id = window.setInterval(doFetch, 15000);
+    const wake = () => { if (!cancelled) doFetch(); };
+    wakeSubs.add(wake);
     return () => {
       cancelled = true;
+      wakeSubs.delete(wake);
       window.clearInterval(id);
     };
   }, [target?.conId, target?.symbol, target?.secType]);
@@ -2429,8 +2454,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
     doFetch();
     const id = window.setInterval(doFetch, 15000);
+    const wake = () => { if (!cancelled) doFetch(); };
+    wakeSubs.add(wake);
     return () => {
       cancelled = true;
+      wakeSubs.delete(wake);
       window.clearInterval(id);
     };
   }, [target?.conId, target?.symbol, target?.secType]);
@@ -2531,8 +2559,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
     open();
 
+    const wake = () => {
+      if (closed) return;
+      if (retry) { clearTimeout(retry); retry = null; }
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch { /* already closed */ }
+        ws = null;
+      }
+      open();
+    };
+    wakeSubs.add(wake);
+
     return () => {
       closed = true;
+      wakeSubs.delete(wake);
       if (retry) clearTimeout(retry);
       if (ws) {
         ws.onclose = null;
