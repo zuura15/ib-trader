@@ -187,6 +187,12 @@ interface Props {
    *  ``curve_window_bars``. Only effective when ``showFuzzyCurve``
    *  is true. */
   fuzzyCurveWindowBars?: number;
+  /** Price series visualization. ``'candles'`` (default) renders
+   *  OHLC candlesticks so intra-bar wicks are visible; ``'line'``
+   *  renders a 1px close polyline (the pre-2026-05-20 default).
+   *  Changing this rebuilds the chart (lightweight-charts can't
+   *  swap series types in place). */
+  chartStyle?: 'candles' | 'line';
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -211,6 +217,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     showFuzzyLines = false,
     showFuzzyCurve = false,
     fuzzyCurveWindowBars,
+    chartStyle = 'candles',
   }: Props,
   ref,
 ) {
@@ -245,7 +252,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  // Price series — union typed so the same ref holds either a
+  // CandlestickSeries or a LineSeries depending on ``chartStyle``.
+  // The chart-create effect re-runs when chartStyle changes,
+  // disposing the old chart entirely and rebuilding with the new
+  // series type (lightweight-charts can't swap series types in
+  // place).
+  const seriesRef = useRef<
+    ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null
+  >(null);
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const divergenceSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
   // Auto-detected support/resistance lines on the price pane. Recreated
@@ -783,28 +798,33 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       },
       crosshair: { mode: 1 },
     });
-    // Candlestick price series (2026-05-20: switched from LineSeries
-    // so the operator can see intra-bar high/low/range — closes-only
-    // were missing wicks on fast-tape contracts like MNQ where a 3-min
-    // bar can hide a 5-10 point intra-bar excursion. SR detection
-    // still runs on closes (see ``sr_fan.py``); the candles are a
-    // visual upgrade only. Bullish (close >= open) renders green;
-    // bearish renders red. Tracks the theme's bullish/bearish hues
-    // so the dark/light/mocha themes stay coherent.
-    const series = chart.addSeries(CandlestickSeries, {
-      upColor: colors.bullish,
-      downColor: colors.bearish,
-      borderUpColor: colors.bullish,
-      borderDownColor: colors.bearish,
-      wickUpColor: colors.bullish,
-      wickDownColor: colors.bearish,
-      // ``priceLineVisible: true`` draws a horizontal dashed line at
-      // the latest close, with a price label on the right axis. It
-      // floats with every ``series.update()`` call — the visible
-      // "this chart is live and this is the current price" cue.
-      priceLineVisible: true,
-      lastValueVisible: true,
-    });
+    // Price series — candles by default (added 2026-05-20 so the
+    // operator can see intra-bar high/low/range), line as a toggle
+    // when the operator prefers the cleaner close-only look. SR
+    // detection still runs on closes regardless of visualisation;
+    // changing chartStyle does not change strategy behaviour.
+    const series: ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> =
+      chartStyle === 'candles'
+        ? chart.addSeries(CandlestickSeries, {
+            upColor: colors.bullish,
+            downColor: colors.bearish,
+            borderUpColor: colors.bullish,
+            borderDownColor: colors.bearish,
+            wickUpColor: colors.bullish,
+            wickDownColor: colors.bearish,
+            // priceLineVisible draws a horizontal dashed line at the
+            // latest close, with a price label on the right axis.
+            // Floats with every ``series.update()`` — the visible
+            // "this chart is live, this is the current price" cue.
+            priceLineVisible: true,
+            lastValueVisible: true,
+          })
+        : chart.addSeries(LineSeries, {
+            color: colors.line,
+            lineWidth: 2,
+            priceLineVisible: true,
+            lastValueVisible: true,
+          });
 
     let rsi: ISeriesApi<'Line'> | null = null;
     if (showRsi) {
@@ -2073,7 +2093,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       volumeSeriesRef.current = null;
       barsRef.current = [];
     };
-  }, [theme, showRsi]);
+    // chartStyle is a dep because lightweight-charts can't swap a
+    // series type in place — flipping line ↔ candles disposes the
+    // chart and rebuilds with the new series.
+  }, [theme, showRsi, chartStyle]);
 
   // Data fetch + 30s refresh + retry-with-backoff.
   useEffect(() => {
@@ -2135,17 +2158,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         retryDelayMs = 1500;
         if (cancelled) return;
         const fullBars = toBars(bars);
-        // CandlestickSeries payload — one OHLC quadruple per bar. The
-        // SR detector still reads ``barsRef.current`` (stored below);
-        // it consumes closes for pivots regardless of how the chart
-        // visualises the bars.
-        const points = fullBars.map((b) => ({
-          time: b.time,
-          open: b.open,
-          high: b.high,
-          low: b.low,
-          close: b.close,
-        }));
+        // setData payload shape depends on ``chartStyle``. CandlestickSeries
+        // expects OHLC; LineSeries expects ``{time, value}``. The SR
+        // detector reads ``barsRef.current`` regardless and consumes
+        // closes for pivots, so visualisation choice is purely visual.
+        const points: Array<
+          { time: UTCTimestamp; open: number; high: number; low: number; close: number }
+          | { time: UTCTimestamp; value: number }
+        > = chartStyle === 'candles'
+          ? fullBars.map((b) => ({
+              time: b.time,
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+            }))
+          : fullBars.map((b) => ({ time: b.time, value: b.close }));
         // Stash the OHLC-rich bars so SR detection (which needs wick
         // high/low) has access. The lightweight-charts price series
         // only carries close, so we keep this parallel structure.
@@ -2218,8 +2246,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         }
 
         if (rsiSeries && points.length >= RSI_DEFAULTS.period + 1) {
-          // RSI is computed on closes — pull from the candle payload.
-          const closes = points.map((p) => p.close);
+          // RSI is computed on closes. The points array is either
+          // candle-shaped ({open, high, low, close}) or line-shaped
+          // ({value}); use barsRef which always carries OHLC.
+          const closes = fullBars.map((b) => b.close);
           const rsiVals = computeRsi(closes, RSI_DEFAULTS.period);
           const rsiPoints: { time: UTCTimestamp; value: number }[] = [];
           for (let i = 0; i < rsiVals.length; i++) {
@@ -2718,17 +2748,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             };
             allBars.push(lastBar);
           }
-          // Push the candle for the in-progress bar. ``series.update``
+          // Push the bar update for the in-progress slot. ``series.update``
           // overwrites the bar at this time if it exists, appends a
-          // new one otherwise — matches the OHLC ref's "same time"
-          // vs "new time" split above.
-          series.update({
-            time: barSec as UTCTimestamp,
-            open: lastBar.open,
-            high: lastBar.high,
-            low: lastBar.low,
-            close: lastBar.close,
-          });
+          // new one otherwise — matches the OHLC ref's "same time" vs
+          // "new time" split above. Payload shape depends on the
+          // operator-selected ``chartStyle``.
+          if (chartStyle === 'candles') {
+            (series as ISeriesApi<'Candlestick'>).update({
+              time: barSec as UTCTimestamp,
+              open: lastBar.open,
+              high: lastBar.high,
+              low: lastBar.low,
+              close: lastBar.close,
+            });
+          } else {
+            (series as ISeriesApi<'Line'>).update({
+              time: barSec as UTCTimestamp,
+              value: lastBar.close,
+            });
+          }
           // Trigger SR re-evaluation on every live tick. The throttle
           // inside scheduleSrRecomputeRef caps actual recomputes at
           // 1/sec so fast-tape charts don't churn. This is what

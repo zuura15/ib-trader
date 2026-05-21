@@ -153,6 +153,10 @@ export function BotChart({
   // zero IB-pacing impact.
   const [showFuzzyLines, setShowFuzzyLines] = useState(false);
   const [showFuzzyCurve, setShowFuzzyCurve] = useState(false);
+  // Chart visualisation toggle. Candles by default (the 2026-05-20
+  // upgrade); line is the pre-upgrade close-only render for operators
+  // who prefer the cleaner look or compact panes.
+  const [chartStyle, setChartStyle] = useState<'candles' | 'line'>('candles');
   // Trajectory-curve window in BARS. 3-min cadence → 60 bars = 3 h
   // (default). Operator-tunable from the SR filters popover, only
   // relevant when ``showFuzzyCurve`` is on.
@@ -531,6 +535,51 @@ export function BotChart({
                 <span>{label}</span>
               </label>
             ))}
+            {/* ── Chart style ──────────────────────────────────────
+                Candles vs line price series. Changing this disposes
+                the chart and rebuilds — the pivot/SR detector is
+                unaffected (it always reads OHLC), so this is purely
+                a visual choice. */}
+            <div
+              style={{
+                marginTop: 6, paddingTop: 6,
+                borderTop: '1px solid var(--border-default)',
+                fontSize: 10, color: 'var(--text-muted)',
+              }}
+            >
+              Chart style:
+            </div>
+            <div
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '3px 0',
+              }}
+            >
+              {(['candles', 'line'] as const).map((opt) => (
+                <button
+                  key={opt}
+                  type="button"
+                  onClick={() => setChartStyle(opt)}
+                  style={{
+                    flex: 1,
+                    padding: '3px 8px',
+                    fontSize: 11,
+                    border: '1px solid var(--border-default)',
+                    borderRadius: 3,
+                    cursor: 'pointer',
+                    background: chartStyle === opt
+                      ? 'var(--accent-blue)'
+                      : 'var(--panel-bg, #fff)',
+                    color: chartStyle === opt
+                      ? '#fff'
+                      : 'var(--text-primary)',
+                    fontWeight: chartStyle === opt ? 600 : 400,
+                  }}
+                >
+                  {opt === 'candles' ? 'Candles' : 'Line'}
+                </button>
+              ))}
+            </div>
             {/* ── Layer-2 overlays ──────────────────────────────────
                 Off by default — the operator can toggle on per pane
                 without affecting any other chart. Both toggles
@@ -700,6 +749,7 @@ export function BotChart({
           showFuzzyLines={showFuzzyLines}
           showFuzzyCurve={showFuzzyCurve}
           fuzzyCurveWindowBars={curveWindowBars}
+          chartStyle={chartStyle}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
