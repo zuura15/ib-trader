@@ -519,9 +519,27 @@ export const useStore = create<AppStore>((set, get) => ({
         };
         open();
 
+        // Background tabs are throttled / discarded by the browser; the
+        // 2 s reconnect timer may be mid-wait or the socket may be in a
+        // half-closed state when the user returns. On visible, drop the
+        // stale socket and force an immediate reopen so the live ticker
+        // resumes without waiting for the next retry tick.
+        const onVisible = () => {
+          if (document.visibilityState !== 'visible' || closed) return;
+          if (retry) { clearTimeout(retry); retry = null; }
+          if (ws) {
+            ws.onclose = null;
+            try { ws.close(); } catch { /* already closed */ }
+            ws = null;
+          }
+          open();
+        };
+        document.addEventListener('visibilitychange', onVisible);
+
         // Close the WS on page unload so we don't leak open subscriptions.
         window.addEventListener('beforeunload', () => {
           closed = true;
+          document.removeEventListener('visibilitychange', onVisible);
           if (retry) clearTimeout(retry);
           if (ws) { ws.onclose = null; ws.close(); }
         });

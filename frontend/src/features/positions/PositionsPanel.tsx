@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useStore } from '../../data/store';
 import { formatPrice, formatCurrency, pnlClass, formatIbPasteSymbol } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
+import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 function LiveIndicator({ connected }: { connected: boolean }) {
   return (
@@ -160,6 +161,10 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   const [sortKey, setSortKey] = useState<SortKey>('symbol');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
+  // Lifted reopen handle — visibility-wake calls it on tab return.
+  const wakeRef = useRef<() => void>(() => {});
+  useVisibilityWake(() => wakeRef.current());
+
   // Subscribe to positions via WebSocket — push-driven, no polling. The
   // server pushes a fresh snapshot on every position:changes event plus a
   // 30s safety-net re-push.
@@ -196,8 +201,19 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
     };
 
     open();
+    wakeRef.current = () => {
+      if (closed) return;
+      if (retry) { clearTimeout(retry); retry = null; }
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch { /* already closed */ }
+        ws = null;
+      }
+      open();
+    };
     return () => {
       closed = true;
+      wakeRef.current = () => {};
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };

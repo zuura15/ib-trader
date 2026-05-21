@@ -70,6 +70,7 @@ export class WSManager {
   private cmdOutputHandlers = new Map<string, CommandOutputHandler>();
   // Commands subscribed before the WS opened — flushed on connect.
   private pendingCmdSubscriptions = new Set<string>();
+  private visibilityHandler: (() => void) | null = null;
 
   /**
    * Subscribe to live output for a single in-flight command.
@@ -102,7 +103,48 @@ export class WSManager {
     this.onDiff = handlers.onDiff;
     this.onSnapshot = handlers.onSnapshot;
     this.onStatus = handlers.onStatus || null;
+    this.attachVisibilityWake();
     this.connect();
+  }
+
+  /**
+   * Browsers throttle / discard background tabs. When the tab returns
+   * to ``visible`` the backoff timer may be mid-wait or the socket may
+   * be in a half-closed state. Reset state and force an immediate
+   * reconnect so the UI doesn't sit on a stale snapshot until the next
+   * scheduled retry fires.
+   */
+  wakeUp(): void {
+    if (this.destroyed) return;
+    this.reconnectMs = MIN_RECONNECT_MS;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      // Connection looks healthy — leave it. The server will resume
+      // pushing diffs naturally and a forced reconnect would discard
+      // the pending snapshot state on both ends.
+      return;
+    }
+    if (this.ws) {
+      this.ws.onclose = null;
+      try { this.ws.close(); } catch { /* already closed */ }
+      this.ws = null;
+    }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    this.connect();
+  }
+
+  private attachVisibilityWake(): void {
+    if (this.visibilityHandler) return;
+    this.visibilityHandler = () => {
+      if (document.visibilityState === 'visible') this.wakeUp();
+    };
+    document.addEventListener('visibilitychange', this.visibilityHandler);
   }
 
   /**
@@ -112,6 +154,10 @@ export class WSManager {
     this.destroyed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
     if (this.ws) {
       this.ws.onclose = null; // Prevent reconnect
       this.ws.close();

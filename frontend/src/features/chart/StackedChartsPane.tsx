@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { PanelShell } from '../../components/PanelShell';
 import { SymbolChart } from './SymbolChart';
 import type { ChartTarget } from '../../data/store';
+import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 interface BrokerPosition {
   id: string;
@@ -16,6 +17,10 @@ const MAX_ROWS = 6;
 export function StackedChartsPane() {
   const [positions, setPositions] = useState<BrokerPosition[]>([]);
   const [wsLive, setWsLive] = useState(false);
+
+  // Lifted reopen handle — visibility-wake calls it on tab return.
+  const wakeRef = useRef<() => void>(() => {});
+  useVisibilityWake(() => wakeRef.current());
 
   // Mirror PositionsPanel's WS subscription so the stack tracks the
   // same live position list. Keeping a private subscription here (rather
@@ -54,8 +59,19 @@ export function StackedChartsPane() {
     };
 
     open();
+    wakeRef.current = () => {
+      if (closed) return;
+      if (retry) { clearTimeout(retry); retry = null; }
+      if (ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch { /* already closed */ }
+        ws = null;
+      }
+      open();
+    };
     return () => {
       closed = true;
+      wakeRef.current = () => {};
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };
