@@ -247,16 +247,27 @@ class IBClientBase(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def subscribe_market_data(self, con_id: int, symbol: str) -> None:
+    async def subscribe_market_data(
+        self, con_id: int, symbol: str, *, count_ref: bool = True,
+    ) -> None:
         """Subscribe to streaming market data for a contract.
 
-        Ref-counted: calling twice for the same con_id increments the
-        reference count without creating a duplicate IB subscription.
-        Call unsubscribe_market_data to decrement.
+        ``count_ref=True`` (default): ref-counted — calling twice for
+        the same con_id increments the reference count without creating
+        a duplicate IB subscription. Call ``unsubscribe_market_data``
+        to decrement. Used by the bot lifecycle.
+
+        ``count_ref=False``: idempotent ambient subscription — first
+        call subscribes; subsequent calls for the same con_id are
+        no-ops. Use for long-lived ambient subscriptions that have no
+        paired unsubscribe (watchlist, positionEvent). Without this,
+        high-frequency callers (positionEvent fires on every IB
+        position push) leak refs unboundedly.
 
         Args:
             con_id: IB contract ID.
             symbol: Ticker symbol (for logging and contract lookup).
+            count_ref: Whether to bump the ref counter on this call.
         """
         ...
 

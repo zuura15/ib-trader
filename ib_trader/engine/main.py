@@ -295,7 +295,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
                 # default STK qualify path.
                 sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
                 info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
-                await ctx.ib.subscribe_market_data(info["con_id"], sym)
+                # count_ref=False — watchlist is an ambient lifetime
+                # subscription (no paired unsubscribe), so don't take
+                # a refcount slot.
+                await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
                 watchlist_subscribed += 1
             except Exception:
                 logger.warning('{"event": "WATCHLIST_SUB_FAILED", "symbol": "%s"}', sym)
@@ -769,7 +772,10 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
 
         if subscribe_mktdata and sec_type in ("STK", "FUT"):
             try:
-                await ctx.ib.subscribe_market_data(con_id, sym)
+                # count_ref=False — positions-cache seed is one-shot
+                # at startup; positionEvent handler keeps the ambient
+                # subscription alive afterwards. No paired unsub.
+                await ctx.ib.subscribe_market_data(con_id, sym, count_ref=False)
             except Exception as e:
                 logger.debug("market data subscribe failed for %s", sym, exc_info=e)
 
@@ -1266,11 +1272,15 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             logger.debug("seed contract cache (positionEvent) failed", exc_info=e)
 
         # Subscribe to live ticks for STK and FUT so subsequent ticker
-        # reads here and chart updates have a price to show. Idempotent
-        # — wrapper deduplicates by con_id.
+        # reads here and chart updates have a price to show. count_ref=
+        # False because positionEvent fires on every IB position push
+        # (every minor avg-cost adjustment, hundreds of times an hour),
+        # and it has no paired unsubscribe — refcounting here was the
+        # root cause of the 2026-05-21 chart-slowdown leak (2700+
+        # leaked refs over a session).
         if qty != 0 and sec_type in ("STK", "FUT"):
             try:
-                await ctx.ib.subscribe_market_data(con_id, symbol)
+                await ctx.ib.subscribe_market_data(con_id, symbol, count_ref=False)
             except Exception as e:
                 logger.debug(
                     "market data subscribe (positionEvent) failed for %s",
