@@ -3,7 +3,7 @@ name: "Sawtooth RSI \u2014 QQQ"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
-manual_entry_only: false
+manual_entry_only: true   # flipped 2026-05-24 — operator going fully manual via console
 config:
   strategy_name: sawtooth_rsi
   strategy_config: config/strategies/sawtooth_qqq.yaml
