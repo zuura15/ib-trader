@@ -2621,14 +2621,19 @@ async def _handle_close_fill(
                correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
                commission=commission)
 
-    # Compute realized P&L: (exit - entry) * qty * direction - commission
-    # Get entry data from transactions
+    # Compute realized P&L: (exit - entry) * qty * multiplier * direction - commission
+    # Multiplier turns a per-unit price diff into dollars: 1 for STK, 5 for
+    # MES, 10 for MGC, 20 for ZN, etc. close_ctx.multiplier is sourced from
+    # the contract at close-time (see _OrderContext construction), so this
+    # also handles cases where the same root has a different multiplier per
+    # contract month.
     entry_txn = ctx.transactions.get_entry_fill(trade_group.id)
     entry_price = Decimal(str(entry_txn.ib_avg_fill_price)) if entry_txn and entry_txn.ib_avg_fill_price else Decimal("0")
     entry_side = entry_txn.side if entry_txn else ("BUY" if close_ctx.side == "SELL" else "SELL")
     entry_filled_qty = entry_txn.ib_filled_qty or Decimal("0") if entry_txn else Decimal("0")
     direction = Decimal("1") if entry_side == "BUY" else Decimal("-1")
-    this_pnl = (avg_price - entry_price) * qty_filled * direction - commission
+    multiplier = close_ctx.multiplier or Decimal("1")
+    this_pnl = (avg_price - entry_price) * qty_filled * multiplier * direction - commission
 
     # Aggregate with any existing P&L from prior partial closes or profit takers
     existing_pnl = trade_group.realized_pnl or Decimal("0")
@@ -2681,12 +2686,15 @@ async def _handle_close_partial(
                correlation_id=close_ctx.correlation_id, security_type=close_ctx.security_type,
                commission=commission)
 
-    # Get entry data from transactions for P&L calc
+    # Get entry data from transactions for P&L calc. Multiplier turns the
+    # per-unit price diff into dollars (1 for STK, 5 MES, 10 MGC, etc.) —
+    # same correction applied in _handle_close_fill.
     entry_txn = ctx.transactions.get_entry_fill(trade_group.id)
     entry_price = Decimal(str(entry_txn.ib_avg_fill_price)) if entry_txn and entry_txn.ib_avg_fill_price else Decimal("0")
     entry_side = entry_txn.side if entry_txn else ("BUY" if close_ctx.side == "SELL" else "SELL")
     direction = Decimal("1") if entry_side == "BUY" else Decimal("-1")
-    this_pnl = (avg_price - entry_price) * qty_filled * direction - commission
+    multiplier = close_ctx.multiplier or Decimal("1")
+    this_pnl = (avg_price - entry_price) * qty_filled * multiplier * direction - commission
 
     # Aggregate with any existing P&L from prior partial closes
     existing_pnl = trade_group.realized_pnl or Decimal("0")
