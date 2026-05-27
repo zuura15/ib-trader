@@ -677,27 +677,71 @@ async def _stream_command_output_to_ws(
                     return
 
 
-async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
-    """Push broker positions to the WebSocket on every position:changes event.
+def _position_quote_stream_keys(positions: list[dict]) -> set[str]:
+    """Stream keys to watch for live tick-driven P&L updates.
 
-    Sends an initial snapshot, then re-reads and pushes on each event from
-    the engine's position:changes stream. A 30s fallback XREAD timeout
-    re-issues the snapshot so missed events can't strand the client.
+    The engine's tick publisher writes `quote:{symbol}` per IB tick where
+    `symbol` is the STK ticker or the FUT localSymbol (e.g. ``MESM6``).
+    The positions snapshot carries ``symbol`` (STK ticker, FUT root) and
+    ``expiry``, so for FUTs we re-derive the IB-paste form to match the
+    publisher's key. OPT positions are skipped — the engine doesn't
+    publish per-option quote streams.
+    """
+    from ib_trader.redis.streams import StreamNames
+    from ib_trader.utils.symbol import format_ib_paste_symbol
+
+    keys: set[str] = set()
+    for p in positions:
+        sec = (p.get("sec_type") or "").upper()
+        if sec not in ("STK", "FUT"):
+            continue
+        sym = p.get("symbol") or ""
+        if not sym:
+            continue
+        if sec == "FUT":
+            try:
+                key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
+            except Exception:
+                continue
+        else:
+            key_sym = sym
+        keys.add(StreamNames.quote(key_sym))
+    return keys
+
+
+async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
+    """Push broker positions to the WebSocket on every tick or position change.
+
+    Subscribes via XREAD to the union of ``position:changes`` plus one
+    ``quote:{symbol}`` stream per held STK/FUT. On any event a fresh
+    snapshot is fetched and pushed — coalesced by the XREAD block window
+    (~250ms) so a burst of ticks across multiple symbols collapses into
+    a single re-render. A 30 s safety re-push fires when no event arrives
+    so the UI never strands on stale numbers.
     """
     import os
+    import time
     import httpx
     from ib_trader.redis.streams import StreamNames
 
     engine_port = os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
     engine_url = f"http://127.0.0.1:{engine_port}"
 
-    async def push_snapshot():
+    # Max push rate ≈ 4 Hz. XREAD natively batches ticks that arrive
+    # within the same block window, so even on a noisy 10-symbol day
+    # the client sees ≤ 4 re-renders per second.
+    COALESCE_BLOCK_MS = 250
+    SAFETY_RE_PUSH_S = 30.0
+
+    async def fetch_positions() -> list[dict]:
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{engine_url}/engine/positions")
-                positions = resp.json() if resp.status_code == 200 else []
+                return resp.json() if resp.status_code == 200 else []
         except Exception:
-            positions = []
+            return []
+
+    async def push(positions: list[dict]) -> None:
         try:
             await websocket.send_text(_json_dumps({
                 "type": "positions",
@@ -707,22 +751,41 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
             raise asyncio.CancelledError() from e  # WS closed — exit the stream task
 
     # Initial snapshot so the UI hydrates immediately
-    await push_snapshot()
+    positions = await fetch_positions()
+    await push(positions)
+    last_push_ts = time.monotonic()
 
-    last_id = "$"
+    # Build the XREAD watch set: position:changes + one quote:{sym} per holding.
+    watch: dict[str, str] = {StreamNames.position_changes(): "$"}
+    for key in _position_quote_stream_keys(positions):
+        watch[key] = "$"
+
     while True:
         try:
-            results = await redis.xread(
-                {StreamNames.position_changes(): last_id}, block=30000,
-            )
-            # Whether we got an event or timed out, re-push the snapshot.
-            # The event payload isn't rich enough to patch in place, and
-            # position data benefits from a fresh read on every event.
+            results = await redis.xread(watch, block=COALESCE_BLOCK_MS)
+            now = time.monotonic()
+            event_seen = False
             if results:
-                for _stream, entries in results:
-                    for entry_id, _raw in entries:
-                        last_id = entry_id
-            await push_snapshot()
+                event_seen = True
+                for stream, entries in results:
+                    watch[stream] = entries[-1][0]
+
+            should_push = event_seen or (now - last_push_ts) >= SAFETY_RE_PUSH_S
+            if not should_push:
+                continue
+
+            positions = await fetch_positions()
+            await push(positions)
+            last_push_ts = now
+
+            # Reconcile quote-stream subs with the current holdings so a
+            # closed position stops waking us, and a newly-opened one starts.
+            new_quote_keys = _position_quote_stream_keys(positions)
+            current_quote_keys = {k for k in watch if k.startswith("quote:")}
+            for k in new_quote_keys - current_quote_keys:
+                watch[k] = "$"
+            for k in current_quote_keys - new_quote_keys:
+                watch.pop(k, None)
         except (WebSocketDisconnect, asyncio.CancelledError):
             return
         except (ConnectionError, OSError, _RedisConnectionError):
