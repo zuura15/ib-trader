@@ -290,23 +290,21 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
               <th className="text-right" style={thStyle('quantity')} onClick={() => handleSort('quantity')}>
                 Qty{sortIndicator('quantity')}
               </th>
+              <th className="text-right" style={thStyle('pnl')} onClick={() => handleSort('pnl')}>
+                P&L{sortIndicator('pnl')}
+              </th>
               <th className="text-right" style={thStyle('price')} onClick={() => handleSort('price')}>
                 Price{sortIndicator('price')}
               </th>
               <th className="text-right" style={thStyle('avg_cost')} onClick={() => handleSort('avg_cost')}>
                 Avg Cost{sortIndicator('avg_cost')}
               </th>
-              {!compact && (
-                <th className="text-right" style={thStyle('pnl')} onClick={() => handleSort('pnl')}>
-                  P&L{sortIndicator('pnl')}
-                </th>
-              )}
             </tr>
           </thead>
           <tbody>
             {sorted.length === 0 ? (
               <tr>
-                <td colSpan={compact ? 4 : 5} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
+                <td colSpan={5} style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>
                   No positions
                 </td>
               </tr>
@@ -369,25 +367,23 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
                   >
                     {qty > 0 ? '+' : ''}{qty}
                   </td>
+                  <td className={`text-right font-mono ${pnl !== null ? pnlClass(pnl) : ''}`}>
+                    {pnl !== null ? formatCurrency(pnl) : <span className="value-na">—</span>}
+                  </td>
                   <td className="text-right font-mono" style={{ color: 'var(--text-primary)' }}>
                     {mkt !== null ? `$${mkt.toFixed(2)}` : <span className="value-na">—</span>}
                   </td>
                   <td className="text-right font-mono" style={{ color: 'var(--text-secondary)' }}>
                     ${avg.toFixed(2)}
                   </td>
-                  {!compact && (
-                    <td className={`text-right font-mono ${pnl !== null ? pnlClass(pnl) : ''}`}>
-                      {pnl !== null ? formatCurrency(pnl) : <span className="value-na">—</span>}
-                    </td>
-                  )}
                 </tr>
               );
             })}
           </tbody>
-          {sorted.length > 0 && !compact && (
+          {sorted.length > 0 && (
             <tfoot>
               <tr>
-                <td colSpan={4} className="text-right font-semibold text-[10px]"
+                <td colSpan={2} className="text-right font-semibold text-[10px]"
                   style={{ color: 'var(--text-secondary)', borderTop: '1px solid var(--border-default)' }}>
                   TOTAL
                 </td>
@@ -395,6 +391,8 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
                   style={{ borderTop: '1px solid var(--border-default)' }}>
                   {formatCurrency(totalPnl)}
                 </td>
+                <td style={{ borderTop: '1px solid var(--border-default)' }} />
+                <td style={{ borderTop: '1px solid var(--border-default)' }} />
               </tr>
             </tfoot>
           )}
