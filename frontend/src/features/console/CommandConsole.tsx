@@ -331,8 +331,11 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
                   </div>
                 )}
 
-                {/* Output */}
-                {(cmd.output || cmd.status === 'failure') && (!compact || cmd.status === 'failure') && (
+                {/* Output — shown in both layouts. Was previously hidden on
+                    success in compact (mobile) mode, which made completed
+                    orders look like nothing had happened: only the green
+                    checkmark changed, no fill price or confirmation text. */}
+                {(cmd.output || cmd.status === 'failure') && (
                   <div
                     className="pl-6 mt-0.5 whitespace-pre-wrap"
                     style={{
