@@ -709,6 +709,74 @@ def _position_quote_stream_keys(positions: list[dict]) -> set[str]:
     return keys
 
 
+async def _overlay_live_prices(positions: list[dict], redis) -> None:
+    """Replace each position's `market_price` with the latest tick from Redis.
+
+    The engine's positions cache only refreshes ``market_price`` every 60 s
+    (or on positionEvent), so streaming the cache as-is gives the UI a
+    "live frame rate, stale numbers" feel. The engine separately publishes
+    every tick to ``quote:{symbol}:latest`` (60 s TTL). Here we read that
+    key per held STK/FUT and override the cached price — preserving the
+    cache's slow-moving fields (qty, avg_cost, multiplier, expiry).
+
+    Best-effort: any read failure leaves the cached value in place rather
+    than blanking the price. ``last`` is preferred (matches what the chart
+    polyline shows); mid (``(bid+ask)/2``) is the fallback for illiquid
+    symbols that haven't printed a trade yet.
+    """
+    if redis is None or not positions:
+        return
+    from ib_trader.redis.state import StateKeys
+    from ib_trader.utils.symbol import format_ib_paste_symbol
+
+    # Build (position, redis_key) pairs once so we can pipeline the GETs.
+    targets: list[tuple[dict, str]] = []
+    for p in positions:
+        sec = (p.get("sec_type") or "").upper()
+        if sec not in ("STK", "FUT"):
+            continue
+        sym = p.get("symbol") or ""
+        if not sym:
+            continue
+        if sec == "FUT":
+            try:
+                key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
+            except Exception:
+                continue
+        else:
+            key_sym = sym
+        targets.append((p, StateKeys.quote_latest(key_sym)))
+
+    if not targets:
+        return
+
+    try:
+        raw_values = await redis.mget([k for _, k in targets])
+    except Exception:
+        return
+
+    import json as _json
+    for (pos, _key), raw in zip(targets, raw_values):
+        if not raw:
+            continue
+        try:
+            q = _json.loads(raw)
+        except Exception:
+            continue
+        last = q.get("last")
+        bid = q.get("bid")
+        ask = q.get("ask")
+        if last not in (None, "", "None"):
+            pos["market_price"] = str(last)
+        elif bid not in (None, "", "None") and ask not in (None, "", "None"):
+            try:
+                pos["market_price"] = str(round(
+                    (float(bid) + float(ask)) / 2, 4,
+                ))
+            except (TypeError, ValueError):
+                pass
+
+
 async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
     """Push broker positions to the WebSocket on every tick or position change.
 
@@ -737,9 +805,11 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{engine_url}/engine/positions")
-                return resp.json() if resp.status_code == 200 else []
+                positions = resp.json() if resp.status_code == 200 else []
         except Exception:
             return []
+        await _overlay_live_prices(positions, redis)
+        return positions
 
     async def push(positions: list[dict]) -> None:
         try:
