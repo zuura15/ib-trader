@@ -1,4 +1,5 @@
 import type { TabNode } from 'flexlayout-react';
+import type { ReactElement } from 'react';
 import { CommandConsole } from '../features/console/CommandConsole';
 import { LogStream, ErrorStream } from '../features/logs/LogStream';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
@@ -17,8 +18,9 @@ import { ChartPane } from '../features/chart/ChartPane';
 import { StackedChartsPane } from '../features/chart/StackedChartsPane';
 import { ChartBotPane } from '../features/chart-bot/ChartBotPane';
 import { AuditFeedPane } from '../features/audit-feed/AuditFeedPane';
+import { ErrorBoundary } from '../app/ErrorBoundary';
 
-export function componentFactory(node: TabNode) {
+function buildComponent(node: TabNode): ReactElement {
   const component = node.getComponent();
   const config = node.getConfig() || {};
 
@@ -64,4 +66,16 @@ export function componentFactory(node: TabNode) {
     default:
       return <div className="p-4 text-xs" style={{ color: 'var(--text-muted)' }}>Unknown component: {component}</div>;
   }
+}
+
+export function componentFactory(node: TabNode) {
+  // Wrap every pane in its own ErrorBoundary so one pane crashing leaves
+  // the rest of the workstation usable. The label combines component +
+  // tab name so diagnostics point straight at the offender.
+  const label = `${node.getComponent() || 'unknown'}/${node.getName() || ''}`.trim();
+  return (
+    <ErrorBoundary label={label} variant="pane">
+      {buildComponent(node)}
+    </ErrorBoundary>
+  );
 }
