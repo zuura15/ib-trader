@@ -14,14 +14,16 @@
  */
 
 export interface DiagEvent {
-  kind: 'error' | 'rejection' | 'react';
+  kind: 'error' | 'rejection' | 'react' | 'boot' | 'watchdog';
   message: string;
   stack?: string;
   componentStack?: string;
-  source?: string;        // filename or 'react-boundary' / 'window' / 'promise'
+  source?: string;        // filename or 'react-boundary' / 'window' / 'promise' / 'boot'
   ts: string;             // ISO timestamp
   url: string;
   userAgent: string;
+  /** Milliseconds since `boot:script-loaded`, when known. */
+  bootElapsedMs?: number;
 }
 
 const RING_MAX = 25;
@@ -35,20 +37,40 @@ function notify(): void {
   }
 }
 
-export function recordDiag(ev: Omit<DiagEvent, 'ts' | 'url' | 'userAgent'>): void {
+// Captured at module evaluation — earliest reference point we have for
+// timing every subsequent boot milestone. Errors that fire before React
+// renders still get a relative offset.
+const bootStartMs = typeof performance !== 'undefined' ? performance.now() : 0;
+
+export function recordDiag(ev: Omit<DiagEvent, 'ts' | 'url' | 'userAgent' | 'bootElapsedMs'>): void {
   const full: DiagEvent = {
     ...ev,
     ts: new Date().toISOString(),
     url: typeof window !== 'undefined' ? window.location.href : '',
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+    bootElapsedMs: typeof performance !== 'undefined'
+      ? Math.round(performance.now() - bootStartMs)
+      : undefined,
   };
   ring.push(full);
   if (ring.length > RING_MAX) ring.shift();
   try {
-    // eslint-disable-next-line no-console
-    console.error(`[diag:${ev.kind}]`, ev.message, ev.stack || '', ev.componentStack || '');
+    const consoleFn = ev.kind === 'boot' || ev.kind === 'watchdog'
+      // eslint-disable-next-line no-console
+      ? console.info : console.error;
+    consoleFn(`[diag:${ev.kind} +${full.bootElapsedMs}ms]`, ev.message,
+      ev.source || '', ev.stack || '', ev.componentStack || '');
   } catch { /* console not available */ }
   notify();
+}
+
+/** Convenience helper for boot milestones. */
+export function recordBoot(message: string, extra?: Record<string, unknown>): void {
+  recordDiag({
+    kind: 'boot',
+    message: extra ? `${message} ${JSON.stringify(extra)}` : message,
+    source: 'boot',
+  });
 }
 
 export function getDiagRing(): DiagEvent[] {
