@@ -1138,8 +1138,25 @@ class InsyncClient(IBClientBase):
             con_id, symbol,
         )
 
-    async def unsubscribe_market_data(self, con_id: int) -> None:
-        """Unsubscribe from streaming market data (ref-counted)."""
+    async def unsubscribe_market_data(
+        self, con_id: int, *, count_ref: bool = True,
+    ) -> None:
+        """Unsubscribe from streaming market data (ref-counted).
+
+        ``count_ref=True`` (default): mirror of the paired subscribe.
+        Decrement the per-symbol ref count; cancel only when refs reach
+        zero. Used by the bot start/stop lifecycle.
+
+        ``count_ref=False``: no-op. Mirrors ``subscribe_market_data(
+        count_ref=False)`` for ambient subscriptions that have no
+        symmetric tear-down — the watchlist startup, position-cache
+        seed, and positionEvent handler all subscribe ambiently and
+        must not be torn down by a paired unsubscribe call from a
+        different caller (bot stop cycling the same con_id would
+        otherwise zero-out the watchlist's ambient slot).
+        """
+        if not count_ref:
+            return
         entry = self._streaming.get(con_id)
         if entry is None:
             return
@@ -1640,7 +1657,26 @@ class InsyncClient(IBClientBase):
         died, TWS crashed). We distinguish the two via ``_expected_disconnect``
         and only escalate the unexpected case to the engine via the
         registered callback.
+
+        Either way, we clear ``_streaming`` and ``_realtime_bars`` so the
+        local subscription bookkeeping matches reality: IB-side, every
+        subscription is dropped on disconnect. Keeping our dicts in sync
+        means the next ``subscribe_market_data`` call actually issues a
+        fresh ``reqMktData`` instead of short-circuiting on a stale entry
+        (the bug that left the engine with 0 tickers across the IB Gateway
+        02:15 PT self-restart on 2026-05-28).
         """
+        stream_count = len(self._streaming)
+        bar_count = len(self._realtime_bars)
+        self._streaming.clear()
+        self._realtime_bars.clear()
+        if stream_count or bar_count:
+            logger.info(
+                '{"event": "IB_SUBSCRIPTIONS_CLEARED_ON_DISCONNECT", '
+                '"streaming_dropped": %d, "realtime_bars_dropped": %d}',
+                stream_count, bar_count,
+            )
+
         if self._expected_disconnect:
             logger.info('{"event": "IB_DISCONNECTED", "expected": true}')
             return

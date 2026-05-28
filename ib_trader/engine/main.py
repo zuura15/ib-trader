@@ -223,7 +223,20 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         if hasattr(ctx.ib, "set_disconnect_callback"):
             ctx.ib.set_disconnect_callback(lambda: _raise_ib_disconnect_alert(ctx))
         if hasattr(ctx.ib, "set_connect_callback"):
-            ctx.ib.set_connect_callback(lambda: _resolve_ib_disconnect_alert(ctx))
+            # Chain two on-connect actions:
+            #   1. Clear the IB_GATEWAY_RECONNECTING alert (legacy behaviour).
+            #   2. Re-issue every market-data subscription. The engine's local
+            #      _streaming dict was wiped at disconnect (see
+            #      insync_client._on_disconnected); without re-subscribing
+            #      here, the engine reconnects with 0 tickers and the
+            #      tick-publisher silently goes dormant — the failure we
+            #      saw across the IB Gateway 02:15 PT self-restart.
+            ctx.ib.set_connect_callback(
+                lambda: (
+                    _resolve_ib_disconnect_alert(ctx),
+                    _spawn_background(_resubscribe_all_after_reconnect(ctx)),
+                ),
+            )
 
         # Fail fast if the configured account_id isn't one the Gateway
         # can actually trade. IB authenticates at the session level, so
@@ -609,6 +622,61 @@ _IB_RECONNECT_TRIGGERS: frozenset[str] = frozenset({
     "IB_GATEWAY_DISCONNECTED",   # CATASTROPHIC, fired after 5 min
     "IB_GATEWAY_RECONNECTING",   # WARNING, fired immediately
 })
+
+
+async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
+    """Re-issue every market-data subscription after an IB reconnect.
+
+    Mirrors the startup sequence: watchlist symbols first, then held
+    positions. count_ref=False everywhere so we don't bump refs we
+    didn't bump originally. Best-effort — a single failed re-subscribe
+    is logged but doesn't abort the rest.
+
+    Required because ib_async loses all its subscriptions on socket
+    drop and never re-issues them on its own. Without this, the engine
+    reconnects but ends up holding zero tickers — the tick publisher
+    silently goes dormant and the watchdog fires "no quote ticks for
+    infinite" hours later.
+
+    Idempotent — safe to call multiple times (subscribe_market_data
+    short-circuits when the symbol is already in _streaming).
+    """
+    from ib_trader.config.loader import load_watchlist
+    from ib_trader.repl.commands import _is_futures_local_symbol
+
+    started = asyncio.get_event_loop().time()
+    watchlist_ok = watchlist_fail = 0
+    pos_count = 0
+
+    try:
+        symbols = load_watchlist("config/watchlist.yaml")
+    except Exception:
+        logger.exception('{"event": "POSTRECONNECT_WATCHLIST_LOAD_FAILED"}')
+        symbols = []
+    for sym in symbols:
+        try:
+            sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
+            info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
+            await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
+            watchlist_ok += 1
+        except Exception:
+            watchlist_fail += 1
+            logger.warning(
+                '{"event": "POSTRECONNECT_WATCHLIST_SUB_FAILED", "symbol": "%s"}',
+                sym,
+            )
+
+    try:
+        pos_count = await _refresh_positions_cache(ctx, subscribe_mktdata=True)
+    except Exception:
+        logger.exception('{"event": "POSTRECONNECT_POSITION_REFRESH_FAILED"}')
+
+    elapsed = asyncio.get_event_loop().time() - started
+    logger.info(
+        '{"event": "POSTRECONNECT_RESUBSCRIBE_DONE", "duration_s": %.2f, '
+        '"watchlist_ok": %d, "watchlist_failed": %d, "positions_touched": %d}',
+        elapsed, watchlist_ok, watchlist_fail, pos_count,
+    )
 
 
 def _resolve_ib_disconnect_alert(ctx: AppContext) -> None:
