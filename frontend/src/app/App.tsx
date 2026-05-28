@@ -22,67 +22,93 @@ function CatastrophicOverlay() {
       position: 'fixed', inset: 0, zIndex: 99999,
       background: 'rgba(0, 0, 0, 0.85)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      padding: '2rem',
+      padding: '1rem',
     }}>
+      {/* Constrained card with a pinned footer — the Acknowledge button is
+          ALWAYS visible regardless of how many active alerts or how long the
+          messages are. Previous version centered everything in a single
+          flow, so a long message could push the button below the fold and
+          leave the page unusable (the watchdog regression on 2026-05-28). */}
       <div style={{
         background: 'var(--bg-surface, #1a1a2e)',
         border: '2px solid var(--accent-red, #ef4444)',
         borderRadius: '12px',
-        padding: '2rem 2.5rem',
-        maxWidth: '520px',
         width: '100%',
-        textAlign: 'center',
+        maxWidth: '560px',
+        maxHeight: 'calc(100vh - 2rem)',
+        display: 'flex',
+        flexDirection: 'column',
       }}>
         <div style={{
-          fontSize: '2.5rem',
-          marginBottom: '0.75rem',
+          padding: '1.5rem 2rem 0.75rem',
+          textAlign: 'center',
+          borderBottom: '1px solid rgba(239, 68, 68, 0.3)',
         }}>
-          &#9888;
+          <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>&#9888;</div>
+          <h2 style={{
+            color: 'var(--accent-red, #ef4444)',
+            fontSize: '1.1rem',
+            fontWeight: 700,
+            letterSpacing: '0.02em',
+            margin: 0,
+            paddingBottom: '0.75rem',
+          }}>
+            SYSTEM ALERT{active.length > 1 ? ` · ${active.length} active` : ''}
+          </h2>
         </div>
-        <h2 style={{
-          color: 'var(--accent-red, #ef4444)',
-          fontSize: '1.25rem',
-          fontWeight: 700,
-          marginBottom: '1rem',
-          letterSpacing: '0.02em',
+        <div style={{
+          flex: 1,
+          minHeight: 0,
+          overflowY: 'auto',
+          padding: '1rem 2rem',
         }}>
-          SYSTEM ALERT
-        </h2>
-        {active.map((a) => (
-          <div key={a.id} style={{ marginBottom: '1rem' }}>
-            <div style={{
-              color: 'var(--text-primary, #e2e8f0)',
-              fontSize: '0.95rem',
-              fontWeight: 600,
-              marginBottom: '0.35rem',
+          {active.map((a) => (
+            <div key={a.id} style={{
+              marginBottom: '0.75rem',
+              paddingBottom: '0.75rem',
+              borderBottom: '1px solid rgba(255,255,255,0.05)',
             }}>
-              {a.title}
+              <div style={{
+                color: 'var(--text-primary, #e2e8f0)',
+                fontSize: '0.9rem',
+                fontWeight: 600,
+                marginBottom: '0.25rem',
+              }}>
+                {a.title}
+              </div>
+              <div style={{
+                color: 'var(--text-muted, #94a3b8)',
+                fontSize: '0.8rem',
+                lineHeight: 1.5,
+              }}>
+                {a.message}
+              </div>
             </div>
-            <div style={{
-              color: 'var(--text-muted, #94a3b8)',
+          ))}
+        </div>
+        <div style={{
+          padding: '0.75rem 2rem 1.25rem',
+          borderTop: '1px solid rgba(239, 68, 68, 0.3)',
+          display: 'flex',
+          justifyContent: 'center',
+          gap: '0.5rem',
+        }}>
+          <button
+            onClick={() => active.forEach((a) => dismissAlert(a.id))}
+            style={{
+              padding: '0.5rem 1.5rem',
+              background: 'var(--accent-red, #ef4444)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '6px',
               fontSize: '0.85rem',
-              lineHeight: 1.5,
-            }}>
-              {a.message}
-            </div>
-          </div>
-        ))}
-        <button
-          onClick={() => active.forEach((a) => dismissAlert(a.id))}
-          style={{
-            marginTop: '1rem',
-            padding: '0.5rem 1.5rem',
-            background: 'var(--accent-red, #ef4444)',
-            color: '#fff',
-            border: 'none',
-            borderRadius: '6px',
-            fontSize: '0.85rem',
-            fontWeight: 600,
-            cursor: 'pointer',
-          }}
-        >
-          Acknowledge
-        </button>
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Acknowledge {active.length > 1 ? `all (${active.length})` : ''}
+          </button>
+        </div>
       </div>
     </div>
   );

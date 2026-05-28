@@ -56,9 +56,10 @@ PT = ZoneInfo("America/Los_Angeles")
 # Tunables — kept module-local; overridable via settings.yaml.
 DEFAULT_SILENCE_THRESHOLD_S = 60
 DEFAULT_WATCHDOG_INTERVAL_S = 15
-DEFAULT_ALERT_DEBOUNCE_S = 300  # one alert per 5 min of continuous silence
-DEFAULT_RECONNECT_PT = "02:30"  # daily reconnect time
-DEFAULT_RECONNECT_MAX_GAP_HOURS = 30  # force a cycle if none happened in this window
+DEFAULT_STARTUP_GRACE_S = 120        # no alerts in the first 2 min after loop start
+DEFAULT_MIN_CONFIRMATIONS = 3        # require 3 consecutive silent polls before alerting
+DEFAULT_RECONNECT_PT = "02:30"       # daily reconnect time
+DEFAULT_RECONNECT_MAX_GAP_HOURS = 30 # force a cycle if none happened in this window
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +226,25 @@ async def reconnect_ib(ctx: "AppContext", *, source: str) -> ReconnectResult:
 # ---------------------------------------------------------------------------
 
 async def tick_silence_watchdog_loop(ctx: "AppContext") -> None:
-    """Detect quote-stream silence and surface it loudly.
+    """Detect quote-stream silence and surface it loudly (once).
 
     Polls every ``interval_s`` seconds. When the silence exceeds
     ``threshold_s`` AND we expect ticks (session window check), dump
-    rich ib_async state and fire a CATASTROPHIC alert. Debounced via
-    ``alert_debounce_s`` so a long stall doesn't generate one alert
-    per poll.
+    rich ib_async state and fire a single dedup'd WARNING alert
+    (overwrites the same row on every re-fire — see ``dedup_key`` in
+    ``log_and_alert``). Severity is WARNING because the symptom is
+    "trading data may be stale" — important to flag, but not "halt
+    the universe behind a blocking modal."
+
+    Two startup-grace mechanisms protect against false positives:
+
+      * ``startup_grace_s`` — no alerts at all for the first N seconds
+        after this loop starts, so the engine's own subscribe-watchlist
+        / refresh-positions sequence has room to publish the first
+        heartbeat.
+      * ``min_confirmations`` — N consecutive silence detections needed
+        before alerting. Suppresses single-poll glitches and the
+        "fresh-start, heartbeat key not yet written" race.
     """
     interval_s = float(ctx.settings.get(
         "tick_watchdog_interval_seconds", DEFAULT_WATCHDOG_INTERVAL_S,
@@ -239,63 +252,84 @@ async def tick_silence_watchdog_loop(ctx: "AppContext") -> None:
     threshold_s = float(ctx.settings.get(
         "tick_watchdog_silence_threshold_seconds", DEFAULT_SILENCE_THRESHOLD_S,
     ))
-    debounce_s = float(ctx.settings.get(
-        "tick_watchdog_alert_debounce_seconds", DEFAULT_ALERT_DEBOUNCE_S,
+    startup_grace_s = float(ctx.settings.get(
+        "tick_watchdog_startup_grace_seconds", DEFAULT_STARTUP_GRACE_S,
+    ))
+    min_confirmations = int(ctx.settings.get(
+        "tick_watchdog_min_confirmations", DEFAULT_MIN_CONFIRMATIONS,
     ))
 
-    last_alert_mono: float | None = None
+    loop_started_mono = asyncio.get_event_loop().time()
+    consecutive_silent = 0
 
     while True:
         try:
             await asyncio.sleep(interval_s)
+
+            # Startup grace: don't even evaluate for the first N seconds.
+            if (asyncio.get_event_loop().time() - loop_started_mono) < startup_grace_s:
+                continue
+
             silence = await _heartbeat_silence_seconds(ctx)
             if silence is None:
-                # Heartbeat key missing entirely. Treat as a hard "no data"
-                # signal — but only after the first interval, to avoid
-                # firing during the engine's own startup gap.
+                # Heartbeat key missing → treat as a long silence (the TTL
+                # already expired, or the publisher hasn't published yet).
                 silence = float("inf")
+
             if silence <= threshold_s:
+                consecutive_silent = 0
                 continue
+
             if not _ticks_expected_now():
+                consecutive_silent = 0
                 logger.debug(
                     '{"event": "TICK_WATCHDOG_SILENCE_IGNORED", '
-                    '"silence_s": %.1f, "reason": "ticks_not_expected"}',
-                    silence if silence != float("inf") else -1,
+                    '"silence_s": %s, "reason": "ticks_not_expected"}',
+                    "null" if silence == float("inf") else f"{silence:.1f}",
+                )
+                continue
+
+            consecutive_silent += 1
+            if consecutive_silent < min_confirmations:
+                logger.debug(
+                    '{"event": "TICK_WATCHDOG_SILENCE_UNCONFIRMED", '
+                    '"consecutive": %d, "required": %d}',
+                    consecutive_silent, min_confirmations,
                 )
                 continue
 
             # Snapshot ib_async state for postmortem before alerting.
             snapshot = _capture_ib_state(ctx)
             silence_display = (
-                "infinite" if silence == float("inf") else f"{silence:.1f}s"
+                "60s+" if silence == float("inf") else f"{silence:.0f}s"
             )
             logger.error(
                 '{"event": "TICK_WATCHDOG_SILENCE_DETECTED", '
-                '"silence_s": %s, "ib_state": %s}',
+                '"silence_s": %s, "consecutive": %d, "ib_state": %s}',
                 "null" if silence == float("inf") else f"{silence:.1f}",
-                json.dumps(snapshot, default=str),
+                consecutive_silent, json.dumps(snapshot, default=str),
             )
 
-            now_mono = asyncio.get_event_loop().time()
-            if last_alert_mono is None or (now_mono - last_alert_mono) >= debounce_s:
-                last_alert_mono = now_mono
-                try:
-                    from ib_trader.logging_.alerts import log_and_alert
-                    await log_and_alert(
-                        redis=ctx.redis,
-                        trigger="TICK_STREAM_SILENT",
-                        message=(
-                            f"No quote ticks for {silence_display}. "
-                            f"IB connection reports {snapshot.get('connState')!r}, "
-                            f"ib_async holds {snapshot.get('ticker_count')} ticker(s). "
-                            "Trading bots may be sitting on stale prices. "
-                            "Try POST /engine/ib/reconnect to recover."
-                        ),
-                        severity="CATASTROPHIC",
-                        exc_info=False,
-                    )
-                except Exception:
-                    logger.exception('{"event": "TICK_WATCHDOG_ALERT_FAILED"}')
+            try:
+                from ib_trader.logging_.alerts import log_and_alert
+                await log_and_alert(
+                    redis=ctx.redis,
+                    trigger="TICK_STREAM_SILENT",
+                    message=(
+                        f"Quote stream silent ≥{silence_display}. "
+                        f"IB connState={snapshot.get('connState')}, "
+                        f"tickers held={snapshot.get('ticker_count')}. "
+                        "Trading bots may be on stale prices. "
+                        "Try POST /api/system/ib/reconnect to recover."
+                    ),
+                    severity="WARNING",  # amber banner, not blocking modal
+                    exc_info=False,
+                    # Stable id — every re-fire overwrites the same row
+                    # instead of piling up new alerts.
+                    dedup_key="watchdog:tick-stream",
+                )
+            except Exception:
+                logger.exception('{"event": "TICK_WATCHDOG_ALERT_FAILED"}')
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -76,6 +76,7 @@ async def log_and_alert(
     ib_order_id: str | None = None,
     extra: dict[str, Any] | None = None,
     exc_info: bool = True,
+    dedup_key: str | None = None,
 ) -> None:
     """Log the failure at ERROR and publish an alert to ``alerts:active``.
 
@@ -114,7 +115,20 @@ async def log_and_alert(
     if redis is None:
         return
 
-    alert_id = str(uuid.uuid4())
+    # ``dedup_key`` derives a stable alert_id so repeated firings of the
+    # same condition (e.g. "tick stream silent") update one row instead
+    # of piling up. Without this the watchdog accumulated 140+ duplicate
+    # CATASTROPHIC alerts in ~17 h, each rendered as a separate blocking
+    # modal — the page became unusable. Callers that don't pass a
+    # dedup_key keep the legacy "one-row-per-fire" behaviour (e.g. a
+    # one-off order rejection that wants its own audit entry).
+    if dedup_key:
+        # uuid5 is deterministic — same key → same id. The namespace is
+        # arbitrary but stable; ``trigger`` keeps two callers using the
+        # same dedup_key under different triggers from colliding.
+        alert_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{trigger}|{dedup_key}"))
+    else:
+        alert_id = str(uuid.uuid4())
     alert_dict: dict[str, Any] = {
         "id": alert_id,
         "severity": severity,
