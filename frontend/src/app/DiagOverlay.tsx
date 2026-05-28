@@ -37,26 +37,30 @@ export function DiagOverlay() {
 
     const checkVisual = () => {
       const root = document.getElementById('root');
-      const layout = document.querySelector('.flexlayout__layout');
+      // Mobile uses a swipe container (no flexlayout); desktop uses
+      // .flexlayout__layout. The watchdog needs to know EITHER is fine —
+      // the previous version only looked for flexlayout and auto-fired
+      // the overlay on every mobile page load.
+      const desktopLayout = document.querySelector('.flexlayout__layout');
+      const mobileLayout = document.querySelector('.mobile-swipe-container');
+      const layout = desktopLayout || mobileLayout;
       const rootRect = root?.getBoundingClientRect();
       const layoutRect = (layout as HTMLElement | null)?.getBoundingClientRect();
       const rootOk = !!rootRect && rootRect.width > 50 && rootRect.height > 50;
       const layoutOk = !!layoutRect && layoutRect.width > 50 && layoutRect.height > 50;
       const styleSheets = document.styleSheets.length;
-      const headerPresent = !!document.querySelector('header');
 
       recordBoot('watchdog-check', {
         rootRect: rootRect ? `${Math.round(rootRect.width)}x${Math.round(rootRect.height)}` : null,
         layoutRect: layoutRect ? `${Math.round(layoutRect.width)}x${Math.round(layoutRect.height)}` : null,
+        layoutFlavor: desktopLayout ? 'desktop' : mobileLayout ? 'mobile' : 'none',
         styleSheets,
-        headerPresent,
       });
 
-      const suspicious =
-        !root || !rootOk ||
-        // We expect either the workstation's <header> (desktop) or the
-        // mobile layout to have rendered something visible by now.
-        (!layoutOk && !headerPresent);
+      // White-screen signal: root is missing/zero-sized, OR no recognized
+      // layout shell rendered. Either flavor counts — only the absence of
+      // BOTH is the trigger.
+      const suspicious = !root || !rootOk || !layoutOk;
       if (suspicious) {
         recordDiag({
           kind: 'watchdog',
