@@ -212,3 +212,15 @@ def setup_logging(
     root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(stream_handler)
+
+    # Mute third-party transport plumbing — httpx + httpcore log every
+    # internal step of every HTTP exchange at DEBUG. With ib-api proxying
+    # to the engine on a tight cadence, this fills ib_trader.log with
+    # ~10 MB / 30 min of `connect_tcp.started` / `receive_response_body`
+    # noise and rotates every structured engine event off disk (we lost
+    # ~13 days of TICK_PUBLISHER_HEARTBEAT etc. before the 14:45 PT
+    # market-data silence on 2026-05-27, which left us unable to root-
+    # cause the symptom from logs). WARNING is enough — real transport
+    # errors still surface.
+    for noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

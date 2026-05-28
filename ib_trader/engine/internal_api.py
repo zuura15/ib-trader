@@ -904,6 +904,30 @@ async def health():
     )
 
 
+@app.post("/engine/ib/reconnect")
+async def reconnect_ib_endpoint():
+    """Drop the IB socket and reconnect, then re-subscribe market data.
+
+    Same code path the daily scheduler uses (see
+    ``engine/ib_resilience.py``). Returns a structured summary —
+    duration, per-subscription counts, pre-cycle silence — so the caller
+    can confirm the cycle actually re-anchored the upstream session.
+
+    Intended for operator use when the tick-silence watchdog has fired
+    or when the user notices stale prices. Safe to call repeatedly;
+    each call is one full disconnect → connect → resubscribe cycle.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    try:
+        from ib_trader.engine.ib_resilience import reconnect_ib
+        result = await reconnect_ib(_ctx, source="manual")
+        return result.__dict__
+    except Exception as e:
+        logger.exception('{"event": "MANUAL_IB_RECONNECT_FAILED"}')
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 def set_context(ctx) -> None:
     """Set the AppContext for the internal API handlers."""
     global _ctx

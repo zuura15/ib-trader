@@ -33,6 +33,34 @@ async def get_system_health():
     return {"status": "ok", "pid": _os.getpid()}
 
 
+@router.post("/system/ib/reconnect")
+async def post_ib_reconnect():
+    """Proxy to the engine's manual IB-reconnect endpoint.
+
+    Surfaces ``POST /engine/ib/reconnect`` to the LAN so the operator
+    can trigger a reconnect cycle from the browser console / a curl
+    on the laptop, e.g. when the tick-silence watchdog has fired.
+    Returns the engine's structured ReconnectResult dict.
+    """
+    import os as _os
+    import httpx
+    from fastapi import HTTPException
+
+    port = _os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
+    url = f"http://127.0.0.1:{port}/engine/ib/reconnect"
+    # Reconnect can take 10–30 s on a slow IB Gateway; give it room.
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url)
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=503, detail=f"engine unreachable: {e}") from e
+    except httpx.TimeoutException as e:
+        raise HTTPException(status_code=504, detail=f"engine reconnect timeout: {e}") from e
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
 @router.get("/status")
 async def get_status(
     redis=Depends(get_redis),
