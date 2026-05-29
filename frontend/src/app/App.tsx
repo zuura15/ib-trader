@@ -182,7 +182,15 @@ export function App() {
   const tickSimulation = useStore((s) => s.tickSimulation);
   const initWebSocket = useStore((s) => s.initWebSocket);
   const initWatchlist = useStore((s) => s.initWatchlist);
-  const isMobile = useIsMobile();
+  const layoutOverride = useStore((s) => s.layoutOverride);
+  const viewportIsMobile = useIsMobile();
+  // Manual override beats viewport detection so users can force a layout
+  // when the browser misreports its viewport (Chrome Android's "Desktop
+  // site" / UA-Client-Hints stickiness is the recurring case).
+  const isMobile =
+    layoutOverride === 'mobile' ? true
+    : layoutOverride === 'desktop' ? false
+    : viewportIsMobile;
 
   useEffect(() => {
     if (dataMode === 'live') {

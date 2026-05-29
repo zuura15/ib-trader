@@ -3,6 +3,7 @@ import { useStore } from '../../data/store';
 import { formatCurrency } from '../../utils/format';
 import type { LayoutVariant, ThemeMode } from '../../types';
 import { SettingsModal } from '../settings/SettingsModal';
+import { LayoutToggle } from './LayoutToggle';
 
 const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
   { id: 'dark',     label: 'Midnight', icon: '🌑' },
@@ -185,6 +186,11 @@ export function GlobalHeader() {
             ))}
           </div>
         </div>
+
+        {/* Layout override (auto / mobile / desktop) — escapes Chrome's
+            sticky "Desktop site" preference when the viewport heuristic
+            disagrees with what the user actually wants. */}
+        <LayoutToggle size="sm" />
 
         {/* Settings */}
         <button

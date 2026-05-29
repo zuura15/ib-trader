@@ -46,6 +46,14 @@ interface AppStore {
   theme: ThemeMode;
   setTheme: (t: ThemeMode) => void;
 
+  // Layout override — manual escape from Chrome's "Desktop site" /
+  // UA-Client-Hints viewport trickery. ``auto`` (default) defers to the
+  // matchMedia(max-width: 767px) check in App.useIsMobile; ``mobile``
+  // and ``desktop`` force the corresponding layout regardless of the
+  // browser's reported viewport.
+  layoutOverride: 'auto' | 'mobile' | 'desktop';
+  setLayoutOverride: (v: 'auto' | 'mobile' | 'desktop') => void;
+
   // Global state
   global: GlobalState;
   updateGlobal: (partial: Partial<GlobalState>) => void;
@@ -189,6 +197,19 @@ export const useStore = create<AppStore>((set, get) => ({
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('ib-theme', next);
     set({ theme: next });
+  },
+
+  layoutOverride: (() => {
+    const v = localStorage.getItem('ib-layout-override');
+    return v === 'mobile' || v === 'desktop' ? v : 'auto';
+  })(),
+  setLayoutOverride: (next) => {
+    if (next === 'auto') {
+      localStorage.removeItem('ib-layout-override');
+    } else {
+      localStorage.setItem('ib-layout-override', next);
+    }
+    set({ layoutOverride: next });
   },
 
   global: {

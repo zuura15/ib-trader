@@ -1,5 +1,6 @@
 import { useStore } from '../../data/store';
 import type { ThemeMode } from '../../types';
+import { LayoutToggle } from './LayoutToggle';
 
 const THEME_CYCLE: ThemeMode[] = ['dark', 'charcoal', 'navy', 'mocha', 'light'];
 const THEME_ICONS: Record<ThemeMode, string> = {
@@ -72,18 +73,21 @@ export function MobileHeader() {
         </span>
       </div>
 
-      {/* Right: theme cycler */}
-      <button
-        onClick={() => {
-          const idx = THEME_CYCLE.indexOf(theme);
-          setTheme(THEME_CYCLE[(idx + 1) % THEME_CYCLE.length]);
-        }}
-        className="border-none cursor-pointer rounded"
-        style={{ background: 'transparent', color: 'var(--text-muted)', fontSize: 16, minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
-        aria-label="Cycle theme"
-      >
-        <span>{THEME_ICONS[theme]}</span>
-      </button>
+      {/* Right: layout override + theme cycler */}
+      <div className="flex items-center gap-2">
+        <LayoutToggle size="xs" />
+        <button
+          onClick={() => {
+            const idx = THEME_CYCLE.indexOf(theme);
+            setTheme(THEME_CYCLE[(idx + 1) % THEME_CYCLE.length]);
+          }}
+          className="border-none cursor-pointer rounded"
+          style={{ background: 'transparent', color: 'var(--text-muted)', fontSize: 16, minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+          aria-label="Cycle theme"
+        >
+          <span>{THEME_ICONS[theme]}</span>
+        </button>
+      </div>
     </div>
   );
 }
