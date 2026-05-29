@@ -1076,6 +1076,25 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
+    except RuntimeError as e:
+        # Starlette raises RuntimeError("WebSocket is not connected. Need to
+        # call \"accept\" first.") when the underlying transport has been
+        # torn down before ``receive_text`` runs — e.g. the browser closed
+        # the tab mid-handshake, a side-task already closed the socket,
+        # or a Vite-proxy HMR reload. Equivalent to WebSocketDisconnect in
+        # outcome; log at DEBUG instead of dumping a full stack at ERROR.
+        msg = str(e)
+        if "not connected" in msg.lower() or "need to call \"accept\"" in msg.lower():
+            logger.debug(
+                '{"event": "WEBSOCKET_DROPPED_PRE_ACCEPT", "detail": %s}',
+                json.dumps(msg),
+            )
+        else:
+            logger.exception(json.dumps({"event": "WEBSOCKET_ERROR"}))
+            try:
+                await websocket.close(code=1011)
+            except Exception as ce:
+                logger.debug("websocket close failed", exc_info=ce)
     except Exception:
         logger.exception(json.dumps({"event": "WEBSOCKET_ERROR"}))
         try:
