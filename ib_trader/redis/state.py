@@ -184,6 +184,20 @@ class StateKeys:
         return f"hb:{process}"
 
     @staticmethod
+    def console_pnl_24h() -> str:
+        """Rolling 24h log of realized P&L from console-initiated closes.
+
+        Redis sorted set. score = epoch ms (also embedded in member so
+        equal-ms entries don't dedup). member = JSON-encoded
+        ``{pnl, symbol, qty, ts, serial, source}``. Producers ZADD on
+        every console close fill (full or partial) and ZREMRANGEBYSCORE
+        to evict entries older than 24h. The API endpoint sums what
+        remains. Bot-driven closes are NOT recorded here — this surface
+        is operator-facing console P&L only.
+        """
+        return "console:pnl:24h"
+
+    @staticmethod
     def engine_session() -> str:
         """Metadata about the engine's current IB connection.
 

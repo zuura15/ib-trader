@@ -4,6 +4,7 @@ import { useStore } from '../../data/store';
 import { formatTime } from '../../utils/format';
 import { PanelShell } from '../../components/PanelShell';
 import { VoiceModal, isSpeechAvailable } from './VoiceModal';
+import { ConsolePnl24hBadge } from './ConsolePnl24hBadge';
 import type { CommandStatus } from '../../types';
 
 const statusIcon: Record<CommandStatus, string> = {
@@ -278,7 +279,7 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
   const isTerminal = (s: CommandStatus) => s === 'success' || s === 'failure';
 
   return (
-    <PanelShell title="Console" accent="blue" right={
+    <PanelShell title="Console" titleExtra={<ConsolePnl24hBadge />} accent="blue" right={
       activeCount > 0
         ? <span className="animate-pulse" style={{ fontSize: 10, color: 'var(--accent-blue)' }}>
             {activeCount} command{activeCount > 1 ? 's' : ''} running...

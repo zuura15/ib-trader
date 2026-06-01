@@ -28,11 +28,13 @@ export function PanelShell({
   accent = 'blue',
   children,
   right,
+  titleExtra,
 }: {
   title: string;
   accent?: 'blue' | 'green' | 'amber' | 'red' | 'purple';
   children: ReactNode;
   right?: ReactNode;
+  titleExtra?: ReactNode;
 }) {
   return (
     <div className="panel-shell">
@@ -40,6 +42,7 @@ export function PanelShell({
         <div style={{ display: 'flex', alignItems: 'center' }}>
           <span className="accent-dot" style={{ background: accentColors[accent] }} />
           <span className="panel-title">{title}</span>
+          {titleExtra}
         </div>
         {right}
       </div>

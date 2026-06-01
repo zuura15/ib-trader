@@ -375,3 +375,18 @@ export function getRegime(opts: {
   if (opts.barSize) qs.set('bar_size', opts.barSize);
   return request<RegimeReading>(`/regime?${qs.toString()}`);
 }
+
+// --- Console P&L ---
+
+export interface ConsolePnl24h {
+  pnl: string;
+  count: number;
+  since_ms: number;
+  until_ms: number;
+  window_ms: number;
+  error?: string;
+}
+
+export function getConsolePnl24h() {
+  return request<ConsolePnl24h>('/console/pnl/24h');
+}

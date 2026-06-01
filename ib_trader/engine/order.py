@@ -1944,7 +1944,50 @@ async def _execute_market_order(
     ctx.tracker.unregister(ib_order_id)
 
 
-def _emit_console_close_pnl(
+_CONSOLE_PNL_WINDOW_MS = 24 * 60 * 60 * 1000
+
+
+async def _record_console_close_pnl(
+    ctx: AppContext, pnl: Decimal, symbol: str, qty: Decimal,
+    serial: int, source: str,
+) -> None:
+    """Append a console-close P&L event to the rolling 24h Redis log.
+
+    Producer side of the operator-facing 24h console P&L surfaced in the
+    console panel header. Best-effort: a Redis failure logs WARNING but
+    must NOT break the order/close path. Also prunes entries older than
+    24h on every write so the set self-maintains without a separate
+    sweeper.
+    """
+    redis = getattr(ctx, "redis", None)
+    if redis is None:
+        return
+    try:
+        import json as _json
+        import time as _time
+        from ib_trader.redis.state import StateKeys
+
+        ts_ms = int(_time.time() * 1000)
+        member = _json.dumps({
+            "pnl": str(pnl),
+            "symbol": symbol,
+            "qty": str(qty),
+            "ts_ms": ts_ms,
+            "serial": int(serial) if serial is not None else None,
+            "source": source,
+        }, sort_keys=True)
+        key = StateKeys.console_pnl_24h()
+        await redis.zadd(key, {member: ts_ms})
+        cutoff = ts_ms - _CONSOLE_PNL_WINDOW_MS
+        await redis.zremrangebyscore(key, 0, cutoff)
+    except Exception:
+        logger.warning(
+            '{"event": "CONSOLE_PNL_LOG_FAILED", "serial": %s, "symbol": "%s"}',
+            serial, symbol,
+        )
+
+
+async def _emit_console_close_pnl(
     ctx: AppContext, order_ctx: _OrderContext,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
 ) -> None:
@@ -1999,6 +2042,10 @@ def _emit_console_close_pnl(
         '"realized_pnl": "%s"}',
         order_ctx.trade_serial, pre_qty, pre_avg, avg_price,
         closed_qty, multiplier, commission, pnl,
+    )
+    await _record_console_close_pnl(
+        ctx, pnl, order_ctx.symbol, closed_qty,
+        order_ctx.trade_serial, source="console_buysell",
     )
 
 
@@ -2062,7 +2109,7 @@ async def _handle_fill(
     # Bot orders carry ``bot_ref`` and skip this — they have their own
     # emit path via strategy actions.
     if not getattr(cmd, "bot_ref", None):
-        _emit_console_close_pnl(
+        await _emit_console_close_pnl(
             ctx, order_ctx, qty_filled, avg_price, commission,
         )
 
@@ -2769,6 +2816,12 @@ async def _handle_close_fill(
         '"qty_filled": "%s", "avg_price": "%s", "realized_pnl": "%s"}',
         close_ctx.correlation_id, trade_group.serial_number, qty_filled, avg_price, realized_pnl,
     )
+    # Log this single close-leg's contribution (not the cumulative trade
+    # group total) so the 24h window aggregator sees one event per fill.
+    await _record_console_close_pnl(
+        ctx, this_pnl, close_ctx.symbol, qty_filled,
+        trade_group.serial_number, source="console_close",
+    )
 
 
 async def _handle_close_partial(
@@ -2820,6 +2873,10 @@ async def _handle_close_partial(
         '{"event": "CLOSE_ORDER_PARTIAL", "correlation_id": "%s", "serial": %d, '
         '"qty_filled": "%s", "qty_requested": "%s", "realized_pnl": "%s"}',
         close_ctx.correlation_id, trade_group.serial_number, qty_filled, qty_requested, realized_pnl,
+    )
+    await _record_console_close_pnl(
+        ctx, this_pnl, close_ctx.symbol, qty_filled,
+        trade_group.serial_number, source="console_close_partial",
     )
 
 
