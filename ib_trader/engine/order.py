@@ -1915,76 +1915,6 @@ async def _execute_market_order(
     ctx.tracker.unregister(ib_order_id)
 
 
-def _arm_console_close_pnl_emit(
-    ctx: AppContext, order_ctx: _OrderContext, qty_filled: Decimal,
-) -> None:
-    """Print realized P&L for console orders that close an open position.
-
-    Registers a per-order ``CommissionReport`` callback. When IB delivers
-    a non-sentinel ``realizedPNL`` for any execution of this order (i.e.
-    the fill closed or reduced an opposite-side position), emit a SUCCESS/
-    WARNING line into the console pane — same shape as the ``close``
-    command's P&L print.
-
-    Multi-execution orders fire one callback per execution; we de-dup by
-    ``exec_id`` and print each chunk independently rather than trying to
-    accumulate — keeps the operator's mental model close to what IB sees.
-
-    Race note: if IB delivered the commission report inline with execDetails
-    (rare but possible), it may have already fired before this registration.
-    In that case the realized value is still preserved in
-    ``trade_groups.ib_realized_pnl`` via the global callback in
-    ``engine/main.on_commission``; the operator just won't see the live
-    line for that one execution. Accept the race — the data isn't lost,
-    and the realtime miss is rare in practice.
-    """
-    if not order_ctx.ib_order_id:
-        return
-    if not hasattr(ctx.ib, "register_commission_callback"):
-        return
-
-    multiplier = order_ctx.multiplier or Decimal("1")
-    symbol = order_ctx.symbol
-    serial = order_ctx.trade_serial
-    seen_execs: set[str] = set()
-
-    async def on_comm(
-        ib_order_id: str, exec_id: str, commission: Decimal,
-        realized_pnl: Decimal | None = None,
-    ) -> None:
-        if not exec_id or exec_id in seen_execs:
-            return
-        seen_execs.add(exec_id)
-        if realized_pnl is None or realized_pnl == 0:
-            return
-        try:
-            pnl = Decimal(str(realized_pnl))
-        except (TypeError, ValueError):
-            return
-        sign_prefix = "+" if pnl >= 0 else "-"
-        sev = OutputSeverity.SUCCESS if pnl >= 0 else OutputSeverity.WARNING
-        ctx.router.emit(
-            f"  P&L (closed position): {sign_prefix}${abs(pnl)}  "
-            f"[{_fmt_qty(qty_filled)} {symbol}, serial #{serial}]",
-            pane=OutputPane.COMMAND, severity=sev,
-            event="CONSOLE_CLOSE_PNL_DISPLAY",
-        )
-
-    try:
-        ctx.ib.register_commission_callback(
-            on_comm, ib_order_id=order_ctx.ib_order_id,
-        )
-    except Exception:
-        logger.debug(
-            "console close-pnl callback registration failed",
-            exc_info=True,
-        )
-    # Suppress unused-warning for multiplier — kept in the closure for
-    # future use (e.g. switching from IB realizedPNL to a locally-computed
-    # value derived from pre-order avg_cost × multiplier).
-    _ = multiplier
-
-
 async def _handle_fill(
     order_ctx: _OrderContext, trade_group: TradeGroup, qty_filled: Decimal,
     avg_price: Decimal, commission: Decimal, cmd, con_id: int, ctx: AppContext,
@@ -2033,15 +1963,11 @@ async def _handle_fill(
         order_ctx.correlation_id, trade_group.serial_number, order_ctx.symbol, qty_filled, avg_price, commission,
     )
 
-    # Console-side close P&L disclosure. When a buy/sell happens to close
-    # (or reduce) an existing opposite-side position, IB delivers a real
-    # ``realizedPNL`` on the execution's CommissionReport. Print it here
-    # so the operator gets the same P&L feedback the explicit ``close``
-    # command emits, instead of having to look it up in the trades pane.
-    # Bot orders carry a ``bot_ref`` and skip this — they have their own
-    # emit path via the strategy actions.
-    if not getattr(cmd, "bot_ref", None):
-        _arm_console_close_pnl_emit(ctx, order_ctx, qty_filled)
+    # Console-side close P&L disclosure for orders that close opposite-
+    # side positions is handled by the global on_commission callback in
+    # engine.main — registering per-order here would miss the early
+    # commission reports of multi-execution orders, which fire before
+    # _handle_fill returns.
 
     # Place profit taker and/or trailing stop if configured. When both
     # are present they share an OCA group so IB cancels one when the

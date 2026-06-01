@@ -1076,6 +1076,26 @@ class InsyncClient(IBClientBase):
             return None
         return trade.orderStatus.status or None
 
+    def get_order_meta(self, ib_order_id: str) -> dict | None:
+        """Return basic order metadata (symbol, side, qty, orderRef) from the
+        live trade cache. Used by the engine's global commission callback to
+        decide whether an order is console-originated (empty orderRef) and
+        to format the console P&L emit. None if the trade isn't cached.
+        """
+        trade = self.__active_trades.get(ib_order_id)
+        if trade is None:
+            return None
+        contract = getattr(trade, "contract", None)
+        order = getattr(trade, "order", None)
+        return {
+            "symbol": getattr(contract, "symbol", None) if contract else None,
+            "local_symbol": (
+                getattr(contract, "localSymbol", None) if contract else None
+            ),
+            "side": getattr(order, "action", None) if order else None,
+            "order_ref": (getattr(order, "orderRef", None) or "") if order else "",
+        }
+
     async def subscribe_market_data(
         self, con_id: int, symbol: str, *, count_ref: bool = True,
     ) -> None:

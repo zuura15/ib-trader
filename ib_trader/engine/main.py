@@ -42,6 +42,7 @@ from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 from ib_trader.data.repositories.template_repository import OrderTemplateRepository
 from ib_trader.engine.tracker import OrderTracker
 from ib_trader.logging_.logger import setup_logging
+from ib_trader.repl.output_router import OutputPane, OutputSeverity
 
 logger = logging.getLogger(__name__)
 
@@ -1257,6 +1258,49 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 realized_pnl if realized_pnl is not None else "",
                 "true" if ib_pnl_written else "false",
             )
+
+            # Console-side close P&L disclosure. When a console buy/sell
+            # closes (or reduces) an open opposite-side position, IB
+            # attributes the realized P&L to that execution's
+            # CommissionReport. Echo it into the console pane so the
+            # operator gets the same feedback the explicit ``close``
+            # command emits — instead of seeing only the FILLED entry
+            # line and having to look up the trade.
+            #
+            # Gate: console orders have an empty IB orderRef; bot orders
+            # encode bot_ref into the orderRef at place-time. Done in
+            # the global handler (not per-order) because partial-fill
+            # orders fire commission reports BEFORE the strategy's
+            # _handle_fill returns — a per-order callback registered
+            # there would miss the early executions.
+            if (
+                realized_pnl is not None and realized_pnl != 0
+                and hasattr(ctx.ib, "get_order_meta")
+            ):
+                try:
+                    meta = ctx.ib.get_order_meta(ib_order_id) or {}
+                    order_ref = (meta.get("order_ref") or "").strip()
+                    if not order_ref:
+                        sym = (
+                            meta.get("local_symbol")
+                            or meta.get("symbol") or "?"
+                        )
+                        sign = "+" if realized_pnl >= 0 else "-"
+                        sev = (
+                            OutputSeverity.SUCCESS if realized_pnl >= 0
+                            else OutputSeverity.WARNING
+                        )
+                        ctx.router.emit(
+                            f"  P&L (closed position): {sign}${abs(realized_pnl)}  "
+                            f"[{sym}, exec {exec_id[-8:] if exec_id else '?'}]",
+                            pane=OutputPane.COMMAND, severity=sev,
+                            event="CONSOLE_CLOSE_PNL_DISPLAY",
+                        )
+                except Exception:
+                    logger.debug(
+                        "console close-pnl emit failed",
+                        exc_info=True,
+                    )
         except Exception:
             logger.exception(
                 '{"event": "COMMISSION_APPLY_FAILED", "ib_order_id": "%s"}',
