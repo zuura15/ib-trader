@@ -12,7 +12,9 @@ from datetime import date
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from ib_async import IB, Contract, Future, LimitOrder, MarketOrder, Order, Trade, Fill
+from ib_async import (
+    IB, Contract, Future, LimitOrder, MarketOrder, Option, Order, Trade, Fill, Stock,
+)
 
 from ib_trader.broker.exceptions import AmbiguousInstrument, ExpiredContractError
 from ib_trader.broker.types import FutureExpiryCandidate
@@ -222,6 +224,16 @@ class InsyncClient(IBClientBase):
         self._streaming: dict[int, dict] = {}
         # Ref-counted 5-second real-time bar subscriptions.
         self._realtime_bars: dict[int, dict] = {}
+        # Snapshots captured at disconnect so that bot-owned subscriptions
+        # (chart-bot's quote+5s-bar feed, not on the watchlist and not
+        # tied to an open position) survive across an IB Gateway
+        # reconnect. The engine's post-reconnect routine only re-subs
+        # watchlist + positions; without this snapshot, any symbol
+        # outside those two sets was silently orphaned at the 02:30 PT
+        # scheduled reconnect on 2026-06-01.
+        # Stored as lists of (con_id, symbol, refs[, what_to_show, callbacks]).
+        self._pending_resub_streaming: list[tuple[int, str, int]] = []
+        self._pending_resub_rt_bars: list[tuple[int, str, str, list, int]] = []
         # Disconnect handling. _expected_disconnect is set True before we
         # intentionally call disconnect() so the disconnectedEvent handler
         # knows not to scream about it. _on_unexpected_disconnect is an
@@ -568,6 +580,231 @@ class InsyncClient(IBClientBase):
             "tick_size": str(tick),
             "raw": raw,
         }
+
+    # ------------------------------------------------------------------
+    # Options
+    # ------------------------------------------------------------------
+
+    async def qualify_option(
+        self,
+        root: str,
+        expiry: str,
+        strike: Decimal,
+        right: str,
+        exchange: str = "SMART",
+        currency: str = "USD",
+        trading_class: str | None = None,
+    ) -> dict:
+        """Qualify an option to a fully-specified IB contract.
+
+        Uses ``reqContractDetailsAsync`` so we receive ``minTick`` in the
+        same round-trip — important for option pricing where ticks can be
+        $0.05 above $3, $0.01 below.
+        """
+        from ib_trader.utils.symbol import (
+            format_option_localsymbol, normalize_option_right,
+        )
+        await self._throttle()
+        right_c = normalize_option_right(right)
+        if not expiry.isdigit() or len(expiry) != 8:
+            raise ValueError(f"option expiry must be YYYYMMDD: {expiry!r}")
+
+        option = Option(
+            symbol=root,
+            lastTradeDateOrContractMonth=expiry,
+            strike=float(strike),
+            right=right_c,
+            exchange=exchange,
+            currency=currency,
+            tradingClass=trading_class or "",
+        )
+        details = await self.__ib.reqContractDetailsAsync(option)
+        if not details:
+            raise ValueError(
+                f"no IB contract matched OPT {root} {expiry} {strike} {right_c}",
+            )
+        # SMART can return one row per child exchange (CBOE, AMEX, etc.).
+        # Caller passed SMART for routing, so we keep the first SMART-routed
+        # candidate; if none are SMART, fall back to the first.
+        smart = [d for d in details if (d.contract.exchange or "").upper() == "SMART"]
+        d = smart[0] if smart else details[0]
+        qualified = d.contract
+        tick = Decimal(str(d.minTick)) if d.minTick else Decimal("0.01")
+        multiplier = qualified.multiplier or "100"
+        local_symbol = (
+            qualified.localSymbol
+            or format_option_localsymbol(root, expiry, strike, right_c)
+        )
+        raw = json.dumps({
+            "conId": qualified.conId,
+            "symbol": qualified.symbol,
+            "secType": qualified.secType,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "tradingClass": qualified.tradingClass,
+            "lastTradeDateOrContractMonth": qualified.lastTradeDateOrContractMonth,
+            "strike": str(qualified.strike),
+            "right": qualified.right,
+            "localSymbol": local_symbol,
+            "minTick": str(tick),
+        })
+        self._contract_cache[qualified.conId] = Contract(
+            conId=qualified.conId,
+            symbol=qualified.symbol,
+            secType=qualified.secType,
+            exchange=qualified.exchange,
+            currency=qualified.currency,
+            lastTradeDateOrContractMonth=qualified.lastTradeDateOrContractMonth,
+            strike=qualified.strike,
+            right=qualified.right,
+            multiplier=qualified.multiplier,
+            tradingClass=qualified.tradingClass,
+            localSymbol=local_symbol,
+        )
+        logger.info(
+            '{"event": "CONTRACT_FETCHED", "local_symbol": "%s", "con_id": %d,'
+            ' "sec_type": "OPT", "root": "%s", "expiry": "%s",'
+            ' "strike": "%s", "right": "%s", "tick": "%s"}',
+            local_symbol, qualified.conId, root,
+            qualified.lastTradeDateOrContractMonth, qualified.strike,
+            qualified.right, tick,
+        )
+        return {
+            "con_id": qualified.conId,
+            "exchange": qualified.exchange,
+            "currency": qualified.currency,
+            "multiplier": multiplier,
+            "trading_class": qualified.tradingClass or None,
+            "expiry": qualified.lastTradeDateOrContractMonth,
+            "strike": Decimal(str(qualified.strike)),
+            "right": qualified.right,
+            "tick_size": str(tick),
+            "local_symbol": local_symbol,
+            "raw": raw,
+        }
+
+    async def get_option_chain(
+        self,
+        root: str,
+        exchange: str = "SMART",
+        currency: str = "USD",
+    ) -> dict:
+        """Fetch full chain metadata for ``root`` via ``reqSecDefOptParams``.
+
+        Two-step: qualify the underlying STK to get its con_id, then ask
+        IB for the option-chain parameters. The chain endpoint returns
+        one entry per (exchange, tradingClass); we prefer the SMART
+        entry if present.
+        """
+        await self._throttle()
+        # Qualify the underlying — reuse the STK qualify path. This also
+        # populates _contract_cache for any downstream quote fetch on the
+        # underlying.
+        stock = Stock(symbol=root, exchange=exchange, currency=currency)
+        results = await self.__ib.qualifyContractsAsync(stock)
+        qualified = results[0] if results else None
+        if qualified is None or not getattr(qualified, "conId", 0):
+            raise ValueError(f"option chain: underlying {root!r} did not qualify")
+        underlying_con_id = qualified.conId
+
+        await self._throttle()
+        chains = await self.__ib.reqSecDefOptParamsAsync(
+            underlyingSymbol=root,
+            futFopExchange="",
+            underlyingSecType="STK",
+            underlyingConId=underlying_con_id,
+        )
+        if not chains:
+            raise ValueError(f"option chain: IB returned no chain for {root!r}")
+
+        smart = [c for c in chains if (c.exchange or "").upper() == "SMART"]
+        chain = smart[0] if smart else chains[0]
+        # IB returns strikes as floats; convert to Decimal at the wrapper
+        # edge so engine code never sees a float.
+        strikes = sorted(Decimal(str(s)) for s in chain.strikes)
+        expirations = sorted(str(e) for e in chain.expirations)
+        exchanges = sorted({(c.exchange or "").upper() for c in chains if c.exchange})
+
+        logger.info(
+            '{"event": "OPTION_CHAIN_FETCHED", "root": "%s", "con_id": %d,'
+            ' "trading_class": "%s", "multiplier": "%s",'
+            ' "expirations": %d, "strikes": %d}',
+            root, underlying_con_id, chain.tradingClass, chain.multiplier,
+            len(expirations), len(strikes),
+        )
+        return {
+            "underlying_con_id": underlying_con_id,
+            "trading_class": chain.tradingClass,
+            "multiplier": str(chain.multiplier),
+            "expirations": expirations,
+            "strikes": strikes,
+            "exchanges": exchanges,
+        }
+
+    async def get_option_snapshot(self, con_id: int) -> dict:
+        """Fetch bid/ask/last + model greeks for an option contract.
+
+        Uses streaming ``reqMktData`` with no extra generic ticks: IB
+        delivers ``modelGreeks`` automatically for OPT contracts. We poll
+        up to 5 s for both a quote AND a greeks computation, breaking
+        early once both arrive.
+        """
+        await self._throttle()
+        contract = self._contract_cache.get(con_id)
+        if contract is None:
+            # We don't have a fully-specified Option in cache — IB still
+            # accepts a bare conId+exchange for market data.
+            contract = Contract(conId=con_id, exchange="SMART", currency="USD")
+
+        ticker = self.__ib.reqMktData(contract, "", False, False)
+        for _ in range(50):  # up to 5 s in 100 ms steps
+            await asyncio.sleep(0.1)
+            have_quote = (
+                (ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0)
+                or (ticker.last and ticker.last > 0)
+            )
+            have_greeks = ticker.modelGreeks is not None and (
+                ticker.modelGreeks.delta is not None
+            )
+            if have_quote and have_greeks:
+                break
+        self.__ib.cancelMktData(contract)
+
+        def _d(x) -> Decimal | None:
+            # ib_async represents missing values as NaN floats (x != x is
+            # the NaN check) or None. Map both to None so callers don't
+            # silently get NaN in Decimal arithmetic.
+            if x is None or (isinstance(x, float) and x != x):
+                return None
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return None
+
+        bid = _d(ticker.bid) if ticker.bid and ticker.bid > 0 else Decimal("0")
+        ask = _d(ticker.ask) if ticker.ask and ticker.ask > 0 else Decimal("0")
+        last = _d(ticker.last) if ticker.last and ticker.last > 0 else Decimal("0")
+        mg = ticker.modelGreeks
+        result = {
+            "bid": bid or Decimal("0"),
+            "ask": ask or Decimal("0"),
+            "last": last or Decimal("0"),
+            "implied_vol": _d(mg.impliedVol) if mg else None,
+            "delta": _d(mg.delta) if mg else None,
+            "gamma": _d(mg.gamma) if mg else None,
+            "vega": _d(mg.vega) if mg else None,
+            "theta": _d(mg.theta) if mg else None,
+            "underlying_price": _d(mg.undPrice) if mg else None,
+            "model_price": _d(mg.optPrice) if mg else None,
+        }
+        logger.debug(
+            '{"event": "OPTION_SNAPSHOT", "con_id": %d, "bid": "%s",'
+            ' "ask": "%s", "delta": "%s", "iv": "%s"}',
+            con_id, result["bid"], result["ask"],
+            result["delta"], result["implied_vol"],
+        )
+        return result
 
     async def list_future_expiries(
         self,
@@ -1196,6 +1433,74 @@ class InsyncClient(IBClientBase):
                 con_id, entry["refs"],
             )
 
+    async def resubscribe_pending(self) -> tuple[int, int, int, int]:
+        """Replay every market-data and RT-bar subscription captured by
+        ``_on_disconnected`` so bot-owned feeds survive an IB reconnect.
+
+        Returns ``(mkt_ok, mkt_fail, bar_ok, bar_fail)``. Drains the
+        pending lists so re-running is a no-op. Best-effort: a single
+        failure is logged but doesn't abort the rest. Called by the
+        engine's post-reconnect routine BEFORE its watchlist/positions
+        re-sub, so the watchlist pass becomes a cheap no-op for any
+        symbol that was already streaming pre-disconnect.
+        """
+        mkt_pending = self._pending_resub_streaming
+        bar_pending = self._pending_resub_rt_bars
+        self._pending_resub_streaming = []
+        self._pending_resub_rt_bars = []
+
+        mkt_ok = mkt_fail = bar_ok = bar_fail = 0
+
+        for con_id, symbol, refs in mkt_pending:
+            try:
+                # First call creates the sub with refs=1; remaining
+                # refs-1 calls bump the ref count to match the
+                # pre-disconnect total.
+                await self.subscribe_market_data(con_id, symbol, count_ref=True)
+                for _ in range(max(0, refs - 1)):
+                    await self.subscribe_market_data(con_id, symbol, count_ref=True)
+                mkt_ok += 1
+            except Exception:
+                mkt_fail += 1
+                logger.warning(
+                    '{"event": "RESUB_MKTDATA_FAILED", "con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+
+        for con_id, symbol, what_to_show, callbacks, refs in bar_pending:
+            try:
+                primary = callbacks[0] if callbacks else None
+                await self.subscribe_realtime_bars(
+                    con_id, symbol, what_to_show=what_to_show, callback=primary,
+                )
+                # Re-attach any additional callbacks beyond the primary.
+                entry = self._realtime_bars.get(con_id)
+                if entry is not None:
+                    for cb in callbacks[1:]:
+                        if cb not in entry["callbacks"]:
+                            entry["callbacks"].append(cb)
+                    # Bump refs to match the pre-disconnect total.
+                    for _ in range(max(0, refs - 1)):
+                        await self.subscribe_realtime_bars(
+                            con_id, symbol, what_to_show=what_to_show,
+                        )
+                bar_ok += 1
+            except Exception:
+                bar_fail += 1
+                logger.warning(
+                    '{"event": "RESUB_RT_BARS_FAILED", "con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+
+        if mkt_pending or bar_pending:
+            logger.info(
+                '{"event": "RESUB_PENDING_DONE", "mkt_ok": %d, "mkt_fail": %d, '
+                '"bar_ok": %d, "bar_fail": %d}',
+                mkt_ok, mkt_fail, bar_ok, bar_fail,
+            )
+
+        return (mkt_ok, mkt_fail, bar_ok, bar_fail)
+
     def get_ticker(self, con_id: int) -> dict | None:
         """Return current streaming ticker data, or None."""
         entry = self._streaming.get(con_id)
@@ -1515,6 +1820,7 @@ class InsyncClient(IBClientBase):
         self._realtime_bars[con_id] = {
             "bars": bars, "refs": 1, "contract": contract,
             "callbacks": callbacks, "symbol": symbol,
+            "what_to_show": what_to_show,
         }
 
         # Register update handler
@@ -1688,13 +1994,40 @@ class InsyncClient(IBClientBase):
         """
         stream_count = len(self._streaming)
         bar_count = len(self._realtime_bars)
+
+        # Snapshot pre-clear so resubscribe_pending() can replay every
+        # subscription on the next connect, preserving ref counts and
+        # bar callbacks. Resolve symbol from the cached contract.
+        self._pending_resub_streaming = [
+            (
+                con_id,
+                (entry["contract"].localSymbol or entry["contract"].symbol),
+                int(entry.get("refs", 1)),
+            )
+            for con_id, entry in self._streaming.items()
+        ]
+        self._pending_resub_rt_bars = [
+            (
+                con_id,
+                entry.get("symbol")
+                or (entry["contract"].localSymbol or entry["contract"].symbol),
+                entry.get("what_to_show", "TRADES"),
+                list(entry.get("callbacks") or []),
+                int(entry.get("refs", 1)),
+            )
+            for con_id, entry in self._realtime_bars.items()
+        ]
+
         self._streaming.clear()
         self._realtime_bars.clear()
         if stream_count or bar_count:
             logger.info(
                 '{"event": "IB_SUBSCRIPTIONS_CLEARED_ON_DISCONNECT", '
-                '"streaming_dropped": %d, "realtime_bars_dropped": %d}',
+                '"streaming_dropped": %d, "realtime_bars_dropped": %d, '
+                '"pending_resub_streaming": %d, "pending_resub_rt_bars": %d}',
                 stream_count, bar_count,
+                len(self._pending_resub_streaming),
+                len(self._pending_resub_rt_bars),
             )
 
         if self._expected_disconnect:

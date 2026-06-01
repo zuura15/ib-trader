@@ -647,6 +647,20 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
     started = asyncio.get_event_loop().time()
     watchlist_ok = watchlist_fail = 0
     pos_count = 0
+    resub_mkt_ok = resub_mkt_fail = resub_bar_ok = resub_bar_fail = 0
+
+    # Replay any subscriptions captured at disconnect FIRST. This covers
+    # bot-owned feeds (e.g. chart-bot's quote + 5s bars) that aren't on
+    # the watchlist and aren't tied to an open position, and would
+    # otherwise be silently orphaned across the daily reconnect.
+    if hasattr(ctx.ib, "resubscribe_pending"):
+        try:
+            (
+                resub_mkt_ok, resub_mkt_fail,
+                resub_bar_ok, resub_bar_fail,
+            ) = await ctx.ib.resubscribe_pending()
+        except Exception:
+            logger.exception('{"event": "POSTRECONNECT_RESUB_PENDING_FAILED"}')
 
     try:
         symbols = load_watchlist("config/watchlist.yaml")
@@ -674,8 +688,11 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
     elapsed = asyncio.get_event_loop().time() - started
     logger.info(
         '{"event": "POSTRECONNECT_RESUBSCRIBE_DONE", "duration_s": %.2f, '
-        '"watchlist_ok": %d, "watchlist_failed": %d, "positions_touched": %d}',
+        '"watchlist_ok": %d, "watchlist_failed": %d, "positions_touched": %d, '
+        '"resub_mkt_ok": %d, "resub_mkt_failed": %d, '
+        '"resub_bars_ok": %d, "resub_bars_failed": %d}',
         elapsed, watchlist_ok, watchlist_fail, pos_count,
+        resub_mkt_ok, resub_mkt_fail, resub_bar_ok, resub_bar_fail,
     )
 
 
