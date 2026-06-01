@@ -52,6 +52,14 @@ class _OrderContext:
     tick_size: Decimal = dataclasses.field(default_factory=lambda: STK_TICK)
     multiplier: Decimal = dataclasses.field(default_factory=lambda: Decimal("1"))
     con_id: int | None = None
+    # Snapshot of the pre-order position state (from positions_cache) so
+    # _handle_fill can compute realized P&L synchronously when a console
+    # buy/sell closes (or reduces) an opposite-side position. IB delivers
+    # the same value asynchronously via CommissionReport.realizedPNL, but
+    # that arrives after the command has returned and the WS stream is
+    # closed — too late to reach the console pane.
+    pre_position_qty: Decimal | None = None
+    pre_position_avg_cost: Decimal | None = None
 
 
 def _session_tif() -> str:
@@ -378,6 +386,25 @@ async def execute_order(
         side_code = "B" if side == "BUY" else "S"
         order_ref = encode_order_ref(cmd.bot_ref, cmd.symbol, side_code, serial)
 
+    # Snapshot pre-order position (from engine cache) so _handle_fill can
+    # compute realized P&L when this order closes/reduces an opposite-side
+    # holding. Best-effort: if positions_cache hasn't been populated yet
+    # (early-boot races, no held positions on this con_id) the snapshot
+    # stays None and the P&L emit is silently skipped.
+    pre_qty: Decimal | None = None
+    pre_avg: Decimal | None = None
+    try:
+        for _p in (getattr(ctx, "positions_cache", None) or []):
+            if _p.get("con_id") == con_id:
+                _q = _p.get("quantity")
+                _a = _p.get("avg_cost")
+                if _q is not None and _a is not None:
+                    pre_qty = Decimal(str(_q))
+                    pre_avg = Decimal(str(_a))
+                break
+    except Exception as e:
+        logger.debug("pre-order position snapshot failed", exc_info=e)
+
     order_ctx = _OrderContext(
         trade_id=trade_group.id,
         trade_serial=serial,
@@ -395,6 +422,8 @@ async def execute_order(
         multiplier=multiplier,
         con_id=int(con_id) if str(con_id).lstrip("-").isdigit() else None,
         order_ref=order_ref,
+        pre_position_qty=pre_qty,
+        pre_position_avg_cost=pre_avg,
     )
 
     if cmd.stop_loss:
@@ -1915,6 +1944,64 @@ async def _execute_market_order(
     ctx.tracker.unregister(ib_order_id)
 
 
+def _emit_console_close_pnl(
+    ctx: AppContext, order_ctx: _OrderContext,
+    qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
+) -> None:
+    """Emit realized P&L when this fill closed (or reduced) an opposite-side
+    position. Synchronous so it lands in the console pane while the user's
+    command is still streaming output.
+
+    Formula mirrors _handle_close_fill exactly:
+        pnl = (exit - entry) × closed_qty × multiplier × direction − commission
+
+    where ``direction`` is +1 if the pre-existing position was long, -1 if
+    short. ``closed_qty`` is min(this_fill, |pre_qty|) — anything beyond the
+    pre-existing exposure is opening a new position the other way and not
+    counted here.
+
+    Skipped silently when the pre-order snapshot is absent (positions cache
+    cold) or when the fill is same-side as the existing position (pure
+    open, no close). IB's CommissionReport delivers the authoritative
+    value asynchronously and writes it to trade_groups.ib_realized_pnl
+    — this emit is just for the live operator-facing readout.
+    """
+    pre_qty = order_ctx.pre_position_qty
+    pre_avg = order_ctx.pre_position_avg_cost
+    if pre_qty is None or pre_avg is None or pre_qty == 0:
+        return
+
+    # Direction = sign of the pre-existing position. BUY against a short
+    # closes; SELL against a long closes. Same-side: skip.
+    pre_is_long = pre_qty > 0
+    order_is_buy = order_ctx.side == "BUY"
+    if pre_is_long == order_is_buy:
+        return  # opening or adding, not closing
+
+    direction = Decimal("1") if pre_is_long else Decimal("-1")
+    closed_qty = min(qty_filled, abs(pre_qty))
+    multiplier = order_ctx.multiplier or Decimal("1")
+    pnl = (
+        (avg_price - pre_avg) * closed_qty * multiplier * direction
+        - commission
+    )
+    sign = "+" if pnl >= 0 else "-"
+    sev = OutputSeverity.SUCCESS if pnl >= 0 else OutputSeverity.WARNING
+    ctx.router.emit(
+        f"  P&L (closed {closed_qty} {order_ctx.symbol}): {sign}${abs(pnl)}",
+        pane=OutputPane.COMMAND, severity=sev,
+        event="CONSOLE_CLOSE_PNL_DISPLAY",
+    )
+    logger.info(
+        '{"event": "CONSOLE_CLOSE_PNL_COMPUTED", "serial": %d, '
+        '"pre_qty": "%s", "pre_avg": "%s", "exit_price": "%s", '
+        '"closed_qty": "%s", "multiplier": "%s", "commission": "%s", '
+        '"realized_pnl": "%s"}',
+        order_ctx.trade_serial, pre_qty, pre_avg, avg_price,
+        closed_qty, multiplier, commission, pnl,
+    )
+
+
 async def _handle_fill(
     order_ctx: _OrderContext, trade_group: TradeGroup, qty_filled: Decimal,
     avg_price: Decimal, commission: Decimal, cmd, con_id: int, ctx: AppContext,
@@ -1963,11 +2050,21 @@ async def _handle_fill(
         order_ctx.correlation_id, trade_group.serial_number, order_ctx.symbol, qty_filled, avg_price, commission,
     )
 
-    # Console-side close P&L disclosure for orders that close opposite-
-    # side positions is handled by the global on_commission callback in
-    # engine.main — registering per-order here would miss the early
-    # commission reports of multi-execution orders, which fire before
-    # _handle_fill returns.
+    # Console-side close P&L disclosure. When this fill closes (or
+    # reduces) an opposite-side position, compute realized P&L from the
+    # pre-order avg_cost (snapshotted at order-creation time, see
+    # execute_order) and emit synchronously — so the console pane sees
+    # it while the command is still in flight. IB delivers the same
+    # number via CommissionReport.realizedPNL but that arrives after the
+    # command has returned and the WS stream is closed, too late to
+    # reach the console.
+    #
+    # Bot orders carry ``bot_ref`` and skip this — they have their own
+    # emit path via strategy actions.
+    if not getattr(cmd, "bot_ref", None):
+        _emit_console_close_pnl(
+            ctx, order_ctx, qty_filled, avg_price, commission,
+        )
 
     # Place profit taker and/or trailing stop if configured. When both
     # are present they share an OCA group so IB cancels one when the
