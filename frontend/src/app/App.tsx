@@ -3,6 +3,7 @@ import { GlobalHeader } from '../features/header/GlobalHeader';
 import { WorkstationLayout } from '../layout/WorkstationLayout';
 import { MobileLayout } from '../layout/MobileLayout';
 import { useStore } from '../data/store';
+import { useVisibilityRepaint } from '../hooks/useVisibilityRepaint';
 
 // Full-screen blocking overlay for CATASTROPHIC alerts (IB Gateway down, etc.)
 // Renders on top of everything so the user can't miss it. The dismiss button
@@ -191,6 +192,14 @@ export function App() {
     layoutOverride === 'mobile' ? true
     : layoutOverride === 'desktop' ? false
     : viewportIsMobile;
+
+  // Repaints the page when the tab returns to visible. Without this, the
+  // app sometimes renders white after a tab switch — Chrome pauses
+  // rAF-driven layout in hidden tabs and doesn't auto-repaint on
+  // return, so flexlayout + lightweight-charts stay stuck on a stale
+  // frame until any user event (mousemove, keystroke, F12) fires a
+  // layout pass.
+  useVisibilityRepaint();
 
   useEffect(() => {
     if (dataMode === 'live') {
