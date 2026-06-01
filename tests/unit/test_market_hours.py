@@ -12,6 +12,7 @@ from ib_trader.engine.market_hours import (
     is_session_break,
     is_ib_session_active,
     is_overnight_session,
+    is_cme_futures_break,
     presubmitted_reason,
     session_label,
 )
@@ -224,3 +225,41 @@ class TestSessionLabel:
     def test_overnight_start_label(self):
         label = session_label(_et(2026, 3, 9, 21, 0))
         assert "overnight" in label.lower()
+
+
+# ── CME futures daily break ───────────────────────────────────────────────────
+
+class TestCmeFuturesBreak:
+    def test_weekday_before_5pm_not_break(self):
+        # Monday 4:59 PM ET — still ticking.
+        assert not is_cme_futures_break(_et(2026, 3, 9, 16, 59))
+
+    def test_weekday_exactly_5pm_is_break(self):
+        # Monday 5:00 PM ET — CME-family halt starts.
+        assert is_cme_futures_break(_et(2026, 3, 9, 17, 0))
+
+    def test_weekday_545pm_is_break(self):
+        # Monday 5:45 PM ET — mid-break (matches the user's observed
+        # 2:45 PT = 5:45 ET stale-quote spam window).
+        assert is_cme_futures_break(_et(2026, 3, 9, 17, 45))
+
+    def test_weekday_exactly_6pm_not_break(self):
+        # Monday 6:00 PM ET — futures session resumes.
+        assert not is_cme_futures_break(_et(2026, 3, 9, 18, 0))
+
+    def test_weekday_8pm_not_break(self):
+        assert not is_cme_futures_break(_et(2026, 3, 9, 20, 0))
+
+    def test_morning_not_break(self):
+        # Tuesday 10 AM ET — clearly active futures session.
+        assert not is_cme_futures_break(_et(2026, 3, 10, 10, 0))
+
+    def test_saturday_not_break(self):
+        # Saturday 5:30 PM ET — already in weekend closure, not a
+        # daily break.
+        assert not is_cme_futures_break(_et(2026, 3, 7, 17, 30))
+
+    def test_sunday_530pm_not_break(self):
+        # Sunday 5:30 PM ET — before futures reopen at 6:00 PM,
+        # weekend closure handles this window.
+        assert not is_cme_futures_break(_et(2026, 3, 8, 17, 30))

@@ -3247,11 +3247,28 @@ class StrategyBotRunner(BotBase):
             per_symbol_elapsed > _STALE_QUOTE_WARN_SECONDS
             and not self._quote_stale_logged
         ):
+            # FUT during the CME 5–6 PM ET daily break: the feed is
+            # supposed to be silent. Suppress the warn entirely and
+            # latch the flag so we don't spam every 10 s for the full
+            # hour. The flag clears on the next quote tick (line
+            # 2568) as soon as the session reopens.
+            sec_type = str(
+                self.strategy_config.get("sec_type", "STK")
+            ).upper()
+            if sec_type in ("FUT", "FOP"):
+                from ib_trader.engine.market_hours import is_cme_futures_break
+                if is_cme_futures_break():
+                    self._quote_stale_logged = True
+                    return
+
             # Warn-level probe for a quiet individual symbol — ONCE per
-            # stale episode (guarded by _quote_stale_logged, reset on
-            # fresh ticks). Informational, not a halt: QQQ may be
-            # ticking fine while PSQ is silent for several minutes on a
-            # slow day.
+            # stale episode (latched via _quote_stale_logged, cleared on
+            # the next fresh tick at line 2568). Informational, not a
+            # halt: QQQ may be ticking fine while PSQ is silent for
+            # several minutes on a slow day. The latch is what keeps the
+            # log from filling with one warn per 10 s tick of the
+            # supervisor for the full duration of the quiet stretch.
+            self._quote_stale_logged = True
             probe = await self._probe_quote_source(symbol)
             logger.warning(
                 '{"event": "STALE_QUOTES", "bot_id": "%s", "symbol": "%s", '

@@ -32,6 +32,15 @@ _BREAK_START_MINS = 3 * 60 + 50   # 3:50 AM
 _BREAK_END_MINS = 4 * 60           # 4:00 AM
 _OVERNIGHT_START_MINS = 20 * 60    # 8:00 PM
 
+# CME-family daily maintenance break: 5:00 PM – 6:00 PM ET, Mon–Fri.
+# Equity index (ES/NQ/YM/MES/MNQ), metals (GC/MGC/SI/HG), Treasuries
+# (ZN/ZB), energy (CL/NG) — all CME/CBOT/NYMEX/COMEX products go quiet
+# during this hour. Quote ticks stop entirely; the engine's per-symbol
+# freshness probe will correctly observe no ticks but bots must NOT
+# interpret that as a stream stall.
+_CME_BREAK_START_MINS = 17 * 60         # 5:00 PM
+_CME_BREAK_END_MINS = 18 * 60           # 6:00 PM
+
 
 def _now_et() -> datetime:
     """Return the current time in US/Eastern. Isolated for test patching."""
@@ -76,6 +85,24 @@ def is_session_break(now: datetime | None = None) -> bool:
         return False
     mins = n.hour * 60 + n.minute
     return _BREAK_START_MINS <= mins < _BREAK_END_MINS
+
+
+def is_cme_futures_break(now: datetime | None = None) -> bool:
+    """True during the CME-family daily maintenance break (5:00–6:00 PM ET).
+
+    CME, CBOT, NYMEX, COMEX products (ES/NQ/MES/MNQ/GC/MGC/CL/ZN/...)
+    halt for one hour daily Mon–Fri at the close of each session. Quote
+    feed goes silent during this window — the per-symbol stale-quote
+    watchdog must NOT escalate it as a fault for FUT contracts. Also
+    inactive on the weekend (covered by ``is_weekend_closure``).
+    """
+    n = _et(now)
+    if is_weekend_closure(n):
+        return False
+    if n.weekday() >= 5:
+        return False  # Sat/Sun — futures already closed.
+    mins = n.hour * 60 + n.minute
+    return _CME_BREAK_START_MINS <= mins < _CME_BREAK_END_MINS
 
 
 def is_overnight_session(now: datetime | None = None) -> bool:
