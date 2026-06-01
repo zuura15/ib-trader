@@ -7,12 +7,15 @@ const REFRESH_MS = 30_000;
 function formatPnl(pnl: string): { text: string; positive: boolean | null } {
   const n = Number(pnl);
   if (!Number.isFinite(n)) return { text: '—', positive: null };
-  if (n === 0) return { text: '$0', positive: null };
+  if (n === 0) return { text: '$0.00', positive: null };
   const sign = n >= 0 ? '+' : '-';
-  const abs = Math.abs(n);
-  const formatted = abs >= 100
-    ? abs.toFixed(0)
-    : abs.toFixed(2);
+  // Always 2 decimals — operator wants cents resolution at all sizes,
+  // including the running total once it crosses $100. Thousand
+  // separator (toLocaleString) keeps large totals scannable.
+  const formatted = Math.abs(n).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
   return { text: `${sign}$${formatted}`, positive: n >= 0 };
 }
 
