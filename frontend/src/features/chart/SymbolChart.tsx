@@ -1145,116 +1145,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // ``detected = A OR B OR BOS``. Direction is "v_up" (V
     // recovery) or "v_down" (inverted V). Display only — does
     // not affect entry gating.
+    // V-state + ADX diagnostic badge removed at operator request
+    // (2026-06-02). The painter is kept as a no-op that tears down
+    // any pre-existing badge on the next call so historical instances
+    // don't linger in the DOM across HMR reloads. Re-enable by
+    // restoring the prior painter from git history if the regime
+    // diagnostic is needed again.
     paintRegimeBadgeRef.current = () => {
-      let badge = regimeBadgeRef.current;
-      if (!badge && el) {
-        badge = document.createElement('div');
-        badge.setAttribute(
-          'style',
-          'position:absolute;top:6px;left:8px;z-index:11;'
-          + 'font-family:ui-monospace,Menlo,monospace;font-size:11px;'
-          + 'padding:2px 8px;border-radius:4px;line-height:1.25;'
-          + 'background:rgba(120,120,120,0.12);color:rgba(80,80,80,0.85);'
-          + 'user-select:none;letter-spacing:0.3px;font-weight:600;'
-          + 'white-space:pre;cursor:default;',
-        );
-        el.appendChild(badge);
-        regimeBadgeRef.current = badge;
+      const existing = regimeBadgeRef.current;
+      if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
       }
-      if (!badge) return;
-      const r = regimeReadingRef.current;
-      const v = r?.v_state ?? null;
-      if (r === null || v === null) {
-        badge.textContent = 'V: …';
-        badge.title = 'waiting for first regime fetch';
-        badge.style.background = 'rgba(120,120,120,0.12)';
-        badge.style.color = 'rgba(80,80,80,0.85)';
-        return;
-      }
-      // Color by detection state:
-      //   detected (any trigger) → green-ish (real signal)
-      //   no impulse / nothing fired → gray.
-      let bg = 'rgba(120,120,120,0.10)';
-      let fg = 'rgba(80,80,80,0.85)';
-      if (v.detected) {
-        if (v.direction === 'v_up') {
-          bg = 'rgba(34,139,75,0.15)';   // green for V recovery
-          fg = 'rgba(20,100,55,0.95)';
-        } else {
-          bg = 'rgba(200,60,60,0.15)';   // red for inverted V
-          fg = 'rgba(150,30,30,0.95)';
-        }
-      }
-      badge.style.background = bg;
-      badge.style.color = fg;
-      // For fired indicators, show the V-bottom time (the impulse
-      // extreme) instead of a tick mark. The bottom is the same
-      // moment for all three indicators by definition — repeating
-      // the time is intentional so the operator can see at a
-      // glance which indicators agree on "the V happened here."
-      // "—" for indicators that haven't fired.
-      let extremeLabel = '—';
-      if (v.impulse_extreme_time) {
-        try {
-          const dt = new Date(v.impulse_extreme_time);
-          if (!Number.isNaN(dt.getTime())) {
-            // Local time, HH:MM in 24h — matches operator's PT clock.
-            const hh = dt.getHours().toString().padStart(2, '0');
-            const mm = dt.getMinutes().toString().padStart(2, '0');
-            extremeLabel = `${hh}:${mm}`;
-          }
-        } catch { /* fall back to "—" */ }
-      }
-      const mark = (b: boolean) => (b ? extremeLabel : '—');
-      const dirLabel = v.direction === 'v_up'
-        ? 'V·UP'
-        : v.direction === 'v_down'
-        ? 'V·DOWN'
-        : 'V·—';
-      // Append the ADX regime direction at the end so the operator
-      // sees BOTH readings on one line: V detection (the bar-level
-      // event) and ADX regime (the longer-term direction the entry
-      // gate uses). Separator is " ; " so the two halves are
-      // visually distinct.
-      const regimeLabel = r.regime === 'up' ? 'ADX·UP'
-        : r.regime === 'down' ? 'ADX·DOWN'
-        : r.regime === 'flat' ? 'ADX·FLAT'
-        : r.regime === 'uncertain' ? 'ADX·UNCERTAIN'
-        : 'ADX·…';
-      badge.textContent = (
-        `${dirLabel}  BOS:${mark(v.bos_confirmed)} `
-        + `A:${mark(v.trigger_a_fired)} `
-        + `B:${mark(v.trigger_b_fired)}`
-        + ` ; ${regimeLabel}`
-      );
-      // Tooltip with full diagnostic.
-      const fmt = (x: number | null | undefined, d = 4) =>
-        x == null || !Number.isFinite(x) ? '—' : x.toFixed(d);
-      const tip: string[] = [
-        `direction: ${v.direction ?? 'none'}`,
-        `detected: ${v.detected}`,
-        `BOS (break-of-structure): ${v.bos_confirmed}`,
-        `A (retrace ≥ 30%): ${v.trigger_a_fired}`,
-        `B (exhaustion ≥ 10 bars): ${v.trigger_b_fired}`,
-      ];
-      if (v.impulse_extreme_price != null) {
-        tip.push(`impulse extreme @ ${fmt(v.impulse_extreme_price, 2)}`);
-      }
-      if (v.impulse_magnitude != null) {
-        tip.push(`impulse magnitude: ${fmt(v.impulse_magnitude, 2)}`);
-      }
-      if (v.impulse_atr_mult != null) {
-        tip.push(`impulse / ATR: ${fmt(v.impulse_atr_mult, 2)}×`);
-      }
-      if (v.retrace_pct != null) {
-        tip.push(`retrace: ${(v.retrace_pct * 100).toFixed(1)}%`);
-      }
-      if (v.bars_since_extreme != null) {
-        tip.push(`bars since extreme: ${v.bars_since_extreme}`);
-      }
-      tip.push('');
-      tip.push('Display-only — does not gate entries.');
-      badge.title = tip.join('\n');
+      regimeBadgeRef.current = null;
     };
 
     setChartVersion((v) => v + 1);

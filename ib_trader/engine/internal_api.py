@@ -556,15 +556,25 @@ async def get_history(
         )
 
     # IB's durationStr only accepts S/D/W/M/Y — no H. The "S" format
-    # is capped at 86400 (24h); anything longer must use "N D". Round
-    # up to whole days so a 48h chart preload (= "2 D") clears the
-    # cap. ``use_rth=False`` keeps the day-based request returning
-    # 24h calendar windows for futures.
+    # is capped at 86400 (24h); anything longer must use "N D".
+    #
+    # CME futures gotcha (2026-06-02 MGCQ6 incident): "N D" with
+    # useRTH=False returns "the current trading session + (N-1) prior
+    # sessions", NOT "N×24h calendar". CME sessions run ~23h with a
+    # 1h daily break, so e.g. a hours=48 request rounded to "2 D"
+    # returns only ~23-25h of bars — just the current session.
+    # Operator saw the MGCQ6 chart start at 3pm PT yesterday instead
+    # of midday two days ago.
+    #
+    # Fix: round up to the next whole day AND add one extra session
+    # buffer so the returned data covers the full requested calendar
+    # window. Cheap — backend over-fetches modestly; frontend's
+    # setVisibleRange clamps to the actual display window anyway.
     hours_int = max(1, int(hours))
     if hours_int <= 24:
         duration_str = f"{hours_int * 3600} S"
     else:
-        days = (hours_int + 23) // 24
+        days = (hours_int + 23) // 24 + 1
         duration_str = f"{days} D"
     # TRADES is what the bot reasons about and what the operator sees
     # on the chart. The prior BID_ASK feed put bot decisions on
