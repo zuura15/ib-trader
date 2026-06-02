@@ -1760,13 +1760,23 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         },
         sliceLast: stash.sliceTo,
       };
-      void fetch('/api/debug/log/sr-debug', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(snapshot),
-      }).catch(() => {
-        // server-side debug log is best-effort; ignore network errors
-      });
+      // Server-side debug tail is opt-in. Each snapshot is several KB
+      // and recomputes fire ~1/s per chart pane; with multiple charts
+      // open the Network panel buffers MBs/min and Chrome's memory
+      // climbs over a long session. Enable from the browser console
+      // when actually debugging SR:
+      //     localStorage.setItem('ib-sr-debug', '1')
+      // Disable: localStorage.removeItem('ib-sr-debug')
+      if (typeof window !== 'undefined'
+          && window.localStorage?.getItem('ib-sr-debug') === '1') {
+        void fetch('/api/debug/log/sr-debug', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(snapshot),
+        }).catch(() => {
+          // server-side debug log is best-effort; ignore network errors
+        });
+      }
     };
     // Throttle: cap at one recompute per ``SR_THROTTLE_MS``. Leading-
     // edge fire so a fresh event takes effect immediately; trailing
