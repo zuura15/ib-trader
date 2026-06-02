@@ -308,6 +308,116 @@ async def run_transaction_reconciliation(ctx: AppContext) -> dict:
     return result
 
 
+async def run_cancel_verification(
+    ctx: AppContext, *, since_minutes: int = 240,
+) -> dict:
+    """Detect ledger-cancelled orders that IB still has working.
+
+    Backstop for the 10340 silent-cancel-rejection failure mode (see
+    ``engine/order._finalize_partial_cancel``). The at-decision probe
+    in the engine handles the live path; this catches anything that
+    slipped through (e.g. orders cancelled before this fix shipped, or
+    a probe-failure case the engine fail-safed past as a soft warning
+    rather than a hard halt).
+
+    For each recently-cancelled order, queries IB's open-orders list.
+    If the order is still there, writes a ``TransactionAction.DISCREPANCY``
+    row and fires a ``CATASTROPHIC`` alert naming the order_id and qty.
+    Does NOT auto-heal — operator must reconcile in TWS.
+
+    Returns ``{checked, still_open, details}``.
+    """
+    logger.info(
+        '{"event": "CANCEL_VERIFICATION_STARTED", "since_minutes": %d}',
+        since_minutes,
+    )
+
+    still_open: list[int] = []
+    try:
+        cancelled = ctx.transactions.get_recent_cancelled(
+            since_minutes=since_minutes,
+        )
+        if not cancelled:
+            logger.info(
+                '{"event": "CANCEL_VERIFICATION_COMPLETE", '
+                '"checked": 0, "still_open": 0}',
+            )
+            return {"checked": 0, "still_open": 0, "details": []}
+
+        ib_orders = await ctx.ib.get_open_orders()
+        ib_open_ids = {int(o["ib_order_id"]) for o in ib_orders}
+
+        for txn in cancelled:
+            if txn.ib_order_id is None:
+                continue
+            if txn.ib_order_id not in ib_open_ids:
+                continue
+
+            # Ledger says CANCELLED but IB still has it open. This is
+            # the 10340 silent-rejection signature, or any other path
+            # where the at-decision probe missed.
+            now = _now_utc()
+            discrepancy_event = TransactionEvent(
+                ib_order_id=txn.ib_order_id,
+                ib_perm_id=txn.ib_perm_id,
+                action=TransactionAction.DISCREPANCY,
+                symbol=txn.symbol,
+                side=txn.side,
+                order_type=txn.order_type,
+                quantity=txn.quantity,
+                limit_price=txn.limit_price,
+                account_id=txn.account_id,
+                ib_status="LEDGER_CANCELLED_BUT_LIVE_AT_IB",
+                trade_serial=txn.trade_serial,
+                requested_at=now,
+                ib_responded_at=now,
+                is_terminal=False,
+            )
+            ctx.transactions.insert(discrepancy_event)
+
+            alert_msg = (
+                f"Order #{txn.ib_order_id} ({txn.symbol} {txn.side} "
+                f"{txn.quantity}) is recorded CANCELLED in the audit ledger "
+                f"but IB still shows it as open. Verify and cancel in TWS — "
+                f"this is the silent-cancel-rejection pattern (IB error 10340)."
+            )
+            alert = SystemAlert(
+                severity=AlertSeverity.CATASTROPHIC,
+                trigger="CANCEL_VERIFICATION_DISCREPANCY",
+                message=alert_msg,
+                created_at=now,
+            )
+            ctx.alerts.create(alert)
+
+            logger.error(
+                '{"event": "CANCEL_VERIFICATION_DISCREPANCY", '
+                '"ib_order_id": %d, "symbol": "%s", "qty": "%s"}',
+                txn.ib_order_id, txn.symbol, str(txn.quantity),
+            )
+            still_open.append(txn.ib_order_id)
+
+    except Exception as e:
+        logger.error(
+            '{"event": "CANCEL_VERIFICATION_FAILED", "error": "%s"}',
+            str(e), exc_info=True,
+        )
+        return {
+            "checked": 0, "still_open": 0,
+            "details": [], "error": str(e),
+        }
+
+    logger.info(
+        '{"event": "CANCEL_VERIFICATION_COMPLETE", '
+        '"checked": %d, "still_open": %d}',
+        len(cancelled), len(still_open),
+    )
+    return {
+        "checked": len(cancelled),
+        "still_open": len(still_open),
+        "details": still_open,
+    }
+
+
 async def run_commission_reconciliation(
     ctx: AppContext, lookback_hours: float = 24.0,
 ) -> dict:

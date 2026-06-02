@@ -27,7 +27,7 @@ from ib_trader.data.repository import (
 from ib_trader.data.repositories.transaction_repository import TransactionRepository
 from ib_trader.daemon.reconciler import (
     run_reconciliation, run_transaction_reconciliation,
-    run_commission_reconciliation,
+    run_commission_reconciliation, run_cancel_verification,
 )
 from ib_trader.daemon.monitor import check_repl_heartbeat, check_ib_connectivity
 from ib_trader.daemon.integrity import run_integrity_check
@@ -244,6 +244,13 @@ async def run_daemon(ctx: AppContext, session_factory) -> None:
                 print("[DAEMON] Running reconciliation...")
                 result = await run_reconciliation(ctx)
                 await run_transaction_reconciliation(ctx)
+                # Catch ledger-cancelled-but-IB-open orders (10340
+                # silent-rejection backstop). Fires CATASTROPHIC alerts
+                # on any divergence; never auto-heals.
+                try:
+                    await run_cancel_verification(ctx)
+                except Exception as _e:
+                    print(f"[DAEMON] WARNING  cancel verification failed: {_e}")
                 last_recon_time = datetime.now(timezone.utc)
                 last_recon_changes = result["changes"]
                 if last_recon_changes > 0:

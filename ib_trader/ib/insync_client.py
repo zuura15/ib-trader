@@ -215,6 +215,18 @@ class InsyncClient(IBClientBase):
         # a generic timeout message.  Safe to lose on crash (in-flight orders
         # are recovered from SQLite as ABANDONED on next startup).
         self._order_errors: dict[str, str] = {}
+        # In-flight cancel requests, keyed by ib_order_id. Populated when
+        # cancel_order dispatches a cancelOrder call and cleared once the
+        # order reaches a terminal status. Used by _on_error to recognise
+        # when IB error 10340 ("ManualOrderIndicator not supported") is
+        # rejecting our cancel — versus the unrelated background notice
+        # IB sends on some place-order flows — so we can auto-retry with
+        # a cleaned payload exactly once. See _retry_cancel_clean.
+        self._pending_cancel_ids: set[str] = set()
+        # ib_order_ids for which we've already attempted one clean retry.
+        # Prevents an infinite retry loop if IB still rejects after the
+        # strip. Cleared along with _pending_cancel_ids on terminal status.
+        self._cancel_retry_attempted: set[str] = set()
         # IB error codes that indicate an order was rejected or has a price/
         # validation problem.  110 = price doesn't conform to min tick.
         # 200-299 = order/account-level errors (201=rejected, 203=no shorting…).
@@ -1221,8 +1233,112 @@ class InsyncClient(IBClientBase):
                 trade.orderStatus.status, ib_order_id,
             )
             return
+        # Mark this id as having a cancel in flight. _on_error consults
+        # this set to recognise when error 10340 is rejecting our
+        # cancel (vs the same code firing as a benign place-order notice
+        # on an unrelated request). Cleared on terminal status by
+        # _on_order_status.
+        self._pending_cancel_ids.add(ib_order_id)
+        self._cancel_retry_attempted.discard(ib_order_id)
         self.__ib.cancelOrder(trade.order)
         logger.info('{"event": "ORDER_CANCELED", "ib_order_id": "%s"}', ib_order_id)
+
+    async def _retry_cancel_clean(
+        self, ib_order_id: str, *, original_code: int, original_msg: str,
+    ) -> None:
+        """Retry a cancel after stripping attributes IB rejected.
+
+        Triggered by ``_on_error`` when IB code 10340 ("ManualOrderIndicator
+        not supported") fires for an in-flight cancel. ib_async sometimes
+        sets ``Order.manualOrderIndicator`` on the cancel payload; newer
+        TWS API builds reject it. Strip it, retry once. Capped at one
+        retry per cancel attempt — if the second attempt also fails, the
+        engine's existing reqOpenOrders verification in _handle_partial
+        catches the still-live order and escalates CATASTROPHIC.
+
+        Best-effort: a failure here logs and returns without raising —
+        the caller (an _on_error callback) cannot meaningfully recover.
+        """
+        if ib_order_id in self._cancel_retry_attempted:
+            logger.warning(
+                '{"event": "ORDER_CANCEL_RETRY_SKIPPED", '
+                '"reason": "already retried once", "ib_order_id": "%s", '
+                '"original_code": %d, "original_msg": "%s"}',
+                ib_order_id, original_code, original_msg,
+            )
+            return
+        self._cancel_retry_attempted.add(ib_order_id)
+        trade = self.__active_trades.get(ib_order_id)
+        if trade is None:
+            logger.warning(
+                '{"event": "ORDER_CANCEL_RETRY_SKIPPED", '
+                '"reason": "trade not in active cache", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            return
+        terminal = {"Cancelled", "Filled", "Inactive"}
+        if trade.orderStatus.status in terminal:
+            logger.info(
+                '{"event": "ORDER_CANCEL_RETRY_SKIPPED", '
+                '"reason": "already terminal", "status": "%s", "ib_order_id": "%s"}',
+                trade.orderStatus.status, ib_order_id,
+            )
+            return
+        try:
+            await self._throttle()
+            order = trade.order
+            # Strip the attribute IB just rejected. Setting to UNSET_INTEGER
+            # would be ideal but ib_async uses a sentinel that's not stable
+            # across versions; falsy/empty is the safer cross-version idiom
+            # and matches what ib_async treats as "unset" on outbound serialise.
+            if hasattr(order, "manualOrderIndicator"):
+                try:
+                    order.manualOrderIndicator = None
+                except Exception as e:
+                    logger.debug("clear manualOrderIndicator failed",
+                                 exc_info=e)
+            self.__ib.cancelOrder(order)
+            logger.warning(
+                '{"event": "IB_CANCEL_RETRY_AFTER_10340", '
+                '"ib_order_id": "%s", "original_code": %d, '
+                '"original_msg": "%s"}',
+                ib_order_id, original_code, original_msg,
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "IB_CANCEL_RETRY_FAILED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+
+    async def is_order_open_at_ib(self, ib_order_id: str) -> bool | None:
+        """Authoritative check: does IB still have this order working?
+
+        Calls ``reqOpenOrdersAsync`` and looks for the id in the result.
+        Used by the engine's partial-fill cancel path as a final verify
+        before writing TransactionAction.CANCELLED — if the cancel was
+        silently rejected by IB (e.g. error 10340 path), the order is
+        still alive and we must NOT record it as cancelled.
+
+        Returns:
+            True  — IB confirms the order is still in its open-orders list
+            False — IB confirms the order is gone (terminal at IB)
+            None  — query failed (network blip, throttle, etc.); caller
+                    must fail-SAFE (treat as 'might still be open')
+        """
+        try:
+            await self._throttle()
+            open_trades = await self.__ib.reqOpenOrdersAsync()
+            return any(
+                str(getattr(t.order, "orderId", "")) == ib_order_id
+                for t in open_trades
+            )
+        except Exception:
+            logger.exception(
+                '{"event": "IB_OPEN_ORDERS_PROBE_FAILED", '
+                '"ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            return None
 
     async def get_order_status(self, ib_order_id: str) -> dict:
         """Get current status of an order from IB."""
@@ -1903,6 +2019,10 @@ class InsyncClient(IBClientBase):
             removed = True
         self._order_errors.pop(ib_order_id, None)
         self._previous_clean_status_map.pop(ib_order_id, None)
+        # Clear cancel-retry state too — terminal status (filled,
+        # cancelled, inactive) means there's nothing left to retry.
+        self._pending_cancel_ids.discard(ib_order_id)
+        self._cancel_retry_attempted.discard(ib_order_id)
         if removed:
             logger.debug(
                 '{"event": "CALLBACKS_UNREGISTERED", "ib_order_id": "%s"}',
@@ -2059,6 +2179,18 @@ class InsyncClient(IBClientBase):
                     '{"event": "IB_NOTICE", "ib_order_id": "%s", "code": %d, "msg": "%s"}',
                     ib_order_id, errorCode, errorString,
                 )
+                # 10340 is informational on a place-order flow but a
+                # SILENT REJECT on a cancel — IB drops the cancel and
+                # the order keeps working. If we just dispatched a
+                # cancel for this id, retry once with manualOrderIndicator
+                # cleared. See _retry_cancel_clean for the rationale.
+                if (errorCode == 10340
+                        and ib_order_id in self._pending_cancel_ids):
+                    _spawn_background(self._retry_cancel_clean(
+                        ib_order_id,
+                        original_code=errorCode,
+                        original_msg=errorString,
+                    ))
             elif is_benign_race:
                 # Expected race when our walker/close path amends or
                 # cancels an order that IB just terminalized. The engine

@@ -144,6 +144,35 @@ class TransactionRepository:
             .all()
         )
 
+    def get_recent_cancelled(
+        self, *, since_minutes: int = 240,
+    ) -> list[TransactionEvent]:
+        """Return rows whose most-recent action is CANCELLED, scoped to a
+        recent time window. Used by the cancel-verification reconciler
+        to detect orders the engine marked CANCELLED that are still
+        actually working at IB (the 10340 silent-rejection failure mode).
+
+        Window defaults to 240 min (4h) — wider than the typical mid
+        order's settle horizon but bounded so the IB reqOpenOrders
+        comparison stays cheap.
+        """
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+        s = self._session()
+        latest = (
+            s.query(func.max(TransactionEvent.id).label("max_id"))
+            .filter(TransactionEvent.ib_order_id.isnot(None))
+            .filter(TransactionEvent.requested_at >= cutoff)
+            .group_by(TransactionEvent.ib_order_id)
+            .subquery()
+        )
+        return (
+            s.query(TransactionEvent)
+            .join(latest, TransactionEvent.id == latest.c.max_id)
+            .filter(TransactionEvent.action == TransactionAction.CANCELLED)
+            .all()
+        )
+
     def get_by_ib_order_id(self, ib_order_id: int) -> list[TransactionEvent]:
         """Return all rows for a given IB order ID, chronological."""
         return (

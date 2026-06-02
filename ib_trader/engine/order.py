@@ -1088,19 +1088,36 @@ async def _execute_mid_order(
                            commission=final_commission)
                 # pnl=None — entry partials shouldn't clobber realized_pnl.
                 ctx.trades.update_pnl(trade_group.id, None, final_commission)
-                _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
-                           qty, ib_order_id=_safe_int(ib_order_id),
-                           trade_serial=trade_group.serial_number, is_terminal=True,
-                           ib_responded_at=_now_utc(),
-                           trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
-                           correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
+                # Verify cancel before recording it as terminal. See
+                # _finalize_partial_cancel docstring + order #98852
+                # incident 2026-06-02.
+                cancelled_written, cancel_note = await _finalize_partial_cancel(
+                    ctx, order_ctx, trade_group,
+                    ib_order_id=ib_order_id, qty_requested=qty,
+                    final_qty=final_qty,
+                    effective_avg=final_avg or Decimal("0"),
+                    commission=final_commission, resolution=resolution,
+                )
+                severity = (
+                    OutputSeverity.WARNING if cancelled_written
+                    else OutputSeverity.ERROR
+                )
+                icon = "\u26a0" if cancelled_written else "\u274c"
+                event = (
+                    "ORDER_PARTIAL_DISPLAY" if cancelled_written
+                    else "ORDER_CANCEL_FAILED_DISPLAY"
+                )
+                suffix = (
+                    "(cancel beat remainder)" if cancelled_written
+                    else f"({cancel_note})"
+                )
                 ctx.router.emit(
-                    f"\u26a0 PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty)} filled "
-                    f"@ avg ${_fmt_price(final_avg)} (cancel beat remainder)\n"
+                    f"{icon} PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty)} filled "
+                    f"@ avg ${_fmt_price(final_avg)} {suffix}\n"
                     f"  Commission: ${_fmt_money(final_commission)}\n"
                     f"  Serial: #{trade_group.serial_number}",
-                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-                    event="ORDER_PARTIAL_DISPLAY",
+                    pane=OutputPane.COMMAND, severity=severity,
+                    event=event,
                 )
                 # Console-side close P&L for the filled-then-cancelled
                 # subset. Mirrors the gate in _handle_fill / _handle_partial.
@@ -1110,21 +1127,43 @@ async def _execute_mid_order(
                         final_avg or Decimal("0"), final_commission,
                     )
             else:
-                ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
-                _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
-                           qty, ib_order_id=_safe_int(ib_order_id),
-                           trade_serial=trade_group.serial_number, is_terminal=True,
-                           ib_responded_at=_now_utc(),
-                           trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
-                           correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
-                cancel_note = "cancel confirmed" if resolution == "cancelled" else "cancel ack timeout"
-                ctx.router.emit(
-                    f"\u2717 EXPIRED: 0/{qty} filled | order window closed "
-                    f"({int(_total_order_wait(settings))}s, {cancel_note})\n"
-                    f"  Serial: #{trade_group.serial_number}",
-                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-                    event="ORDER_EXPIRED_DISPLAY",
+                # Zero-fill expiry \u2014 verify cancel before marking the
+                # trade group CLOSED or writing CANCELLED. If IB silently
+                # rejected the cancel (e.g. error 10340) the order is
+                # still working at IB. _finalize_partial_cancel handles
+                # the probe + alert; we mark trade_group CLOSED only
+                # when IB confirms terminal.
+                cancelled_written, cancel_note = await _finalize_partial_cancel(
+                    ctx, order_ctx, trade_group,
+                    ib_order_id=ib_order_id, qty_requested=qty,
+                    final_qty=Decimal("0"),
+                    effective_avg=Decimal("0"),
+                    commission=Decimal("0"), resolution=resolution,
                 )
+                if cancelled_written:
+                    ctx.trades.update_status(
+                        trade_group.id, TradeStatus.CLOSED,
+                    )
+                severity = (
+                    OutputSeverity.WARNING if cancelled_written
+                    else OutputSeverity.ERROR
+                )
+                if cancelled_written:
+                    ctx.router.emit(
+                        f"\u2717 EXPIRED: 0/{qty} filled | order window closed "
+                        f"({int(_total_order_wait(settings))}s, {cancel_note})\n"
+                        f"  Serial: #{trade_group.serial_number}",
+                        pane=OutputPane.COMMAND, severity=severity,
+                        event="ORDER_EXPIRED_DISPLAY",
+                    )
+                else:
+                    ctx.router.emit(
+                        f"\u274c CANCEL FAILED: 0/{qty} filled but order "
+                        f"may STILL BE WORKING at IB ({cancel_note})\n"
+                        f"  Serial: #{trade_group.serial_number}",
+                        pane=OutputPane.COMMAND, severity=severity,
+                        event="ORDER_CANCEL_FAILED_DISPLAY",
+                    )
                 logger.info(
                     '{"event": "ORDER_EXPIRED", "correlation_id": "%s", "serial": %d, '
                     '"reason": "reprice_timeout_no_fill", "cancel_resolution": "%s"}',
@@ -2398,6 +2437,151 @@ async def _cancel_and_await_resolution(
     )
 
 
+async def _finalize_partial_cancel(
+    ctx: AppContext, order_ctx: _OrderContext, trade_group: TradeGroup,
+    *, ib_order_id: str, qty_requested: Decimal, final_qty: Decimal,
+    effective_avg: Decimal, commission: Decimal, resolution: str,
+) -> tuple[bool, str]:
+    """Write the terminal CANCELLED row only when IB confirms the cancel.
+
+    Returns ``(cancelled_written, display_note)`` for the caller's display
+    string. ``cancelled_written`` is True when we wrote
+    TransactionAction.CANCELLED; False when we deliberately left the order
+    open on the ledger because IB still has it working (or we couldn't
+    confirm). ``display_note`` is the human-facing string the caller
+    embeds into its PARTIAL line.
+
+    Three branches:
+
+    * ``resolution == "cancelled"`` — IB returned Cancelled and the
+      _verify_cancel guard passed. No probe needed. Write CANCELLED.
+    * ``resolution == "timeout"`` AND ``is_order_open_at_ib`` returns
+      False — IB has terminalised it on their side, just no event made
+      it back to us in 120 s. Write CANCELLED.
+    * ``resolution == "timeout"`` AND ``is_order_open_at_ib`` returns
+      True (or None on probe failure — fail safe) — IB rejected the
+      cancel silently and the order is still working. DO NOT write
+      CANCELLED. Fire CATASTROPHIC alert ``IB_CANCEL_FAILED_ORDER_STILL_LIVE``
+      so the operator sees a blocking modal and reconciles in TWS.
+
+    The lie this prevents: prior behaviour wrote CANCELLED regardless
+    of resolution. An IB-rejected cancel (e.g. error 10340) plus the
+    120 s timeout combined to mark a still-live order as cancelled
+    in the audit ledger, which then drove operator decisions on
+    follow-on trades. See order #98852 incident 2026-06-02.
+    """
+    if resolution == "cancelled":
+        _write_txn(
+            ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
+            order_ctx.order_type, qty_requested,
+            ib_order_id=_safe_int(ib_order_id),
+            trade_serial=trade_group.serial_number, is_terminal=True,
+            ib_responded_at=_now_utc(),
+            trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+            correlation_id=order_ctx.correlation_id,
+            security_type=order_ctx.security_type,
+        )
+        return (True, "cancel confirmed")
+
+    # resolution == "timeout" — IB never sent us a terminal status for
+    # the residual within 120 s. Probe authoritatively.
+    still_open: bool | None = None
+    if hasattr(ctx.ib, "is_order_open_at_ib"):
+        try:
+            still_open = await ctx.ib.is_order_open_at_ib(ib_order_id)
+        except Exception:
+            logger.exception(
+                '{"event": "ORDER_CANCEL_VERIFY_PROBE_FAILED", '
+                '"ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            still_open = None
+
+    if still_open is False:
+        # IB has the order gone; our event channel just missed the
+        # terminal. Safe to mark as cancelled in the ledger.
+        _write_txn(
+            ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
+            order_ctx.order_type, qty_requested,
+            ib_order_id=_safe_int(ib_order_id),
+            trade_serial=trade_group.serial_number, is_terminal=True,
+            ib_responded_at=_now_utc(),
+            trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+            correlation_id=order_ctx.correlation_id,
+            security_type=order_ctx.security_type,
+        )
+        logger.info(
+            '{"event": "ORDER_CANCEL_TIMEOUT_VERIFIED_TERMINAL", '
+            '"ib_order_id": "%s", "serial": %d}',
+            ib_order_id, trade_group.serial_number,
+        )
+        return (True, "cancel ack timeout (verified terminal at IB)")
+
+    # still_open is True OR None (probe failed). Fail safe: do NOT
+    # write CANCELLED. Fire CATASTROPHIC and surface the still-live
+    # residual to the operator.
+    final_remainder = qty_requested - final_qty
+    msg = (
+        f"Cancel for order #{ib_order_id} ({order_ctx.symbol} "
+        f"{order_ctx.side}) was NOT acknowledged by IB. {final_qty}/"
+        f"{qty_requested} filled; {final_remainder} contracts may still "
+        f"be working as a limit at IB. Verify and cancel manually in TWS."
+    )
+    if still_open is None:
+        msg = (
+            f"Cancel verification probe FAILED for order #{ib_order_id} "
+            f"({order_ctx.symbol} {order_ctx.side}). {final_qty}/{qty_requested} "
+            f"filled; status of remaining {final_remainder} is UNKNOWN. "
+            f"Check TWS — order may still be live."
+        )
+
+    redis = getattr(ctx, "redis", None)
+    try:
+        from ib_trader.logging_.alerts import log_and_alert
+        await log_and_alert(
+            redis=redis,
+            trigger="IB_CANCEL_FAILED_ORDER_STILL_LIVE",
+            message=msg,
+            severity="CATASTROPHIC",
+            symbol=order_ctx.symbol,
+            ib_order_id=ib_order_id,
+            extra={
+                "serial": trade_group.serial_number,
+                "side": order_ctx.side,
+                "qty_filled": str(final_qty),
+                "qty_requested": str(qty_requested),
+                "qty_residual": str(final_remainder),
+                "probe_result": (
+                    "still_open" if still_open else "probe_failed"
+                ),
+            },
+            dedup_key=f"cancel_failed:{ib_order_id}",
+            exc_info=False,
+        )
+    except Exception:
+        logger.exception(
+            '{"event": "IB_CANCEL_FAILED_ALERT_DISPATCH_FAILED", '
+            '"ib_order_id": "%s"}',
+            ib_order_id,
+        )
+
+    logger.error(
+        '{"event": "ORDER_CANCEL_FAILED_LIVE_AT_IB", "ib_order_id": "%s", '
+        '"serial": %d, "qty_filled": "%s", "qty_residual": "%s", '
+        '"probe_result": "%s"}',
+        ib_order_id, trade_group.serial_number,
+        final_qty, final_remainder,
+        "still_open" if still_open else "probe_failed",
+    )
+
+    note = (
+        "cancel FAILED — order still live at IB"
+        if still_open
+        else "cancel UNVERIFIED — probe failed, check TWS"
+    )
+    return (False, note)
+
+
 async def _handle_partial(
     order_ctx: _OrderContext, trade_group: TradeGroup, qty_requested: Decimal,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
@@ -2467,24 +2651,37 @@ async def _handle_partial(
                commission=commission)
     # pnl=None — partials on the entry side shouldn't clobber realized_pnl.
     ctx.trades.update_pnl(trade_group.id, None, commission)
-    _write_txn(ctx, TransactionAction.CANCELLED, order_ctx.symbol, order_ctx.side,
-               order_ctx.order_type, qty_requested,
-               ib_order_id=_safe_int(ib_order_id),
-               trade_serial=trade_group.serial_number, is_terminal=True,
-               ib_responded_at=_now_utc(),
-               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
-               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
+
+    # Verify the cancel before recording it as terminal. On
+    # resolution="timeout" with the order still alive at IB, this
+    # writes NO CANCELLED row and fires a CATASTROPHIC alert instead
+    # \u2014 so the operator gets a blocking modal naming the still-live
+    # qty. See _finalize_partial_cancel docstring + order #98852
+    # incident 2026-06-02.
+    cancelled_written, cancel_note = await _finalize_partial_cancel(
+        ctx, order_ctx, trade_group,
+        ib_order_id=ib_order_id, qty_requested=qty_requested,
+        final_qty=final_qty, effective_avg=effective_avg,
+        commission=commission, resolution=resolution,
+    )
 
     final_remainder = qty_requested - final_qty
-    cancel_note = "cancel confirmed" if resolution == "cancelled" else "cancel ack timeout"
+    severity = (
+        OutputSeverity.WARNING if cancelled_written else OutputSeverity.ERROR
+    )
+    icon = "\u26a0" if cancelled_written else "\u274c"
+    event = (
+        "ORDER_PARTIAL_DISPLAY" if cancelled_written
+        else "ORDER_CANCEL_FAILED_DISPLAY"
+    )
     ctx.router.emit(
-        f"\u26a0 PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty_requested)} "
+        f"{icon} PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty_requested)} "
         f"filled @ avg ${_fmt_price(effective_avg)} | "
-        f"{_fmt_qty(final_remainder)} shares not filled ({cancel_note})\n"
+        f"{_fmt_qty(final_remainder)} not filled ({cancel_note})\n"
         f"  Commission: ${_fmt_money(commission)}\n"
         f"  Serial: #{trade_group.serial_number}",
-        pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
-        event="ORDER_PARTIAL_DISPLAY",
+        pane=OutputPane.COMMAND, severity=severity,
+        event=event,
     )
     logger.info(
         '{"event": "ORDER_PARTIAL_FILL", "correlation_id": "%s", "serial": %d, '
