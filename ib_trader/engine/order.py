@@ -1095,13 +1095,20 @@ async def _execute_mid_order(
                            trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
                            correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
                 ctx.router.emit(
-                    f"\u26a0 PARTIAL: {final_qty}/{qty} filled @ avg "
-                    f"${final_avg} (cancel beat remainder)\n"
-                    f"  Commission: ${final_commission}\n"
+                    f"\u26a0 PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty)} filled "
+                    f"@ avg ${_fmt_price(final_avg)} (cancel beat remainder)\n"
+                    f"  Commission: ${_fmt_money(final_commission)}\n"
                     f"  Serial: #{trade_group.serial_number}",
                     pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
                     event="ORDER_PARTIAL_DISPLAY",
                 )
+                # Console-side close P&L for the filled-then-cancelled
+                # subset. Mirrors the gate in _handle_fill / _handle_partial.
+                if final_qty > 0 and not getattr(cmd, "bot_ref", None):
+                    await _emit_console_close_pnl(
+                        ctx, order_ctx, final_qty,
+                        final_avg or Decimal("0"), final_commission,
+                    )
             else:
                 ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
                 _write_txn(ctx, TransactionAction.CANCELLED, cmd.symbol, side, "LIMIT",
@@ -2471,9 +2478,10 @@ async def _handle_partial(
     final_remainder = qty_requested - final_qty
     cancel_note = "cancel confirmed" if resolution == "cancelled" else "cancel ack timeout"
     ctx.router.emit(
-        f"\u26a0 PARTIAL: {final_qty}/{qty_requested} filled @ avg ${effective_avg} | "
-        f"{final_remainder} shares not filled ({cancel_note})\n"
-        f"  Commission: ${commission}\n"
+        f"\u26a0 PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty_requested)} "
+        f"filled @ avg ${_fmt_price(effective_avg)} | "
+        f"{_fmt_qty(final_remainder)} shares not filled ({cancel_note})\n"
+        f"  Commission: ${_fmt_money(commission)}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
         event="ORDER_PARTIAL_DISPLAY",
@@ -2484,6 +2492,16 @@ async def _handle_partial(
         order_ctx.correlation_id, trade_group.serial_number,
         final_qty, qty_requested, resolution,
     )
+
+    # Console-side close P&L disclosure for partial fills that close
+    # (or reduce) an opposite-side position. Same gating as _handle_fill:
+    # console orders only \u2014 bot orders carry bot_ref and have their own
+    # exit-pnl path. Was missing here, so a 3/5 partial that closed a
+    # short still printed only Commission and no P&L line.
+    if final_qty > 0 and not getattr(cmd, "bot_ref", None):
+        await _emit_console_close_pnl(
+            ctx, order_ctx, final_qty, effective_avg, commission,
+        )
 
     if cmd.take_profit_price or cmd.profit_amount:
         from ib_trader.repl.commands import BuyCommand as BC
