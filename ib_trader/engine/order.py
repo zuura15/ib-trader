@@ -13,7 +13,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from ib_trader.config.context import AppContext
 from ib_trader.repl.output_router import OutputPane, OutputSeverity
@@ -118,6 +118,41 @@ def _fmt_qty(q) -> str:
     if d == d.to_integral_value():
         return str(int(d))
     return str(d)
+
+
+def _fmt_money(amount, *, places: int = 2) -> str:
+    """Format a money figure for human display.
+
+    Always shows ``places`` decimals (default 2 — cents) and inserts
+    thousand separators so futures notionals like 6,438.93 don't render
+    as a wall of digits. Sign is NOT prefixed — callers add ``+`` / ``-``
+    if they want signed display (the realized-P&L emit does).
+
+    Quantizes via ``Decimal.quantize`` rather than ``round()`` so
+    repeating decimals from price-averaging division (e.g.
+    ``4513.933333…`` from ``13541.80 / 3``) collapse to ``4,513.93``
+    without floating-point intermediates.
+    """
+    try:
+        d = Decimal(str(amount))
+    except (InvalidOperation, ValueError, TypeError):
+        return str(amount)
+    quant = Decimal(10) ** -places
+    try:
+        rounded = d.quantize(quant, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return str(amount)
+    sign = "-" if rounded < 0 else ""
+    abs_str = f"{abs(rounded):,.{places}f}"
+    return f"{sign}{abs_str}"
+
+
+def _fmt_price(price) -> str:
+    """Price formatter: enough decimals to keep tick precision (4 places)
+    but otherwise the same thousand-separated, quantized formatting as
+    money. Used for display of fills and limits where sub-cent ticks
+    (futures, FX) matter."""
+    return _fmt_money(price, places=4).rstrip("0").rstrip(".") or "0"
 
 
 def _safe_int(val) -> int | None:
@@ -745,7 +780,8 @@ async def _execute_mid_order(
             _fill_running_qty += _qty
             ctx.tracker.notify_filled(fill_ib_id)
             ctx.router.emit(
-                f"[{_now_display()}] Filled {_fmt_qty(_qty)} @ ${_avg} "
+                f"[{_now_display()}] Filled {_fmt_qty(_qty)} @ "
+                f"${_fmt_price(_avg)} "
                 f"({_fmt_qty(_fill_running_qty)}/{_fmt_qty(qty)})",
                 pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
                 event="ORDER_PARTIAL_FILL_DISPLAY",
@@ -1175,7 +1211,8 @@ async def _execute_bid_ask_order(
             _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
             ctx.router.emit(
-                f"[{_now_display()}] Filled {_fmt_qty(q)} @ ${avg} "
+                f"[{_now_display()}] Filled {_fmt_qty(q)} @ "
+                f"${_fmt_price(avg)} "
                 f"({_fmt_qty(_fill_qty)}/{_fmt_qty(qty)})",
                 pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
                 event="ORDER_PARTIAL_FILL_DISPLAY",
@@ -1904,7 +1941,8 @@ async def _execute_market_order(
             _fill_commission += commission
             ctx.tracker.notify_filled(fill_ib_id)
             ctx.router.emit(
-                f"[{_now_display()}] Filled {_fmt_qty(q)} @ ${avg} "
+                f"[{_now_display()}] Filled {_fmt_qty(q)} @ "
+                f"${_fmt_price(avg)} "
                 f"({_fmt_qty(_fill_qty)}/{_fmt_qty(qty)})",
                 pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
                 event="ORDER_PARTIAL_FILL_DISPLAY",
@@ -2031,7 +2069,8 @@ async def _emit_console_close_pnl(
     sign = "+" if pnl >= 0 else "-"
     sev = OutputSeverity.SUCCESS if pnl >= 0 else OutputSeverity.WARNING
     ctx.router.emit(
-        f"  P&L (closed {closed_qty} {order_ctx.symbol}): {sign}${abs(pnl)}",
+        f"  P&L (closed {_fmt_qty(closed_qty)} {order_ctx.symbol}): "
+        f"{sign}${_fmt_money(abs(pnl))}",
         pane=OutputPane.COMMAND, severity=sev,
         event="CONSOLE_CLOSE_PNL_DISPLAY",
     )
@@ -2073,8 +2112,9 @@ async def _handle_fill(
                commission=commission)
 
     ctx.router.emit(
-        f"\u2713 FILLED: {_fmt_qty(qty_filled)} shares {order_ctx.symbol} @ ${avg_price} avg\n"
-        f"  Commission: ${commission}\n"
+        f"\u2713 FILLED: {_fmt_qty(qty_filled)} shares {order_ctx.symbol} @ "
+        f"${_fmt_price(avg_price)} avg\n"
+        f"  Commission: ${_fmt_money(commission)}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="ORDER_FILLED_DISPLAY",
@@ -2086,8 +2126,9 @@ async def _handle_fill(
         from ib_trader.engine.pricing import notional_value
         notional = notional_value(qty_filled, avg_price, order_ctx.multiplier)
         ctx.router.emit(
-            f"  fill notional=${notional} (qty {qty_filled} \u00d7 mult {order_ctx.multiplier} \u00d7 "
-            f"price ${avg_price}), commission=${commission}",
+            f"  fill notional=${_fmt_money(notional)} (qty {_fmt_qty(qty_filled)} \u00d7 "
+            f"mult {order_ctx.multiplier} \u00d7 price ${_fmt_price(avg_price)}), "
+            f"commission=${_fmt_money(commission)}",
             pane=OutputPane.LOG, severity=OutputSeverity.INFO,
             event="FUT_FILL_NOTIONAL",
         )
@@ -2802,11 +2843,15 @@ async def _handle_close_fill(
     if remaining <= 0:
         ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
 
-    pnl_str = f"+${realized_pnl}" if realized_pnl >= 0 else f"-${abs(realized_pnl)}"
+    pnl_str = (
+        f"+${_fmt_money(realized_pnl)}" if realized_pnl >= 0
+        else f"-${_fmt_money(abs(realized_pnl))}"
+    )
     closed_label = "CLOSED" if remaining <= 0 else "PARTIAL CLOSE"
     ctx.router.emit(
-        f"\u2713 {closed_label}: {qty_filled} shares {close_ctx.symbol} @ ${avg_price}\n"
-        f"  P&L: {pnl_str} (commission: ${total_commission})\n"
+        f"\u2713 {closed_label}: {_fmt_qty(qty_filled)} shares "
+        f"{close_ctx.symbol} @ ${_fmt_price(avg_price)}\n"
+        f"  P&L: {pnl_str} (commission: ${_fmt_money(total_commission)})\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="CLOSE_ORDER_FILLED",
@@ -2861,10 +2906,15 @@ async def _handle_close_partial(
     ctx.trades.update_pnl(trade_group.id, realized_pnl, total_commission)
 
     remainder = qty_requested - qty_filled
-    pnl_str = f"+${realized_pnl}" if realized_pnl >= 0 else f"-${abs(realized_pnl)}"
+    pnl_str = (
+        f"+${_fmt_money(realized_pnl)}" if realized_pnl >= 0
+        else f"-${_fmt_money(abs(realized_pnl))}"
+    )
     ctx.router.emit(
-        f"\u26a0 CLOSE PARTIAL: {qty_filled}/{qty_requested} filled @ ${avg_price}\n"
-        f"  {remainder} shares still open. P&L on closed portion: {pnl_str}\n"
+        f"\u26a0 CLOSE PARTIAL: {_fmt_qty(qty_filled)}/{_fmt_qty(qty_requested)} "
+        f"filled @ ${_fmt_price(avg_price)}\n"
+        f"  {_fmt_qty(remainder)} shares still open. "
+        f"P&L on closed portion: {pnl_str}\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
         event="CLOSE_ORDER_PARTIAL",
