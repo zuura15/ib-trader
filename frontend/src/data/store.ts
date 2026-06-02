@@ -692,9 +692,16 @@ export const useStore = create<AppStore>((set, get) => ({
       });
     }
     if (data.commands) {
+      // Preserve the operator's originally-typed command text for any
+      // command we already have locally. The server stores the EXPANDED
+      // form ("buy MGCQ6 1 mid --sec-type FUT --exchange CME") on
+      // pending_commands for audit clarity, but the operator typed only
+      // "buy MGCQ6 1 mid" — the arrow-up history would otherwise replay
+      // the verbose form, which is annoying to edit and re-submit.
+      const localById = new Map(get().commands.map(c => [c.id, c.command]));
       const parsed = (data.commands as unknown[]).map((c: any) => ({
         id: c.id,
-        command: c.command_text,
+        command: localById.get(c.id) || c.command_text,
         status: c.status?.toLowerCase(),
         output: c.output,
         startedAt: parseUTC(c.submitted_at),
