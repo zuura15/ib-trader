@@ -73,6 +73,19 @@ ib_min_call_interval_ms: 100
 # Live accounts with real-time subscriptions should use 1. Auto-detect
 # overrides this per-session based on the classified mode.
 ib_market_data_type: 3
+
+# Hourly prophylactic resubscribe (cancel + reqMktData every
+# subscription on a timer). Addresses the IB-side "parked subscription"
+# failure mode where idle Gateway silently stops pushing ticks for some
+# symbols without firing an error or closing the socket. Each cycle
+# takes ~(stagger × N_symbols) seconds; per-symbol data gap is ~250 ms.
+# Set ``prophylactic_resub_interval_hours: 0`` to disable.
+prophylactic_resub_interval_hours: 1
+prophylactic_resub_stagger_seconds: 2
+# Wait this long after engine startup before the first cycle, so the
+# initial watchlist + position subscribe has room to settle.
+prophylactic_resub_startup_delay_seconds: 600
+
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081

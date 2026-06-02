@@ -60,6 +60,9 @@ DEFAULT_STARTUP_GRACE_S = 120        # no alerts in the first 2 min after loop s
 DEFAULT_MIN_CONFIRMATIONS = 3        # require 3 consecutive silent polls before alerting
 DEFAULT_RECONNECT_PT = "02:30"       # daily reconnect time
 DEFAULT_RECONNECT_MAX_GAP_HOURS = 30 # force a cycle if none happened in this window
+DEFAULT_PROPHYLACTIC_INTERVAL_H = 1.0
+DEFAULT_PROPHYLACTIC_STAGGER_S = 2.0
+DEFAULT_PROPHYLACTIC_STARTUP_DELAY_S = 600  # 10 min — let the first session settle
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +424,163 @@ async def scheduled_reconnect_loop(ctx: "AppContext") -> None:
             # Don't tight-loop on a persistent failure; wait an hour
             # before re-arming the wall-clock calculation.
             await asyncio.sleep(3600)
+
+
+async def prophylactic_resubscribe_loop(ctx: "AppContext") -> None:
+    """Every N hours, cancel + re-issue every market-data subscription.
+
+    Addresses the "IB silently parks idle subscriptions" failure mode
+    (operator-reported pattern, 2026-06-02). The TCP socket stays open,
+    no error fires, our dicts still say "subscribed", but IB stops
+    pushing ticks for some symbols. A fresh ``reqMktData`` unsticks
+    IB's parked state because from its side this is a brand-new
+    subscription. We do the same thing a Gateway restart does — per
+    symbol, without dropping the socket.
+
+    Cadence is set in ``settings.yaml`` (``prophylactic_resub_interval_hours``,
+    default 1). A startup delay (``prophylactic_resub_startup_delay_seconds``,
+    default 600) lets the engine's first watchlist + positions subscribe
+    settle before we start cycling. Stagger between symbols
+    (``prophylactic_resub_stagger_seconds``, default 2) bounds per-symbol
+    data gaps to ~250 ms each and avoids a thundering-herd reqMktData
+    burst at IB.
+
+    Raises a WARNING ``IB_PROPHYLACTIC_RESUB_INFLIGHT`` alert at start
+    and resolves it on completion. ``bots.runtime.check_stale_quote``
+    consults this trigger and suppresses per-bot STALE_QUOTES halts
+    during the swap window so bots don't avalanche-halt mid-cycle.
+    """
+    from ib_trader.logging_.alerts import log_and_alert
+
+    interval_h = float(ctx.settings.get(
+        "prophylactic_resub_interval_hours", DEFAULT_PROPHYLACTIC_INTERVAL_H,
+    ))
+    stagger_s = float(ctx.settings.get(
+        "prophylactic_resub_stagger_seconds", DEFAULT_PROPHYLACTIC_STAGGER_S,
+    ))
+    startup_delay_s = float(ctx.settings.get(
+        "prophylactic_resub_startup_delay_seconds",
+        DEFAULT_PROPHYLACTIC_STARTUP_DELAY_S,
+    ))
+
+    if interval_h <= 0:
+        logger.info(
+            '{"event": "IB_PROPHYLACTIC_RESUB_DISABLED", '
+            '"interval_h": %.3f}',
+            interval_h,
+        )
+        return
+
+    interval_s = interval_h * 3600.0
+    logger.info(
+        '{"event": "IB_PROPHYLACTIC_RESUB_SCHEDULED", '
+        '"interval_h": %.2f, "stagger_s": %.2f, "startup_delay_s": %.0f}',
+        interval_h, stagger_s, startup_delay_s,
+    )
+
+    if not hasattr(ctx.ib, "prophylactic_resubscribe_all"):
+        logger.warning(
+            '{"event": "IB_PROPHYLACTIC_RESUB_NO_API", '
+            '"reason": "client lacks prophylactic_resubscribe_all"}',
+        )
+        return
+
+    await asyncio.sleep(startup_delay_s)
+
+    redis = getattr(ctx, "redis", None)
+
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+
+            streaming_count = len(getattr(ctx.ib, "_streaming", {}))
+            bars_count = len(getattr(ctx.ib, "_realtime_bars", {}))
+            logger.info(
+                '{"event": "PROPHYLACTIC_RESUB_STARTED", '
+                '"interval_h": %.2f, "streaming_count": %d, '
+                '"bars_count": %d, "stagger_s": %.2f}',
+                interval_h, streaming_count, bars_count, stagger_s,
+            )
+
+            # Raise an in-flight WARNING so bots suppress per-symbol
+            # STALE_QUOTES halts for the duration of the swap window.
+            try:
+                await log_and_alert(
+                    redis=redis,
+                    trigger="IB_PROPHYLACTIC_RESUB_INFLIGHT",
+                    message=(
+                        f"Routine subscription refresh: cycling "
+                        f"{streaming_count} quote + {bars_count} bar subs "
+                        f"(stagger {stagger_s:.1f}s)."
+                    ),
+                    severity="WARNING",
+                    dedup_key="prophylactic_resub",
+                    exc_info=False,
+                )
+            except Exception:
+                logger.exception(
+                    '{"event": "IB_PROPHYLACTIC_RESUB_ALERT_FAILED"}',
+                )
+
+            started = asyncio.get_event_loop().time()
+            try:
+                result = await ctx.ib.prophylactic_resubscribe_all(
+                    stagger_s=stagger_s,
+                )
+                duration_s = asyncio.get_event_loop().time() - started
+                logger.info(
+                    '{"event": "PROPHYLACTIC_RESUB_DONE", '
+                    '"duration_s": %.2f, "mkt_ok": %d, "mkt_fail": %d, '
+                    '"mkt_total": %d, "bar_ok": %d, "bar_fail": %d, '
+                    '"bar_total": %d}',
+                    duration_s,
+                    result["mkt_ok"], result["mkt_fail"], result["mkt_total"],
+                    result["bar_ok"], result["bar_fail"], result["bar_total"],
+                )
+            finally:
+                # Always resolve the in-flight alert — even on failure
+                # we don't want it latched (operator would think a
+                # resub is still running forever).
+                await _resolve_prophylactic_alert(redis)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('{"event": "IB_PROPHYLACTIC_RESUB_LOOP_ERROR"}')
+            # Resolve any latched alert, then wait an hour before
+            # re-arming so a persistent failure doesn't tight-loop.
+            await _resolve_prophylactic_alert(redis)
+            await asyncio.sleep(3600)
+
+
+async def _resolve_prophylactic_alert(redis) -> None:
+    """HDEL the IB_PROPHYLACTIC_RESUB_INFLIGHT alert from alerts:active.
+
+    Mirrors the pattern in ``main._resolve_ib_disconnect_alert``. The
+    dedup_key gives the alert a stable uuid5 id, so we can drop it by
+    re-deriving the id rather than scanning the hash.
+    """
+    if redis is None:
+        return
+    try:
+        import uuid as _uuid
+        from ib_trader.redis.state import StateKeys
+        from ib_trader.redis.streams import publish_activity
+
+        alert_id = str(_uuid.uuid5(
+            _uuid.NAMESPACE_DNS,
+            "IB_PROPHYLACTIC_RESUB_INFLIGHT|prophylactic_resub",
+        ))
+        removed = await redis.hdel(StateKeys.alerts_active(), alert_id)
+        if removed:
+            await publish_activity(redis, "alerts")
+            logger.info(
+                '{"event": "IB_PROPHYLACTIC_RESUB_ALERT_RESOLVED"}',
+            )
+    except Exception:
+        logger.exception(
+            '{"event": "IB_PROPHYLACTIC_RESUB_ALERT_RESOLVE_FAILED"}',
+        )
 
 
 # ---------------------------------------------------------------------------

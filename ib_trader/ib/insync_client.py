@@ -1501,6 +1501,128 @@ class InsyncClient(IBClientBase):
 
         return (mkt_ok, mkt_fail, bar_ok, bar_fail)
 
+    async def prophylactic_resubscribe_all(
+        self, *, stagger_s: float = 2.0,
+    ) -> dict[str, int]:
+        """Cancel + re-issue every live market-data and RT-bar subscription.
+
+        Operator-facing recovery primitive for the "IB silently parks
+        idle subscriptions" failure mode: the TCP socket stays open,
+        no error fires, the engine's dicts still say "subscribed", but
+        IB stops pushing ticks for some symbols. A fresh ``reqMktData``
+        unsticks IB's parked state because from its side this is a
+        brand-new subscription. We mimic what restarting the Gateway
+        does, but per-symbol and without dropping the socket.
+
+        Per-symbol procedure: ``cancelMktData(contract)`` → 250 ms IB
+        settle → drop the dict entry → ``subscribe_market_data`` to
+        re-issue with the same refs. Then sleep ``stagger_s`` before
+        moving to the next symbol so the rate-limit and the per-symbol
+        data gap stay bounded (one symbol at a time has a ~250 ms hole,
+        not the whole watchlist at once).
+
+        Returns ``{mkt_ok, mkt_fail, mkt_total, bar_ok, bar_fail,
+        bar_total}``. Best-effort: a single symbol's failure is logged
+        and skipped without aborting the rest.
+
+        Called by the engine's hourly ``prophylactic_resubscribe_loop``;
+        also reusable by a manual ``/api/system/ib/resub`` if we add one
+        later.
+        """
+        # Snapshot keys + per-entry restore info BEFORE mutating either
+        # dict, so the iteration is deterministic and concurrent
+        # subscribe/unsubscribe from other paths (e.g. bot start) can't
+        # cause RuntimeError: dict changed size.
+        mkt_items: list[tuple[int, str, int]] = [
+            (
+                con_id,
+                (entry["contract"].localSymbol or entry["contract"].symbol),
+                int(entry.get("refs", 1)),
+            )
+            for con_id, entry in self._streaming.items()
+        ]
+        bar_items: list[tuple[int, str, str, list, int]] = [
+            (
+                con_id,
+                entry.get("symbol")
+                or (entry["contract"].localSymbol or entry["contract"].symbol),
+                entry.get("what_to_show", "TRADES"),
+                list(entry.get("callbacks") or []),
+                int(entry.get("refs", 1)),
+            )
+            for con_id, entry in self._realtime_bars.items()
+        ]
+
+        mkt_ok = mkt_fail = 0
+        for con_id, symbol, refs in mkt_items:
+            entry = self._streaming.get(con_id)
+            try:
+                if entry is not None:
+                    try:
+                        self.__ib.cancelMktData(entry["contract"])
+                    except Exception as e:
+                        logger.debug("cancelMktData failed during prophylactic",
+                                     exc_info=e)
+                    self._streaming.pop(con_id, None)
+                # Brief IB-side settle so the cancel is acknowledged
+                # before the re-issue. 250 ms is empirically enough on
+                # CME / SMART feeds without observable price gaps.
+                await asyncio.sleep(0.25)
+                await self.subscribe_market_data(con_id, symbol, count_ref=True)
+                for _ in range(max(0, refs - 1)):
+                    await self.subscribe_market_data(con_id, symbol, count_ref=True)
+                mkt_ok += 1
+            except Exception:
+                mkt_fail += 1
+                logger.warning(
+                    '{"event": "PROPHYLACTIC_MKTDATA_FAILED", '
+                    '"con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+            if stagger_s > 0:
+                await asyncio.sleep(stagger_s)
+
+        bar_ok = bar_fail = 0
+        for con_id, symbol, what_to_show, callbacks, refs in bar_items:
+            entry = self._realtime_bars.get(con_id)
+            try:
+                if entry is not None:
+                    try:
+                        self.__ib.cancelRealTimeBars(entry["bars"])
+                    except Exception as e:
+                        logger.debug("cancelRealTimeBars failed during prophylactic",
+                                     exc_info=e)
+                    self._realtime_bars.pop(con_id, None)
+                await asyncio.sleep(0.25)
+                primary = callbacks[0] if callbacks else None
+                await self.subscribe_realtime_bars(
+                    con_id, symbol, what_to_show=what_to_show, callback=primary,
+                )
+                new_entry = self._realtime_bars.get(con_id)
+                if new_entry is not None:
+                    for cb in callbacks[1:]:
+                        if cb not in new_entry["callbacks"]:
+                            new_entry["callbacks"].append(cb)
+                    for _ in range(max(0, refs - 1)):
+                        await self.subscribe_realtime_bars(
+                            con_id, symbol, what_to_show=what_to_show,
+                        )
+                bar_ok += 1
+            except Exception:
+                bar_fail += 1
+                logger.warning(
+                    '{"event": "PROPHYLACTIC_RT_BARS_FAILED", '
+                    '"con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+            if stagger_s > 0:
+                await asyncio.sleep(stagger_s)
+
+        return {
+            "mkt_ok": mkt_ok, "mkt_fail": mkt_fail, "mkt_total": len(mkt_items),
+            "bar_ok": bar_ok, "bar_fail": bar_fail, "bar_total": len(bar_items),
+        }
+
     def get_ticker(self, con_id: int) -> dict | None:
         """Return current streaming ticker data, or None."""
         entry = self._streaming.get(con_id)

@@ -3102,16 +3102,23 @@ class StrategyBotRunner(BotBase):
         return info
 
     async def _ib_reconnect_alert_active(self) -> bool:
-        """True if the engine has an active IB Gateway reconnect alert.
+        """True if an engine-driven IB subscription cycle is in flight.
 
-        When the engine's ib_async ``disconnectedEvent`` fires, it
-        publishes ``IB_GATEWAY_RECONNECTING`` to ``alerts_active``
-        immediately (and escalates to ``IB_GATEWAY_DISCONNECTED`` after
-        5 min). Both alerts are cleared on a successful reconnect.
+        Three triggers count as "in flight" — bots suppress per-symbol
+        STALE_QUOTES halts whenever any of them is latched:
 
-        The stale-quote watchdog consults this signal so a Gateway
-        outage does not crash every bot in lockstep — the engine owns
-        the reconnect loop, and bots should pause until it succeeds.
+          * ``IB_GATEWAY_RECONNECTING`` — fired on every disconnectedEvent
+            and cleared on the next successful reconnect.
+          * ``IB_GATEWAY_DISCONNECTED`` — 5-min escalation of the above.
+          * ``IB_PROPHYLACTIC_RESUB_INFLIGHT`` — fired by the engine's
+            hourly prophylactic resubscribe loop, cleared at end of cycle
+            (~30 s). Avoids bots avalanche-halting during a swap window
+            where the brief per-symbol data gap is expected.
+
+        The stale-quote watchdog consults this signal so a transient
+        engine-level cycle does not crash every bot in lockstep — the
+        engine owns the recovery, and bots should pause until it
+        completes.
         """
         redis = self.config.get("_redis") if self.config else None
         if redis is None:
@@ -3131,7 +3138,8 @@ class StrategyBotRunner(BotBase):
             except (TypeError, ValueError):
                 continue
             if trigger in ("IB_GATEWAY_RECONNECTING",
-                           "IB_GATEWAY_DISCONNECTED"):
+                           "IB_GATEWAY_DISCONNECTED",
+                           "IB_PROPHYLACTIC_RESUB_INFLIGHT"):
                 return True
         return False
 

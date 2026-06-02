@@ -324,6 +324,7 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # --- Start background tasks ---
         from ib_trader.engine.ib_resilience import (
             scheduled_reconnect_loop, tick_silence_watchdog_loop,
+            prophylactic_resubscribe_loop,
         )
         bg_tasks = [
             asyncio.create_task(_heartbeat_loop(ctx, pid)),
@@ -345,6 +346,14 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             # 02:15 self-restart). Pre-emptive cure for the multi-hour
             # tick-silence symptoms we've seen across long sessions.
             asyncio.create_task(scheduled_reconnect_loop(ctx)),
+
+            # Hourly prophylactic resubscribe: cancels + re-issues every
+            # market-data subscription to unstick IB-side parked symbols
+            # during idle periods. Mimics what a Gateway restart does
+            # per-symbol, without dropping the socket. See
+            # prophylactic_resubscribe_loop docstring for the failure
+            # mode it addresses.
+            asyncio.create_task(prophylactic_resubscribe_loop(ctx)),
         ]
 
         # Reconciler: startup recovery + sanity checks
