@@ -69,6 +69,18 @@ class OrderRequest(BaseModel):
     # ``--trail 0.5%`` / ``--trail 2.0`` CLI flag.
     trail_percent: Optional[str] = Field(default=None, description="Trailing stop percent (e.g. '0.5' for 0.5%)")
     trail_amount: Optional[str] = Field(default=None, description="Trailing stop fixed offset (instrument points)")
+    # Original operator-typed command text. When the API route can
+    # supply this (console buy/sell), the engine stores it on
+    # pending_commands.command_text instead of the rebuilt-with-flags
+    # form. The expanded form is still derivable from the structured
+    # fields above; preserving the original keeps arrow-up history in
+    # the console pane readable across page reloads. Optional so older
+    # internal callers (bots) that don't have a raw command text
+    # continue to fall back to the synthesised one.
+    original_cmd_text: Optional[str] = Field(
+        default=None,
+        description="Operator-typed text to store on pending_commands.command_text",
+    )
 
 
 class OrderResponse(BaseModel):
@@ -168,27 +180,39 @@ async def place_order(req: OrderRequest):
     # explicit ``--sec-type`` / ``--expiry`` / ``--trading-class`` /
     # ``--exchange`` flags (parser accepts them; the CLI shorthand
     # produces the same fields on BuyCommand / SellCommand).
-    side_cmd = "buy" if side_upper == "BUY" else "sell"
-    cmd_text = f"{side_cmd} {req.symbol} {req.qty} {req.order_type}"
-    if req.profit:
-        cmd_text += f" --profit {req.profit}"
-    if req.stop_loss:
-        cmd_text += f" --stop-loss {req.stop_loss}"
-    if req.price:
-        cmd_text += f" --price {req.price}"
-    sec_type_u = (req.security_type or "STK").upper()
-    if sec_type_u != "STK":
-        cmd_text += f" --sec-type {sec_type_u}"
-    if req.expiry:
-        cmd_text += f" --expiry {req.expiry}"
-    if req.trading_class:
-        cmd_text += f" --trading-class {req.trading_class}"
-    if req.exchange:
-        cmd_text += f" --exchange {req.exchange}"
-    if req.trail_percent:
-        cmd_text += f" --trail {req.trail_percent}%"
-    elif req.trail_amount:
-        cmd_text += f" --trail {req.trail_amount}"
+    #
+    # When ``original_cmd_text`` is provided (console buy/sell — the
+    # /api/commands route passes the operator-typed text through), we
+    # store THAT on pending_commands.command_text so the console's
+    # arrow-up history replays what the operator typed, not the
+    # synthesised verbose form. The structured fields on the request
+    # carry the unambiguous execution payload — no audit fidelity
+    # lost. Internal bot callers that don't supply ``original_cmd_text``
+    # fall back to the synthesised string for legibility.
+    if req.original_cmd_text:
+        cmd_text = req.original_cmd_text
+    else:
+        side_cmd = "buy" if side_upper == "BUY" else "sell"
+        cmd_text = f"{side_cmd} {req.symbol} {req.qty} {req.order_type}"
+        if req.profit:
+            cmd_text += f" --profit {req.profit}"
+        if req.stop_loss:
+            cmd_text += f" --stop-loss {req.stop_loss}"
+        if req.price:
+            cmd_text += f" --price {req.price}"
+        sec_type_u = (req.security_type or "STK").upper()
+        if sec_type_u != "STK":
+            cmd_text += f" --sec-type {sec_type_u}"
+        if req.expiry:
+            cmd_text += f" --expiry {req.expiry}"
+        if req.trading_class:
+            cmd_text += f" --trading-class {req.trading_class}"
+        if req.exchange:
+            cmd_text += f" --exchange {req.exchange}"
+        if req.trail_percent:
+            cmd_text += f" --trail {req.trail_percent}%"
+        elif req.trail_amount:
+            cmd_text += f" --trail {req.trail_amount}"
 
     # Pass bot_ref through to execute_single_command — the engine encodes
     # orderRef AFTER allocating the real trade serial (not the bot's stale one).

@@ -90,6 +90,14 @@ async def submit_command(body: CommandRequest):
                     "cmd_id": body.command_id,
                     "security_type": cmd.security_type,
                     "schema_version": 2,
+                    # Preserve the operator-typed text on
+                    # pending_commands.command_text so the console's
+                    # arrow-up history doesn't replay the synthesised
+                    # form with auto-appended --sec-type / --exchange
+                    # flags. Structured fields above carry the
+                    # unambiguous execution payload — no audit fidelity
+                    # lost.
+                    "original_cmd_text": cmd_text,
                 }
                 if cmd.expiry:
                     payload["expiry"] = cmd.expiry
