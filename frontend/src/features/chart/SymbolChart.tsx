@@ -5,7 +5,7 @@ import {
   createChart, ColorType, LineSeries, HistogramSeries,
   type IChartApi, type ISeriesApi, type UTCTimestamp,
 } from 'lightweight-charts';
-import { getHistory, getRegime, type RegimeReading } from '../../api/client';
+import { getHistory } from '../../api/client';
 import {
   type SavedRange, type Bar,
   VISIBLE_MINUTES, PRELOAD_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
@@ -544,11 +544,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const paintApexBadgeRef = useRef<(() => void) | null>(null);
   // Regime badge — top-left, directly under the SR apex badge.
   // Shows ADX / +DI / −DI / ATR / Donchian extremes from the
-  // backend's chart_signal regime classifier (/api/regime). Single
-  // value per chart, fetched alongside SR every 15s.
-  const regimeBadgeRef = useRef<HTMLDivElement | null>(null);
-  const regimeReadingRef = useRef<RegimeReading | null>(null);
-  const paintRegimeBadgeRef = useRef<(() => void) | null>(null);
+  // V-state/ADX regime diagnostic badge fully removed 2026-06-02.
+  // No longer fetched, no longer painted. Restore from git history if
+  // the diagnostic is needed again.
   // Below this many bars, SR detection is skipped entirely — the
   // existing lines stay on screen. 30 bars × 3 min = 90 min.
   // The old ``SR_MIN_BARS`` viewport gate was removed (2026-05-10): it
@@ -1145,19 +1143,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // ``detected = A OR B OR BOS``. Direction is "v_up" (V
     // recovery) or "v_down" (inverted V). Display only — does
     // not affect entry gating.
-    // V-state + ADX diagnostic badge removed at operator request
-    // (2026-06-02). The painter is kept as a no-op that tears down
-    // any pre-existing badge on the next call so historical instances
-    // don't linger in the DOM across HMR reloads. Re-enable by
-    // restoring the prior painter from git history if the regime
-    // diagnostic is needed again.
-    paintRegimeBadgeRef.current = () => {
-      const existing = regimeBadgeRef.current;
-      if (existing && existing.parentNode) {
-        existing.parentNode.removeChild(existing);
-      }
-      regimeBadgeRef.current = null;
-    };
+    // V-state/ADX regime diagnostic badge removed 2026-06-02. The
+    // painter, the ref, and the 15s /api/regime fetch effect that
+    // drove it are all gone. A one-time mount-time DOM sweep below
+    // (see useEffect with the badge-cleanup comment) handles any
+    // leftover element from a pre-restart bundle that may still be
+    // attached when the user views a stale tab.
 
     setChartVersion((v) => v + 1);
 
@@ -1953,10 +1944,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         srApexBadgeRef.current.parentNode.removeChild(srApexBadgeRef.current);
       }
       srApexBadgeRef.current = null;
-      if (regimeBadgeRef.current && regimeBadgeRef.current.parentNode) {
-        regimeBadgeRef.current.parentNode.removeChild(regimeBadgeRef.current);
-      }
-      regimeBadgeRef.current = null;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -2340,39 +2327,30 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
   }, [target?.conId, target?.symbol, target?.secType]);
 
-  // Regime fetch — one ADX/ATR/Donchian reading per chart, refreshed
-  // on the same 15s cadence as SR. ``insufficient`` regimes still
-  // return a payload (we render the regime label + n_bars only); a
-  // 503/error leaves the last good reading in place so a flaky
-  // engine restart doesn't blank the badge.
+  // Regime fetch removed 2026-06-02 along with the badge it drove.
+  // No /api/regime calls are made from the chart any more; the
+  // backend endpoint stays around in case a future surface needs it.
+
+  // One-time DOM sweep on mount: any badge element painted by a
+  // pre-restart bundle (still hanging in the user's stale tab) is
+  // removed. Identifies the badge by its distinctive monospace font
+  // + position-absolute top:6px;left:8px. Cheap; only runs once per
+  // chart mount.
   useEffect(() => {
-    if (!target) return;
-    let cancelled = false;
-    const doFetch = async () => {
-      try {
-        const reading = await getRegime({
-          conId: target.conId,
-          symbol: target.symbol,
-          secType: target.secType,
-          hours: 24,
-          barSize: '3 mins',
-        });
-        if (cancelled) return;
-        if (reading) regimeReadingRef.current = reading;
-      } catch {
-        // Preserve last-good reading on transient failures.
+    const containerEl = containerRef.current;
+    if (!containerEl) return;
+    const stragglers = containerEl.querySelectorAll<HTMLDivElement>(
+      'div[style*="font-family:ui-monospace"]',
+    );
+    stragglers.forEach((node) => {
+      const txt = node.textContent || '';
+      if (
+        txt.includes('V·') || txt.includes('ADX·')
+        || txt.includes('BOS:') || txt.includes('V: …')
+      ) {
+        node.parentNode?.removeChild(node);
       }
-      paintRegimeBadgeRef.current?.();
-    };
-    doFetch();
-    const id = window.setInterval(doFetch, 15000);
-    const wake = () => { if (!cancelled) doFetch(); };
-    wakeSubs.add(wake);
-    return () => {
-      cancelled = true;
-      wakeSubs.delete(wake);
-      window.clearInterval(id);
-    };
+    });
   }, [target?.conId, target?.symbol, target?.secType]);
 
   // Live tick subscription. Engine publishes STK ticks keyed on
