@@ -181,8 +181,15 @@ def parse_buy_sell(
     """Parse a buy or sell command from tokenized input.
 
     Grammar:
-        buy/sell SYMBOL QTY STRATEGY [PROFIT] [--take-profit-price N]
-                                               [--stop-loss N] [--dollars N]
+        buy/sell SYMBOL QTY [STRATEGY] [PROFIT] [--take-profit-price N]
+                                                 [--stop-loss N] [--dollars N]
+
+    STRATEGY is optional. When omitted (only SYMBOL + QTY positionals),
+    it defaults to ``smart_market`` — the session-aware aggressive-mid
+    execution algo (see ``Strategy.SMART_MARKET``). This is the
+    project-wide default for bots (per the strategy YAMLs); making it
+    the implicit default for console buy/sell too means a fast
+    ``buy MGCQ6 1`` does the same thing without spelling it out.
 
     Args:
         tokens: List including the verb ('buy' or 'sell') as tokens[0].
@@ -323,9 +330,9 @@ def parse_buy_sell(
     security_type = "STK"
     expiry_yyyymm: str | None = None
 
-    if len(positional) < 3:
+    if len(positional) < 2:
         _emit_error(
-            f"\u2717 Error: usage: {verb} SYMBOL QTY STRATEGY [PROFIT]",
+            f"\u2717 Error: usage: {verb} SYMBOL QTY [STRATEGY] [PROFIT]",
             router,
         )
         return None
@@ -352,16 +359,28 @@ def parse_buy_sell(
             _emit_error(f"\u2717 Error: {e}", router)
             return None
 
-    try:
-        strategy = Strategy(positional[2].lower())
-    except ValueError:
-        valid = ", ".join(f"'{s}'" for s in Strategy)
-        _emit_error(f"\u2717 Error: STRATEGY must be one of {valid}, got {positional[2]!r}", router)
-        return None
+    # STRATEGY positional is optional \u2014 when omitted, default to
+    # smart_market (the bots' production-default execution algo).
+    # Operator typing ``buy MGCQ6 1`` gets the session-aware
+    # aggressive-mid behaviour without having to spell it out.
+    if len(positional) < 3:
+        strategy = Strategy.SMART_MARKET
+        next_pos = 2  # PROFIT (if any) would still need to follow STRATEGY
+    else:
+        try:
+            strategy = Strategy(positional[2].lower())
+        except ValueError:
+            valid = ", ".join(f"'{s}'" for s in Strategy)
+            _emit_error(
+                f"\u2717 Error: STRATEGY must be one of {valid}, "
+                f"got {positional[2]!r}",
+                router,
+            )
+            return None
+        next_pos = 3
 
     # For 'limit' strategy, the next positional is the required limit price
     limit_price = None
-    next_pos = 3  # index of next positional to consume
 
     if strategy == Strategy.LIMIT:
         if len(positional) < 4:

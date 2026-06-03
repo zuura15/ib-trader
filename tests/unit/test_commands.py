@@ -131,6 +131,37 @@ class TestParseBuySell:
         assert cmd is None
         assert "Error" in capsys.readouterr().out
 
+    def test_strategy_optional_defaults_to_smart_market(self):
+        """``buy SYMBOL QTY`` with no STRATEGY positional defaults to
+        smart_market — the session-aware aggressive-mid algo used by
+        the production bot strategies. Operator convenience."""
+        from ib_trader.repl.commands import Strategy
+        cmd = parse_buy_sell(["buy", "MGCQ6", "1"])
+        assert cmd is not None
+        assert cmd.symbol == "MGCQ6"
+        assert cmd.qty == Decimal("1")
+        assert cmd.strategy == Strategy.SMART_MARKET
+        # FUT auto-detection from localSymbol still fires.
+        assert cmd.security_type == "FUT"
+        assert cmd.exchange == "CME"
+
+    def test_strategy_optional_defaults_for_stk_too(self):
+        """Default also applies to STK orders — no per-sec-type
+        special case."""
+        from ib_trader.repl.commands import Strategy
+        cmd = parse_buy_sell(["sell", "AAPL", "10"])
+        assert cmd is not None
+        assert cmd.strategy == Strategy.SMART_MARKET
+        assert cmd.security_type == "STK"
+
+    def test_explicit_strategy_still_works(self):
+        """``buy SYMBOL QTY mid`` keeps the explicit STRATEGY path —
+        no regression for callers that spell it out."""
+        from ib_trader.repl.commands import Strategy
+        cmd = parse_buy_sell(["buy", "MGCQ6", "1", "mid"])
+        assert cmd is not None
+        assert cmd.strategy == Strategy.MID
+
     def test_unknown_option_returns_none(self, capsys):
         cmd = parse_buy_sell(["buy", "MSFT", "10", "mid", "--unknown", "val"])
         assert cmd is None
