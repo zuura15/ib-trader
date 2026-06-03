@@ -5,6 +5,20 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-03
 
+### Changed
+- **Positions WS push: token-bucket rate cap + reused httpx client.**
+  ``_stream_positions_to_ws`` (``api/ws.py``) used to push on every
+  XREAD wake. With 14 quote streams ticking multi-Hz and two browser
+  subscribers (PositionsPanel + StackedChartsPane), the api process
+  was at 30-50% CPU just doing redundant httpx + Redis-mget +
+  JSON-encode + WS-send work — positions are a display, not an
+  order surface, so 2 Hz is plenty. New ``MIN_PUSH_INTERVAL_S=0.5``
+  token-bucket cap: extra wakes inside the window still advance the
+  XREAD last_id so no event is lost, but the push itself is rate-
+  limited. Also reuses a single ``httpx.AsyncClient`` across the
+  loop's lifetime instead of constructing one per push (was wasting
+  TCP+TLS setup on every iteration).
+
 ### Fixed
 - **Engine sluggishness from redundant qualify_contract storm.** Chart
   panes' 30s history + 15s SR polling loops were hitting symbol-only

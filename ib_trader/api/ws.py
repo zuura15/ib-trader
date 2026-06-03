@@ -783,9 +783,19 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
     Subscribes via XREAD to the union of ``position:changes`` plus one
     ``quote:{symbol}`` stream per held STK/FUT. On any event a fresh
     snapshot is fetched and pushed — coalesced by the XREAD block window
-    (~250ms) so a burst of ticks across multiple symbols collapses into
-    a single re-render. A 30 s safety re-push fires when no event arrives
-    so the UI never strands on stale numbers.
+    AND a token-bucket cap so a torrent of quote ticks across 14+
+    symbols never exceeds ``MIN_PUSH_INTERVAL_S`` re-renders. A 30 s
+    safety re-push fires when no event arrives so the UI never strands
+    on stale numbers.
+
+    Token-bucket rationale (2026-06-03): pre-fix this loop pushed on
+    every XREAD wake; with N held positions × multi-Hz quote streams,
+    ``event_seen`` was true on nearly every 250ms block and each push
+    did httpx + Redis-mget + JSON-encode + WS-send. With two browser
+    subscribers (PositionsPanel + StackedChartsPane) that drove
+    ``ib-api`` to 30-50% CPU. Positions are a display, not an order
+    surface — 2 Hz is plenty, and capping here cuts the push work
+    roughly in half while UX feels identical.
     """
     import os
     import time
@@ -795,74 +805,92 @@ async def _stream_positions_to_ws(websocket: WebSocket, redis) -> None:
     engine_port = os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
     engine_url = f"http://127.0.0.1:{engine_port}"
 
-    # Max push rate ≈ 4 Hz. XREAD natively batches ticks that arrive
-    # within the same block window, so even on a noisy 10-symbol day
-    # the client sees ≤ 4 re-renders per second.
+    # XREAD block window — how long we wait for a wake event before
+    # falling through to the safety-repush check.
     COALESCE_BLOCK_MS = 250
+    # Token-bucket cap: at most one push per interval, regardless of
+    # how many XREAD wakes occur. Missed wakes accumulate in
+    # ``watch[stream] = entries[-1][0]`` so the next allowed push
+    # carries the latest state for every stream — no event lost,
+    # just rate-limited rendering.
+    MIN_PUSH_INTERVAL_S = 0.5
     SAFETY_RE_PUSH_S = 30.0
 
-    async def fetch_positions() -> list[dict]:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{engine_url}/engine/positions")
+    # Reuse a single httpx client across the loop's lifetime. The
+    # pre-fix code constructed a fresh ``AsyncClient`` (with TCP+TLS
+    # setup + teardown) on every push — wasted ms per iteration at
+    # several Hz. ``with`` is on the outer scope so the client lives
+    # exactly as long as the stream task.
+    async with httpx.AsyncClient(timeout=5) as http_client:
+
+        async def fetch_positions() -> list[dict]:
+            try:
+                resp = await http_client.get(f"{engine_url}/engine/positions")
                 positions = resp.json() if resp.status_code == 200 else []
-        except Exception:
-            return []
-        await _overlay_live_prices(positions, redis)
-        return positions
+            except Exception:
+                return []
+            await _overlay_live_prices(positions, redis)
+            return positions
 
-    async def push(positions: list[dict]) -> None:
-        try:
-            await websocket.send_text(_json_dumps({
-                "type": "positions",
-                "data": positions,
-            }))
-        except (RuntimeError, WebSocketDisconnect) as e:
-            raise asyncio.CancelledError() from e  # WS closed — exit the stream task
+        async def push(positions: list[dict]) -> None:
+            try:
+                await websocket.send_text(_json_dumps({
+                    "type": "positions",
+                    "data": positions,
+                }))
+            except (RuntimeError, WebSocketDisconnect) as e:
+                raise asyncio.CancelledError() from e  # WS closed — exit the stream task
 
-    # Initial snapshot so the UI hydrates immediately
-    positions = await fetch_positions()
-    await push(positions)
-    last_push_ts = time.monotonic()
+        # Initial snapshot so the UI hydrates immediately
+        positions = await fetch_positions()
+        await push(positions)
+        last_push_ts = time.monotonic()
 
-    # Build the XREAD watch set: position:changes + one quote:{sym} per holding.
-    watch: dict[str, str] = {StreamNames.position_changes(): "$"}
-    for key in _position_quote_stream_keys(positions):
-        watch[key] = "$"
+        # Build the XREAD watch set: position:changes + one quote:{sym} per holding.
+        watch: dict[str, str] = {StreamNames.position_changes(): "$"}
+        for key in _position_quote_stream_keys(positions):
+            watch[key] = "$"
 
-    while True:
-        try:
-            results = await redis.xread(watch, block=COALESCE_BLOCK_MS)
-            now = time.monotonic()
-            event_seen = False
-            if results:
-                event_seen = True
-                for stream, entries in results:
-                    watch[stream] = entries[-1][0]
+        while True:
+            try:
+                results = await redis.xread(watch, block=COALESCE_BLOCK_MS)
+                now = time.monotonic()
+                event_seen = False
+                if results:
+                    event_seen = True
+                    for stream, entries in results:
+                        watch[stream] = entries[-1][0]
 
-            should_push = event_seen or (now - last_push_ts) >= SAFETY_RE_PUSH_S
-            if not should_push:
-                continue
+                since_last = now - last_push_ts
+                # No event AND under the safety-repush deadline → idle.
+                if not event_seen and since_last < SAFETY_RE_PUSH_S:
+                    continue
+                # Event arrived but we just pushed → drop this wake.
+                # The XREAD last_id was advanced above, so subsequent
+                # ticks still queue cleanly; we'll re-push on the next
+                # wake that lands after the token window.
+                if event_seen and since_last < MIN_PUSH_INTERVAL_S:
+                    continue
 
-            positions = await fetch_positions()
-            await push(positions)
-            last_push_ts = now
+                positions = await fetch_positions()
+                await push(positions)
+                last_push_ts = now
 
-            # Reconcile quote-stream subs with the current holdings so a
-            # closed position stops waking us, and a newly-opened one starts.
-            new_quote_keys = _position_quote_stream_keys(positions)
-            current_quote_keys = {k for k in watch if k.startswith("quote:")}
-            for k in new_quote_keys - current_quote_keys:
-                watch[k] = "$"
-            for k in current_quote_keys - new_quote_keys:
-                watch.pop(k, None)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            return
-        except (ConnectionError, OSError, _RedisConnectionError):
-            return  # Redis shut down
-        except Exception:
-            logger.exception('{"event": "WS_POSITIONS_STREAM_ERROR"}')
-            await asyncio.sleep(1)
+                # Reconcile quote-stream subs with the current holdings so a
+                # closed position stops waking us, and a newly-opened one starts.
+                new_quote_keys = _position_quote_stream_keys(positions)
+                current_quote_keys = {k for k in watch if k.startswith("quote:")}
+                for k in new_quote_keys - current_quote_keys:
+                    watch[k] = "$"
+                for k in current_quote_keys - new_quote_keys:
+                    watch.pop(k, None)
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                return
+            except (ConnectionError, OSError, _RedisConnectionError):
+                return  # Redis shut down
+            except Exception:
+                logger.exception('{"event": "WS_POSITIONS_STREAM_ERROR"}')
+                await asyncio.sleep(1)
 
 
 async def _activity_listener(
