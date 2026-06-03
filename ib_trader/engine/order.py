@@ -1607,7 +1607,19 @@ async def _walk_limit_aggressive(
         # (tens to hundreds of ms), during which IB can fill/cancel the
         # order. Amending a terminal order triggers IB error 104 / 201 and
         # an ib_async AssertionError — skip the amend entirely instead.
-        if track is not None and (track.is_filled or track.is_canceled):
+        #
+        # ``track.is_filled`` was REMOVED from this guard (order #916
+        # incident 2026-06-03): ``notify_filled`` fires on EVERY fill
+        # callback, including partials, so a 15/50 partial flips
+        # is_filled True and would short-circuit the walker into
+        # ``filled_or_canceled`` → fall-through to ``_handle_partial``
+        # which cancels the residual 35 — defeating the smart_market
+        # promise. de54ea2 removed is_filled from the top-of-loop
+        # check but missed this site; the get_order_status block below
+        # already detects TRUE terminality (qty_filled >= target_qty,
+        # or status in {Filled, Cancelled, Inactive, ApiCancelled}),
+        # making the is_filled clause both redundant AND harmful.
+        if track is not None and track.is_canceled:
             return {
                 "status": "filled_or_canceled",
                 "hit_cap": False,

@@ -5,6 +5,24 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-03
 
+### Fixed
+- **smart_market walker exits on partial fill (pre-amend guard).** Order
+  #916 (SELL 50 MGCQ6 smart_market): 15 filled on first partial,
+  walker exited and ``_handle_partial`` cancelled the residual 35 —
+  operator saw ``PARTIAL: 15/50 filled | 35 not filled`` when the
+  algo should have walked aggressively to fill the full 50. Root
+  cause: ``de54ea2`` removed ``track.is_filled`` from the top-of-loop
+  exit check, but the pre-amend guard at ``_walk_limit_aggressive``
+  line ~1610 still had it. ``notify_filled`` fires on EVERY fill
+  callback including partials, so a 15-contract partial flipped
+  ``is_filled`` True and short-circuited the walker into
+  ``filled_or_canceled``. The guard's actual job (skip amend on
+  truly-terminal orders to avoid IB error 104/201) is already done
+  by the ``get_order_status`` block immediately below it; the
+  ``is_filled`` clause was redundant AND harmful. New test
+  ``test_walker_does_not_exit_at_preamend_guard_when_is_filled_set``
+  fails without the fix and passes with it.
+
 ### Changed
 - **Positions WS push: token-bucket rate cap + reused httpx client.**
   ``_stream_positions_to_ws`` (``api/ws.py``) used to push on every

@@ -154,6 +154,55 @@ async def test_walker_exits_on_duration_expired():
 
 
 @pytest.mark.asyncio
+async def test_walker_does_not_exit_at_preamend_guard_when_is_filled_set():
+    """Order #916 incident 2026-06-03: SELL 50 MGCQ6 smart_market, 15
+    filled on first partial, walker exited and ``_handle_partial``
+    cancelled the residual 35 — operator saw ``PARTIAL: 15/50 filled
+    | 35 not filled (cancel confirmed)`` when smart_market should
+    have walked aggressively to fill the full 50.
+
+    Root cause: ``de54ea2`` removed ``track.is_filled`` from the
+    top-of-loop exit check, but the pre-amend guard at line ~1610
+    still had it. ``track.is_filled`` is set by ``notify_filled``,
+    which fires on EVERY fill callback including partials — so the
+    second guard fired on the 15-contract partial and exited the
+    walker with ``status="filled_or_canceled"``.
+
+    The guard's actual job (avoid amending a terminal order) is
+    already done correctly by the ``get_order_status`` block
+    immediately below it, which checks the IB status string and the
+    fill-vs-target ratio. The ``is_filled`` clause was both
+    redundant and harmful; this test pins the fix.
+    """
+    # Two iterations needed:
+    #   iter 1 mid-loop status read  → 15 (partial, not target)
+    #   iter 1 pre-amend status read → 15 (still not terminal)
+    #   iter 2 mid-loop status read  → 50 (target → exits "filled")
+    ctx, track = _make_ctx(qty_filled_sequence=[
+        Decimal("15"), Decimal("15"), Decimal("50"),
+    ])
+    # Real prod: on_fill calls notify_filled on every fill including
+    # partials, so track.is_filled is True before the walker resumes
+    # after the partial. fill_event also set so wait_for returns.
+    track.is_filled = True
+    track.fill_event.set()
+
+    result = await _walk_limit_aggressive(
+        ctx, con_id=1, ib_order_id="916", symbol="MGCQ6", side="BUY",
+        trigger_price=Decimal("100"),
+        interval_seconds=0.01,
+        total_duration_seconds=None,
+        floor_price=Decimal("110"),
+        target_qty=Decimal("50"),
+    )
+    assert result["status"] == "filled", (
+        f"walker must NOT exit at the pre-amend guard when "
+        f"track.is_filled is True from a partial; got {result}. "
+        f"Order #916 (SELL 50 MGCQ6 smart_market) incident 2026-06-03."
+    )
+
+
+@pytest.mark.asyncio
 async def test_walker_clears_fill_event_after_consume():
     """asyncio.Event stays set forever once .set() is called. Without
     clearing in the walker, after a partial fill the wait_for returns
