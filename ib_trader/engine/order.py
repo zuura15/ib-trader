@@ -1472,11 +1472,22 @@ async def _walk_limit_aggressive(
 
     Every ``interval_seconds`` (default ~100 ms) we read the current
     mid and step the limit aggressively toward the far side (bid for
-    SELL, ask for BUY). Exits early on:
-      - track.fill_event set (filled or cancelled)
-      - full fill observed in order status
+    SELL, ask for BUY). Exits on:
+      - FULL fill observed in order status (qty_filled >= target_qty)
+      - terminal cancel (track.is_canceled)
       - ``total_duration_seconds`` elapsed (RTH)
       - ``floor_price`` reached (ETH)
+
+    Critical: PARTIAL fills do NOT exit the walker — they wake it up
+    via ``track.fill_event`` so it can re-amend and chase the next
+    fill. The prior implementation exited on ``track.is_filled`` (set
+    on ANY fill), which made smart_market silently dispatch to
+    ``_handle_partial`` after the first fill and cancel the residual.
+    That defeated the algo entirely: 1/19 fills triggered a cancel
+    of the remaining 18, leaving them to either get cancelled (the
+    documented intent of "smart_market") or, on cancel-rejection, sit
+    indefinitely. Operator-reported as the "real damaging bug" in the
+    #894 incident.
 
     Returns a dict describing how we exited: ``{status, hit_cap,
     last_sent_price, filled_qty}``.
@@ -1513,15 +1524,17 @@ async def _walk_limit_aggressive(
         return snap["bid"], snap["ask"], snap["last"]
 
     while True:
-        if track and (track.is_filled or track.is_canceled):
+        # Terminal-cancel exits the walker (a partial fill does NOT —
+        # see docstring). Operator-cancelled or IB-cancelled orders
+        # have nothing left for us to walk against.
+        if track and track.is_canceled:
             return {"status": "filled_or_canceled", "hit_cap": False,
                     "last_sent_price": last_sent}
         if deadline is not None and loop.time() >= deadline:
             return {"status": "duration_expired", "hit_cap": False,
                     "last_sent_price": last_sent}
 
-        # Check current fill status — if IB filled during our nap, exit
-        # without another amend (amend on a filled order would error).
+        # Check current fill status — full fill is the happy-path exit.
         st = await ctx.ib.get_order_status(ib_order_id)
         if (st.get("qty_filled") or Decimal("0")) >= target_qty:
             return {"status": "filled", "hit_cap": False,
@@ -1532,6 +1545,12 @@ async def _walk_limit_aggressive(
 
         # Sleep either until the next interval tick or the deadline,
         # whichever is sooner. Wake immediately on a fill/cancel event.
+        # IMPORTANT: clear fill_event after consuming so subsequent
+        # partial fills also wake us. asyncio.Event stays set forever
+        # once .set() is called; without clearing, the wait_for returns
+        # immediately every iteration after the first fill, which would
+        # tight-loop on get_order_status + _get_prices and saturate IB's
+        # rate limiter.
         wait = interval_seconds
         if deadline is not None:
             wait = min(wait, max(deadline - loop.time(), 0.0))
@@ -1540,6 +1559,8 @@ async def _walk_limit_aggressive(
                 await asyncio.wait_for(track.fill_event.wait(), timeout=wait)
             except asyncio.TimeoutError:
                 pass
+            else:
+                track.fill_event.clear()
         else:
             await asyncio.sleep(wait)
 
