@@ -156,6 +156,34 @@ def test_unregister_clears_cancel_retry_state():
     assert "98852" not in client._cancel_retry_attempted
 
 
+def test_ib_async_cancel_order_patched_to_skip_manual_time():
+    """Importing insync_client monkey-patches ``ib_async.Client.cancelOrder``
+    to send ONLY the 3-field (tag, version, orderId) message — skipping
+    the optional ``manualCancelOrderTime`` field that triggers IB error
+    10340 on the prod Gateway version. Without this, every cancel
+    attempt is silently rejected. See insync_client.py module docstring
+    for the incident #867 context."""
+    # Module-import side-effect; harmless if already imported.
+    import ib_trader.ib.insync_client  # noqa: F401
+    from ib_async.client import Client
+
+    sent: list = []
+
+    class _StubClient:
+        def send(self, *fields):
+            sent.append(fields)
+        def serverVersion(self):
+            return 200  # post-169 — the original path would send the
+                        # extra field; patched path must not.
+
+    # Call the bound method against our stub.
+    Client.cancelOrder(_StubClient(), 12345, "20260602 18:48:06")
+
+    assert sent == [(4, 1, 12345)], (
+        f"patched cancelOrder must send only [4, 1, orderId]; got {sent}"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Part B: _finalize_partial_cancel — verify before writing CANCELLED
 # ──────────────────────────────────────────────────────────────────────

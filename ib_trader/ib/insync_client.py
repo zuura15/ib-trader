@@ -23,6 +23,49 @@ from ib_trader.ib.base import IBClientBase
 from ib_trader.ib.overnight_patch import apply as _apply_overnight_patch
 
 
+# ─── Monkey-patch: strip manualCancelOrderTime from cancelOrder ───────────────
+#
+# Operator-reported incident 2026-06-02 (order #867 MNQM6): every cancel
+# attempt against the running IB Gateway version was being rejected with
+# error 10340 "The following order attribute is not supported:
+# ManualOrderIndicator". ib_async's ``Client.cancelOrder`` appends an
+# optional ``manualCancelOrderTime`` field whenever ``serverVersion() >=
+# 169``; this Gateway version accepts the field on PlaceOrder (orders
+# transmit fine) but rejects it on CancelOrder, blocking every
+# cancel-path the engine has — partial-fill cleanup, walker-expiry MKT
+# escalation, the explicit ``close`` verb, smart_market's residual
+# cancel. The misleading "ManualOrderIndicator" wording is IB's
+# translation of "your cancel message has an attribute I don't want".
+#
+# Workaround: send only the original 3-field cancel message (tag 4,
+# version 1, orderId). MIFID-II audit-trail metadata is lost — irrelevant
+# for US futures trading and reversible once the Gateway is upgraded.
+# Re-test cancel after applying; remove this patch when ib_async is
+# upgraded and the issue is resolved upstream.
+try:
+    from ib_async.client import Client as _IBClient
+
+    def _cancel_order_no_extras(self, orderId, manualCancelOrderTime=""):
+        # Original ib_async sends `[4, 1, orderId, manualCancelOrderTime]`
+        # when serverVersion >= 169. We drop the optional 4th field —
+        # IB Gateway rejects it as 10340 on cancel even though it
+        # accepts it on place.
+        self.send(4, 1, orderId)
+
+    _IBClient.cancelOrder = _cancel_order_no_extras
+    logging.getLogger(__name__).info(
+        '{"event": "IB_ASYNC_PATCHED_CANCELORDER_NO_MANUAL_TIME"}',
+    )
+except Exception:
+    # Defensive — if ib_async's internal layout changes upstream,
+    # surface the failure but don't break the import. Operator sees
+    # this in the engine boot log.
+    logging.getLogger(__name__).exception(
+        '{"event": "IB_ASYNC_CANCELORDER_PATCH_FAILED"}',
+    )
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 # Exchange → product-session timezone mapping. CME-family products settle in
 # America/Chicago; unmapped exchanges fall back to UTC (with a warning at
 # the call site). See Epic 1 D9.
