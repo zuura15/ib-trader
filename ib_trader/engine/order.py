@@ -3110,13 +3110,60 @@ async def _handle_close_partial(
     qty_requested: Decimal, qty_filled: Decimal, avg_price: Decimal,
     commission: Decimal, ib_order_id: str, ctx: AppContext,
 ) -> None:
-    """Record a partial close fill and cancel the remaining quantity."""
-    await ctx.ib.cancel_order(ib_order_id)
+    """Attempt to cancel the remainder, wait for IB's decision, then either
+    promote to FILLED (cancel lost the race) or finalize as PARTIAL.
+
+    Mirrors the buy/sell ``_handle_partial`` pattern. Pre-fix this function
+    fired ``cancel_order`` blindly and immediately wrote ``PARTIAL_FILL`` —
+    when IB had already terminalised the order as Filled between the
+    dispatcher's snapshot and the cancel, the ledger landed with under-
+    counted fills for a fully-filled order. See order #108025, 2026-06-03.
+    """
+    settle_timeout = float(ctx.settings.get("cancel_settle_timeout_seconds", 120))
+    track = ctx.tracker.get(ib_order_id)
+
+    _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, close_ctx.symbol, close_ctx.side,
+               close_ctx.order_type, qty_requested,
+               ib_order_id=_safe_int(ib_order_id),
+               trade_serial=trade_group.serial_number,
+               trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
+               correlation_id=close_ctx.correlation_id,
+               security_type=close_ctx.security_type)
+
+    resolution, ib_reported_qty, ib_reported_avg, ib_reported_commission, _ib_status = \
+        await _cancel_and_await_resolution(
+            ctx, ib_order_id, qty_requested, track=track, timeout=settle_timeout,
+            heartbeat_label=f"Cancel pending #{trade_group.serial_number} —",
+        )
+    # IB's view may have advanced past the caller's snapshot during the
+    # cancel-settle window. Take whichever source reports more fills.
+    if ib_reported_qty > qty_filled:
+        final_qty = ib_reported_qty
+        effective_avg = ib_reported_avg if ib_reported_avg is not None else avg_price
+    else:
+        final_qty = qty_filled
+        effective_avg = avg_price
+    if ib_reported_commission > commission:
+        commission = ib_reported_commission
+
+    if resolution == "filled":
+        # Cancel lost the race — IB filled the remainder. Promote to a
+        # full close so the ledger / P&L reflects reality.
+        logger.warning(
+            '{"event": "CLOSE_CANCEL_FILL_RACE_RESOLVED", "ib_order_id": "%s", '
+            '"serial": %d, "qty_filled": "%s", "resolution": "filled"}',
+            ib_order_id, trade_group.serial_number, str(final_qty),
+        )
+        await _handle_close_fill(
+            close_ctx, trade_group, final_qty, effective_avg or avg_price,
+            commission, ctx,
+        )
+        return
 
     _write_txn(ctx, TransactionAction.PARTIAL_FILL, close_ctx.symbol, close_ctx.side,
                close_ctx.order_type, qty_requested,
                ib_order_id=_safe_int(ib_order_id),
-               ib_filled_qty=qty_filled, ib_avg_fill_price=avg_price,
+               ib_filled_qty=final_qty, ib_avg_fill_price=effective_avg,
                trade_serial=trade_group.serial_number,
                ib_responded_at=_now_utc(),
                trade_id=close_ctx.trade_id, leg_type=close_ctx.leg_type,
@@ -3131,7 +3178,7 @@ async def _handle_close_partial(
     entry_side = entry_txn.side if entry_txn else ("BUY" if close_ctx.side == "SELL" else "SELL")
     direction = Decimal("1") if entry_side == "BUY" else Decimal("-1")
     multiplier = close_ctx.multiplier or Decimal("1")
-    this_pnl = (avg_price - entry_price) * qty_filled * multiplier * direction - commission
+    this_pnl = (effective_avg - entry_price) * final_qty * multiplier * direction - commission
 
     # Aggregate with any existing P&L from prior partial closes
     existing_pnl = trade_group.realized_pnl or Decimal("0")
@@ -3141,14 +3188,14 @@ async def _handle_close_partial(
 
     ctx.trades.update_pnl(trade_group.id, realized_pnl, total_commission)
 
-    remainder = qty_requested - qty_filled
+    remainder = qty_requested - final_qty
     pnl_str = (
         f"+${_fmt_money(realized_pnl)}" if realized_pnl >= 0
         else f"-${_fmt_money(abs(realized_pnl))}"
     )
     ctx.router.emit(
-        f"\u26a0 CLOSE PARTIAL: {_fmt_qty(qty_filled)}/{_fmt_qty(qty_requested)} "
-        f"filled @ ${_fmt_price(avg_price)}\n"
+        f"\u26a0 CLOSE PARTIAL: {_fmt_qty(final_qty)}/{_fmt_qty(qty_requested)} "
+        f"filled @ ${_fmt_price(effective_avg)}\n"
         f"  {_fmt_qty(remainder)} shares still open. "
         f"P&L on closed portion: {pnl_str}\n"
         f"  Serial: #{trade_group.serial_number}",
@@ -3158,10 +3205,10 @@ async def _handle_close_partial(
     logger.info(
         '{"event": "CLOSE_ORDER_PARTIAL", "correlation_id": "%s", "serial": %d, '
         '"qty_filled": "%s", "qty_requested": "%s", "realized_pnl": "%s"}',
-        close_ctx.correlation_id, trade_group.serial_number, qty_filled, qty_requested, realized_pnl,
+        close_ctx.correlation_id, trade_group.serial_number, final_qty, qty_requested, realized_pnl,
     )
     await _record_console_close_pnl(
-        ctx, this_pnl, close_ctx.symbol, qty_filled,
+        ctx, this_pnl, close_ctx.symbol, final_qty,
         trade_group.serial_number, source="console_close_partial",
     )
 
@@ -3731,19 +3778,37 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
 
     # ── Determine outcome ────────────────────────────────────────────────
     status = await ctx.ib.get_order_status(ib_order_id)
-    if _fill_qty > 0:
-        qty_filled = _fill_qty
-        avg_price = _fill_notional / _fill_qty
-        commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
-    else:
-        qty_filled = status["qty_filled"]
-        avg_price = status["avg_fill_price"]
-        commission = status["commission"] or Decimal("0")
+    ib_filled = status.get("qty_filled") or Decimal("0")
+    ib_status = status.get("status") or ""
 
-    # Fallback: if IB says the order is Filled but get_order_status still
-    # reports 0 fills (race condition in ib_async's internal state), trust
-    # the fill callback or the IB status string rather than the qty.
-    if qty_filled == 0 and status["status"] == "Filled" and track.is_filled:
+    # IB's orderStatus is sole source of truth for terminal state. When IB
+    # reports Filled, trust its qty_filled over the local _fill_qty
+    # accumulator: on_fill callbacks dispatch via _spawn_background and
+    # are auto-unregistered the moment status flips terminal, so a fast
+    # multi-execution fill can leave the second fill's on_fill queued and
+    # never run — _fill_qty lands at 4 even though IB has 10. Pre-fix the
+    # dispatcher routed under-counted closes into _handle_close_partial,
+    # which wrote PARTIAL_FILL filled=4 for a fully-filled order. See
+    # order #108025 incident 2026-06-03.
+    if ib_status == "Filled" and ib_filled > 0:
+        qty_filled = ib_filled
+    elif _fill_qty > 0:
+        qty_filled = _fill_qty
+    else:
+        qty_filled = ib_filled
+
+    if _fill_qty > 0:
+        avg_price = _fill_notional / _fill_qty
+    else:
+        avg_price = status.get("avg_fill_price")
+    commission = (
+        _fill_commission if _fill_commission > 0
+        else status.get("commission") or Decimal("0")
+    )
+
+    # Edge: ib_async sometimes briefly reports Filled+qty_filled=0 between
+    # callback dispatch and orderStatus sync. Re-read after a short sleep.
+    if qty_filled == 0 and ib_status == "Filled" and track.is_filled:
         logger.warning(
             '{"event": "CLOSE_FILL_RACE_CONDITION", "ib_order_id": "%s", '
             '"status": "Filled", "qty_filled": 0, "note": "retrying get_order_status"}',
@@ -3751,14 +3816,18 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         )
         await asyncio.sleep(0.5)
         status = await ctx.ib.get_order_status(ib_order_id)
-        if _fill_qty > 0:
-            qty_filled = _fill_qty
-            avg_price = _fill_notional / _fill_qty
-            commission = _fill_commission if _fill_commission > 0 else (status["commission"] or Decimal("0"))
-        else:
-            qty_filled = status["qty_filled"]
-            avg_price = status["avg_fill_price"]
-            commission = status["commission"] or Decimal("0")
+        ib_filled = status.get("qty_filled") or Decimal("0")
+        qty_filled = ib_filled if ib_filled > 0 else _fill_qty
+        if avg_price is None:
+            avg_price = (
+                (_fill_notional / _fill_qty) if _fill_qty > 0
+                else status.get("avg_fill_price")
+            )
+        if commission == 0:
+            commission = (
+                _fill_commission if _fill_commission > 0
+                else status.get("commission") or Decimal("0")
+            )
 
     if qty_filled > 0 and avg_price is not None:
         if qty_filled >= qty_to_close:

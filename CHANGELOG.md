@@ -3,6 +3,25 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-06-03
+
+### Fixed
+- **Close SMART_MARKET ledger lies on fast multi-execution fills.** Order
+  #108025 (SELL 10 MNQM6): IB filled 4 then 6 within 10ms, the second
+  ExecDetails callback queued behind the terminal status dispatch and
+  never ran (callbacks are auto-unregistered the moment status flips
+  Filled), the local `_fill_qty` accumulator landed at 4 even though IB
+  reported `Filled qty_filled=10`. The close dispatcher routed to
+  `_handle_close_partial` which fired `cancel_order` blindly (IB
+  correctly returned "already terminal Filled") and then wrote
+  `PARTIAL_FILL filled=4` for a fully-filled order — same class of bug
+  as the buy/sell `_handle_partial` we fixed earlier. Two fixes:
+  (a) `execute_close` dispatch now trusts IB's `status[qty_filled]`
+  when `status[status] == "Filled"` per the ledger-never-self-derives
+  tenet; (b) `_handle_close_partial` uses `_cancel_and_await_resolution`
+  and, when `resolution=="filled"`, promotes to `_handle_close_fill`
+  with the IB-authoritative qty — mirrors the proven buy/sell pattern.
+
 ## 2026-05-12
 
 ### Fixed
