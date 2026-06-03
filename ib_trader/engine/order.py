@@ -3303,7 +3303,11 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_ORDER_PLACED",
         )
-    elif cmd.strategy == Strategy.MID:
+    elif cmd.strategy in (Strategy.MID, Strategy.SMART_MARKET):
+        # Both strategies place an initial LMT at mid. They diverge in
+        # the post-place phase: MID uses the slow reprice walker;
+        # SMART_MARKET uses the aggressive walker with MKT escalation
+        # (RTH) or slippage cap (ETH). See post-place dispatch below.
         bid, ask, last = await _fresh_prices(ctx, con_id, entry_symbol)
         if bid == 0 and ask == 0:
             if last == 0:
@@ -3326,9 +3330,12 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
                    "LIMIT", qty_to_close, limit_price=initial_price,
                    ib_order_id=_safe_int(ib_order_id), trade_serial=cmd.serial,
                    ib_responded_at=_now_utc(), price_placed=initial_price, **_txn_common)
+        _algo_label = (
+            "smart_market" if cmd.strategy == Strategy.SMART_MARKET else "mid"
+        )
         ctx.router.emit(
             f"[{_now_display()}] Close #{cmd.serial} placed "
-            f"@ ${initial_price} (bid: ${bid} ask: ${ask})",
+            f"@ ${initial_price} (bid: ${bid} ask: ${ask}, {_algo_label})",
             pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
             event="CLOSE_ORDER_PLACED",
         )
@@ -3510,7 +3517,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         # Don't unregister tracker — callbacks stay active for the app session.
         return
 
-    # ── Start reprice loop (mid strategy only) ───────────────────────────
+    # ── Start reprice loop (mid strategy) / smart_market walker ──────────
     settings = ctx.settings
     reprice_task = None
     if cmd.strategy == Strategy.MID:
@@ -3535,6 +3542,138 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             )
         )
         wait_timeout = float(settings["reprice_active_duration_seconds"]) + 2
+    elif cmd.strategy == Strategy.SMART_MARKET:
+        # SMART_MARKET close: aggressive-mid walker. During RTH it
+        # walks toward the far side for ``smart_market_rth_duration_seconds``
+        # then escalates to MKT for any residual. During ETH it walks
+        # but caps at the slippage floor; if the cap is hit the order
+        # is left resting and a CATASTROPHIC alert fires.
+        sm_interval = float(
+            settings.get("smart_market_reprice_interval_ms", 100)
+        ) / 1000.0
+        sm_rth_duration = float(
+            settings.get("smart_market_rth_duration_seconds", 10)
+        )
+        sm_max_slip = Decimal(str(
+            settings.get("smart_market_eth_max_slippage_pct", 0.005)
+        ))
+        sm_rth = not is_outside_rth()
+        sm_floor = _slippage_floor(initial_price, close_side, sm_max_slip)
+
+        sm_walk = await _walk_limit_aggressive(
+            ctx, con_id, ib_order_id, entry_symbol, close_side, initial_price,
+            interval_seconds=sm_interval,
+            total_duration_seconds=sm_rth_duration if sm_rth else None,
+            floor_price=None if sm_rth else sm_floor,
+            target_qty=qty_to_close,
+        )
+
+        # ETH cap reached — leave the limit resting, alert, return.
+        if sm_walk.get("hit_cap"):
+            sm_status = await ctx.ib.get_order_status(ib_order_id)
+            sm_filled = sm_status.get("qty_filled") or Decimal("0")
+            sm_residual = qty_to_close - sm_filled
+            await _raise_eth_cap_alert(
+                ctx, entry_symbol, close_side, initial_price, sm_floor,
+                sm_residual, ib_order_id, trade_group,
+            )
+            # Don't unregister callbacks — late fill at the cap can
+            # still be recorded.
+            return
+
+        # RTH duration expired with residual — cancel the limit, place
+        # MKT for the rest, then dispatch to _handle_close_fill or
+        # _handle_close_partial based on the combined result.
+        if sm_rth and sm_walk.get("status") == "duration_expired":
+            sm_status = await ctx.ib.get_order_status(ib_order_id)
+            sm_filled_pre = sm_status.get("qty_filled") or Decimal("0")
+            if sm_filled_pre < qty_to_close:
+                ctx.router.emit(
+                    f"⟳ SMART_MARKET: walker expired, crossing to MKT "
+                    f"for residual ({_fmt_qty(qty_to_close - sm_filled_pre)} "
+                    f"of {_fmt_qty(qty_to_close)})…",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+                    event="SMART_MARKET_CLOSE_CROSS_TO_MARKET",
+                )
+                sm_settle = float(
+                    settings.get("cancel_settle_timeout_seconds", 120)
+                )
+                _resolution, sm_final_qty, sm_final_avg, sm_final_comm, _ = \
+                    await _cancel_and_await_resolution(
+                        ctx, ib_order_id, qty_to_close, track=track,
+                        timeout=sm_settle,
+                        heartbeat_label=(
+                            f"Cancel pending #{cmd.serial} —"
+                        ),
+                    )
+                # Submit the MKT for the remainder.
+                sm_residual = qty_to_close - sm_final_qty
+                if sm_residual > 0:
+                    try:
+                        sm_mkt_id = await ctx.ib.place_market_order(
+                            con_id, entry_symbol, close_side, sm_residual,
+                            outside_rth=True, order_ref=close_ctx.order_ref,
+                        )
+                    except Exception:
+                        logger.exception(
+                            '{"event": "SMART_MARKET_CLOSE_MKT_FAILED", '
+                            '"symbol": "%s", "ib_order_id": "%s"}',
+                            entry_symbol, ib_order_id,
+                        )
+                        sm_mkt_id = None
+                    if sm_mkt_id is not None:
+                        sm_mkt_track = ctx.tracker.register(
+                            close_ctx.correlation_id, sm_mkt_id, entry_symbol,
+                        )
+                        await _await_full_fill_or_timeout(
+                            sm_mkt_track, sm_mkt_id, sm_residual,
+                            float(settings.get(
+                                "market_order_wait_seconds", 30,
+                            )), ctx,
+                        )
+                        sm_mkt_status = await ctx.ib.get_order_status(sm_mkt_id)
+                        sm_mkt_filled = sm_mkt_status.get(
+                            "qty_filled",
+                        ) or Decimal("0")
+                        sm_mkt_avg = sm_mkt_status.get("avg_fill_price")
+                        sm_mkt_comm = sm_mkt_status.get(
+                            "commission",
+                        ) or Decimal("0")
+                        # Combine LMT fills + MKT fills into a single
+                        # close-fill record on the original close_ctx.
+                        sm_total_qty = sm_final_qty + sm_mkt_filled
+                        sm_total_comm = sm_final_comm + sm_mkt_comm
+                        if sm_total_qty > 0:
+                            sm_lmt_notional = (
+                                sm_final_qty * (sm_final_avg or Decimal("0"))
+                            )
+                            sm_mkt_notional = (
+                                sm_mkt_filled * (sm_mkt_avg or Decimal("0"))
+                            )
+                            sm_blended_avg = (
+                                (sm_lmt_notional + sm_mkt_notional)
+                                / sm_total_qty
+                            )
+                            if sm_total_qty >= qty_to_close:
+                                await _handle_close_fill(
+                                    close_ctx, trade_group, sm_total_qty,
+                                    sm_blended_avg, sm_total_comm, ctx,
+                                )
+                            else:
+                                await _handle_close_partial(
+                                    close_ctx, trade_group, qty_to_close,
+                                    sm_total_qty, sm_blended_avg,
+                                    sm_total_comm, ib_order_id, ctx,
+                                )
+                        ctx.tracker.unregister(sm_mkt_id)
+                        ctx.tracker.unregister(ib_order_id)
+                        return
+                # No residual to cross OR MKT submit failed: fall through
+                # to standard post-walk handling with what we have.
+        # Walker exited via fill or partial-then-cancel — fall through to
+        # the unified post-fill code block below, which dispatches to
+        # _handle_close_fill / _handle_close_partial as appropriate.
+        wait_timeout = 0.1  # already settled by the walker; brief drain
     else:
         # BID / ASK / MARKET — single unified give-up window.
         wait_timeout = _total_order_wait(settings)

@@ -122,7 +122,9 @@ async def submit_command(body: CommandRequest):
                 resp = await client.post(f"{engine_url}/engine/orders", json=payload)
             elif verb == "close":
                 serial = int(parts[1]) if len(parts) > 1 else 0
-                strategy = parts[2] if len(parts) > 2 else "market"
+                # Default matches parse_close + CloseRequest pydantic
+                # model — see ib_trader/repl/commands.py:parse_close.
+                strategy = parts[2] if len(parts) > 2 else "smart_market"
                 resp = await client.post(f"{engine_url}/engine/close", json={
                     "serial": serial,
                     "strategy": strategy,

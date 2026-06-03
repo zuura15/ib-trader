@@ -138,7 +138,7 @@ class SellCommand:
 class CloseCommand:
     """Parsed 'close' command."""
     serial: int
-    strategy: Strategy               # default "mid"
+    strategy: Strategy               # default "smart_market"
     profit_amount: Decimal | None
     take_profit_price: Decimal | None
     limit_price: Decimal | None = None
@@ -478,7 +478,13 @@ def parse_close(
     args = tokens[1:]
     take_profit_price = None
     profit_amount = None
-    strategy = Strategy.MID
+    # Default to smart_market — the session-aware aggressive-mid algo.
+    # During RTH walks toward the far side for N seconds then crosses
+    # to MKT for any residual; during ETH walks but caps at the
+    # slippage floor. Matches buy/sell's default and what production
+    # bot strategies use. Operator can override with an explicit
+    # strategy token, e.g. ``close 4 market`` or ``close 4 mid``.
+    strategy = Strategy.SMART_MARKET
 
     positional = []
     i = 0

@@ -98,7 +98,9 @@ class CloseRequest(BaseModel):
     """Request body for closing a position."""
 
     serial: int
-    strategy: str = "market"
+    # Default matches parse_close + the API route handler. See
+    # ib_trader/repl/commands.py:parse_close for rationale.
+    strategy: str = "smart_market"
     profit: Optional[str] = None
     bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
     cmd_id: Optional[str] = Field(default=None, description="Caller-supplied command id; keys the Redis live-output stream")

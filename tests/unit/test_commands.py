@@ -169,15 +169,29 @@ class TestParseBuySell:
 
 
 class TestParseClose:
-    def test_basic_close(self):
+    def test_basic_close_defaults_to_smart_market(self):
+        """Default close strategy is smart_market — the session-aware
+        aggressive-mid algo. Operator can override with any explicit
+        Strategy token. Previously defaulted to mid."""
         cmd = parse_close(["close", "4"])
         assert isinstance(cmd, CloseCommand)
         assert cmd.serial == 4
-        assert cmd.strategy == "mid"
+        assert cmd.strategy == "smart_market"
 
     def test_close_with_market(self):
         cmd = parse_close(["close", "4", "market"])
         assert cmd.strategy == "market"
+
+    def test_close_with_smart_market_explicit(self):
+        """Explicit smart_market token still works (parity with default)."""
+        cmd = parse_close(["close", "4", "smart_market"])
+        assert cmd.strategy == "smart_market"
+
+    def test_close_with_mid_still_supported(self):
+        """Operators who want the prior default behaviour can opt back
+        into mid explicitly."""
+        cmd = parse_close(["close", "4", "mid"])
+        assert cmd.strategy == "mid"
 
     def test_close_with_profit(self):
         cmd = parse_close(["close", "4", "mid", "200"])
