@@ -263,6 +263,28 @@ class InsyncClient(IBClientBase):
         # API message.  A bare Contract(conId=...) omits these fields and
         # causes IB to reject orders with "Missing order exchange".
         self._contract_cache: dict[int, Contract] = {}
+        # Symbol-keyed memoization of qualify_contract() return values.
+        # ``_contract_cache`` (above) is keyed by con_id and is consulted
+        # by *callers* — but qualify_contract itself, when invoked with
+        # only a symbol, has no con_id yet, so it has to go to IB to
+        # discover one. Result: chart/SR polling loops that pass
+        # ``symbol=...`` re-fetch the SAME contract every 15-30 s and
+        # saturate the global IB throttle queue, blocking unrelated
+        # order calls behind hundreds of redundant lookups
+        # (2026-06-03 chart-bot storm: ~6 qualifies/contract/minute
+        # for 21 min on two FUT contracts, ~280 wasted IB calls).
+        #
+        # Key is the full qualify arg-tuple so calls with different
+        # (sec_type, exchange, currency, expiry, trading_class) still
+        # round-trip — IB may legitimately resolve differently across
+        # those combinations. Cache is monotonic to match
+        # ``_contract_cache`` semantics; futures roll naturally to new
+        # symbols so stale entries are harmless.
+        self._qualify_result_cache: dict[tuple, dict] = {}
+        # Tracks last successful CONTRACT_FETCHED timestamp per con_id
+        # for the CONTRACT_FETCH_BURST regression detector below.
+        self._last_fetch_ts: dict[int, float] = {}
+        self._process_start_ts: float = time.monotonic()
         # Short-lived price cache to avoid hammering the IB API on every
         # reprice step when live market data is unavailable (e.g. error 10197).
         # Keyed by con_id; value is (bid, ask, last, expiry_monotonic).
@@ -409,8 +431,20 @@ class InsyncClient(IBClientBase):
         raise ``ExpiredContractError``. The returned dict grows
         ``trading_class`` and ``tick_size`` fields for FUT.
         """
-        await self._throttle()
         sec_type_u = sec_type.upper()
+        # Symbol-level memoization. Skip throttle + IB roundtrip when
+        # we've already resolved this (symbol, sec_type, exchange,
+        # currency, expiry, trading_class) tuple. See
+        # ``_qualify_result_cache`` docstring in __init__ for the
+        # 2026-06-03 chart-bot storm context that drove this.
+        cache_key = (
+            symbol, sec_type_u, exchange, currency, expiry, trading_class,
+        )
+        cached = self._qualify_result_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        await self._throttle()
         if sec_type_u == "FUT":
             # When `expiry` is supplied, caller has explicit (root,
             # YYYYMM) — use the standard symbol+expiry path. Otherwise
@@ -418,13 +452,16 @@ class InsyncClient(IBClientBase):
             # and qualify by that. Both paths land on the same dict
             # response and seed the contract cache identically.
             if expiry:
-                return await self._qualify_future(
+                result = await self._qualify_future(
                     root=symbol, exchange=exchange, currency=currency,
                     expiry=_normalize_expiry(expiry), trading_class=trading_class,
                 )
-            return await self._qualify_future_by_local_symbol(
-                local_symbol=symbol, exchange=exchange, currency=currency,
-            )
+            else:
+                result = await self._qualify_future_by_local_symbol(
+                    local_symbol=symbol, exchange=exchange, currency=currency,
+                )
+            self._record_qualify_result(symbol, cache_key, result)
+            return result
 
         contract = Contract(symbol=symbol, secType=sec_type, exchange=exchange, currency=currency)
         results = await self.__ib.qualifyContractsAsync(contract)
@@ -463,13 +500,53 @@ class InsyncClient(IBClientBase):
             '{"event": "CONTRACT_FETCHED", "symbol": "%s", "con_id": %d}',
             symbol, qualified.conId,
         )
-        return {
+        result = {
             "con_id": qualified.conId,
             "exchange": qualified.exchange,
             "currency": qualified.currency,
             "multiplier": qualified.multiplier or None,
             "raw": raw,
         }
+        self._record_qualify_result(symbol, cache_key, result)
+        return result
+
+    def _record_qualify_result(
+        self, symbol: str, cache_key: tuple, result: dict,
+    ) -> None:
+        """Memoize a successful qualify result and fire the
+        ``CONTRACT_FETCH_BURST`` regression detector if the same con_id
+        has been re-qualified through a different cache key within the
+        last 5 min (process uptime > 2 min — startup warm is exempt).
+
+        With ``_qualify_result_cache`` populated, repeat qualifies for
+        the same arg-tuple skip IB entirely. A WARNING here therefore
+        means some caller bypassed the cache contract — e.g. passes
+        different kwargs each time for the same symbol, or someone
+        added a new code path that hits ``reqContractDetailsAsync``
+        directly. Surfaces the regression class that drove the
+        2026-06-03 chart-bot storm before it can rot in production.
+        """
+        con_id = int(result.get("con_id") or 0)
+        if not con_id:
+            return
+        self._qualify_result_cache[cache_key] = result
+        now = time.monotonic()
+        prev = self._last_fetch_ts.get(con_id)
+        self._last_fetch_ts[con_id] = now
+        if prev is None:
+            return
+        if (now - self._process_start_ts) <= 120:
+            return  # startup warm — multiple resolves are expected
+        elapsed = now - prev
+        if elapsed > 300:
+            return
+        logger.warning(
+            '{"event": "CONTRACT_FETCH_BURST", "con_id": %d, '
+            '"symbol": "%s", "seconds_since_last_fetch": %.1f, '
+            '"uptime_s": %.1f, "note": "cache bypass — investigate '
+            'caller passing different kwargs or hitting IB directly"}',
+            con_id, symbol, elapsed, now - self._process_start_ts,
+        )
 
     async def _qualify_future(
         self,

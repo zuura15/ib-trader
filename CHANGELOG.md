@@ -6,6 +6,23 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-06-03
 
 ### Fixed
+- **Engine sluggishness from redundant qualify_contract storm.** Chart
+  panes' 30s history + 15s SR polling loops were hitting symbol-only
+  HTTP endpoints (``/engine/history?symbol=...``, ``/engine/sr?symbol=...``);
+  the backend handler called ``qualify_contract`` for every such
+  request, BEFORE consulting its bars cache, so two visible chart-bots
+  produced ~12 redundant IB lookups/minute (one per visible chart × 6
+  per minute). Each goes through ``_throttle()`` (100ms min interval)
+  and serialises on the global IB throttle lock, blocking unrelated
+  smart_market / cancel calls behind the queue. ``qualify_contract``
+  now memoises by ``(symbol, sec_type, exchange, currency, expiry,
+  trading_class)`` and returns the cached dict before throttling.
+  Same con_id never goes to IB twice in steady state. New
+  ``CONTRACT_FETCH_BURST`` WARNING fires when the same con_id is
+  re-qualified within 5 min after process uptime > 2 min — surfaces
+  the regression class so the next sloppy caller is loud, not silent.
+
+### Fixed
 - **Close SMART_MARKET ledger lies on fast multi-execution fills.** Order
   #108025 (SELL 10 MNQM6): IB filled 4 then 6 within 10ms, the second
   ExecDetails callback queued behind the terminal status dispatch and
