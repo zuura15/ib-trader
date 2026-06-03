@@ -156,31 +156,61 @@ def test_unregister_clears_cancel_retry_state():
     assert "98852" not in client._cancel_retry_attempted
 
 
-def test_ib_async_cancel_order_patched_to_skip_manual_time():
+def test_ib_async_cancel_order_patched_full_fields_by_serverversion():
     """Importing insync_client monkey-patches ``ib_async.Client.cancelOrder``
-    to send ONLY the 3-field (tag, version, orderId) message — skipping
-    the optional ``manualCancelOrderTime`` field that triggers IB error
-    10340 on the prod Gateway version. Without this, every cancel
-    attempt is silently rejected. See insync_client.py module docstring
-    for the incident #867 context."""
-    # Module-import side-effect; harmless if already imported.
+    to send the FULL cancelOrder field set the Gateway's serverVersion
+    expects. ib_async 2.1.0 only sends through v169 natively, but the
+    prod Gateway is on v178 and rejects under-sized cancel messages
+    with error 10340 "{expected field name} not supported".
+
+    Pins the per-serverVersion field count so we'll fail loudly if the
+    patch ever gets accidentally reverted or the version thresholds
+    drift out of sync with IB's API changelog. See insync_client.py
+    module docstring for the incident #894 (and prior #867/#883)
+    context."""
     import ib_trader.ib.insync_client  # noqa: F401
     from ib_async.client import Client
 
     sent: list = []
 
     class _StubClient:
+        def __init__(self, sv):
+            self._sv = sv
+
         def send(self, *fields):
             sent.append(fields)
+
         def serverVersion(self):
-            return 200  # post-169 — the original path would send the
-                        # extra field; patched path must not.
+            return self._sv
 
-    # Call the bound method against our stub.
-    Client.cancelOrder(_StubClient(), 12345, "20260602 18:48:06")
+    # serverVersion 178 (prod) → expect all v169-v176 optional fields
+    # present with empty-string defaults for the operator-identity ones.
+    sent.clear()
+    Client.cancelOrder(_StubClient(178), 12345, "")
+    assert sent == [(4, 1, 12345, "", "", "", "", "")], (
+        f"v178: expected base+manualCancelOrderTime+extOperator+"
+        f"manualOrderIndicator+externalUserId+externalUserIdType; got {sent}"
+    )
 
+    # Old Gateway < v169 — no optional fields appended.
+    sent.clear()
+    Client.cancelOrder(_StubClient(168), 12345, "")
     assert sent == [(4, 1, 12345)], (
-        f"patched cancelOrder must send only [4, 1, orderId]; got {sent}"
+        f"v168: expected [4, 1, orderId] only; got {sent}"
+    )
+
+    # v169 floor — just manualCancelOrderTime appended.
+    sent.clear()
+    Client.cancelOrder(_StubClient(169), 12345, "20260602 18:48:06")
+    assert sent == [(4, 1, 12345, "20260602 18:48:06")], (
+        f"v169: expected manualCancelOrderTime only; got {sent}"
+    )
+
+    # v175 — through manualOrderIndicator; externalUserId NOT yet appended.
+    sent.clear()
+    Client.cancelOrder(_StubClient(175), 12345, "")
+    assert sent == [(4, 1, 12345, "", "", "")], (
+        f"v175: expected through manualOrderIndicator; got {sent}"
     )
 
 

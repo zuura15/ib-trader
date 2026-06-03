@@ -23,38 +23,56 @@ from ib_trader.ib.base import IBClientBase
 from ib_trader.ib.overnight_patch import apply as _apply_overnight_patch
 
 
-# ─── Monkey-patch: strip manualCancelOrderTime from cancelOrder ───────────────
+# ─── Monkey-patch: extend cancelOrder to match Gateway serverVersion ──────────
 #
-# Operator-reported incident 2026-06-02 (order #867 MNQM6): every cancel
-# attempt against the running IB Gateway version was being rejected with
-# error 10340 "The following order attribute is not supported:
-# ManualOrderIndicator". ib_async's ``Client.cancelOrder`` appends an
-# optional ``manualCancelOrderTime`` field whenever ``serverVersion() >=
-# 169``; this Gateway version accepts the field on PlaceOrder (orders
-# transmit fine) but rejects it on CancelOrder, blocking every
-# cancel-path the engine has — partial-fill cleanup, walker-expiry MKT
-# escalation, the explicit ``close`` verb, smart_market's residual
-# cancel. The misleading "ManualOrderIndicator" wording is IB's
-# translation of "your cancel message has an attribute I don't want".
+# Operator-reported incidents 2026-06-02 (orders #867, #883, #894): every
+# cancel attempt against the prod IB Gateway was rejected with error
+# 10340 "The following order attribute is not supported:
+# {ExternalUserId|ManualOrderIndicator}" — different field name each
+# time, depending on which cancel was sent.
 #
-# Workaround: send only the original 3-field cancel message (tag 4,
-# version 1, orderId). MIFID-II audit-trail metadata is lost — irrelevant
-# for US futures trading and reversible once the Gateway is upgraded.
-# Re-test cancel after applying; remove this patch when ib_async is
-# upgraded and the issue is resolved upstream.
+# Root cause: Gateway is on serverVersion 178 (probed). ib_async 2.1.0's
+# Client.cancelOrder only sends fields through v169 (orderId +
+# manualCancelOrderTime). v174 added extOperator, v175 added
+# manualOrderIndicator, v176 added externalUserId + externalUserIdType.
+# The Gateway parses cancelOrder positionally; when expected-position
+# fields are missing it reports "{the expected field name} not supported"
+# — misleading wording for "your message has fewer fields than I expect".
+#
+# A first hotfix (f72e1f8) STRIPPED manualCancelOrderTime, sending a
+# 3-field message. That made things worse — even more fields missing,
+# still 10340 rejections (different field-name each time the parser hit
+# the next missing slot).
+#
+# Correct fix: send the FULL cancelOrder field set the Gateway's
+# serverVersion expects, with empty-string defaults for the v174+
+# optional ones (we have no operator-identity to attribute). Remove
+# this monkey-patch once ib_async is upgraded to a version that
+# handles serverVersion 174+ natively.
 try:
     from ib_async.client import Client as _IBClient
 
-    def _cancel_order_no_extras(self, orderId, manualCancelOrderTime=""):
-        # Original ib_async sends `[4, 1, orderId, manualCancelOrderTime]`
-        # when serverVersion >= 169. We drop the optional 4th field —
-        # IB Gateway rejects it as 10340 on cancel even though it
-        # accepts it on place.
-        self.send(4, 1, orderId)
+    def _cancel_order_full_fields(self, orderId, manualCancelOrderTime=""):
+        # Match the Gateway's cancelOrder protocol layout positionally.
+        # Thresholds match IB's TWS API changelog and the field names
+        # IB returns in 10340 errors. Empty strings for the optional
+        # operator-identity fields — we're an automated retail account.
+        fields = [4, 1, orderId]
+        sv = self.serverVersion() or 0
+        if sv >= 169:
+            fields.append(manualCancelOrderTime or "")
+        if sv >= 174:
+            fields.append("")  # extOperator
+        if sv >= 175:
+            fields.append("")  # manualOrderIndicator (empty = default automated)
+        if sv >= 176:
+            fields.append("")  # externalUserId
+            fields.append("")  # externalUserIdType
+        self.send(*fields)
 
-    _IBClient.cancelOrder = _cancel_order_no_extras
+    _IBClient.cancelOrder = _cancel_order_full_fields
     logging.getLogger(__name__).info(
-        '{"event": "IB_ASYNC_PATCHED_CANCELORDER_NO_MANUAL_TIME"}',
+        '{"event": "IB_ASYNC_PATCHED_CANCELORDER_FULL_FIELDS"}',
     )
 except Exception:
     # Defensive — if ib_async's internal layout changes upstream,
