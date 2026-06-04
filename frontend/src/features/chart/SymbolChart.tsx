@@ -8,7 +8,7 @@ import {
 import { getHistory } from '../../api/client';
 import {
   type SavedRange, type Bar,
-  VISIBLE_MINUTES, PRELOAD_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
+  VISIBLE_MINUTES, PRELOAD_HOURS, SR_LOOKBACK_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
   targetKey, loadSavedRange, saveRange,
   toBars, themeColors, localUtcSeconds,
 } from './chartUtils';
@@ -2309,7 +2309,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         1, Math.ceil(minBroken * 60 / BAR_SECONDS),
       );
       const payload = await fetchBackendSr(
-        target, PRELOAD_HOURS, BAR_SIZE,
+        // SR detection lookback intentionally shorter than the chart's
+        // visible-history (PRELOAD_HOURS) — see SR_LOOKBACK_HOURS
+        // docstring for why.
+        target, SR_LOOKBACK_HOURS, BAR_SIZE,
         {
           breakStaleBars,
           includeBrokenWedges: showBrokenSrRef.current,

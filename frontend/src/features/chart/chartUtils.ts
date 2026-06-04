@@ -3,6 +3,17 @@ import type { HistoryBar } from '../../api/client';
 
 export const VISIBLE_MINUTES = 90;
 export const PRELOAD_HOURS = 48;
+// SR detection lookback — separate from PRELOAD_HOURS because SR's
+// per-bar cost (pivot detection + line fitting + wedge search) scales
+// roughly linearly with bar count, and 48 h × 1-min bars = 2880 bars
+// times out the API → engine HTTP request before the algo finishes.
+// 12 h × 1-min = 720 bars matches the OLD 48 h × 3-min workload (960
+// bars) without losing any structure the operator actually scans
+// (they zoom within the last few hours; SR over older bars isn't
+// load-bearing). The chart history fetch still uses PRELOAD_HOURS
+// so the operator can pan back into prior sessions and see bars,
+// just not redrawn SR.
+export const SR_LOOKBACK_HOURS = 12;
 export const REFRESH_INTERVAL_MS = 30_000;
 // 1-min bars: tuned for the operator's manual-scan workflow (eyeball
 // triggers on the chart, execute via the console). Replaces the prior
