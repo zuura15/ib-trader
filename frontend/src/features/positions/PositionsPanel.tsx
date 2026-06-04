@@ -84,6 +84,7 @@ function sortPositions(positions: BrokerPosition[], key: SortKey, dir: SortDir):
 export function PositionsPanel({ compact = false }: { compact?: boolean }) {
   const dataMode = useStore((s) => s.dataMode);
   const mockPositions = useStore((s) => s.positions);
+  const resyncToken = useStore((s) => s.resyncToken);
 
   // Mock mode — use store positions
   if (dataMode === 'mock') {
@@ -217,7 +218,10 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };
-  }, []);
+    // Re-run on resyncToken bump (top-header Resync button) so the
+    // positions WS subscription is rebuilt from scratch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resyncToken]);
 
   const handleSort = (key: SortKey) => {
     if (key === sortKey) {

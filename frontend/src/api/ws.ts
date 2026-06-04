@@ -148,6 +148,35 @@ export class WSManager {
   }
 
   /**
+   * Unconditionally tear down and reopen the WebSocket.
+   *
+   * Unlike ``wakeUp`` (which short-circuits when the socket looks
+   * healthy because the server is presumed to be pushing diffs), this
+   * is the operator-driven "force everything" path used by the
+   * top-header Resync button. We don't get to peek at server state
+   * from here, so we just close and let ``connect`` rebuild —
+   * subscribe frames + a fresh snapshot follow naturally.
+   */
+  forceReconnect(): void {
+    if (this.destroyed) return;
+    this.reconnectMs = MIN_RECONNECT_MS;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.ws) {
+      this.ws.onclose = null;
+      try { this.ws.close(); } catch { /* already closed */ }
+      this.ws = null;
+    }
+    this.connect();
+  }
+
+  /**
    * Disconnect and stop reconnecting.
    */
   stop(): void {

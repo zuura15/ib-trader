@@ -69,6 +69,7 @@ export function LogStream({
 }: LogStreamProps) {
   const dataMode = useStore((s) => s.dataMode);
   const mockLogs = useStore((s) => s.logs);
+  const resyncToken = useStore((s) => s.resyncToken);
   const [liveLogs, setLiveLogs] = useState<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastTimestamp = useRef<string>('');
@@ -152,7 +153,7 @@ export function LogStream({
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };
-  }, [dataMode, maxLines]);
+  }, [dataMode, maxLines, resyncToken]);
 
   const logsRaw: LogEntry[] = dataMode === 'live' ? liveLogs : mockLogs.map(l => ({
     id: l.id,

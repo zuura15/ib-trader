@@ -2,11 +2,30 @@ import { useEffect } from 'react';
 import {
   DEFAULT_SETTINGS, setUserSetting, useUserSetting,
 } from '../../data/userSettings';
+import { useStore } from '../../data/store';
+import type { LayoutVariant, ThemeMode } from '../../types';
+import { LayoutToggle } from '../header/LayoutToggle';
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
+
+const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
+  { id: 'dark',     label: 'Midnight', icon: '🌑' },
+  { id: 'charcoal', label: 'Charcoal', icon: '◼' },
+  { id: 'navy',     label: 'Navy',     icon: '🔵' },
+  { id: 'mocha',    label: 'Mocha',    icon: '☕' },
+  { id: 'light',    label: 'Light',    icon: '☀' },
+];
+
+const VARIANT_LABELS: Record<LayoutVariant, string> = {
+  A: 'Classic',
+  B: 'Modern',
+  C: 'Command',
+  D: 'Bots',
+  T: 'Trader',
+};
 
 export function SettingsModal({ open, onClose }: Props) {
   // Esc closes.
@@ -19,6 +38,10 @@ export function SettingsModal({ open, onClose }: Props) {
 
   const signalActiveBars = useUserSetting('signalActiveBars');
   const brokenLookbackMinutes = useUserSetting('brokenLookbackMinutes');
+  const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
+  const activeVariant = useStore((s) => s.activeVariant);
+  const setVariant = useStore((s) => s.setVariant);
 
   if (!open) return null;
 
@@ -63,6 +86,58 @@ export function SettingsModal({ open, onClose }: Props) {
           </button>
         </header>
         <div style={{ padding: '12px 14px' }}>
+          <SectionTitle>Theme</SectionTitle>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
+            {THEMES.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setTheme(t.id)}
+                title={t.label}
+                style={{
+                  background: theme === t.id ? 'var(--accent-blue)' : 'var(--bg-secondary)',
+                  color: theme === t.id ? (theme === 'light' ? '#fff' : '#090b0f') : 'var(--text-secondary)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 4,
+                  padding: '4px 8px',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                }}
+              >
+                <span style={{ marginRight: 4 }}>{t.icon}</span>{t.label}
+              </button>
+            ))}
+          </div>
+
+          <SectionTitle>Layout</SectionTitle>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+            {(['A', 'B', 'C', 'D', 'T'] as LayoutVariant[]).map((v) => (
+              <button
+                key={v}
+                onClick={() => setVariant(v)}
+                style={{
+                  background: activeVariant === v ? 'var(--accent-blue)' : 'var(--bg-secondary)',
+                  color: activeVariant === v ? (theme === 'dark' ? '#090b0f' : '#ffffff') : 'var(--text-secondary)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 4,
+                  padding: '4px 10px',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                }}
+              >
+                {v} · {VARIANT_LABELS[v]}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Layout mode
+            </span>
+            <LayoutToggle size="xs" />
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              (auto follows viewport; mobile/desktop forces it)
+            </span>
+          </div>
+
           <SectionTitle>Chart signals</SectionTitle>
           <SettingRow
             label="Buy/Sell signal lifetime"

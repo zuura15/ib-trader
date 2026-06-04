@@ -75,6 +75,19 @@ interface AppStore {
   // Position refresh trigger — bumped after each command completes
   positionRefreshTick: number;
 
+  // Resync token — bumped by the top-header Resync button. Components
+  // that hold long-lived subscriptions (chart panes' raw WebSocket,
+  // 30s history loop, 15s SR loop, positions push, log stream)
+  // include this in their useEffect dep array so the effect tears
+  // down and re-runs, dropping any silently-half-dead connection and
+  // re-fetching fresh data. ``resyncStatus`` drives the button's
+  // own indicator. See triggerResync / triggerDeepResync below.
+  resyncToken: number;
+  resyncStatus: 'idle' | 'running' | 'done' | 'failed';
+  resyncMessage: string | null;
+  triggerResync: () => Promise<void>;
+  triggerDeepResync: () => Promise<void>;
+
   // Positions
   positions: Position[];
   updatePosition: (symbol: string, partial: Partial<Position>) => void;
@@ -121,6 +134,70 @@ interface AppStore {
   initWebSocket: () => void;
   handleSnapshot: (data: Record<string, unknown[]>) => void;
   handleDiff: (channel: Channel, diff: WSDiff) => void;
+}
+
+/**
+ * Operator-driven "resync everything" routine. Bumps ``resyncToken``
+ * (so chart panes, positions panel, log stream tear down their
+ * subscriptions and re-establish), forces wsManager to reconnect,
+ * and fires the engine HTTP endpoints that re-establish backend
+ * state (watchlist subscriptions, positions cache). The ``deep``
+ * flavor additionally triggers ``prophylactic-resub`` which is
+ * heavier (cycles every IB market-data subscription).
+ *
+ * Wrapped in a top-level helper so both ``triggerResync`` and
+ * ``triggerDeepResync`` share the orchestration code.
+ */
+async function _runResync(
+  set: (partial: Partial<AppStore> | ((s: AppStore) => Partial<AppStore>)) => void,
+  _get: () => AppStore,
+  opts: { deep: boolean },
+): Promise<void> {
+  const t0 = performance.now();
+  set({ resyncStatus: 'running', resyncMessage: opts.deep ? 'Deep resync…' : 'Resyncing…' });
+
+  // Bump the token immediately so every subscribed component starts
+  // its tear-down + re-subscribe in parallel with the HTTP calls.
+  set((s) => ({ resyncToken: s.resyncToken + 1 }));
+
+  // Kick the central wsManager (watchlist / positions panel snapshot).
+  try { wsManager.forceReconnect(); } catch { /* no-op */ }
+
+  // Engine HTTP — best-effort, log + carry on if individual calls fail.
+  const fails: string[] = [];
+  try {
+    const r = await fetch('/api/system/resync', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deep: opts.deep }),
+    });
+    if (!r.ok) fails.push(`engine:${r.status}`);
+  } catch (e) {
+    fails.push(`engine:${(e as Error).message}`);
+  }
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  if (fails.length === 0) {
+    set({
+      resyncStatus: 'done',
+      resyncMessage: `${opts.deep ? 'Deep r' : 'R'}esynced in ${elapsed}s`,
+    });
+  } else {
+    set({
+      resyncStatus: 'failed',
+      resyncMessage: `Resync issues: ${fails.join(', ')}`,
+    });
+  }
+
+  // Drop back to idle after a few seconds so the button stops
+  // shouting the last result.
+  window.setTimeout(() => {
+    set((s) => (
+      s.resyncStatus === 'idle'
+        ? {}
+        : { resyncStatus: 'idle', resyncMessage: null }
+    ));
+  }, 3500);
 }
 
 export const useStore = create<AppStore>((set, get) => ({
@@ -242,6 +319,16 @@ export const useStore = create<AppStore>((set, get) => ({
   setTradeGroups: (tradeGroups) => set({ tradeGroups }),
 
   positionRefreshTick: 0,
+
+  resyncToken: 0,
+  resyncStatus: 'idle',
+  resyncMessage: null,
+  triggerResync: async () => {
+    await _runResync(set, get, { deep: false });
+  },
+  triggerDeepResync: async () => {
+    await _runResync(set, get, { deep: true });
+  },
 
   positions: DATA_MODE === 'mock' ? mockPositions : [],
   updatePosition: (symbol, partial) => set((s) => ({

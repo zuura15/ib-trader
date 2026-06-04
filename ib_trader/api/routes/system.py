@@ -61,6 +61,91 @@ async def post_ib_reconnect():
     return resp.json()
 
 
+@router.post("/system/resync")
+async def post_system_resync(body: dict | None = None):
+    """Operator-driven resync — the "untie the knot" button.
+
+    Default (``body = {"deep": false}``):
+      * POST ``/engine/reload-watchlist`` — re-subscribes any watchlist
+        symbol that has fallen out of ``_streaming`` (e.g. after a
+        scheduled IB reconnect dropped a bot-owned symbol).
+      * GET  ``/engine/positions/refresh`` for a sentinel symbol —
+        forces ``reqPositionsAsync`` so positionEvents fire fresh
+        snapshots for every held position.
+
+    Deep (``body = {"deep": true}``):
+      * Above PLUS POST ``/engine/prophylactic-resub`` — cycles every
+        active ``reqMktData`` to unstick IB-side parked subscriptions.
+        Reserve for "everything is stuck and the light resync did
+        not help" — briefly interrupts every quote stream.
+
+    Best-effort: each engine call's success/failure is reported
+    individually so the UI can show what landed. A single failed
+    call does not abort the rest.
+    """
+    import os as _os
+    import httpx
+    from fastapi import HTTPException
+
+    deep = bool((body or {}).get("deep"))
+    port = _os.environ.get("IB_TRADER_ENGINE_INTERNAL_PORT", "8081")
+    base = f"http://127.0.0.1:{port}"
+
+    results: dict[str, dict] = {}
+
+    async def _call(name: str, method: str, path: str, *, params=None, timeout=10.0):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if method == "POST":
+                    resp = await client.post(f"{base}{path}", params=params)
+                else:
+                    resp = await client.get(f"{base}{path}", params=params)
+            results[name] = {
+                "ok": resp.status_code < 400,
+                "status": resp.status_code,
+            }
+            try:
+                payload = resp.json()
+                # Cap nested payloads — the engine endpoints can return
+                # multi-symbol details and we don't need them all in
+                # the proxy response.
+                results[name]["data"] = payload
+            except Exception:
+                results[name]["text"] = resp.text[:500]
+        except httpx.ConnectError as e:
+            results[name] = {"ok": False, "error": f"engine unreachable: {e}"}
+        except httpx.TimeoutException as e:
+            results[name] = {"ok": False, "error": f"timeout: {e}"}
+        except Exception as e:
+            results[name] = {"ok": False, "error": str(e)}
+
+    await _call("reload_watchlist", "POST", "/engine/reload-watchlist")
+    # positions/refresh takes a ``symbol=`` arg to pull a single
+    # symbol's qty back, but the side-effect (reqPositionsAsync →
+    # fresh positionEvents for every position) is what we want
+    # regardless of which symbol is passed. Use a benign sentinel.
+    await _call(
+        "positions_refresh", "GET", "/engine/positions/refresh",
+        params={"symbol": "_resync_sentinel"},
+    )
+
+    if deep:
+        # Prophylactic resub takes ~30 s for ~14 subs at 2 s stagger;
+        # give it head room without leaving the operator hanging.
+        await _call(
+            "prophylactic_resub", "POST", "/engine/prophylactic-resub",
+            timeout=90.0,
+        )
+
+    any_ok = any(r.get("ok") for r in results.values())
+    if not any_ok:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "every engine call failed", "results": results},
+        )
+    return {"deep": deep, "results": results}
+
+
 @router.get("/status")
 async def get_status(
     redis=Depends(get_redis),

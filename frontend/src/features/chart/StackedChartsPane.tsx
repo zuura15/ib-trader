@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { PanelShell } from '../../components/PanelShell';
 import { SymbolChart } from './SymbolChart';
-import type { ChartTarget } from '../../data/store';
+import { useStore, type ChartTarget } from '../../data/store';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 interface BrokerPosition {
@@ -17,6 +17,7 @@ const MAX_ROWS = 6;
 export function StackedChartsPane() {
   const [positions, setPositions] = useState<BrokerPosition[]>([]);
   const [wsLive, setWsLive] = useState(false);
+  const resyncToken = useStore((s) => s.resyncToken);
 
   // Lifted reopen handle — visibility-wake calls it on tab return.
   const wakeRef = useRef<() => void>(() => {});
@@ -75,7 +76,9 @@ export function StackedChartsPane() {
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
     };
-  }, []);
+    // Re-run on resyncToken bump.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resyncToken]);
 
   // Same stocks/futures-only filter the user actually charts. Drop OPT
   // because we'd just chart the underlying stock — better to surface

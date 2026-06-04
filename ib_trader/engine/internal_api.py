@@ -409,6 +409,41 @@ async def reload_watchlist():
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/engine/prophylactic-resub")
+async def prophylactic_resub():
+    """Force an immediate prophylactic resubscribe of every active
+    market-data + bar subscription.
+
+    Wraps ``ctx.ib.prophylactic_resubscribe_all`` so the operator can
+    trigger it manually from the UI (the "Resync" header button on
+    shift+click) instead of waiting up to an hour for the scheduled
+    loop. Equivalent recovery to a Gateway restart for individually-
+    parked symbol subscriptions, without the ~30 s engine outage.
+
+    Heavy compared to ``/engine/reload-watchlist`` — cancels and
+    re-issues ``reqMktData`` for every active subscription, briefly
+    interrupting every quote stream. Reserve for "everything is
+    stuck and a light resync did not help."
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    if not hasattr(_ctx.ib, "prophylactic_resubscribe_all"):
+        raise HTTPException(
+            status_code=501,
+            detail="prophylactic_resubscribe_all not available on this client",
+        )
+    try:
+        result = await _ctx.ib.prophylactic_resubscribe_all(stagger_s=2.0)
+    except Exception as e:
+        logger.exception('{"event": "MANUAL_PROPHYLACTIC_RESUB_FAILED"}')
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    logger.info(
+        '{"event": "MANUAL_PROPHYLACTIC_RESUB_DONE", "result": "%s"}',
+        result,
+    )
+    return {"status": "resubscribed", "detail": result}
+
+
 @app.get("/engine/instruments/expiries")
 async def list_future_expiries(root: str, exchange: str = "CME", trading_class: str | None = None):
     """Return upcoming futures expiries for ``root`` (engine direct IB call).

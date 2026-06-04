@@ -1,28 +1,11 @@
 import { useState } from 'react';
 import { useStore } from '../../data/store';
 import { formatCurrency } from '../../utils/format';
-import type { LayoutVariant, ThemeMode } from '../../types';
 import { SettingsModal } from '../settings/SettingsModal';
-import { LayoutToggle } from './LayoutToggle';
-
-const THEMES: { id: ThemeMode; label: string; icon: string }[] = [
-  { id: 'dark',     label: 'Midnight', icon: '🌑' },
-  { id: 'charcoal', label: 'Charcoal', icon: '◼' },
-  { id: 'navy',     label: 'Navy',     icon: '🔵' },
-  { id: 'mocha',    label: 'Mocha',    icon: '☕' },
-  { id: 'light',    label: 'Light',    icon: '☀' },
-];
-
-const variantLabels: Record<LayoutVariant, string> = {
-  A: 'Classic',
-  B: 'Modern',
-  C: 'Command',
-  D: 'Bots',
-  T: 'Trader',
-};
+import { ResyncButton } from './ResyncButton';
 
 export function GlobalHeader() {
-  const { global, activeVariant, setVariant, theme, setTheme, dataMode, wsConnected } = useStore();
+  const { global, dataMode, wsConnected } = useStore();
   const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, engineStartedAt } = global;
   // Format "up since" with the engine's start timestamp. The backend
   // writes it as a timezone-aware ISO (server-local PT); ``new Date``
@@ -139,60 +122,12 @@ export function GlobalHeader() {
           </div>
         )}
 
-        {/* Theme picker */}
-        <div className="rounded border p-1" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
-          <div style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4, paddingLeft: 8 }}>
-            Theme
-          </div>
-          <div className="flex gap-1">
-            {THEMES.map((t) => (
-              <button
-                key={t.id}
-                onClick={() => setTheme(t.id)}
-                title={t.label}
-                className="rounded px-2 py-1.5 text-xs font-medium cursor-pointer transition-colors"
-                style={{
-                  background: theme === t.id ? 'var(--accent-blue)' : 'var(--bg-secondary)',
-                  color: theme === t.id ? (theme === 'light' ? '#fff' : '#090b0f') : 'var(--text-secondary)',
-                  border: 'none',
-                  fontSize: 11,
-                }}
-              >
-                <span style={{ marginRight: 3 }}>{t.icon}</span>{t.label}
-              </button>
-            ))}
-          </div>
-        </div>
+        {/* Resync — operator override for stuck subscriptions. See
+            ResyncButton for the click vs shift+click semantics. */}
+        <ResyncButton />
 
-        {/* Variant switcher */}
-        <div className="rounded border p-1" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
-          <div style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4, paddingLeft: 8 }}>
-            Layout
-          </div>
-          <div className="flex gap-1">
-            {(['A', 'B', 'C', 'D', 'T'] as LayoutVariant[]).map((v) => (
-              <button
-                key={v}
-                onClick={() => setVariant(v)}
-                className="rounded px-2.5 py-1.5 text-xs font-medium cursor-pointer transition-colors"
-                style={{
-                  background: activeVariant === v ? 'var(--accent-blue)' : 'var(--bg-secondary)',
-                  color: activeVariant === v ? (theme === 'dark' ? '#090b0f' : '#ffffff') : 'var(--text-secondary)',
-                  border: 'none',
-                }}
-              >
-                {v} · {variantLabels[v]}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Layout override (auto / mobile / desktop) — escapes Chrome's
-            sticky "Desktop site" preference when the viewport heuristic
-            disagrees with what the user actually wants. */}
-        <LayoutToggle size="sm" />
-
-        {/* Settings */}
+        {/* Settings (theme + layout selectors moved here so the header
+            has room for the resync button). */}
         <button
           onClick={() => setSettingsOpen(true)}
           title="Settings"

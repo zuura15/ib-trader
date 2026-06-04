@@ -18,7 +18,7 @@ import {
   fetchBackendSr, backendLineToSRLine, backendTsToChartTime,
   type BackendSrPayload,
 } from './srBackend';
-import type { ChartTarget } from '../../data/store';
+import { useStore, type ChartTarget } from '../../data/store';
 import { useUserSetting } from '../../data/userSettings';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
@@ -218,7 +218,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     srBackendApexRef.current = null;
     srArrowsRef.current = [];
     repositionSrSignalsRef.current?.();
-  }, [target?.conId, target?.symbol, target?.secType]);
+  }, [target?.conId, target?.symbol, target?.secType, resyncToken]);
 
   // Global setting: how many bars after firing a signal counts as
   // "active" before it dims to historical. Read via store hook so a
@@ -323,6 +323,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // refs (e.g. ``historicalFires`` at line ~410) can reference it
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
+  // Operator-driven resync (top-header Resync button). Subscribed
+  // here so the chart's long-lived effects (WS, history, SR) can
+  // include it in their dep arrays and re-run when the operator
+  // forces a resync. Selector-scoped subscribe — re-renders only
+  // when the token actually changes.
+  const resyncToken = useStore((s) => s.resyncToken);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -2245,7 +2251,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       if (retryTimer) clearTimeout(retryTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes]);
+  }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes, resyncToken]);
 
   // Set a sensible default visible range as soon as a target is chosen,
   // BEFORE the historical fetch returns. Otherwise lightweight-charts
@@ -2279,7 +2285,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // the same range after series.setData() which always succeeds.
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes]);
+  }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes, resyncToken]);
 
   // Canonical SR fetch — populates the SINGLE source of truth that
   // drives line drawing, wedge shading, and the apex badge. Fetched
@@ -2325,7 +2331,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       wakeSubs.delete(wake);
       window.clearInterval(id);
     };
-  }, [target?.conId, target?.symbol, target?.secType]);
+  }, [target?.conId, target?.symbol, target?.secType, resyncToken]);
 
   // Regime fetch removed 2026-06-02 along with the badge it drove.
   // No /api/regime calls are made from the chart any more; the
@@ -2351,7 +2357,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         node.parentNode?.removeChild(node);
       }
     });
-  }, [target?.conId, target?.symbol, target?.secType]);
+  }, [target?.conId, target?.symbol, target?.secType, resyncToken]);
 
   // Live tick subscription. Engine publishes STK ticks keyed on
   // ``symbol`` and FUT ticks keyed on ``localSymbol`` (= the IB-paste
@@ -2503,7 +2509,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         ws.close();
       }
     };
-  }, [target?.symbol, target?.secType, chartVersion]);
+  }, [target?.symbol, target?.secType, chartVersion, resyncToken]);
 
   useImperativeHandle(ref, () => ({
     resetZoom: () => {

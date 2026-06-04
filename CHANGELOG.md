@@ -5,6 +5,28 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-04
 
+### Added
+- **Resync button in the top header — operator override for stuck
+  subscriptions.** Click: bumps a Zustand ``resyncToken`` (every chart
+  pane / positions panel / log stream tears down and re-establishes
+  its WS), force-reconnects the central ``wsManager``, and hits
+  ``POST /api/system/resync`` which proxies to the engine's
+  ``reload-watchlist`` + ``positions/refresh`` endpoints. Shift+click:
+  same plus ``POST /engine/prophylactic-resub`` — cycles every active
+  ``reqMktData`` to unstick IB-side parked subscriptions (heavier,
+  briefly interrupts every quote stream). Button shows
+  idle / running / done / failed status and auto-clears after a few
+  seconds. Replaces the recurring "operator has to refresh / restart"
+  loop with a single header click.
+- **Theme + layout selectors moved from header to Settings.** The
+  five theme buttons, the A/B/C/D/T variant switcher, and the
+  auto/mobile/desktop layout toggle now live in the Settings modal
+  (gear icon top-right). This frees header space for the Resync
+  button and gets clutter out of the always-visible top bar — these
+  settings change rarely while running.
+- ``POST /api/system/resync`` and ``POST /engine/prophylactic-resub``
+  endpoints wiring the above.
+
 ### Fixed
 - **Chart pane WS frame-arrival watchdog.** ``SymbolChart`` opens a
   RAW ``WebSocket`` (not the central ``wsManager`` that powers the
