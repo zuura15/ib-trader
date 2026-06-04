@@ -2369,14 +2369,31 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
+    // Frame-arrival watchdog. The chart opens a RAW WebSocket here
+    // (not the central wsManager that PositionsPanel / WatchlistPanel
+    // use), so there's no ping/pong heartbeat. After a laptop-sleep
+    // or NAT/proxy timeout the socket can stay in readyState=OPEN
+    // while no frames arrive — ``onclose`` never fires, so the
+    // existing setTimeout-on-close reconnect path never triggers.
+    // useVisibilityWake catches the hidden→visible case but does
+    // NOT fire when the tab stays visible across a laptop sleep.
+    // This watchdog: if no frame for STALE_THRESHOLD_MS, force-close
+    // so onclose → setTimeout(open, 2000) reconnects. Pure additive;
+    // no behaviour change when the WS is healthy.
+    let lastFrameAt: number = Date.now();
+    const STALE_THRESHOLD_MS = 60_000;
+    const WATCHDOG_TICK_MS = 30_000;
 
     const open = () => {
       if (closed) return;
       ws = new WebSocket(url);
+      lastFrameAt = Date.now();
       ws.onopen = () => {
+        lastFrameAt = Date.now();
         ws?.send(JSON.stringify({ type: 'subscribe_quote', symbol: target.symbol }));
       };
       ws.onmessage = (ev) => {
+        lastFrameAt = Date.now();
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type !== 'quote' || msg.symbol !== target.symbol) return;
@@ -2461,9 +2478,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     };
     wakeSubs.add(wake);
 
+    // Periodic staleness check (see lastFrameAt declaration above).
+    const watchdog = window.setInterval(() => {
+      if (closed || !ws) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const sinceFrame = Date.now() - lastFrameAt;
+      if (sinceFrame > STALE_THRESHOLD_MS) {
+        try { ws.close(); } catch { /* already closed */ }
+        // ws.onclose schedules a setTimeout-based reopen, so we
+        // don't call open() directly here. Reset lastFrameAt so
+        // the watchdog doesn't immediately trip again on the new
+        // socket's startup gap.
+        lastFrameAt = Date.now();
+      }
+    }, WATCHDOG_TICK_MS);
+
     return () => {
       closed = true;
       wakeSubs.delete(wake);
+      window.clearInterval(watchdog);
       if (retry) clearTimeout(retry);
       if (ws) {
         ws.onclose = null;

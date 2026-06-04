@@ -3,6 +3,24 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-06-04
+
+### Fixed
+- **Chart pane WS frame-arrival watchdog.** ``SymbolChart`` opens a
+  RAW ``WebSocket`` (not the central ``wsManager`` that powers the
+  watchlist/positions panes), so it had no ping/pong heartbeat and
+  no stall detection. After a laptop sleep or proxy/NAT timeout the
+  socket could stay in ``readyState=OPEN`` while no frames arrived
+  — ``onclose`` never fired, so the existing setTimeout reconnect
+  path never triggered. ``useVisibilityWake`` only covers the
+  hidden→visible transition; a tab that stays visible across a
+  laptop sleep was unprotected. New watchdog ticks every 30s and
+  if no frame for 60s force-closes the WS so ``onclose →
+  setTimeout(open, 2000)`` reconnects. Pure additive; no behaviour
+  change when the WS is healthy. Same incident class the operator
+  reported repeatedly across sessions ("the app is stuck after I
+  was away for hours").
+
 ## 2026-06-03
 
 ### Fixed
