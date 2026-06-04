@@ -99,7 +99,7 @@ export function GlobalHeader() {
             style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}
             title="Sum of NET realized P&L on closed bot trades in the last 24 hours (rolling window) — realized_pnl minus commission per trade. Commission backfills asynchronously after IB's commissionReport, so this can briefly inflate until the report lands."
           >
-            Realized P&L · 24h
+            24h P&L
           </div>
           <div className="font-mono" style={{ fontSize: 13, fontWeight: 600, color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
             {formatCurrency(realizedPnl)}

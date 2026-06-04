@@ -204,6 +204,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
   });
 
+  // Operator-driven resync (top-header Resync button). Subscribed
+  // here so the chart's long-lived effects (WS, history, SR, the
+  // sticky-signal-clear at the next useEffect) can include it in
+  // their dep arrays. Selector-scoped subscribe — re-renders only
+  // when the token actually changes. MUST stay above the next
+  // useEffect or its dep-array reference TDZs at mount time.
+  const resyncToken = useStore((s) => s.resyncToken);
+
   // Wipe sticky buy/sell signals + cached backend SR payload when
   // the user switches to a different symbol. Without this, MGCM6's
   // historical badges would render on ESM6's chart at the same
@@ -323,12 +331,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // refs (e.g. ``historicalFires`` at line ~410) can reference it
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
-  // Operator-driven resync (top-header Resync button). Subscribed
-  // here so the chart's long-lived effects (WS, history, SR) can
-  // include it in their dep arrays and re-run when the operator
-  // forces a resync. Selector-scoped subscribe — re-renders only
-  // when the token actually changes.
-  const resyncToken = useStore((s) => s.resyncToken);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
