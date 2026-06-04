@@ -4,14 +4,18 @@ import type { HistoryBar } from '../../api/client';
 export const VISIBLE_MINUTES = 90;
 export const PRELOAD_HOURS = 48;
 export const REFRESH_INTERVAL_MS = 30_000;
-// 3-min bars: enough resolution to see intraday structure without the
-// chart shifting per-minute on a quiet tape. With VISIBLE_MINUTES=90,
-// the default view shows ~30 bars; the RSI(14) lookback is 42 minutes
-// of price action, which is a sensible scale for swing context.
-export const BAR_SIZE = '3 mins';
+// 1-min bars: tuned for the operator's manual-scan workflow (eyeball
+// triggers on the chart, execute via the console). Replaces the prior
+// 3-min cadence which was inherited from the bot framework's aggregator
+// — bots still aggregate 3-min internally via their own YAML config;
+// the chart display is independent and now favours fresher signal
+// resolution over the smoother swing-context view. With
+// VISIBLE_MINUTES=90, the default view shows 90 bars; RSI(14) lookback
+// is 14 min of price action, closer to tape than the prior 42 min.
+export const BAR_SIZE = '1 min';
 // Seconds per bar — used to round live ticks down to the bar's start
 // time so sub-bar updates land on the same bar (no per-tick shift).
-export const BAR_SECONDS = 3 * 60;
+export const BAR_SECONDS = 60;
 
 // v2: bumped to discard ranges saved by an earlier build where transient
 // auto-fit states could persist as ~2-min "zooms". Old `v1` entries are

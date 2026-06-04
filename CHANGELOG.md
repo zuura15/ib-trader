@@ -5,6 +5,17 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-04
 
+### Changed
+- **Chart bar size: 3 min → 1 min.** The chart pane is now a manual-
+  scan tool (operator eyeballs triggers, executes via the console),
+  not a bot-context view. 1-min cadence shows finer intraday
+  structure for faster manual decisions. ``BAR_SIZE`` and
+  ``BAR_SECONDS`` in ``chartUtils.ts`` flow to both the
+  ``/engine/history`` and ``/engine/sr`` fetches; ``_HISTORY_CACHE``
+  is keyed by bar_size so the change cold-starts the cache cleanly.
+  Bots remain on their own 3-min aggregator (configured via YAML in
+  ``config/bots/``) — chart and bot bar sizes are independent.
+
 ### Added
 - **Resync button in the top header — operator override for stuck
   subscriptions.** Click: bumps a Zustand ``resyncToken`` (every chart
