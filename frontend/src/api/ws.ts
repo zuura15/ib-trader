@@ -57,12 +57,26 @@ const CHANNELS: Channel[] = [
 
 const MIN_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 30000;
+// Message-arrival watchdog. Even with healthy ``readyState``, OS-level
+// TCP can die silently (laptop standby, NAT timeout, network blip) and
+// browsers may report ``OPEN`` for minutes before the next OS-level
+// probe surfaces it. The server pushes a ``status``/``heartbeats`` diff
+// every few seconds in the worst case, so 30 s of silence means the
+// pipe is dead — force-reconnect rather than wait for ``onclose``.
+const WS_STALE_THRESHOLD_MS = 30_000;
+const WS_WATCHDOG_INTERVAL_MS = 10_000;
 
 export class WSManager {
   private ws: WebSocket | null = null;
   private reconnectMs = MIN_RECONNECT_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  // Wall-clock of the most recent inbound message (snapshot / diff /
+  // command_output / pong — anything). Watchdog reads this to detect
+  // silent-dead-pipe; zombie WS where browser reports OPEN but no
+  // bytes flow. Updated in onmessage; reset on connect attempt.
+  private lastMessageAt = 0;
   private onDiff: DiffHandler | null = null;
   private onSnapshot: SnapshotHandler | null = null;
   private onStatus: StatusHandler | null = null;
@@ -109,34 +123,18 @@ export class WSManager {
 
   /**
    * Browsers throttle / discard background tabs. When the tab returns
-   * to ``visible`` the backoff timer may be mid-wait or the socket may
-   * be in a half-closed state. Reset state and force an immediate
-   * reconnect so the UI doesn't sit on a stale snapshot until the next
-   * scheduled retry fires.
+   * to ``visible`` the OS-level TCP may have died (laptop standby,
+   * network blip) but ``ws.readyState`` still reports ``OPEN`` for
+   * minutes — Chrome doesn't surface the underlying close until its
+   * own TCP keepalive expires. **Always force-reconnect on wake**
+   * rather than trusting ``readyState`` — the cost is one snapshot
+   * refetch (small), the alternative is sitting on stale quotes for
+   * hours (the 2026-06-05 zombie-socket bug). ``forceReconnect``
+   * already does the right teardown + reconnect for both healthy and
+   * zombie sockets, so delegate.
    */
   wakeUp(): void {
-    if (this.destroyed) return;
-    this.reconnectMs = MIN_RECONNECT_MS;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // Connection looks healthy — leave it. The server will resume
-      // pushing diffs naturally and a forced reconnect would discard
-      // the pending snapshot state on both ends.
-      return;
-    }
-    if (this.ws) {
-      this.ws.onclose = null;
-      try { this.ws.close(); } catch { /* already closed */ }
-      this.ws = null;
-    }
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
-    this.connect();
+    this.forceReconnect();
   }
 
   private attachVisibilityWake(): void {
@@ -168,6 +166,10 @@ export class WSManager {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     if (this.ws) {
       this.ws.onclose = null;
       try { this.ws.close(); } catch { /* already closed */ }
@@ -183,6 +185,7 @@ export class WSManager {
     this.destroyed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     if (this.visibilityHandler) {
       document.removeEventListener('visibilitychange', this.visibilityHandler);
       this.visibilityHandler = null;
@@ -196,6 +199,11 @@ export class WSManager {
 
   private connect(): void {
     if (this.destroyed) return;
+
+    // Stamp now so the watchdog doesn't fire immediately during the
+    // TCP handshake / WS upgrade window before the server's snapshot
+    // arrives. The first real message bumps this on its own.
+    this.lastMessageAt = Date.now();
 
     try {
       this.ws = new WebSocket(WS_URL);
@@ -227,9 +235,26 @@ export class WSManager {
           this.ws.send(JSON.stringify({ type: 'ping' }));
         }
       }, 25000);
+
+      // Message-arrival watchdog. The server's status/heartbeats diffs
+      // arrive every few seconds in the worst case, so silence beyond
+      // ``WS_STALE_THRESHOLD_MS`` while the tab is visible means the
+      // pipe is dead even though ``readyState`` may still report OPEN
+      // (zombie socket — see ``wakeUp`` docstring). Don't fire while
+      // the tab is hidden: backgrounded tabs are throttled by the
+      // browser and ``setInterval`` cadence is unreliable; visibility
+      // wake will handle the reconnect when the tab returns.
+      this.watchdogTimer = setInterval(() => {
+        if (this.destroyed) return;
+        if (document.visibilityState !== 'visible') return;
+        if (Date.now() - this.lastMessageAt > WS_STALE_THRESHOLD_MS) {
+          this.forceReconnect();
+        }
+      }, WS_WATCHDOG_INTERVAL_MS);
     };
 
     this.ws.onmessage = (event) => {
+      this.lastMessageAt = Date.now();
       try {
         const msg: WSMessage = JSON.parse(event.data);
         if (msg.type === 'snapshot') {
@@ -252,6 +277,7 @@ export class WSManager {
     this.ws.onclose = () => {
       this.onStatus?.(false);
       if (this.pingTimer) clearInterval(this.pingTimer);
+      if (this.watchdogTimer) clearInterval(this.watchdogTimer);
       this.scheduleReconnect();
     };
 

@@ -6,6 +6,24 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-06-05
 
 ### Fixed
+- **Zombie WebSocket after laptop standby no longer freezes quotes.**
+  `WSManager.wakeUp` previously short-circuited when
+  `ws.readyState === OPEN` — but Chrome continues to report `OPEN` for
+  minutes after the OS-level TCP has died (laptop sleep, NAT timeout,
+  network blip). The UI sat on stale quotes until Chrome's own TCP
+  keepalive expired, and even closing+reopening the tab inherited the
+  network-service-level state. Two changes in `frontend/src/api/ws.ts`:
+  - `wakeUp` now always delegates to `forceReconnect` (drops the
+    `readyState` short-circuit). Cost is one snapshot refetch per
+    visibility-resume — bounded and small.
+  - New message-arrival watchdog: every 10 s while the tab is
+    `visible`, if no inbound WS message arrived in the last 30 s,
+    force-reconnect. Catches dead pipes even when visibility didn't
+    change (foreground tab with silent-dead socket).
+  Workaround until the fix is deployed: `chrome://restart` or fully
+  quit Chrome (every window) when quotes feel stuck — that drops the
+  network service process holding the stale state.
+
 - **`GCQ6` (full-size Gold) + every other full-size CME/COMEX/NYMEX
   future no longer raise `AmbiguousInstrument` at qualify time.** IB
   returns parallel candidates for every full-size product — the real
