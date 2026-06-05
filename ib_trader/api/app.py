@@ -7,9 +7,12 @@ the engine service via the pending_commands SQLite table.
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.api.deps import set_session_factory
@@ -17,6 +20,77 @@ from ib_trader.api.routes import commands, trades, orders, alerts, system, bots,
 from ib_trader.api import ws
 
 logger = logging.getLogger(__name__)
+
+# Project root = .../ib-trader. Resolved from this file's location so we
+# don't depend on cwd. Used to locate the optional ``frontend/dist``
+# bundle that ``make prod`` produces and ib-api serves directly.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
+
+
+def _mount_frontend_dist(app: FastAPI) -> None:
+    """Serve the prebuilt frontend bundle from this FastAPI app.
+
+    Skips silently if ``frontend/dist`` is absent — that's the dev-mode
+    path where Vite serves the bundle from :5173 and proxies /api → us.
+    When the bundle IS present (``make prod`` workflow), we mount the
+    hashed-assets directory and add an SPA catch-all so client-side
+    routing works without a separate reverse proxy.
+
+    Must be called AFTER all API + WS routers are registered so the
+    catch-all only matches paths the API doesn't claim.
+    """
+    if not _FRONTEND_DIST.is_dir():
+        logger.info(
+            '{"event": "FRONTEND_DIST_ABSENT", "path": "%s", "detail":'
+            ' "skipping static mount; dev mode (Vite) expected"}',
+            _FRONTEND_DIST,
+        )
+        return
+    assets_dir = _FRONTEND_DIST / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+    index_html = _FRONTEND_DIST / "index.html"
+    if not index_html.is_file():
+        logger.warning(
+            '{"event": "FRONTEND_DIST_INCOMPLETE", "path": "%s", "detail":'
+            ' "no index.html, SPA catch-all not registered"}',
+            _FRONTEND_DIST,
+        )
+        return
+
+    # SPA catch-all: any path the API didn't match falls through to
+    # here. First try the path as a literal file (favicon.ico,
+    # robots.txt, manifest.json — anything Vite drops at the dist
+    # root). If that doesn't resolve to a real file inside dist,
+    # serve index.html so React Router (or our flexlayout SPA
+    # equivalent) handles the route client-side.
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_catch_all(full_path: str) -> FileResponse:
+        # API + WS surfaces are matched by their specific routers
+        # earlier; if we get here with an /api/* (or /ws*) prefix, the
+        # caller hit an UNREGISTERED API endpoint and expects JSON 404,
+        # not an SPA HTML page. Returning index.html for these would
+        # confuse JSON consumers (the api ↔ engine HTTP calls, browser
+        # ``fetch`` checking response.status, etc.).
+        if full_path.startswith(("api/", "ws")):
+            raise HTTPException(status_code=404, detail="Not Found")
+        candidate = _FRONTEND_DIST / full_path
+        try:
+            # Resolve and ensure the path stays inside dist —
+            # cheap path-traversal guard. ``relative_to`` raises
+            # ``ValueError`` if the resolved candidate escapes.
+            resolved = candidate.resolve()
+            resolved.relative_to(_FRONTEND_DIST.resolve())
+            if resolved.is_file():
+                return FileResponse(resolved)
+        except (ValueError, OSError):
+            pass
+        return FileResponse(index_html)
+
+    logger.info(
+        '{"event": "FRONTEND_DIST_MOUNTED", "path": "%s"}', _FRONTEND_DIST,
+    )
 
 
 def create_app(
@@ -125,5 +199,10 @@ def create_app(
     app.include_router(debug.router)
     app.include_router(ws.router)
     app.include_router(console_pnl.router)
+
+    # Must come AFTER all routers so the SPA catch-all only matches
+    # paths that no API / WS route claimed. No-op when ``frontend/dist``
+    # doesn't exist (dev mode — Vite serves the UI from :5173).
+    _mount_frontend_dist(app)
 
     return app

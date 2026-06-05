@@ -76,6 +76,15 @@ if (hasMkcertCert) {
 export default defineConfig({
   customLogger: logger,
   plugins,
+  // Emit source maps in the production build so the diagnostics.ts
+  // ring buffer and the browser console keep showing real
+  // file:line:col for any runtime error or stack trace. The cost is
+  // a ~30 % larger dist (the .map files sit beside the .js and are
+  // fetched only when DevTools is open) — well worth it on the
+  // operator's prod-served bundle.
+  build: {
+    sourcemap: true,
+  },
   server: {
     host: true,
     https,

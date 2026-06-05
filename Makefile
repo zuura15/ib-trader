@@ -42,6 +42,11 @@ IB_MODE_FLAG := $(if $(FORCE_MODE),--force-mode $(FORCE_MODE),)
 # kill) get reaped before we restart so 8081 doesn't EADDRINUSE on relaunch.
 DEV_PORTS := 8000 8081 8082 5173
 
+# Ports owned by `make prod`. Same as dev minus :5173 — no Vite in prod;
+# ib-api on :8000 serves the prebuilt frontend bundle directly. :8081 is
+# the engine's internal API, :8082 reserved for diagnostics.
+PROD_PORTS := 8000 8081 8082
+
 dev:
 	@echo "Starting all services (auto-detect $(if $(FORCE_MODE),forced=$(FORCE_MODE),mode))... (Ctrl+C to stop all)"
 	@mkdir -p run/redis-data logs
@@ -127,6 +132,69 @@ dev:
 		echo "[DEV] ib-api did not come up within 60s. Starting Vite anyway; proxy errors will appear until the API binds."; \
 		cd frontend && VITE_DATA_MODE=live exec npm run dev \
 	) & \
+	wait
+
+prod:
+	@echo "Building frontend (vite build → frontend/dist)..."
+	@# ``build:bundle`` skips the strict ``tsc -b`` pre-check (which
+	@# currently surfaces a backlog of unused-var warnings unrelated to
+	@# runtime correctness). The full strict ``npm run build`` stays
+	@# available for CI once those are cleaned up.
+	@cd frontend && npm run build:bundle
+	@echo "Starting prod services (no Vite; ib-api serves dist directly on :8000)..."
+	@mkdir -p run/redis-data logs
+	@for port in $(PROD_PORTS); do \
+		pids=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "[PROD] Port $$port in use by PID(s) $$pids — killing."; \
+			kill $$pids 2>/dev/null || true; \
+			sleep 0.3; \
+			pids=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null); \
+			if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
+		fi; \
+	done
+	@# Reap orphan ib-engine / ib-api / ib-bots processes — same logic as
+	@# `make dev`; the awk + ps pattern is portable across BSD and GNU.
+	@self_pid=$$$$; \
+	for proc in ib-engine ib-api ib-bots; do \
+		pids=$$(ps -eo pid,args | awk -v me=$$self_pid -v p=$$proc '$$1!=me && $$0 ~ "/\\.venv/bin/" p "( |$$)" { print $$1 }'); \
+		if [ -n "$$pids" ]; then \
+			echo "[PROD] Orphan $$proc PID(s) $$pids — killing."; \
+			kill $$pids 2>/dev/null || true; \
+			sleep 0.3; \
+			pids=$$(ps -eo pid,args | awk -v me=$$self_pid -v p=$$proc '$$1!=me && $$0 ~ "/\\.venv/bin/" p "( |$$)" { print $$1 }'); \
+			if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
+		fi; \
+	done
+	@self_pid=$$$$; \
+	pids=$$(ps -eo pid,args | awk -v me=$$self_pid '$$1!=me && $$2=="uv" && $$3=="run" && $$4 ~ /^ib-(engine|api|bots)$$/ { print $$1 }'); \
+	if [ -n "$$pids" ]; then \
+		echo "[PROD] Orphan uv-run wrapper PID(s) $$pids — killing."; \
+		kill -9 $$pids 2>/dev/null || true; \
+	fi
+	@if .local/bin/redis-cli ping >/dev/null 2>&1; then \
+		echo "[PROD] Redis already running."; \
+	else \
+		echo "[PROD] Starting Redis..."; \
+		.local/bin/redis-server config/redis.conf --daemonize yes; \
+		sleep 0.5; \
+	fi
+	@# Same Ctrl+C-with-live-bot-check protection as `make dev`. Trap on
+	@# SIGINT defers shutdown until the helper confirms no bot is mid-order;
+	@# SIGTERM unconditionally tears down (systemctl / parent kill path).
+	@trap 'scripts/dev/check_dev_can_shutdown.sh && { trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0; }' INT; \
+	trap 'trap "" INT TERM; .local/bin/redis-cli shutdown nosave >/dev/null 2>&1; kill -TERM 0; wait; exit 0' TERM; \
+	if command -v systemd-inhibit >/dev/null 2>&1; then \
+		echo "[PROD] systemd-inhibit: blocking sleep/idle for this session."; \
+		systemd-inhibit --what=sleep:idle --mode=block \
+			--who="ib-trader make prod" --why="trading session active" \
+			sleep infinity & \
+	else \
+		echo "[PROD] systemd-inhibit unavailable — system may auto-suspend mid-session."; \
+	fi; \
+	uv run ib-engine $(IB_MODE_FLAG) & \
+	uv run ib-api & \
+	uv run ib-bots & \
 	wait
 
 e2e-live:

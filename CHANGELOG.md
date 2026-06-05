@@ -5,6 +5,36 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-05
 
+### Added
+- **`make prod` target — production-built frontend served directly by
+  ib-api on :8000.** No Vite running, no dev React build. Eliminates
+  the 2.28 M `PerformanceMeasure` leak from React 18's dev-build
+  Profiler instrumentation (snapshot showed 286 MB of JS heap held by
+  PerformanceMeasure objects alone after a long session), and drops
+  the prod box's process count by one (no node/Vite). Wiring:
+  - `frontend/package.json` adds `build:bundle` = `vite build` (skips
+    the strict `tsc -b` pre-check that fails on pre-existing
+    unused-var warnings; full `npm run build` stays available for CI
+    once those are cleaned up).
+  - `vite.config.ts` enables `build.sourcemap` so the prod bundle's
+    stack traces still resolve to real `file:line:col` in the
+    `diagnostics.ts` ring buffer.
+  - `ib_trader/api/app.py` mounts `frontend/dist/assets` as
+    StaticFiles and adds an SPA catch-all that returns `index.html`
+    for any non-API path. `/api/*` and `/ws*` prefixes raise 404 to
+    JSON callers instead of returning HTML — prevents the
+    "fetch returns 200 with HTML body" confusion mode.
+  - Catch-all is a no-op when `frontend/dist` doesn't exist (dev
+    mode — Vite serves at :5173 and proxies /api → us).
+  - Same orphan-reap / port-clear / Redis-start / Ctrl-C safety
+    boilerplate as `make dev`, just with the Vite block removed and
+    a `vite build` step prepended.
+
+  Switch-over on the prod box: `git pull && make prod`. Browser hits
+  `http://<host>:8000` directly (no `:5173`). HMR is gone (rebuild
+  on every pull), but the prod box doesn't need HMR — pull cadence
+  is manual.
+
 ### Changed
 - **SR lines always render thin.** The post-3rd-touch 4× thickening
   cue (added to flag "near-touch rule in play") was overpowering the
