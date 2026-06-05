@@ -140,7 +140,11 @@ prod:
 	@# currently surfaces a backlog of unused-var warnings unrelated to
 	@# runtime correctness). The full strict ``npm run build`` stays
 	@# available for CI once those are cleaned up.
-	@cd frontend && npm run build:bundle
+	@# ``VITE_DATA_MODE=live`` is baked into the bundle at build time
+	@# (Vite resolves ``import.meta.env.VITE_*`` statically). Without
+	@# it the bundle ships with mock data — same behaviour as ``make
+	@# dev`` which sets the var when launching Vite.
+	@cd frontend && VITE_DATA_MODE=live npm run build:bundle
 	@echo "Starting prod services (no Vite; ib-api serves dist directly on :8000)..."
 	@mkdir -p run/redis-data logs
 	@for port in $(PROD_PORTS); do \
