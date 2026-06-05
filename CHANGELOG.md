@@ -5,6 +5,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-06-05
 
+### Changed
+- **SR lines always render thin.** The post-3rd-touch 4× thickening
+  cue (added to flag "near-touch rule in play") was overpowering the
+  chart and made multi-line clusters hard to read. The solid /
+  dotted / dashed hierarchy already encodes
+  confirmed / emerging / broken — that's the only visual distinction
+  the operator wants. `SymbolChart.tsx` `_renderSrLines`: drop the
+  `hasLooseFourth` branching, always draw one thin segment.
+
 ### Fixed
 - **Zombie WebSocket after laptop standby no longer freezes quotes.**
   `WSManager.wakeUp` previously short-circuited when

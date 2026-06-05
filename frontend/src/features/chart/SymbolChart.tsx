@@ -1363,48 +1363,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // broken/archived = dashed (gave way; kept on screen briefly).
           lineStyle: lineStyleVal,
         };
-        // 5× thicker segment past the 3rd strict touch ONCE the line
-        // has accumulated a 4th-or-later (loose-band) touch. Operator
-        // cue: thick = the near-touch rule is now in play on this
-        // line. ``thirdTouchIdx`` < toIdx means there's daylight
-        // between the 3rd strict touch and the line's right edge —
-        // otherwise we just draw one series.
-        const hasLooseFourth = line.touches >= 4
-          && line.thirdTouchIdx !== null
-          && line.thirdTouchIdx < line.toIdx
-          && !isBroken;
-        if (hasLooseFourth) {
-          const splitIdx = line.thirdTouchIdx as number;
-          // ``splitIdx`` is now in allBars space (post-rebase / backend
-          // resolution), so read time from allBars rather than slice.
-          const splitTime = allBars[splitIdx].time;
-          const splitPrice = line.slope * splitIdx + line.intercept;
-          const dsBefore = ch.addSeries(LineSeries, {
-            ...baseOpts, lineWidth: 1 as any,
-          });
-          dsBefore.setData([
-            { time: startTime, value: startPrice },
-            { time: splitTime, value: splitPrice },
-          ]);
-          srSeriesRef.current.push(dsBefore);
-          const dsAfter = ch.addSeries(LineSeries, {
-            ...baseOpts, lineWidth: 4 as any,
-          });
-          dsAfter.setData([
-            { time: splitTime, value: splitPrice },
-            { time: endTime, value: endPrice },
-          ]);
-          srSeriesRef.current.push(dsAfter);
-        } else {
-          const ds = ch.addSeries(LineSeries, {
-            ...baseOpts, lineWidth: 1 as any,
-          });
-          ds.setData([
-            { time: startTime, value: startPrice },
-            { time: endTime, value: endPrice },
-          ]);
-          srSeriesRef.current.push(ds);
-        }
+        // Always draw a single thin segment. Earlier builds split the
+        // line and thickened the post-3rd-touch segment as a "near-
+        // touch rule in play" cue, but the thick band overpowered the
+        // chart and made multi-line clusters hard to read. Solid vs
+        // dotted vs dashed (set via ``lineStyleVal`` on baseOpts)
+        // already encodes the confirmed / emerging / broken hierarchy,
+        // which is the only distinction the operator wants visually.
+        const ds = ch.addSeries(LineSeries, {
+          ...baseOpts, lineWidth: 1 as any,
+        });
+        ds.setData([
+          { time: startTime, value: startPrice },
+          { time: endTime, value: endPrice },
+        ]);
+        srSeriesRef.current.push(ds);
 
         // Signal: uptrending support or downtrending resistance with
         // 3+ confirming pivot touches → buy/sell indicator. Anchored
