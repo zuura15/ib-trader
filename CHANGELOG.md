@@ -3,6 +3,29 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-06-05
+
+### Fixed
+- **`GCQ6` (full-size Gold) + every other full-size CME/COMEX/NYMEX
+  future no longer raise `AmbiguousInstrument` at qualify time.** IB
+  returns parallel candidates for every full-size product — the real
+  listing (COMEX/NYMEX/CME) and an algo-execution pseudo-exchange
+  (`QBALGO` / `IBALGO`) sharing the same trading class. Pre-fix the
+  qualifier raised on every full-size order; only micros (which only
+  have the real listing) worked. Two changes in
+  `ib/insync_client.py:_qualify_future_by_local_symbol`:
+  - Drop `QBALGO` / `IBALGO` candidates by default. Callers that
+    genuinely want one of those routings can pass it via `exchange=`.
+  - When caller supplies a non-empty `exchange`, filter candidates
+    to that exchange before raising. An empty filter falls back to
+    the unfiltered (post-algo-drop) set so the parser's `CME`
+    default doesn't strand contracts on other exchanges (MGCQ6 on
+    COMEX, etc).
+  Also: `AmbiguousInstrument.__str__` now lists candidates as
+  `tradingClass@exchange` and recommends `--exchange` vs
+  `--trading-class` based on what actually disambiguates them, so the
+  console error tells the operator exactly what to type.
+
 ## 2026-06-04
 
 ### Changed

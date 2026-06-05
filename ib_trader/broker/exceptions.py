@@ -23,10 +23,24 @@ class AmbiguousInstrument(InstrumentResolutionError):
     candidates: Sequence["FutureExpiryCandidate"]
 
     def __str__(self) -> str:
-        tcs = sorted({c.trading_class for c in self.candidates})
+        # Show each candidate as ``tradingClass@exchange`` so the user
+        # can pick the right disambiguator. When trading classes diverge
+        # (ES vs MES) the hint is --trading-class; when they don't but
+        # exchanges do (GC@COMEX vs GC@QBALGO) the hint is --exchange.
+        pairs = sorted({
+            f"{c.trading_class}@{c.exchange or '?'}" for c in self.candidates
+        })
+        tcs = {c.trading_class for c in self.candidates}
+        exs = {c.exchange or "" for c in self.candidates}
+        if len(tcs) > 1:
+            hint = "specify --trading-class"
+        elif len(exs) > 1:
+            hint = "specify --exchange"
+        else:
+            hint = "specify --trading-class or --exchange"
         return (
             f"ambiguous {self.root}: {len(self.candidates)} candidates "
-            f"across trading classes {tcs}; specify trading_class explicitly"
+            f"[{', '.join(pairs)}]; {hint}"
         )
 
 

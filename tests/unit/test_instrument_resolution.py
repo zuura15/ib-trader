@@ -161,3 +161,126 @@ class TestListFutureExpiries:
         candidates = await mock_ib.list_future_expiries(root="ES", exchange="CME")
         tcs = {c.trading_class for c in candidates}
         assert tcs == {"ES", "MES"}
+
+
+class TestFutLocalSymbolMultiExchange:
+    """Full-size futures (GC, NQ, ES, CL) often return parallel candidates
+    from IB: the real listing (COMEX/CME/NYMEX) AND an algo-execution
+    pseudo-exchange (QBALGO/IBALGO) sharing the same trading class.
+    Pre-fix this raised AmbiguousInstrument for every full-size order.
+    """
+
+    @staticmethod
+    def _make_client():
+        from ib_trader.ib.insync_client import InsyncClient
+        client = InsyncClient(
+            host="127.0.0.1", port=4002, client_id=9999, account_id="DU0",
+        )
+
+        async def _no_throttle():
+            return None
+        client._throttle = _no_throttle  # type: ignore[method-assign]
+        return client
+
+    @staticmethod
+    def _details(con_id, exchange, *, local="GCQ6", symbol="GC",
+                 trading_class="GC", multiplier="100", min_tick=0.1,
+                 expiry=None):
+        from types import SimpleNamespace
+        if expiry is None:
+            expiry = _next_year_expiry()
+        return SimpleNamespace(
+            contract=SimpleNamespace(
+                conId=con_id, symbol=symbol, localSymbol=local,
+                tradingClass=trading_class, exchange=exchange,
+                currency="USD", multiplier=multiplier, secType="FUT",
+                lastTradeDateOrContractMonth=expiry,
+            ),
+            minTick=min_tick,
+            marketName="GC",
+            longName="Gold",
+            validExchanges=exchange,
+        )
+
+    def _install_details(self, client, dets):
+        from types import SimpleNamespace
+
+        async def fake_req(_contract):
+            return dets
+
+        client._InsyncClient__ib = SimpleNamespace(reqContractDetailsAsync=fake_req)
+
+    @pytest.mark.asyncio
+    async def test_qbalgo_twin_auto_dropped_when_not_requested(self):
+        client = self._make_client()
+        self._install_details(client, [
+            self._details(con_id=111, exchange="COMEX"),
+            self._details(con_id=222, exchange="QBALGO"),
+        ])
+        result = await client._qualify_future_by_local_symbol(
+            local_symbol="GCQ6", exchange="", currency="USD",
+        )
+        assert result["con_id"] == 111
+        assert result["exchange"] == "COMEX"
+
+    @pytest.mark.asyncio
+    async def test_explicit_exchange_filter_picks_comex(self):
+        client = self._make_client()
+        self._install_details(client, [
+            self._details(con_id=111, exchange="COMEX"),
+            self._details(con_id=222, exchange="QBALGO"),
+        ])
+        result = await client._qualify_future_by_local_symbol(
+            local_symbol="GCQ6", exchange="COMEX", currency="USD",
+        )
+        assert result["con_id"] == 111
+
+    @pytest.mark.asyncio
+    async def test_explicit_qbalgo_keeps_qbalgo(self):
+        client = self._make_client()
+        self._install_details(client, [
+            self._details(con_id=111, exchange="COMEX"),
+            self._details(con_id=222, exchange="QBALGO"),
+        ])
+        result = await client._qualify_future_by_local_symbol(
+            local_symbol="GCQ6", exchange="QBALGO", currency="USD",
+        )
+        assert result["con_id"] == 222
+
+    @pytest.mark.asyncio
+    async def test_filter_to_zero_falls_back_to_unfiltered(self):
+        """Parser defaults exchange=CME for FUT — MGCQ6 lives on COMEX,
+        so the literal CME filter yields zero. Must fall back to the
+        original (post-algo-drop) candidates so existing single-listing
+        flows keep working.
+        """
+        client = self._make_client()
+        self._install_details(client, [
+            self._details(con_id=999, exchange="COMEX",
+                          local="MGCQ6", symbol="MGC",
+                          trading_class="MGC", multiplier="10"),
+        ])
+        result = await client._qualify_future_by_local_symbol(
+            local_symbol="MGCQ6", exchange="CME", currency="USD",
+        )
+        assert result["con_id"] == 999
+
+    @pytest.mark.asyncio
+    async def test_ambiguity_message_shows_exchanges(self):
+        """When real ambiguity remains (two real exchanges, same root),
+        the error message names them so the operator knows which
+        --exchange to specify."""
+        client = self._make_client()
+        # Two non-algo exchanges sharing trading_class → real ambiguity
+        self._install_details(client, [
+            self._details(con_id=111, exchange="COMEX"),
+            self._details(con_id=333, exchange="ICEUS"),
+        ])
+        with pytest.raises(AmbiguousInstrument) as exc_info:
+            await client._qualify_future_by_local_symbol(
+                local_symbol="GCQ6", exchange="", currency="USD",
+            )
+        msg = str(exc_info.value)
+        assert "GC@COMEX" in msg
+        assert "GC@ICEUS" in msg
+        assert "--exchange" in msg

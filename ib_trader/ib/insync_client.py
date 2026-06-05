@@ -158,6 +158,15 @@ _apply_overnight_patch()
 
 logger = logging.getLogger(__name__)
 
+# IB execution-algo routing destinations. These appear as parallel
+# candidates next to the real listing when reqContractDetails is called
+# with empty exchange — same conId-less localSymbol, same trading_class,
+# different exchange. We drop them by default when qualifying so that
+# `GCQ6` (full Gold) resolves to its real COMEX listing instead of
+# raising AmbiguousInstrument. Callers that genuinely want one of these
+# destinations can pass it via the ``exchange`` kwarg explicitly.
+_ALGO_DESTINATIONS: frozenset[str] = frozenset({"QBALGO", "IBALGO"})
+
 # Retain references to fire-and-forget asyncio tasks so the loop's weakref
 # collection doesn't cancel them mid-flight. See Python docs on create_task.
 _background_tasks: set[asyncio.Task] = set()
@@ -649,14 +658,14 @@ class InsyncClient(IBClientBase):
         ``GCM26``). IB resolves the contract uniquely from this string
         — no need for the caller to pre-split into (root, expiry).
 
-        ``exchange`` may be empty; ib-async accepts ``""`` and IB picks
-        the primary listing automatically.
+        ``exchange`` is an optional disambiguator. We pass empty to IB
+        so the response carries every listing, then narrow the set in
+        two passes: drop algo-router pseudo-exchanges (``QBALGO`` /
+        ``IBALGO``) which IB returns alongside the real listing for many
+        full-size futures, then apply the caller's exchange if it leaves
+        at least one survivor. An empty filter falls back to the full
+        set so a wrong default doesn't strand a previously-working call.
         """
-        # localSymbol qualifies uniquely across all exchanges, so we
-        # let IB pick the listing rather than guessing per-product
-        # (COMEX gold, NYMEX oil, CBOT treasuries, GLOBEX equities all
-        # coexist). Caller-supplied exchange is intentionally ignored
-        # here — the localSymbol form is its own answer to "where".
         contract = Future(
             localSymbol=local_symbol,
             exchange="",
@@ -680,6 +689,34 @@ class InsyncClient(IBClientBase):
             raise ExpiredContractError(
                 local_symbol, details[0].contract.lastTradeDateOrContractMonth,
             )
+
+        # Drop IB's algo-execution destinations (QBALGO / IBALGO) unless
+        # the caller explicitly asked for one. They're routing pseudo-
+        # exchanges, not real listings — IB returns them as parallel
+        # candidates for every full-size CME/COMEX/NYMEX future, which
+        # is the proximate cause of `ambiguous GCQ6` for full-size gold
+        # while the micro (MGCQ6) qualifies unambiguously.
+        caller_ex = (exchange or "").upper()
+        if caller_ex not in _ALGO_DESTINATIONS:
+            non_algo = [
+                d for d in candidates
+                if (d.contract.exchange or "").upper() not in _ALGO_DESTINATIONS
+            ]
+            if non_algo:
+                candidates = non_algo
+
+        # Honor caller's explicit exchange when it narrows to >= 1.
+        # An empty filter falls back to the unfiltered set (preserves
+        # behavior when the parser's CME default doesn't match — e.g.
+        # MGCQ6 with default exchange="CME" still resolves on COMEX).
+        if caller_ex:
+            filtered = [
+                d for d in candidates
+                if (d.contract.exchange or "").upper() == caller_ex
+            ]
+            if filtered:
+                candidates = filtered
+
         if len(candidates) > 1:
             cands = [_candidate_from_details(d, d.contract.symbol) for d in candidates]
             raise AmbiguousInstrument(root=local_symbol, candidates=cands)
