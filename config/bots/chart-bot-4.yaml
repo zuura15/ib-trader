@@ -1,5 +1,5 @@
 id: chart-bot-4
-name: "Chart Bot 4 · Micro Nasdaq"
+name: "Chart Bot 4 · Nasdaq"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -14,17 +14,24 @@ auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
-  ref_id: chart-bot-4-mnq
-  # MNQ = Micro E-mini Nasdaq-100. M6 = June 2026.
-  # E-minis trade quarterly only (H/M/U/Z). Industry roll to U6
-  # is ~June 11, 2026.
-  symbol: MNQM6
+  ref_id: chart-bot-4-nq
+  # NQ = full E-mini Nasdaq-100. Switched from micro MNQM6 → full
+  # NQM6 on 2026-06-07 as the operator scaled into full contracts.
+  # Same June 2026 expiry (M6). E-minis trade quarterly only
+  # (H/M/U/Z); industry roll to U6 is ~June 11, 2026. QBALGO twin
+  # is dropped by the qualifier (insync_client 46953eb) so the bare
+  # ``NQM6`` localSymbol resolves to CME unambiguously.
+  symbol: NQM6
   sec_type: FUT
-  # Micro Nasdaq: $2/point. Used by P/L math + trail target.
-  contract_multiplier: 2
-  # Trailing dip: 0.02% × 29,395 pts × $2 ≈ $11.76 per contract per move.
+  # Full Nasdaq: $20/point (10x micro). Used by P/L math + trail
+  # target.
+  contract_multiplier: 20
+  # Trailing dip: same percentage as the micro tuning (0.0002). At
+  # NQ's notional that's ~$117.60 per contract per dip (vs $11.76
+  # on the micro) — same risk-as-fraction-of-position. Manual mode
+  # in effect so this is dormant until ``manual_entry_only`` flips.
   trail_width_pct: 0.0002
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MNQM6
+- NQM6

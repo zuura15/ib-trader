@@ -1,5 +1,5 @@
 id: chart-bot-3
-name: "Chart Bot 3 · Micro SPX"
+name: "Chart Bot 3 · SPX"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -8,22 +8,29 @@ auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
-  ref_id: chart-bot-3-mes
-  # MES = Micro E-mini S&P 500. M6 = June 2026.
-  # E-minis trade quarterly only (H/M/U/Z). Industry roll to U6
-  # is ~June 11, 2026 (~8 days before expiry on June 19). Roll
-  # then, not earlier — U6 is back-month until rollover and has
-  # ~5-10% of M6's volume so spreads are wider.
-  symbol: MESM6
+  ref_id: chart-bot-3-es
+  # ES = full E-mini S&P 500. Switched from micro MESM6 → full ESM6
+  # on 2026-06-07 as the operator scaled into full contracts. Same
+  # June 2026 expiry (M6). E-minis trade quarterly only (H/M/U/Z);
+  # industry roll to U6 is ~June 11, 2026 — roll then, not earlier
+  # (U6 is back-month with wider spreads until rollover). QBALGO
+  # twin is dropped by the qualifier (insync_client 46953eb) so the
+  # bare ``ESM6`` localSymbol resolves to CME unambiguously.
+  symbol: ESM6
   sec_type: FUT
-  # Micro E-mini S&P: $5/point. Used by P/L math + trail target.
-  contract_multiplier: 5
-  # Trailing dip: 0.03% × 7,420 pts × $5 ≈ $11.13 per contract per move.
+  # Full E-mini S&P: $50/point (10x micro). Used by P/L math + trail
+  # target.
+  contract_multiplier: 50
+  # Trailing dip: same percentage as the micro tuning (0.0003). At
+  # ES's notional that's ~$111.30 per contract per dip (vs $11.13
+  # on the micro) — same risk-as-fraction-of-position. Manual mode
+  # in effect so this is dormant until ``manual_entry_only`` flips.
   trail_width_pct: 0.0003
-  # 3 contracts per fire (operator setting 2026-05-18). Override
-  # of strategy yaml's qty_default: 1.
-  qty_default: 3
+  # qty_default reverted to strategy yaml's 1 on the contract scale-
+  # up: 3 full ES = $1M+ notional per fire vs the prior 3-micro
+  # ($110k) intent. Operator picks per-trade size via the console.
+  qty_default: 1
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MESM6
+- ESM6

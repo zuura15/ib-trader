@@ -243,8 +243,11 @@ export const variantC: IJsonModel = {
 // Variant T — Trader (chart-signal bots)
 // 3-column layout:
 //   Left column (~22%):  Console (top) · Stash tabset (bottom)
-//   Middle column (~39%): Slot 1 (top, MGC) · Audit Feed (bottom)
-//   Right column (~39%):  Slot 3 (top, MES) · Slot 4 (bottom, MNQ)
+//   Middle column (~39%): Slot 1 (top, GC) · Audit Feed (bottom)
+//   Right column (~39%):  Slot 3 (top, ES) · Slot 4 (bottom, NQ)
+// Slots target the full-size CME/COMEX contracts (GC/ES/NQ) per
+// the operator's 2026-06-07 scale-up from micros. Symbol is bound
+// per slot via the chart-bot-<n>.yaml ``symbol`` field.
 //
 // flexlayout-react axis alternation: the root ``row`` lays out
 // children horizontally; each child ``row`` stacks its tabsets
@@ -293,7 +296,7 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 1 · Micro Gold', component: 'chart-bot', config: { slot: 1 } },
+              { type: 'tab', name: 'Slot 1 · Gold', component: 'chart-bot', config: { slot: 1 } },
             ],
           },
           {
@@ -314,14 +317,14 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 3 · Micro SPX', component: 'chart-bot', config: { slot: 3 } },
+              { type: 'tab', name: 'Slot 3 · SPX', component: 'chart-bot', config: { slot: 3 } },
             ],
           },
           {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 4 · Micro Nasdaq', component: 'chart-bot', config: { slot: 4 } },
+              { type: 'tab', name: 'Slot 4 · Nasdaq', component: 'chart-bot', config: { slot: 4 } },
             ],
           },
         ],

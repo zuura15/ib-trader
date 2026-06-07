@@ -1,5 +1,5 @@
 id: chart-bot-1
-name: "Chart Bot 1 · Micro Gold"
+name: "Chart Bot 1 · Gold"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -14,17 +14,22 @@ config:
   # Per-bot ref_id keeps the WS state subscription unique. All four
   # chart_signal bots share the same strategy yaml, so they'd
   # collide on the strategy's ref_id without this.
-  ref_id: chart-bot-1-mgc
-  # August 2026 contract (Q6). Rolled from M6 on 2026-05-18.
-  # Next roll: V6 (Oct) before late-August expiry.
-  symbol: MGCQ6
+  ref_id: chart-bot-1-gc
+  # GC = full Gold (100 oz). Switched from micro MGCQ6 → full GCQ6
+  # on 2026-06-07 as the operator scaled into full contracts. Same
+  # August 2026 expiry (Q6). Next roll: V6 (Oct) before late-Aug
+  # expiry. QBALGO twin is dropped by the qualifier (insync_client
+  # commit 46953eb) so the bare ``GCQ6`` localSymbol resolves to
+  # COMEX unambiguously.
+  symbol: GCQ6
   sec_type: FUT
-  # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
-  contract_multiplier: 10
-  # Trailing dip: bumped 0.0002 → 0.0005 (2026-05-19) after a $17
-  # premature exit at MGC 21:18 PT on a 0.92-pt trail that lost to
-  # late-hour bid/ask spread chop. New band ≈ 2.3 pts at $4,578.
-  # Per-contract dollar move: 0.05% × $4,578 × 10 ≈ $22.90.
+  # Full Gold: 100 oz/contract (10x micro). Used by P/L math + trail
+  # target.
+  contract_multiplier: 100
+  # Trailing dip: same percentage as the micro tuning (0.0005). At
+  # GC's notional that's ~$228.90 per contract per dip (vs $22.90
+  # on the micro) — same risk-as-fraction-of-position. Manual mode
+  # in effect so this is dormant until ``manual_entry_only`` flips.
   trail_width_pct: 0.0005
   # After a round-trip, transition back to AWAITING_ENTRY_TRIGGER
   # (not OFF) and respect a one-bar cool-off before re-entering.
@@ -32,4 +37,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MGCQ6
+- GCQ6
