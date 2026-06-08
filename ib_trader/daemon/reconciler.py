@@ -65,6 +65,24 @@ def _maybe_close_trade_group(ctx: AppContext, trade_id: str) -> None:
     has_entry = False
     has_exit = False
     direction = None
+    # Contract multiplier. Stocks default to 1 (no multiplier). For
+    # futures (FUT) the per-point-per-contract value is loaded from
+    # any transaction row that carries it — PLACE_ACCEPTED rows
+    # always have it set since execute_order writes it at place
+    # time. Pre-fix we left this at an implicit 1, which understated
+    # FUT realized P&L by the multiplier (e.g. NQ trades at 20× off
+    # — observed on the operator's 2026-06-08 closes). See
+    # ``_write_txn(multiplier=...)`` callers in engine/order.py.
+    multiplier = Decimal("1")
+    for t in all_txns:
+        if t.multiplier:
+            try:
+                m = Decimal(str(t.multiplier))
+                if m > 0:
+                    multiplier = m
+                    break
+            except (ValueError, ArithmeticError):
+                continue
 
     # Sum commission from all transactions
     for t in all_txns:
@@ -85,12 +103,14 @@ def _maybe_close_trade_group(ctx: AppContext, trade_id: str) -> None:
 
     realized_pnl = None
     if has_entry and has_exit and direction is not None:
+        # Apply contract multiplier so FUT realized P&L is in dollars
+        # rather than price-points × qty. STK leaves multiplier=1.
         if direction == "BUY":
-            # Long trade: profit = exit - entry
-            realized_pnl = exit_value - entry_value
+            # Long trade: profit = (exit - entry) × multiplier
+            realized_pnl = (exit_value - entry_value) * multiplier
         else:
-            # Short trade: profit = entry - exit
-            realized_pnl = entry_value - exit_value
+            # Short trade: profit = (entry - exit) × multiplier
+            realized_pnl = (entry_value - exit_value) * multiplier
 
     if realized_pnl is not None:
         ctx.trades.update_pnl(trade_id, realized_pnl, total_commission)

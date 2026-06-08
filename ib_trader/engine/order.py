@@ -3013,11 +3013,18 @@ async def place_profit_taker(
     else:
         return
 
+    # Pass multiplier on both rows so the daemon reconciler and the
+    # global on_fill PT/SL handler can compute FUT realized P&L in
+    # dollars (multiplier × price-diff × qty) when this PT fires
+    # autonomously and the scoped close handler never runs.
+    pt_multiplier_str = str(mult) if mult and mult != Decimal("1") else None
+
     _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, symbol, pt_side, "LIMIT",
                qty_filled, limit_price=pt_price,
                trade_id=trade_id, leg_type=LegType.PROFIT_TAKER,
                correlation_id=pt_correlation_id, security_type="STK",
-               trade_serial=trade_serial)
+               trade_serial=trade_serial, multiplier=pt_multiplier_str,
+               con_id=con_id)
 
     ib_order_id = await ctx.ib.place_limit_order(
         con_id, symbol, pt_side, qty_filled, pt_price,
@@ -3030,7 +3037,8 @@ async def place_profit_taker(
                ib_responded_at=_now_utc(),
                trade_id=trade_id, leg_type=LegType.PROFIT_TAKER,
                correlation_id=pt_correlation_id, security_type="STK",
-               price_placed=pt_price, trade_serial=trade_serial)
+               price_placed=pt_price, trade_serial=trade_serial,
+               multiplier=pt_multiplier_str, con_id=con_id)
 
     ctx.router.emit(
         f"  Profit taker placed @ ${pt_price}",
@@ -3130,6 +3138,195 @@ async def _handle_close_fill(
         ctx, this_pnl, close_ctx.symbol, qty_filled,
         trade_group.serial_number, source="console_close",
     )
+
+
+async def handle_autonomous_close_fill(
+    ctx: AppContext,
+    ib_order_id: str,
+    qty_filled: Decimal,
+    avg_price: Decimal,
+    commission: Decimal,
+) -> bool:
+    """Handle a fill on a PROFIT_TAKER / STOP_LOSS leg that IB fired
+    autonomously (no scoped close callback was in flight).
+
+    The scoped on_fill callbacks registered by ``execute_order`` /
+    ``execute_close`` only live for the lifetime of their command
+    coroutine. A profit-taker or stop-loss placed at entry time
+    persists at IB as a GTC limit; when IB fills it hours or days
+    later, no scoped callback is alive — only the global on_fill in
+    ``engine/main.py`` runs, and pre-fix that just relayed to the
+    ledger without ever updating ``trade_group.realized_pnl`` or
+    emitting a console message. The operator's status command
+    showed the position as still open, and ``_handle_fill``'s
+    "✓ CLOSED via PT" disclosure never appeared.
+
+    This helper closes that gap. Called from the global on_fill,
+    it:
+      1. Looks up the PLACE_ACCEPTED row for this ib_order_id and
+         confirms the leg is PROFIT_TAKER / STOP_LOSS.
+      2. Idempotency-checks that no FILLED row exists yet (a scoped
+         close path may have raced — leave it alone if so).
+      3. Writes the FILLED TransactionEvent.
+      4. Computes realized P&L with the correct contract multiplier
+         (the 2026-06-08 reconciler-multiplier bug companion fix).
+      5. Updates ``trade_group.realized_pnl`` + ``total_commission``.
+      6. Marks the trade ``CLOSED`` when remaining qty hits zero.
+      7. Emits ``"✓ CLOSED via PT/SL"`` to the console (with the
+         display-time commission-estimate fallback so the operator's
+         net P&L stays consistent).
+
+    Returns True when handled, False when the leg type isn't ours
+    or the scoped path already wrote the FILLED row.
+    """
+    try:
+        order_id_int = int(ib_order_id)
+    except (TypeError, ValueError):
+        return False
+
+    s = ctx.transactions._session_factory()
+    # PLACE_ACCEPTED carries the leg_type, trade_id, multiplier, side.
+    placement = (
+        s.query(TransactionEvent)
+        .filter(
+            TransactionEvent.ib_order_id == order_id_int,
+            TransactionEvent.action == TransactionAction.PLACE_ACCEPTED,
+        )
+        .order_by(TransactionEvent.id.desc())
+        .first()
+    )
+    if placement is None:
+        return False
+    if placement.leg_type not in (LegType.PROFIT_TAKER, LegType.STOP_LOSS):
+        return False
+
+    # Idempotency: scoped close handlers write the FILLED row inside
+    # ``_handle_fill``. If a scoped path already wrote it, don't
+    # double-count.
+    existing_fill = (
+        s.query(TransactionEvent)
+        .filter(
+            TransactionEvent.ib_order_id == order_id_int,
+            TransactionEvent.action.in_(
+                (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL),
+            ),
+        )
+        .first()
+    )
+    if existing_fill is not None:
+        return False
+
+    trade_id = placement.trade_id
+    if not trade_id:
+        return False
+    # TradeRepository doesn't expose a get_by_id today; query directly.
+    trade_group = (
+        s.query(TradeGroup).filter(TradeGroup.id == trade_id).first()
+    )
+    if trade_group is None:
+        return False
+    entry_txn = ctx.transactions.get_entry_fill(trade_id)
+    if entry_txn is None or entry_txn.ib_avg_fill_price is None:
+        return False
+
+    # Multiplier: PT row first (we now write it at placement time),
+    # falling back to the entry row, defaulting to 1 for STK.
+    multiplier = Decimal("1")
+    for source in (placement.multiplier, entry_txn.multiplier):
+        if source:
+            try:
+                m = Decimal(str(source))
+                if m > 0:
+                    multiplier = m
+                    break
+            except (ValueError, ArithmeticError):
+                continue
+
+    entry_price = Decimal(str(entry_txn.ib_avg_fill_price))
+    entry_side = entry_txn.side  # BUY = long, SELL = short
+    direction_sign = Decimal("1") if entry_side == "BUY" else Decimal("-1")
+    this_pnl = (
+        (avg_price - entry_price) * qty_filled * multiplier * direction_sign
+        - commission
+    )
+
+    existing_pnl = trade_group.realized_pnl or Decimal("0")
+    existing_commission = trade_group.total_commission or Decimal("0")
+    realized_pnl = existing_pnl + this_pnl
+    total_commission = existing_commission + commission
+
+    _write_txn(
+        ctx, TransactionAction.FILLED, placement.symbol, placement.side,
+        placement.order_type or "LIMIT", qty_filled,
+        limit_price=placement.limit_price,
+        ib_order_id=order_id_int,
+        ib_status="Filled",
+        ib_filled_qty=qty_filled,
+        ib_avg_fill_price=avg_price,
+        trade_serial=trade_group.serial_number,
+        is_terminal=True,
+        ib_responded_at=_now_utc(),
+        trade_id=trade_id,
+        leg_type=placement.leg_type,
+        correlation_id=placement.correlation_id,
+        security_type=placement.security_type,
+        commission=commission,
+        multiplier=placement.multiplier,
+        con_id=placement.con_id,
+    )
+
+    ctx.trades.update_pnl(trade_id, realized_pnl, total_commission)
+
+    # Compute remaining qty from filled legs (entry filled minus
+    # everything closed/PT'd/stopped so far including this fill).
+    entry_filled_qty = entry_txn.ib_filled_qty or qty_filled
+    filled_legs = ctx.transactions.get_filled_legs(trade_id)
+    closed_qty = Decimal("0")
+    for leg in filled_legs:
+        if leg.leg_type in (LegType.CLOSE, LegType.PROFIT_TAKER, LegType.STOP_LOSS):
+            closed_qty += leg.ib_filled_qty or Decimal("0")
+    # Include this fill since we just wrote it (the query above may
+    # not see it if the session is mid-flush — be defensive).
+    if not any(
+        leg.ib_order_id == order_id_int and leg.action == TransactionAction.FILLED
+        for leg in filled_legs
+    ):
+        closed_qty += qty_filled
+    remaining = entry_filled_qty - closed_qty
+    if remaining <= 0:
+        ctx.trades.update_status(trade_id, TradeStatus.CLOSED)
+
+    # Display: same estimate-aware path as the manual close.
+    display_commission = effective_commission(
+        total_commission, placement.symbol, entry_filled_qty,
+        round_trip=(remaining <= 0),
+    )
+    display_pnl = realized_pnl
+    if total_commission == 0 and display_commission != 0:
+        display_pnl = realized_pnl - display_commission
+    pnl_str = (
+        f"+${_fmt_money(display_pnl)}" if display_pnl >= 0
+        else f"-${_fmt_money(abs(display_pnl))}"
+    )
+    comm_note = "" if total_commission != 0 else " est."
+    closed_label = "CLOSED" if remaining <= 0 else "PARTIAL CLOSE"
+    via = "PT" if placement.leg_type == LegType.PROFIT_TAKER else "SL"
+    ctx.router.emit(
+        f"✓ {closed_label} via {via}: {_fmt_qty(qty_filled)} "
+        f"{placement.symbol} @ ${_fmt_price(avg_price)}\n"
+        f"  P&L: {pnl_str} (commission: ${_fmt_money(display_commission)}{comm_note})\n"
+        f"  Serial: #{trade_group.serial_number}",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
+        event="AUTONOMOUS_CLOSE_FILLED",
+    )
+    logger.info(
+        '{"event": "AUTONOMOUS_CLOSE_FILLED", "via": "%s", "ib_order_id": "%s", '
+        '"trade_id": "%s", "serial": %d, "qty_filled": "%s", "avg_price": "%s", '
+        '"realized_pnl": "%s", "multiplier": "%s"}',
+        via, ib_order_id, trade_id, trade_group.serial_number,
+        qty_filled, avg_price, realized_pnl, multiplier,
+    )
+    return True
 
 
 async def _handle_close_partial(

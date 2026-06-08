@@ -1157,6 +1157,27 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             from ib_trader.redis.streams import publish_activity
             await publish_activity(redis, "orders")
             await publish_activity(redis, "trades")
+
+            # Autonomous PT / SL fill: when IB fires a resting profit-
+            # taker or stop-loss limit, no scoped close callback is
+            # alive (the original ``execute_order`` coroutine returned
+            # long ago). Without this hop the operator's console saw
+            # no "CLOSED via PT" message, ``trade_group.realized_pnl``
+            # never got written by the engine, and only the daemon
+            # reconciler eventually patched things up (with a
+            # multiplier-less P&L number, until the same-PR fix). The
+            # helper is idempotent — it no-ops on entry / manual-close
+            # legs where the scoped path already wrote the FILLED row.
+            try:
+                from ib_trader.engine.order import handle_autonomous_close_fill
+                await handle_autonomous_close_fill(
+                    ctx, ib_order_id, qty_filled, avg_price, commission,
+                )
+            except Exception:
+                logger.exception(
+                    '{"event": "AUTONOMOUS_CLOSE_FILL_ERROR", '
+                    '"ib_order_id": "%s"}', ib_order_id,
+                )
         except Exception:
             logger.exception('{"event": "FILL_RELAY_ERROR", "ib_order_id": "%s"}', ib_order_id)
 
