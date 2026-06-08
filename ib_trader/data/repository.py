@@ -28,6 +28,15 @@ from sqlalchemy import event as sa_event
 
 logger = logging.getLogger(__name__)
 
+# Upper bound (exclusive) of the trade-group serial-number pool. Serials
+# are reused at the lowest gap, so this is a ceiling for the *concurrent*
+# trade-group count, not a lifetime count. Originally 1000 — bumped to
+# 100,000 on 2026-06-07 after the operator filled all 1000 slots while
+# trading futures full-time. At realistic round-trip cadences this is
+# now effectively unbounded; ``next_serial_number`` keeps the gap-fill
+# semantics so reused IDs stay small most of the time.
+MAX_SERIAL_NUMBER = 100_000
+
 
 def safe_commit(session: Session, *, retries: int = 3,
                 backoff_seconds: float = 0.1) -> None:
@@ -296,9 +305,16 @@ class TradeRepository(TradeRepositoryBase):
         safe_commit(s)
 
     def next_serial_number(self) -> int:
-        """Return the lowest unused integer serial number in range 0–999.
+        """Return the lowest unused integer serial number in range 0–99,999.
 
-        Reuses the lowest available number. Wraps within 0–999.
+        Reuses the lowest available number. Wraps within 0–99,999.
+
+        Cap history: original cap was 1000 (operator-readable 3-digit
+        IDs). Operator hit it on 2026-06-07 — every slot 0-999 was in
+        use, blocking new orders entirely. Bumped to 100,000 so the
+        cap is no longer a realistic worry (10 trades/day = 27 years).
+        Existing 0-999 serials are unaffected; the wider range just
+        means new entries CAN land above 999 once 0-999 fills again.
         """
         s = self._session()
         used = {
@@ -306,10 +322,12 @@ class TradeRepository(TradeRepositoryBase):
             for row in s.query(TradeGroup.serial_number).all()
             if row.serial_number is not None
         }
-        for n in range(1000):
+        for n in range(MAX_SERIAL_NUMBER):
             if n not in used:
                 return n
-        raise RuntimeError("All serial numbers 0–999 are in use.")
+        raise RuntimeError(
+            f"All serial numbers 0–{MAX_SERIAL_NUMBER - 1} are in use."
+        )
 
 
 class RepriceEventRepository(RepriceEventRepositoryBase):

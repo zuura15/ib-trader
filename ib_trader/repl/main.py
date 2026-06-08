@@ -302,7 +302,7 @@ async def _cmd_stats(ctx: AppContext) -> None:
         direction = trade.direction[:1]  # L / S
 
         print(
-            f"#{trade.serial_number:<4} {trade.symbol:<8} {direction:<6} "
+            f"#{trade.serial_number:<6} {trade.symbol:<8} {direction:<6} "
             f"{qty_str:<5} {entry_str:<10} {pt_str:<22} {comm_str:<8} {trade_status}"
         )
 
