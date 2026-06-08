@@ -168,10 +168,30 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
         all_trades = trades.get_all()
         open_orders = ctx.transactions.get_open_orders()
 
-        # P&L
+        # P&L. When ``t.total_commission`` is 0 because IB's
+        # commissionReport never landed (observed on full-size CME/
+        # COMEX futures like GCQ6 / NQM6 / ESM6), fall back to a per-
+        # symbol round-trip estimate so the operator's numbers are
+        # consistent rather than gross. Qty defaults to 1 contract —
+        # TradeGroup doesn't carry qty; for a per-trade qty-aware
+        # estimate, the operator's ``stats`` command (REPL/TUI) sums
+        # per-transaction estimates instead.
+        # See ``ib_trader/data/commission_estimates.py``.
+        from ib_trader.data.commission_estimates import effective_commission as _eff_comm
         closed = [t for t in all_trades if t.status.value == "CLOSED" and t.realized_pnl is not None]
-        total_pnl = sum(float(t.realized_pnl) for t in closed)
-        total_commission = sum(float(t.total_commission or 0) for t in closed)
+        total_pnl = 0.0
+        total_commission = 0.0
+        for t in closed:
+            stored = float(t.total_commission or 0)
+            est = float(_eff_comm(t.total_commission, t.symbol, 1, round_trip=True))
+            total_commission += est
+            # If we substituted an estimate, net it out of P&L so the
+            # commission and realized lines stay consistent. The DB's
+            # realized_pnl was computed gross when commission was 0.
+            if stored == 0 and est != 0:
+                total_pnl += float(t.realized_pnl) - est
+            else:
+                total_pnl += float(t.realized_pnl)
 
         lines = [
             f"Positions:  {len(open_trades)} open",

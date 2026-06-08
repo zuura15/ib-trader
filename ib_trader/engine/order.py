@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from ib_trader.config.context import AppContext
+from ib_trader.data.commission_estimates import effective_commission
 from ib_trader.repl.output_router import OutputPane, OutputSeverity
 from ib_trader.data.models import (
     LegType, RepriceEvent, TradeGroup, TradeStatus,
@@ -3091,15 +3092,29 @@ async def _handle_close_fill(
     if remaining <= 0:
         ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
 
-    pnl_str = (
-        f"+${_fmt_money(realized_pnl)}" if realized_pnl >= 0
-        else f"-${_fmt_money(abs(realized_pnl))}"
+    # Display-time commission fallback: when IB's commissionReport
+    # never arrives (observed on full-size CME/COMEX futures like
+    # GCQ6 / NQM6 / ESM6), the stored value is 0 and the operator's
+    # realized-P&L line reads gross. Substitute a per-symbol estimate
+    # so what's printed is consistent with reality. The DB stays
+    # untouched \u2014 see ``commission_estimates`` docstring.
+    display_commission = effective_commission(
+        total_commission, close_ctx.symbol, entry_filled_qty,
+        round_trip=(remaining <= 0),
     )
+    display_pnl = realized_pnl
+    if total_commission == 0 and display_commission != 0:
+        display_pnl = realized_pnl - display_commission
+    pnl_str = (
+        f"+${_fmt_money(display_pnl)}" if display_pnl >= 0
+        else f"-${_fmt_money(abs(display_pnl))}"
+    )
+    comm_note = "" if total_commission != 0 else " est."
     closed_label = "CLOSED" if remaining <= 0 else "PARTIAL CLOSE"
     ctx.router.emit(
         f"\u2713 {closed_label}: {_fmt_qty(qty_filled)} shares "
         f"{close_ctx.symbol} @ ${_fmt_price(avg_price)}\n"
-        f"  P&L: {pnl_str} (commission: ${_fmt_money(total_commission)})\n"
+        f"  P&L: {pnl_str} (commission: ${_fmt_money(display_commission)}{comm_note})\n"
         f"  Serial: #{trade_group.serial_number}",
         pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
         event="CLOSE_ORDER_FILLED",

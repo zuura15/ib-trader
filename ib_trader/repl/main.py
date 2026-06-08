@@ -291,12 +291,29 @@ async def _cmd_stats(ctx: AppContext) -> None:
         else:
             pt_str = "\u2014"
 
-        # Commission: sum all transactions
-        trade_comm = sum(
-            (t.commission or Decimal("0")) for t in txns
-        )
+        # Commission: sum all transactions, falling back to a per-
+        # symbol estimate per terminal-fill row when stored=0 (IB
+        # commissionReport delivery is unreliable for some full-size
+        # futures). See ``ib_trader/data/commission_estimates.py``.
+        from ib_trader.data.commission_estimates import effective_commission as _eff_comm
+        trade_comm = Decimal("0")
+        had_estimate = False
+        for t in txns:
+            if t.action not in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL):
+                continue
+            stored = t.commission
+            est = _eff_comm(
+                stored, t.symbol, t.ib_filled_qty or Decimal("0"),
+                round_trip=False,
+            )
+            trade_comm += est
+            if (stored is None or stored == 0) and est != 0:
+                had_estimate = True
         total_commission += trade_comm
-        comm_str = f"${trade_comm}" if trade_comm else "\u2014"
+        comm_str = (
+            f"${trade_comm}{'*' if had_estimate else ''}"
+            if trade_comm else "\u2014"
+        )
 
         trade_status = "OPEN" if trade.status.value == "OPEN" else "closed"
         direction = trade.direction[:1]  # L / S

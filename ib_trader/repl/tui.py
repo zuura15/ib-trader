@@ -630,8 +630,27 @@ class IBTraderApp(App):
             else:
                 pt_str = "\u2014"
 
-            trade_comm = sum((t.commission or Decimal("0")) for t in txns)
-            comm_str = f"${trade_comm}" if trade_comm else "—"
+            # Commission fallback to per-symbol estimate when IB's
+            # commissionReport never landed (full-size CME/COMEX
+            # futures). See ib_trader/data/commission_estimates.py.
+            from ib_trader.data.commission_estimates import effective_commission as _eff_comm
+            trade_comm = Decimal("0")
+            had_estimate = False
+            for t in txns:
+                if t.action not in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL):
+                    continue
+                stored = t.commission
+                est = _eff_comm(
+                    stored, t.symbol, t.ib_filled_qty or Decimal("0"),
+                    round_trip=False,
+                )
+                trade_comm += est
+                if (stored is None or stored == 0) and est != 0:
+                    had_estimate = True
+            comm_str = (
+                f"${trade_comm}{'*' if had_estimate else ''}"
+                if trade_comm else "—"
+            )
             status = "OPEN" if trade.status.value == "OPEN" else "closed"
             direction = trade.direction[:1]
 
@@ -843,9 +862,27 @@ async def _cmd_stats(ctx: AppContext, router: OutputRouter) -> None:
             pt_str = "PT open"
         else:
             pt_str = "\u2014"
-        trade_comm = sum((t.commission or Decimal("0")) for t in txns)
+        # Same per-fill estimate fallback as the DataTable variant
+        # above. See ib_trader/data/commission_estimates.py.
+        from ib_trader.data.commission_estimates import effective_commission as _eff_comm
+        trade_comm = Decimal("0")
+        had_estimate = False
+        for t in txns:
+            if t.action not in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL):
+                continue
+            stored = t.commission
+            est = _eff_comm(
+                stored, t.symbol, t.ib_filled_qty or Decimal("0"),
+                round_trip=False,
+            )
+            trade_comm += est
+            if (stored is None or stored == 0) and est != 0:
+                had_estimate = True
         total_commission += trade_comm
-        comm_str = f"${trade_comm}" if trade_comm else "\u2014"
+        comm_str = (
+            f"${trade_comm}{'*' if had_estimate else ''}"
+            if trade_comm else "\u2014"
+        )
         trade_status = "OPEN" if trade.status.value == "OPEN" else "closed"
         direction = trade.direction[:1]
         lines.append(
