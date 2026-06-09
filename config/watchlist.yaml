@@ -11,3 +11,10 @@
 - AMZN
 - MESM6
 - MGCQ6
+# Full-size futures bound to chart-bot-1/3/4. Added 2026-06-09 so
+# their quote streams stay subscribed even when the operator is
+# flat — the 2026-06-09 "Gold chart frozen" symptom was the engine
+# dropping GCQ6's sub after the last GCQ6 position closed.
+- GCQ6
+- ESU6
+- NQU6

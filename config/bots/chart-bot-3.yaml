@@ -9,14 +9,13 @@ config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
   ref_id: chart-bot-3-es
-  # ES = full E-mini S&P 500. Switched from micro MESM6 → full ESM6
-  # on 2026-06-07 as the operator scaled into full contracts. Same
-  # June 2026 expiry (M6). E-minis trade quarterly only (H/M/U/Z);
-  # industry roll to U6 is ~June 11, 2026 — roll then, not earlier
-  # (U6 is back-month with wider spreads until rollover). QBALGO
-  # twin is dropped by the qualifier (insync_client 46953eb) so the
-  # bare ``ESM6`` localSymbol resolves to CME unambiguously.
-  symbol: ESM6
+  # ES = full E-mini S&P 500. Rolled from M6 (June 2026) → U6
+  # (September 2026) on 2026-06-09 — industry roll point for the
+  # quarterly cycle (H/M/U/Z), ~10 days before the M6 expiry on
+  # June 19. U6 has carried the majority of volume since today.
+  # Next roll: Z6 (Dec) in early September. QBALGO twin is dropped
+  # by the qualifier (insync_client 46953eb).
+  symbol: ESU6
   sec_type: FUT
   # Full E-mini S&P: $50/point (10x micro). Used by P/L math + trail
   # target.
@@ -33,4 +32,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- ESM6
+- ESU6
