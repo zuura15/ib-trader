@@ -2139,6 +2139,30 @@ async def _emit_console_close_pnl(
     if pre_is_long == order_is_buy:
         return  # opening or adding, not closing
 
+    # Sanity check: ``pre_avg`` is the per-unit price snapshotted from
+    # the positions cache. For a freshly-opened position it should be
+    # very close to ``avg_price`` (this fill's exit price) — they're
+    # both the same instrument trading minutes apart. A wild deviation
+    # means the cache had a stale or wrong multiplier (e.g. NQ
+    # normalized as ES, the 2026-06-09 trade #1121 bug where pre_avg
+    # came out 2.5× under because divisor 50 was used instead of 20).
+    # Refuse to emit P&L in that case — better to show nothing than a
+    # garbage number that contaminates the rolling 24h sum. Threshold
+    # is generous (50% deviation) so legitimate gap moves still emit.
+    deviation_ratio = (
+        abs(avg_price - pre_avg) / avg_price if avg_price else Decimal("0")
+    )
+    if deviation_ratio > Decimal("0.5"):
+        logger.warning(
+            '{"event": "PNL_ANOMALY_REJECTED", "serial": %d, "symbol": "%s", '
+            '"pre_avg": "%s", "exit_price": "%s", "deviation_ratio": "%s", '
+            '"detail": "pre_avg deviates >50%% from exit_price; '
+            'positions-cache pre-snapshot likely stale or wrong multiplier"}',
+            order_ctx.trade_serial, order_ctx.symbol,
+            pre_avg, avg_price, deviation_ratio,
+        )
+        return
+
     direction = Decimal("1") if pre_is_long else Decimal("-1")
     closed_qty = min(qty_filled, abs(pre_qty))
     multiplier = order_ctx.multiplier or Decimal("1")
