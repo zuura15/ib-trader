@@ -22,6 +22,49 @@ function botIdForSlot(slot: number): string {
 
 const QTY_STORAGE_KEY = (slot: number) => `ib-chart-qty-${slot}`;
 
+// Futures localSymbol regex (mirror of ``commission_estimates.py``
+// ``_LOCAL_SYM_RE``): root + month-letter + 1-or-2-digit year. Year
+// limited to two digits so we don't false-positive an unrelated
+// long-alpha-numeric ticker as a futures symbol.
+const FUT_LOCAL_SYM_RE = /^([A-Z][A-Z0-9]{0,4}?)([FGHJKMNQUVXZ])(\d{1,2})$/;
+
+/** Strip the month+year suffix from a futures localSymbol. Returns
+ *  the input upper-cased unchanged for STK / non-futures shapes. */
+function chartSymbolRoot(symbol: string): string {
+  const u = symbol.toUpperCase().trim();
+  const m = u.match(FUT_LOCAL_SYM_RE);
+  return m ? m[1] : u;
+}
+
+/** Map a CME futures month integer (1-12) to its month-code letter.
+ *  Returns null when the month is invalid. */
+const MONTH_CODES = [
+  null, 'F', 'G', 'H', 'J', 'K', 'M',
+  'N', 'Q', 'U', 'V', 'X', 'Z',
+] as const;
+function monthLetterFromExpiry(expiry: string | null | undefined): string | null {
+  if (!expiry || expiry.length < 6) return null;
+  const monthNum = parseInt(expiry.slice(4, 6), 10);
+  if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) return null;
+  return MONTH_CODES[monthNum] ?? null;
+}
+
+/** Reconstruct a futures localSymbol (``NQM6``) from a position row's
+ *  IB root + expiry. Returns null when fields are missing or malformed
+ *  so the caller can fall back to the chart symbol. */
+function positionLocalSymbol(p: { symbol?: string | null; expiry?: string | null }): string | null {
+  const root = (p.symbol ?? '').toString().toUpperCase();
+  if (!root) return null;
+  const expiry = (p.expiry ?? '').toString();
+  const monthLetter = monthLetterFromExpiry(expiry);
+  if (!monthLetter) return null;
+  // Use last-digit-of-year to match the IB-paste localSymbol shape
+  // operators type (``NQM6``, not ``NQM26``). The qualifier accepts
+  // both; we pick the short form to keep the console line readable.
+  const yearLast = expiry.slice(3, 4);
+  return `${root}${monthLetter}${yearLast}`;
+}
+
 function loadQty(slot: number): number {
   try {
     const raw = localStorage.getItem(QTY_STORAGE_KEY(slot));
@@ -105,23 +148,46 @@ export function ChartBotPane({ slot }: Props) {
   })();
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
 
-  // Current held qty for this chart's symbol. Signed: positive = LONG,
-  // negative = SHORT, zero = flat. Drives Close button enable + the
-  // close-side computation.
-  const positionQty = useMemo(() => {
-    if (!symbol) return 0;
+  // Held position for this chart's product, matched by ROOT (not by
+  // localSymbol). ``/api/positions`` returns ``symbol="NQ"`` (IB root)
+  // and ``display_symbol="NQ M26"`` for futures, but the chart's
+  // ``symbol`` is the IB localSymbol form (``NQM6``, ``GCQ6``). A
+  // strict equality check never matches. After today's M→U roll the
+  // mismatch matters even more: the chart is on ``NQU6`` while the
+  // operator still holds ``NQM6`` — Close must target the held
+  // contract, not the chart's display contract.
+  //
+  // Strategy: extract the root from the chart symbol (``NQM6 → NQ``,
+  // ``MGCQ6 → MGC``), find a FUT position with the same root, and
+  // reconstruct that position's localSymbol from its expiry so the
+  // close command goes to the correctly-qualified contract. Non-
+  // futures fall through to the plain-symbol equality path.
+  const heldPosition = useMemo(() => {
+    if (!symbol) return null;
+    const root = chartSymbolRoot(symbol);
+    const isFutures = root !== symbol.toUpperCase();
     for (const p of positions) {
-      const s = (p.symbol ?? '').toString();
-      const ds = (p.display_symbol ?? '').toString();
-      if (s === symbol || ds === symbol) {
-        const q = typeof p.quantity === 'number'
-          ? p.quantity
-          : Number(p.quantity);
-        return Number.isFinite(q) ? q : 0;
+      const pSym = (p.symbol ?? '').toString().toUpperCase();
+      const pSecType = (p.sec_type ?? '').toString().toUpperCase();
+      if (isFutures) {
+        if (pSecType !== 'FUT') continue;
+        if (pSym !== root) continue;
+      } else {
+        // STK / OPT path: direct symbol equality.
+        if (pSym !== symbol.toUpperCase()) continue;
       }
+      const q = typeof p.quantity === 'number'
+        ? p.quantity
+        : Number(p.quantity);
+      if (!Number.isFinite(q) || q === 0) continue;
+      const local = isFutures
+        ? positionLocalSymbol(p) ?? symbol
+        : symbol;
+      return { qty: q, localSymbol: local };
     }
-    return 0;
+    return null;
   }, [positions, symbol]);
+  const positionQty = heldPosition?.qty ?? 0;
 
   const fireCommand = async (
     cmd: string, label: 'buy' | 'sell' | 'close',
@@ -161,13 +227,17 @@ export function ChartBotPane({ slot }: Props) {
     void fireCommand(`sell ${symbol} ${qty}`, 'sell');
   };
   const onClose = () => {
-    if (!symbol || positionQty === 0) return;
-    // Net-flat at IB market price: opposite side for the held qty.
-    // Uses explicit ``market`` strategy to skip the smart_market
-    // walker — Close should be immediate, not patient.
-    const absQty = Math.abs(positionQty);
-    const side = positionQty > 0 ? 'sell' : 'buy';
-    void fireCommand(`${side} ${symbol} ${absQty} market`, 'close');
+    if (!heldPosition) return;
+    // Net-flat at IB market price: opposite side for the held qty
+    // on the contract the operator actually holds (which may be on
+    // a different expiry than the chart is currently showing — e.g.
+    // chart on ``NQU6`` while the held position is ``NQM6`` from
+    // before the roll).
+    const absQty = Math.abs(heldPosition.qty);
+    const side = heldPosition.qty > 0 ? 'sell' : 'buy';
+    void fireCommand(
+      `${side} ${heldPosition.localSymbol} ${absQty} market`, 'close',
+    );
   };
 
   const canClose = positionQty !== 0;
