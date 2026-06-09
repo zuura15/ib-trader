@@ -109,7 +109,11 @@ export function ChartBotPane({ slot }: Props) {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   const addCommand = useStore((s) => s.addCommand);
-  const positions = useStore((s) => s.positions);
+  // ``livePositions`` is the broker-shape (snake_case strings) slice
+  // populated by PositionsPanel's WS ``subscribe_positions`` stream.
+  // The mock-friendly ``positions`` slice doesn't get live data in
+  // live mode — see store.ts comments.
+  const positions = useStore((s) => s.livePositions);
   const tradeGroups = useStore((s) => s.tradeGroups);
 
   // Resolve symbol + secType from the bot config (operator picks via the
@@ -172,7 +176,21 @@ export function ChartBotPane({ slot }: Props) {
     if (!symbol) return null;
     const root = chartSymbolRoot(symbol);
     const isFutures = root !== symbol.toUpperCase();
-    for (const p of positions) {
+    for (const raw of positions) {
+      // ``livePositions`` is typed as ``Array<Record<string, unknown>>``
+      // because it carries the broker-shape (snake_case) rows the WS
+      // delivers. Cast once per row to the known shape so the field
+      // accesses below stay tidy.
+      const p = raw as {
+        symbol?: string | null;
+        sec_type?: string | null;
+        quantity?: string | number | null;
+        avg_cost?: string | number | null;
+        market_price?: string | number | null;
+        multiplier?: string | number | null;
+        expiry?: string | null;
+        display_symbol?: string | null;
+      };
       const pSym = (p.symbol ?? '').toString().toUpperCase();
       const pSecType = (p.sec_type ?? '').toString().toUpperCase();
       if (isFutures) {
@@ -182,10 +200,8 @@ export function ChartBotPane({ slot }: Props) {
         // STK / OPT path: direct symbol equality.
         if (pSym !== symbol.toUpperCase()) continue;
       }
-      const q = typeof p.quantity === 'number'
-        ? p.quantity
-        : Number(p.quantity);
-      if (!Number.isFinite(q) || q === 0) continue;
+      const q = parseFinite(p.quantity);
+      if (q == null || q === 0) continue;
       const local = isFutures
         ? positionLocalSymbol(p) ?? symbol
         : symbol;
@@ -194,14 +210,9 @@ export function ChartBotPane({ slot }: Props) {
       // PositionsPanel.computePnl: (mark - avg) × qty × multiplier.
       // Signed qty handles long/short — a SHORT (qty<0) profits when
       // mark drops below avg, formula produces a positive value.
-      const avgCost = parseFinite(
-        (p as { avg_cost?: string | number | null }).avg_cost,
-      );
-      const markPrice = parseFinite(
-        (p as { market_price?: string | number | null }).market_price,
-      );
-      const multStr = (p as { multiplier?: string | number | null }).multiplier;
-      const mult = parseFinite(multStr);
+      const avgCost = parseFinite(p.avg_cost);
+      const markPrice = parseFinite(p.market_price);
+      const mult = parseFinite(p.multiplier);
       const validMult = mult != null && mult > 0 ? mult : 1;
       const unrealizedPnl =
         avgCost != null && markPrice != null

@@ -190,7 +190,16 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'positions' && Array.isArray(msg.data)) {
-            setPositions(msg.data as BrokerPosition[]);
+            const arr = msg.data as BrokerPosition[];
+            setPositions(arr);
+            // Also publish to the global store so non-PositionsPanel
+            // consumers (chart-pane P&L overlay + Close button, etc.)
+            // have access to the live broker-shape position rows.
+            // Without this the store's ``positions`` slice stays
+            // empty in live mode and chart panes can't compute P&L.
+            useStore.getState().setLivePositions(
+              arr as unknown as Array<Record<string, unknown>>,
+            );
           }
         } catch { /* ignore malformed frames */ }
       };

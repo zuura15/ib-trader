@@ -92,6 +92,15 @@ interface AppStore {
   positions: Position[];
   updatePosition: (symbol: string, partial: Partial<Position>) => void;
   setPositions: (positions: Position[]) => void;
+  // Raw broker-shape positions pushed from PositionsPanel's WS
+  // ``subscribe_positions`` stream. Snake-case strings, IB root in
+  // ``symbol`` field, ``avg_cost`` / ``market_price`` / ``multiplier``
+  // as strings. Distinct from the mock-friendly ``positions`` slice
+  // above because chart panes / Close buttons need the broker shape
+  // (multiplier, expiry, sec_type) that the camel-case mock type
+  // doesn't carry. Empty in mock mode.
+  livePositions: Array<Record<string, unknown>>;
+  setLivePositions: (positions: Array<Record<string, unknown>>) => void;
 
 
   // Bots
@@ -335,6 +344,8 @@ export const useStore = create<AppStore>((set, get) => ({
     positions: s.positions.map((p) => p.symbol === symbol ? { ...p, ...partial } : p),
   })),
   setPositions: (positions) => set({ positions }),
+  livePositions: [],
+  setLivePositions: (livePositions) => set({ livePositions }),
 
   bots: DATA_MODE === 'mock' ? mockBots : [],
   updateBot: (id, partial) => set((s) => ({
