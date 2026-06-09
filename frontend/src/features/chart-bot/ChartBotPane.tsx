@@ -174,8 +174,9 @@ export function ChartBotPane({ slot }: Props) {
   // futures fall through to the plain-symbol equality path.
   const heldPosition = useMemo(() => {
     if (!symbol) return null;
-    const root = chartSymbolRoot(symbol);
-    const isFutures = root !== symbol.toUpperCase();
+    const chartUpper = symbol.toUpperCase();
+    const root = chartSymbolRoot(chartUpper);
+    const isFutures = root !== chartUpper;
     for (const raw of positions) {
       // ``livePositions`` is typed as ``Array<Record<string, unknown>>``
       // because it carries the broker-shape (snake_case) rows the WS
@@ -193,18 +194,28 @@ export function ChartBotPane({ slot }: Props) {
       };
       const pSym = (p.symbol ?? '').toString().toUpperCase();
       const pSecType = (p.sec_type ?? '').toString().toUpperCase();
+      let local: string;
       if (isFutures) {
         if (pSecType !== 'FUT') continue;
         if (pSym !== root) continue;
+        // Reconstruct the position's localSymbol from its expiry and
+        // require an EXACT match against the chart's symbol. Pre-fix
+        // we matched by root only — after the M6 → U6 roll the
+        // operator's NQU6 chart was showing the held NQM6 position's
+        // P&L, which is wrong (different contract, different ticker,
+        // different P&L attribution). Strict contract match keeps
+        // the overlay honest. Operator manages the old-contract
+        // holding via the console (e.g. ``close <serial>``).
+        const reconstructed = positionLocalSymbol(p);
+        if (!reconstructed || reconstructed !== chartUpper) continue;
+        local = reconstructed;
       } else {
         // STK / OPT path: direct symbol equality.
-        if (pSym !== symbol.toUpperCase()) continue;
+        if (pSym !== chartUpper) continue;
+        local = chartUpper;
       }
       const q = parseFinite(p.quantity);
       if (q == null || q === 0) continue;
-      const local = isFutures
-        ? positionLocalSymbol(p) ?? symbol
-        : symbol;
       // Pull the live mark + entry-avg + multiplier so the overlay
       // can compute unrealized P&L in dollars. Same formula as
       // PositionsPanel.computePnl: (mark - avg) × qty × multiplier.
