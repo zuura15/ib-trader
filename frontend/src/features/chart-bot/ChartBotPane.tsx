@@ -370,6 +370,10 @@ export function ChartBotPane({ slot }: Props) {
               position: 'absolute',
               top: '25%',
               right: 12,
+              // Lift above the lightweight-charts canvas; without
+              // this the badge can render but be hidden behind
+              // the chart's auto-stacked canvas layers.
+              zIndex: 20,
               pointerEvents: 'none',
               padding: '4px 10px',
               borderRadius: 4,
@@ -471,21 +475,32 @@ export function ChartBotPane({ slot }: Props) {
           </span>
         )}
 
-        {/* Diagnostic: number of broker-shape rows in the store's
-            ``livePositions`` slice. Visible truth on whether
-            ``PositionsPanel``'s WS push is reaching the store. If
-            this stays at 0 while the Positions tab shows your
-            position, the publish path is broken; if it shows N>0
-            but the Close button is still disabled, the symbol-root
-            match is failing. Tiny + low-contrast so it doesn't
-            steal eyeballs from the chart. Remove after confirmed. */}
+        {/* Diagnostic: tells us at a glance what the chart pane sees.
+            ``pos:N`` = livePositions count (publish path OK if >0).
+            Then either ``no <root>`` (no root-match for this chart's
+            symbol) OR a debug breadcrumb showing avg / mark / qty /
+            unrealizedPnl so we can spot which value is null. Remove
+            after the chart pane wiring is confirmed end-to-end. */}
         <span style={{
           fontSize: 9, color: 'var(--text-muted)', opacity: 0.6,
           fontFamily: 'ui-monospace, monospace',
         }}
           data-testid={`chart-livepos-debug-${slot}`}
         >
-          [pos: {positions.length}]
+          [pos:{positions.length}
+          {symbol && (
+            <>
+              {' '}
+              {heldPosition
+                ? `${chartSymbolRoot(symbol)}=${
+                    heldPosition.qty > 0 ? '+' : ''}${heldPosition.qty} ` +
+                  `avg=${heldPosition.avgCost ?? 'null'} ` +
+                  `mark=${heldPosition.markPrice ?? 'null'} ` +
+                  `pnl=${heldPosition.unrealizedPnl?.toFixed(2) ?? 'null'}`
+                : `no ${chartSymbolRoot(symbol)} held`}
+            </>
+          )}
+          ]
         </span>
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
