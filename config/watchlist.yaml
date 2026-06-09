@@ -11,3 +11,9 @@
 - AMZN
 - MESM6
 - MGCQ6
+# GCQ6 (full Gold) pinned 2026-06-09 — chart-bot-1 displays it but
+# the operator doesn't always hold a GC position, so without a
+# watchlist anchor the engine's IB sub lapses (~2 min after the
+# last GC position closed) and the chart freezes. NQM6 and ESM6
+# don't need this because the operator currently holds those.
+- GCQ6
