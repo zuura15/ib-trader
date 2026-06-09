@@ -17,9 +17,3 @@
 # last GC position closed) and the chart freezes. ESM6 doesn't
 # need this because the operator currently holds ES.
 - GCQ6
-# NQU6 (full Nasdaq Sep) pinned 2026-06-09 — chart-bot-4 targeted
-# NQU6 ahead of the M6 → U6 industry roll, but back-month volume
-# is ~5-10% of M6 right now and the engine drops a back-month
-# sub quickly when nothing else anchors it. Re-evaluate after
-# the actual volume migration (~2026-06-13).
-- NQU6
