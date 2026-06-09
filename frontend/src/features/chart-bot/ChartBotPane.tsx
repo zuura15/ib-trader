@@ -379,48 +379,33 @@ export function ChartBotPane({ slot }: Props) {
           <div
             style={{
               position: 'absolute',
-              top: '25%',
-              right: 12,
-              // Lift above the lightweight-charts canvas; without
-              // this the badge can render but be hidden behind
-              // the chart's auto-stacked canvas layers.
+              // Tight to the chart's top edge. ``right`` is set to
+              // clear lightweight-charts' price axis column (the
+              // right-side labels) — ~62 px on a typical futures
+              // price width — so the badge doesn't overlap any
+              // tick label or grid notch.
+              top: 4,
+              right: 70,
               zIndex: 20,
               pointerEvents: 'none',
-              padding: '4px 10px',
-              borderRadius: 4,
-              background: 'rgba(0,0,0,0.55)',
-              border: '1px solid var(--border-default)',
+              padding: '1px 6px',
+              borderRadius: 3,
+              background: 'rgba(0,0,0,0.45)',
               fontFamily: 'ui-monospace, monospace',
               textAlign: 'right',
-              minWidth: 110,
-              boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
+              lineHeight: 1.15,
             }}
             data-testid={`chart-pnl-overlay-${slot}`}
           >
-            <div style={{
-              fontSize: 18, fontWeight: 700,
-              lineHeight: 1.1,
+            <span style={{
+              fontSize: 11, fontWeight: 700,
               color: heldPosition.unrealizedPnl >= 0
                 ? 'var(--accent-green)'
                 : 'var(--accent-red)',
             }}>
               {heldPosition.unrealizedPnl >= 0 ? '+$' : '-$'}
               {Math.abs(heldPosition.unrealizedPnl).toFixed(2)}
-            </div>
-            <div style={{
-              fontSize: 10,
-              color: 'var(--text-muted)',
-              marginTop: 2,
-              letterSpacing: '0.04em',
-            }}>
-              {heldPosition.qty > 0 ? 'LONG ' : 'SHORT '}
-              {Math.abs(heldPosition.qty)}
-              {' '}
-              {heldPosition.localSymbol}
-              {heldPosition.avgCost != null && (
-                <> @ {heldPosition.avgCost.toFixed(2)}</>
-              )}
-            </div>
+            </span>
           </div>
         )}
       </div>
