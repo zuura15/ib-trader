@@ -61,6 +61,7 @@ export function ChartBotPane({ slot }: Props) {
 
   const addCommand = useStore((s) => s.addCommand);
   const positions = useStore((s) => s.positions);
+  const tradeGroups = useStore((s) => s.tradeGroups);
 
   // Resolve symbol + secType from the bot config (operator picks via the
   // YAML; live picker is the Variant H plan, not this round).
@@ -169,6 +170,32 @@ export function ChartBotPane({ slot }: Props) {
     : positionQty > 0 ? `LONG ${positionQty}`
     : `SHORT ${Math.abs(positionQty)}`;
 
+  // 24h realized P&L for this chart's symbol. Pulled from the
+  // ``tradeGroups`` store slice (populated from /api/trades, which
+  // already prefers ``ib_realized_pnl`` over the engine-computed
+  // ``realized_pnl`` per the serializer). Sums CLOSED trades on
+  // this symbol whose ``closed_at`` is within the last 24 h.
+  const pnl24h = useMemo(() => {
+    if (!symbol) return { sum: 0, count: 0 };
+    const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
+    let sum = 0;
+    let count = 0;
+    for (const t of tradeGroups) {
+      const tsym = (t.symbol ?? '').toString();
+      const tdsym = (t.display_symbol ?? '').toString();
+      if (tsym !== symbol && tdsym !== symbol) continue;
+      if (t.status !== 'CLOSED') continue;
+      if (!t.closedAt) continue;
+      const closedMs = new Date(t.closedAt).getTime();
+      if (!Number.isFinite(closedMs) || closedMs < cutoffMs) continue;
+      const v = t.realizedPnl == null ? NaN : Number(t.realizedPnl);
+      if (!Number.isFinite(v)) continue;
+      sum += v;
+      count += 1;
+    }
+    return { sum, count };
+  }, [tradeGroups, symbol]);
+
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
       {botFetchError && (
@@ -197,12 +224,14 @@ export function ChartBotPane({ slot }: Props) {
           renderHeader={() => null}
         />
       </div>
-      {/* Trade strip. Every click routes through ``addCommand`` ->
-          /api/commands so manual chart-pane orders share the same audit
-          / fill / P&L path as console-typed orders. */}
+      {/* Trade strip. 24h P&L for this chart's symbol on the left,
+          qty + BUY/SELL/CLOSE pushed to the right under the price
+          action. Every click routes through ``addCommand`` ->
+          /api/commands so manual chart-pane orders share the same
+          audit / fill / P&L path as console-typed orders. */}
       <div
         style={{
-          display: 'flex', alignItems: 'center', gap: 6,
+          display: 'flex', alignItems: 'center', gap: 10,
           padding: '6px 10px',
           borderTop: '1px solid var(--border-default)',
           background: 'var(--header-bg)',
@@ -210,105 +239,152 @@ export function ChartBotPane({ slot }: Props) {
         }}
         data-testid={`chart-trade-strip-${slot}`}
       >
+        {/* Left: 24h realized P&L for this symbol. ``—`` when there's
+            no closed trade in the last 24h so the slot doesn't look
+            like a stale zero. */}
         <span style={{
-          fontSize: 10, letterSpacing: '0.15em',
-          textTransform: 'uppercase', color: 'var(--text-muted)',
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          fontFamily: 'ui-monospace, monospace',
         }}>
-          Qty
-        </span>
-        <input
-          type="number"
-          min={1}
-          step={1}
-          value={qty}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            setQty(Number.isFinite(n) && n > 0 ? Math.floor(n) : 1);
-          }}
-          style={{
-            width: 56,
-            padding: '3px 6px',
-            background: 'var(--bg-secondary)',
-            border: '1px solid var(--border-default)',
-            borderRadius: 3,
-            color: 'var(--text-primary)',
-            fontFamily: 'ui-monospace, monospace',
-            fontSize: 12,
-          }}
-          data-testid={`chart-qty-${slot}`}
-        />
-        <button
-          onClick={onBuy}
-          disabled={pendingAction !== null || !symbol}
-          title={symbol
-            ? `buy ${qty} ${symbol} (smart_market) — auto-fires via console`
-            : 'symbol not resolved yet'}
-          style={{
-            background: 'var(--accent-green)', color: '#fff',
-            border: 'none', borderRadius: 3, padding: '3px 14px',
-            fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
-            cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
-            opacity: pendingAction && pendingAction !== 'buy' ? 0.5 : 1,
-            fontFamily: 'ui-monospace, monospace',
-          }}
-          data-testid={`chart-buy-${slot}`}
-        >
-          BUY
-        </button>
-        <button
-          onClick={onSell}
-          disabled={pendingAction !== null || !symbol}
-          title={symbol
-            ? `sell ${qty} ${symbol} (smart_market) — auto-fires via console`
-            : 'symbol not resolved yet'}
-          style={{
-            background: 'var(--accent-red)', color: '#fff',
-            border: 'none', borderRadius: 3, padding: '3px 14px',
-            fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
-            cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
-            opacity: pendingAction && pendingAction !== 'sell' ? 0.5 : 1,
-            fontFamily: 'ui-monospace, monospace',
-          }}
-          data-testid={`chart-sell-${slot}`}
-        >
-          SELL
-        </button>
-        <button
-          onClick={onClose}
-          disabled={pendingAction !== null || !canClose}
-          title={canClose
-            ? `Close ${positionLabel} ${symbol ?? ''} at market — auto-fires via console`
-            : 'No open position on this symbol'}
-          style={{
-            background: 'var(--accent-blue)', color: '#fff',
-            border: 'none', borderRadius: 3, padding: '3px 14px',
-            fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
-            cursor: (pendingAction || !canClose) ? 'not-allowed' : 'pointer',
-            opacity:
-              (pendingAction && pendingAction !== 'close') || !canClose
-                ? 0.5 : 1,
-            fontFamily: 'ui-monospace, monospace',
-          }}
-          data-testid={`chart-close-${slot}`}
-        >
-          CLOSE
-        </button>
-        {positionLabel && (
           <span style={{
-            fontSize: 10, color: 'var(--text-muted)', marginLeft: 4,
-            fontFamily: 'ui-monospace, monospace',
+            fontSize: 10, letterSpacing: '0.15em',
+            textTransform: 'uppercase', color: 'var(--text-muted)',
           }}>
-            {positionLabel}
+            24h P&L
           </span>
-        )}
+          {pnl24h.count > 0 ? (
+            <>
+              <span style={{
+                fontSize: 12, fontWeight: 700,
+                color: pnl24h.sum >= 0
+                  ? 'var(--accent-green)'
+                  : 'var(--accent-red)',
+              }}>
+                {pnl24h.sum >= 0 ? '+$' : '-$'}
+                {Math.abs(pnl24h.sum).toFixed(2)}
+              </span>
+              <span style={{
+                fontSize: 10, color: 'var(--text-muted)',
+              }}>
+                / {pnl24h.count}
+              </span>
+            </>
+          ) : (
+            <span style={{
+              fontSize: 12, color: 'var(--text-muted)',
+            }}>—</span>
+          )}
+        </span>
+
+        {/* Status message (transient — appears for 4s after a click). */}
         {statusMsg && (
           <span style={{
-            fontSize: 10, color: 'var(--text-muted)', marginLeft: 'auto',
+            fontSize: 10, color: 'var(--text-muted)',
             fontFamily: 'ui-monospace, monospace',
           }}>
             {statusMsg}
           </span>
         )}
+
+        {/* Right: position badge + qty + BUY/SELL/CLOSE. The
+            ``marginLeft: auto`` pushes the whole cluster against the
+            right edge so it sits under the chart's price-axis column. */}
+        <div style={{
+          marginLeft: 'auto',
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}>
+          {positionLabel && (
+            <span style={{
+              fontSize: 10, color: 'var(--text-muted)',
+              fontFamily: 'ui-monospace, monospace',
+            }}>
+              {positionLabel}
+            </span>
+          )}
+          <span style={{
+            fontSize: 10, letterSpacing: '0.15em',
+            textTransform: 'uppercase', color: 'var(--text-muted)',
+          }}>
+            Qty
+          </span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={qty}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              setQty(Number.isFinite(n) && n > 0 ? Math.floor(n) : 1);
+            }}
+            style={{
+              width: 56,
+              padding: '3px 6px',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              color: 'var(--text-primary)',
+              fontFamily: 'ui-monospace, monospace',
+              fontSize: 12,
+            }}
+            data-testid={`chart-qty-${slot}`}
+          />
+          <button
+            onClick={onBuy}
+            disabled={pendingAction !== null || !symbol}
+            title={symbol
+              ? `buy ${qty} ${symbol} (smart_market) — auto-fires via console`
+              : 'symbol not resolved yet'}
+            style={{
+              background: 'var(--accent-green)', color: '#fff',
+              border: 'none', borderRadius: 3, padding: '3px 14px',
+              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'buy' ? 0.5 : 1,
+              fontFamily: 'ui-monospace, monospace',
+            }}
+            data-testid={`chart-buy-${slot}`}
+          >
+            BUY
+          </button>
+          <button
+            onClick={onSell}
+            disabled={pendingAction !== null || !symbol}
+            title={symbol
+              ? `sell ${qty} ${symbol} (smart_market) — auto-fires via console`
+              : 'symbol not resolved yet'}
+            style={{
+              background: 'var(--accent-red)', color: '#fff',
+              border: 'none', borderRadius: 3, padding: '3px 14px',
+              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
+              opacity: pendingAction && pendingAction !== 'sell' ? 0.5 : 1,
+              fontFamily: 'ui-monospace, monospace',
+            }}
+            data-testid={`chart-sell-${slot}`}
+          >
+            SELL
+          </button>
+          <button
+            onClick={onClose}
+            disabled={pendingAction !== null || !canClose}
+            title={canClose
+              ? `Close ${positionLabel} ${symbol ?? ''} at market — auto-fires via console`
+              : 'No open position on this symbol'}
+            style={{
+              background: 'var(--accent-blue)', color: '#fff',
+              border: 'none', borderRadius: 3, padding: '3px 14px',
+              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              cursor: (pendingAction || !canClose) ? 'not-allowed' : 'pointer',
+              opacity:
+                (pendingAction && pendingAction !== 'close') || !canClose
+                  ? 0.5 : 1,
+              fontFamily: 'ui-monospace, monospace',
+            }}
+            data-testid={`chart-close-${slot}`}
+          >
+            CLOSE
+          </button>
+        </div>
       </div>
     </div>
   );

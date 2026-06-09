@@ -6,7 +6,7 @@ import { VISIBLE_MINUTES } from '../chart/chartUtils';
 import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import type { ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
-import { PositionStrip } from './PositionStrip';
+// PositionStrip import removed with the 2-row shelf — see chartBody.
 import { getBotTrades } from '../../api/client';
 
 interface Props {
@@ -577,14 +577,12 @@ export function BotChart({
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
-      <div>
-        <PositionStrip
-          state={state}
-          fsmState={fsmState}
-          botId={botId}
-          symbol={symbol}
-        />
-      </div>
+      {/* 2-row PositionStrip removed 2026-06-09. The metrics it
+          surfaced (entry/last/stop/HWM/P&L/24h) were bot-FSM-
+          centric — useful when chart-bots auto-fired, pure visual
+          weight now that all trading is manual via the console.
+          ChartBotPane's trade strip carries the operator-facing
+          24h P&L on the same row as the BUY/SELL/CLOSE buttons. */}
     </div>
   );
 
