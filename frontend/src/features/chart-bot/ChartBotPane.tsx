@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
@@ -286,6 +286,31 @@ export function ChartBotPane({ slot }: Props) {
     : positionQty > 0 ? `LONG ${positionQty}`
     : `SHORT ${Math.abs(positionQty)}`;
 
+  // Stable callback for ``renderHeader`` so a new identity isn't
+  // created on every render — protects ``BotChart``'s ``useEffect``
+  // deps from re-firing whenever the parent re-renders (e.g. on
+  // every ``livePositions`` WS push, which now fires constantly).
+  const renderHeader = useCallback(() => null, []);
+
+  // Memoize the chart subtree so it only re-renders when its own
+  // inputs change. Pre-fix, ``ChartBotPane`` subscribed to
+  // ``livePositions`` which pushes on every IB position event —
+  // ~multi-Hz under active trading. Each parent re-render then
+  // re-mounted/re-effected the chart's WS subscription (the
+  // ``renderHeader`` literal had a new identity each time), causing
+  // the chart's live-tick connection to wedge: subscribe → tear-
+  // down before first tick arrived → repeat. Symptom: chart polyline
+  // froze even though backend Redis streams were healthy.
+  const chartElement = useMemo(() => (
+    <BotChart
+      botId={botId}
+      botRef={bot?.ref_id}
+      symbol={symbol}
+      secType={secType}
+      renderHeader={renderHeader}
+    />
+  ), [botId, bot?.ref_id, symbol, secType, renderHeader]);
+
   // 24h realized P&L for this chart's symbol. Pulled from the
   // ``tradeGroups`` store slice (populated from /api/trades, which
   // already prefers ``ib_realized_pnl`` over the engine-computed
@@ -331,17 +356,7 @@ export function ChartBotPane({ slot }: Props) {
         className="flex-1"
         style={{ minHeight: 0, position: 'relative' }}
       >
-        <BotChart
-          botId={botId}
-          botRef={bot?.ref_id}
-          symbol={symbol}
-          secType={secType}
-          // FSM header explicitly suppressed — chart pane is always live
-          // for manual scanning. The bot lifecycle still cycles in the
-          // background (manual_entry_only=true drops any auto-entries)
-          // but we don't surface it on the chart.
-          renderHeader={() => null}
-        />
+        {chartElement}
         {/* Open-position P&L overlay. Sits in the top-right quadrant
             (top 25% from the top edge, right-justified ~12 px in from
             the right) so it floats above the price polyline without
@@ -455,6 +470,23 @@ export function ChartBotPane({ slot }: Props) {
             {statusMsg}
           </span>
         )}
+
+        {/* Diagnostic: number of broker-shape rows in the store's
+            ``livePositions`` slice. Visible truth on whether
+            ``PositionsPanel``'s WS push is reaching the store. If
+            this stays at 0 while the Positions tab shows your
+            position, the publish path is broken; if it shows N>0
+            but the Close button is still disabled, the symbol-root
+            match is failing. Tiny + low-contrast so it doesn't
+            steal eyeballs from the chart. Remove after confirmed. */}
+        <span style={{
+          fontSize: 9, color: 'var(--text-muted)', opacity: 0.6,
+          fontFamily: 'ui-monospace, monospace',
+        }}
+          data-testid={`chart-livepos-debug-${slot}`}
+        >
+          [pos: {positions.length}]
+        </span>
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
             ``marginLeft: auto`` pushes the whole cluster against the
