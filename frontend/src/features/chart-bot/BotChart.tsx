@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
@@ -273,17 +273,9 @@ export function BotChart({
   }, [botId, symbol]);
 
   const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
-  // Memoize the ChartTarget object so its identity is stable across
-  // re-renders. Pre-fix this was rebuilt every BotChart render and
-  // ``SymbolChart``'s useEffect deps (which include ``target``) saw a
-  // new reference each time — tearing down and re-establishing the
-  // live-tick WS subscription on every parent state update from
-  // ``useBotState``. Symptom: chart polyline froze even though
-  // backend Redis quote streams were healthy.
-  const target: ChartTarget | null = useMemo(
-    () => symbol ? { symbol, secType, conId: null } : null,
-    [symbol, secType],
-  );
+  const target: ChartTarget | null = symbol
+    ? { symbol, secType, conId: null }
+    : null;
 
   const entryLine = state.entry_line && state.entry_line.anchor_time
     && typeof state.entry_line.anchor_price === 'number'

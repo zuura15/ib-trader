@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
@@ -21,55 +21,6 @@ function botIdForSlot(slot: number): string {
 }
 
 const QTY_STORAGE_KEY = (slot: number) => `ib-chart-qty-${slot}`;
-
-// Futures localSymbol regex (mirror of ``commission_estimates.py``
-// ``_LOCAL_SYM_RE``): root + month-letter + 1-or-2-digit year. Year
-// limited to two digits so we don't false-positive an unrelated
-// long-alpha-numeric ticker as a futures symbol.
-const FUT_LOCAL_SYM_RE = /^([A-Z][A-Z0-9]{0,4}?)([FGHJKMNQUVXZ])(\d{1,2})$/;
-
-/** Strip the month+year suffix from a futures localSymbol. Returns
- *  the input upper-cased unchanged for STK / non-futures shapes. */
-function chartSymbolRoot(symbol: string): string {
-  const u = symbol.toUpperCase().trim();
-  const m = u.match(FUT_LOCAL_SYM_RE);
-  return m ? m[1] : u;
-}
-
-/** Map a CME futures month integer (1-12) to its month-code letter.
- *  Returns null when the month is invalid. */
-const MONTH_CODES = [
-  null, 'F', 'G', 'H', 'J', 'K', 'M',
-  'N', 'Q', 'U', 'V', 'X', 'Z',
-] as const;
-function monthLetterFromExpiry(expiry: string | null | undefined): string | null {
-  if (!expiry || expiry.length < 6) return null;
-  const monthNum = parseInt(expiry.slice(4, 6), 10);
-  if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) return null;
-  return MONTH_CODES[monthNum] ?? null;
-}
-
-/** Reconstruct a futures localSymbol (``NQM6``) from a position row's
- *  IB root + expiry. Returns null when fields are missing or malformed
- *  so the caller can fall back to the chart symbol. */
-function positionLocalSymbol(p: { symbol?: string | null; expiry?: string | null }): string | null {
-  const root = (p.symbol ?? '').toString().toUpperCase();
-  if (!root) return null;
-  const expiry = (p.expiry ?? '').toString();
-  const monthLetter = monthLetterFromExpiry(expiry);
-  if (!monthLetter) return null;
-  // Use last-digit-of-year to match the IB-paste localSymbol shape
-  // operators type (``NQM6``, not ``NQM26``). The qualifier accepts
-  // both; we pick the short form to keep the console line readable.
-  const yearLast = expiry.slice(3, 4);
-  return `${root}${monthLetter}${yearLast}`;
-}
-
-function parseFinite(v: unknown): number | null {
-  if (v == null) return null;
-  const n = typeof v === 'number' ? v : Number(String(v));
-  return Number.isFinite(n) ? n : null;
-}
 
 function loadQty(slot: number): number {
   try {
@@ -109,11 +60,7 @@ export function ChartBotPane({ slot }: Props) {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   const addCommand = useStore((s) => s.addCommand);
-  // ``livePositions`` is the broker-shape (snake_case strings) slice
-  // populated by PositionsPanel's WS ``subscribe_positions`` stream.
-  // The mock-friendly ``positions`` slice doesn't get live data in
-  // live mode — see store.ts comments.
-  const positions = useStore((s) => s.livePositions);
+  const positions = useStore((s) => s.positions);
   const tradeGroups = useStore((s) => s.tradeGroups);
 
   // Resolve symbol + secType from the bot config (operator picks via the
@@ -158,88 +105,23 @@ export function ChartBotPane({ slot }: Props) {
   })();
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
 
-  // Held position for this chart's product, matched by ROOT (not by
-  // localSymbol). ``/api/positions`` returns ``symbol="NQ"`` (IB root)
-  // and ``display_symbol="NQ M26"`` for futures, but the chart's
-  // ``symbol`` is the IB localSymbol form (``NQM6``, ``GCQ6``). A
-  // strict equality check never matches. After today's M→U roll the
-  // mismatch matters even more: the chart is on ``NQU6`` while the
-  // operator still holds ``NQM6`` — Close must target the held
-  // contract, not the chart's display contract.
-  //
-  // Strategy: extract the root from the chart symbol (``NQM6 → NQ``,
-  // ``MGCQ6 → MGC``), find a FUT position with the same root, and
-  // reconstruct that position's localSymbol from its expiry so the
-  // close command goes to the correctly-qualified contract. Non-
-  // futures fall through to the plain-symbol equality path.
-  const heldPosition = useMemo(() => {
-    if (!symbol) return null;
-    const chartUpper = symbol.toUpperCase();
-    const root = chartSymbolRoot(chartUpper);
-    const isFutures = root !== chartUpper;
-    for (const raw of positions) {
-      // ``livePositions`` is typed as ``Array<Record<string, unknown>>``
-      // because it carries the broker-shape (snake_case) rows the WS
-      // delivers. Cast once per row to the known shape so the field
-      // accesses below stay tidy.
-      const p = raw as {
-        symbol?: string | null;
-        sec_type?: string | null;
-        quantity?: string | number | null;
-        avg_cost?: string | number | null;
-        market_price?: string | number | null;
-        multiplier?: string | number | null;
-        expiry?: string | null;
-        display_symbol?: string | null;
-      };
-      const pSym = (p.symbol ?? '').toString().toUpperCase();
-      const pSecType = (p.sec_type ?? '').toString().toUpperCase();
-      let local: string;
-      if (isFutures) {
-        if (pSecType !== 'FUT') continue;
-        if (pSym !== root) continue;
-        // Reconstruct the position's localSymbol from its expiry and
-        // require an EXACT match against the chart's symbol. Pre-fix
-        // we matched by root only — after the M6 → U6 roll the
-        // operator's NQU6 chart was showing the held NQM6 position's
-        // P&L, which is wrong (different contract, different ticker,
-        // different P&L attribution). Strict contract match keeps
-        // the overlay honest. Operator manages the old-contract
-        // holding via the console (e.g. ``close <serial>``).
-        const reconstructed = positionLocalSymbol(p);
-        if (!reconstructed || reconstructed !== chartUpper) continue;
-        local = reconstructed;
-      } else {
-        // STK / OPT path: direct symbol equality.
-        if (pSym !== chartUpper) continue;
-        local = chartUpper;
+  // Current held qty for this chart's symbol. Signed: positive = LONG,
+  // negative = SHORT, zero = flat. Drives Close button enable + the
+  // close-side computation.
+  const positionQty = useMemo(() => {
+    if (!symbol) return 0;
+    for (const p of positions) {
+      const s = (p.symbol ?? '').toString();
+      const ds = (p.display_symbol ?? '').toString();
+      if (s === symbol || ds === symbol) {
+        const q = typeof p.quantity === 'number'
+          ? p.quantity
+          : Number(p.quantity);
+        return Number.isFinite(q) ? q : 0;
       }
-      const q = parseFinite(p.quantity);
-      if (q == null || q === 0) continue;
-      // Pull the live mark + entry-avg + multiplier so the overlay
-      // can compute unrealized P&L in dollars. Same formula as
-      // PositionsPanel.computePnl: (mark - avg) × qty × multiplier.
-      // Signed qty handles long/short — a SHORT (qty<0) profits when
-      // mark drops below avg, formula produces a positive value.
-      const avgCost = parseFinite(p.avg_cost);
-      const markPrice = parseFinite(p.market_price);
-      const mult = parseFinite(p.multiplier);
-      const validMult = mult != null && mult > 0 ? mult : 1;
-      const unrealizedPnl =
-        avgCost != null && markPrice != null
-          ? (markPrice - avgCost) * q * validMult
-          : null;
-      return {
-        qty: q,
-        localSymbol: local,
-        avgCost,
-        markPrice,
-        unrealizedPnl,
-      };
     }
-    return null;
+    return 0;
   }, [positions, symbol]);
-  const positionQty = heldPosition?.qty ?? 0;
 
   const fireCommand = async (
     cmd: string, label: 'buy' | 'sell' | 'close',
@@ -279,48 +161,19 @@ export function ChartBotPane({ slot }: Props) {
     void fireCommand(`sell ${symbol} ${qty}`, 'sell');
   };
   const onClose = () => {
-    if (!heldPosition) return;
-    // Net-flat at IB market price: opposite side for the held qty
-    // on the contract the operator actually holds (which may be on
-    // a different expiry than the chart is currently showing — e.g.
-    // chart on ``NQU6`` while the held position is ``NQM6`` from
-    // before the roll).
-    const absQty = Math.abs(heldPosition.qty);
-    const side = heldPosition.qty > 0 ? 'sell' : 'buy';
-    void fireCommand(
-      `${side} ${heldPosition.localSymbol} ${absQty} market`, 'close',
-    );
+    if (!symbol || positionQty === 0) return;
+    // Net-flat at IB market price: opposite side for the held qty.
+    // Uses explicit ``market`` strategy to skip the smart_market
+    // walker — Close should be immediate, not patient.
+    const absQty = Math.abs(positionQty);
+    const side = positionQty > 0 ? 'sell' : 'buy';
+    void fireCommand(`${side} ${symbol} ${absQty} market`, 'close');
   };
 
   const canClose = positionQty !== 0;
   const positionLabel = positionQty === 0 ? null
     : positionQty > 0 ? `LONG ${positionQty}`
     : `SHORT ${Math.abs(positionQty)}`;
-
-  // Stable callback for ``renderHeader`` so a new identity isn't
-  // created on every render — protects ``BotChart``'s ``useEffect``
-  // deps from re-firing whenever the parent re-renders (e.g. on
-  // every ``livePositions`` WS push, which now fires constantly).
-  const renderHeader = useCallback(() => null, []);
-
-  // Memoize the chart subtree so it only re-renders when its own
-  // inputs change. Pre-fix, ``ChartBotPane`` subscribed to
-  // ``livePositions`` which pushes on every IB position event —
-  // ~multi-Hz under active trading. Each parent re-render then
-  // re-mounted/re-effected the chart's WS subscription (the
-  // ``renderHeader`` literal had a new identity each time), causing
-  // the chart's live-tick connection to wedge: subscribe → tear-
-  // down before first tick arrived → repeat. Symptom: chart polyline
-  // froze even though backend Redis streams were healthy.
-  const chartElement = useMemo(() => (
-    <BotChart
-      botId={botId}
-      botRef={bot?.ref_id}
-      symbol={symbol}
-      secType={secType}
-      renderHeader={renderHeader}
-    />
-  ), [botId, bot?.ref_id, symbol, secType, renderHeader]);
 
   // 24h realized P&L for this chart's symbol. Pulled from the
   // ``tradeGroups`` store slice (populated from /api/trades, which
@@ -363,51 +216,18 @@ export function ChartBotPane({ slot }: Props) {
           with <code>strategy_name: chart_signal</code>.
         </div>
       )}
-      <div
-        className="flex-1"
-        style={{ minHeight: 0, position: 'relative' }}
-      >
-        {chartElement}
-        {/* Open-position P&L overlay. Sits in the top-right quadrant
-            (top 25% from the top edge, right-justified ~12 px in from
-            the right) so it floats above the price polyline without
-            covering the most-recent candle. ``pointer-events: none``
-            so chart pans / wheel zooms / crosshair clicks pass
-            through. Only rendered when a position is actually held;
-            otherwise the chart stays clean. */}
-        {heldPosition && heldPosition.unrealizedPnl != null && (
-          <div
-            style={{
-              position: 'absolute',
-              // Tight to the chart's top edge. ``right`` is set to
-              // clear lightweight-charts' price axis column (the
-              // right-side labels) — ~62 px on a typical futures
-              // price width — so the badge doesn't overlap any
-              // tick label or grid notch.
-              top: 4,
-              right: 70,
-              zIndex: 20,
-              pointerEvents: 'none',
-              padding: '1px 6px',
-              borderRadius: 3,
-              background: 'rgba(0,0,0,0.45)',
-              fontFamily: 'ui-monospace, monospace',
-              textAlign: 'right',
-              lineHeight: 1.15,
-            }}
-            data-testid={`chart-pnl-overlay-${slot}`}
-          >
-            <span style={{
-              fontSize: 11, fontWeight: 700,
-              color: heldPosition.unrealizedPnl >= 0
-                ? 'var(--accent-green)'
-                : 'var(--accent-red)',
-            }}>
-              {heldPosition.unrealizedPnl >= 0 ? '+$' : '-$'}
-              {Math.abs(heldPosition.unrealizedPnl).toFixed(2)}
-            </span>
-          </div>
-        )}
+      <div className="flex-1" style={{ minHeight: 0 }}>
+        <BotChart
+          botId={botId}
+          botRef={bot?.ref_id}
+          symbol={symbol}
+          secType={secType}
+          // FSM header explicitly suppressed — chart pane is always live
+          // for manual scanning. The bot lifecycle still cycles in the
+          // background (manual_entry_only=true drops any auto-entries)
+          // but we don't surface it on the chart.
+          renderHeader={() => null}
+        />
       </div>
       {/* Trade strip. 24h P&L for this chart's symbol on the left,
           qty + BUY/SELL/CLOSE pushed to the right under the price
@@ -470,34 +290,6 @@ export function ChartBotPane({ slot }: Props) {
             {statusMsg}
           </span>
         )}
-
-        {/* Diagnostic: tells us at a glance what the chart pane sees.
-            ``pos:N`` = livePositions count (publish path OK if >0).
-            Then either ``no <root>`` (no root-match for this chart's
-            symbol) OR a debug breadcrumb showing avg / mark / qty /
-            unrealizedPnl so we can spot which value is null. Remove
-            after the chart pane wiring is confirmed end-to-end. */}
-        <span style={{
-          fontSize: 9, color: 'var(--text-muted)', opacity: 0.6,
-          fontFamily: 'ui-monospace, monospace',
-        }}
-          data-testid={`chart-livepos-debug-${slot}`}
-        >
-          [pos:{positions.length}
-          {symbol && (
-            <>
-              {' '}
-              {heldPosition
-                ? `${chartSymbolRoot(symbol)}=${
-                    heldPosition.qty > 0 ? '+' : ''}${heldPosition.qty} ` +
-                  `avg=${heldPosition.avgCost ?? 'null'} ` +
-                  `mark=${heldPosition.markPrice ?? 'null'} ` +
-                  `pnl=${heldPosition.unrealizedPnl?.toFixed(2) ?? 'null'}`
-                : `no ${chartSymbolRoot(symbol)} held`}
-            </>
-          )}
-          ]
-        </span>
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
             ``marginLeft: auto`` pushes the whole cluster against the
