@@ -29,7 +29,36 @@ const statusLabel: Record<CommandStatus, string> = {
 };
 
 function copyToClipboard(text: string) {
-  navigator.clipboard.writeText(text).catch(() => {});
+  // Async Clipboard API requires a secure context (HTTPS or localhost).
+  // The operator's prod box serves over plain HTTP on the LAN
+  // (http://192.168.4.66:8000), so ``navigator.clipboard`` is
+  // ``undefined`` there and the previous ``.catch(() => {})`` silently
+  // swallowed the TypeError. Fall back to the legacy
+  // ``document.execCommand('copy')`` path via a transient textarea —
+  // deprecated by spec but supported by every browser and works in
+  // insecure contexts.
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      // Keep it offscreen so it can't steal focus from inputs the
+      // operator is typing into.
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch { /* swallow — no clipboard available at all */ }
+  };
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    navigator.clipboard.writeText(text).catch(fallback);
+    return;
+  }
+  fallback();
 }
 
 // ---------------------------------------------------------------------------

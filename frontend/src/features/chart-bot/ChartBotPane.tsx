@@ -147,13 +147,18 @@ export function ChartBotPane({ slot }: Props) {
     }
   };
 
+  // Command grammar is ``<verb> SYMBOL QTY [STRATEGY] [PROFIT]`` —
+  // SYMBOL goes BEFORE qty (see ``ib_trader/repl/commands.py``
+  // positional[0]=symbol, positional[1]=qty). The 2026-06-09 build
+  // shipped ``buy 1 GCQ6`` which the parser rejected because "1"
+  // failed the futures-localSymbol detector. Fixed below.
   const onBuy = () => {
     if (!symbol || qty <= 0) return;
-    void fireCommand(`buy ${qty} ${symbol}`, 'buy');
+    void fireCommand(`buy ${symbol} ${qty}`, 'buy');
   };
   const onSell = () => {
     if (!symbol || qty <= 0) return;
-    void fireCommand(`sell ${qty} ${symbol}`, 'sell');
+    void fireCommand(`sell ${symbol} ${qty}`, 'sell');
   };
   const onClose = () => {
     if (!symbol || positionQty === 0) return;
@@ -162,7 +167,7 @@ export function ChartBotPane({ slot }: Props) {
     // walker — Close should be immediate, not patient.
     const absQty = Math.abs(positionQty);
     const side = positionQty > 0 ? 'sell' : 'buy';
-    void fireCommand(`${side} ${absQty} ${symbol} market`, 'close');
+    void fireCommand(`${side} ${symbol} ${absQty} market`, 'close');
   };
 
   const canClose = positionQty !== 0;
@@ -332,7 +337,7 @@ export function ChartBotPane({ slot }: Props) {
             onClick={onBuy}
             disabled={pendingAction !== null || !symbol}
             title={symbol
-              ? `buy ${qty} ${symbol} (smart_market) — auto-fires via console`
+              ? `buy ${symbol} ${qty} (smart_market) — auto-fires via console`
               : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-green)', color: '#fff',
@@ -350,7 +355,7 @@ export function ChartBotPane({ slot }: Props) {
             onClick={onSell}
             disabled={pendingAction !== null || !symbol}
             title={symbol
-              ? `sell ${qty} ${symbol} (smart_market) — auto-fires via console`
+              ? `sell ${symbol} ${qty} (smart_market) — auto-fires via console`
               : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-red)', color: '#fff',
