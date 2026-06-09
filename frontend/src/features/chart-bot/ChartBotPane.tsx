@@ -65,6 +65,12 @@ function positionLocalSymbol(p: { symbol?: string | null; expiry?: string | null
   return `${root}${monthLetter}${yearLast}`;
 }
 
+function parseFinite(v: unknown): number | null {
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : Number(String(v));
+  return Number.isFinite(n) ? n : null;
+}
+
 function loadQty(slot: number): number {
   try {
     const raw = localStorage.getItem(QTY_STORAGE_KEY(slot));
@@ -183,7 +189,31 @@ export function ChartBotPane({ slot }: Props) {
       const local = isFutures
         ? positionLocalSymbol(p) ?? symbol
         : symbol;
-      return { qty: q, localSymbol: local };
+      // Pull the live mark + entry-avg + multiplier so the overlay
+      // can compute unrealized P&L in dollars. Same formula as
+      // PositionsPanel.computePnl: (mark - avg) × qty × multiplier.
+      // Signed qty handles long/short — a SHORT (qty<0) profits when
+      // mark drops below avg, formula produces a positive value.
+      const avgCost = parseFinite(
+        (p as { avg_cost?: string | number | null }).avg_cost,
+      );
+      const markPrice = parseFinite(
+        (p as { market_price?: string | number | null }).market_price,
+      );
+      const multStr = (p as { multiplier?: string | number | null }).multiplier;
+      const mult = parseFinite(multStr);
+      const validMult = mult != null && mult > 0 ? mult : 1;
+      const unrealizedPnl =
+        avgCost != null && markPrice != null
+          ? (markPrice - avgCost) * q * validMult
+          : null;
+      return {
+        qty: q,
+        localSymbol: local,
+        avgCost,
+        markPrice,
+        unrealizedPnl,
+      };
     }
     return null;
   }, [positions, symbol]);
@@ -286,7 +316,10 @@ export function ChartBotPane({ slot }: Props) {
           with <code>strategy_name: chart_signal</code>.
         </div>
       )}
-      <div className="flex-1" style={{ minHeight: 0 }}>
+      <div
+        className="flex-1"
+        style={{ minHeight: 0, position: 'relative' }}
+      >
         <BotChart
           botId={botId}
           botRef={bot?.ref_id}
@@ -298,6 +331,57 @@ export function ChartBotPane({ slot }: Props) {
           // but we don't surface it on the chart.
           renderHeader={() => null}
         />
+        {/* Open-position P&L overlay. Sits in the top-right quadrant
+            (top 25% from the top edge, right-justified ~12 px in from
+            the right) so it floats above the price polyline without
+            covering the most-recent candle. ``pointer-events: none``
+            so chart pans / wheel zooms / crosshair clicks pass
+            through. Only rendered when a position is actually held;
+            otherwise the chart stays clean. */}
+        {heldPosition && heldPosition.unrealizedPnl != null && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '25%',
+              right: 12,
+              pointerEvents: 'none',
+              padding: '4px 10px',
+              borderRadius: 4,
+              background: 'rgba(0,0,0,0.55)',
+              border: '1px solid var(--border-default)',
+              fontFamily: 'ui-monospace, monospace',
+              textAlign: 'right',
+              minWidth: 110,
+              boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
+            }}
+            data-testid={`chart-pnl-overlay-${slot}`}
+          >
+            <div style={{
+              fontSize: 18, fontWeight: 700,
+              lineHeight: 1.1,
+              color: heldPosition.unrealizedPnl >= 0
+                ? 'var(--accent-green)'
+                : 'var(--accent-red)',
+            }}>
+              {heldPosition.unrealizedPnl >= 0 ? '+$' : '-$'}
+              {Math.abs(heldPosition.unrealizedPnl).toFixed(2)}
+            </div>
+            <div style={{
+              fontSize: 10,
+              color: 'var(--text-muted)',
+              marginTop: 2,
+              letterSpacing: '0.04em',
+            }}>
+              {heldPosition.qty > 0 ? 'LONG ' : 'SHORT '}
+              {Math.abs(heldPosition.qty)}
+              {' '}
+              {heldPosition.localSymbol}
+              {heldPosition.avgCost != null && (
+                <> @ {heldPosition.avgCost.toFixed(2)}</>
+              )}
+            </div>
+          </div>
+        )}
       </div>
       {/* Trade strip. 24h P&L for this chart's symbol on the left,
           qty + BUY/SELL/CLOSE pushed to the right under the price
