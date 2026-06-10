@@ -204,34 +204,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
   });
 
-  // Window-focus wake. ``useVisibilityWake`` covers tab-switch
-  // (document.visibilityState changes); this covers the operator
-  // switching to a DIFFERENT BROWSER WINDOW or another OS window
-  // entirely. In that case the tab stays "visible" per the
-  // Visibility API but Chrome still throttles requestAnimationFrame,
-  // so lightweight-charts' canvas paints pause. Data keeps arriving
-  // and the in-memory series gets updated, but the chart looks
-  // frozen until the operator returns to the browser window —
-  // exactly the symptom the operator reported on 2026-06-09
-  // ("bars and lines appear as soon as I go to another window and
-  // come back"). Trigger the same wake subscribers as
-  // useVisibilityWake so the chart's repaint + history-refresh
-  // logic catches up. Debounced (500 ms) to coalesce rapid
-  // alt-tab-back behaviour.
-  useEffect(() => {
-    let lastFire = 0;
-    const handler = () => {
-      const now = Date.now();
-      if (now - lastFire < 500) return;
-      lastFire = now;
-      for (const fn of wakeSubs) {
-        try { fn(); } catch { /* isolated */ }
-      }
-    };
-    window.addEventListener('focus', handler);
-    return () => window.removeEventListener('focus', handler);
-  }, [wakeSubs]);
-
   // Operator-driven resync (top-header Resync button). Subscribed
   // here so the chart's long-lived effects (WS, history, SR, the
   // sticky-signal-clear at the next useEffect) can include it in
@@ -359,26 +331,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // refs (e.g. ``historicalFires`` at line ~410) can reference it
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
-  // CHART_BAR_STALL diagnostic. Surfaces a thin amber pill in the
-  // top-center of the chart canvas in two scenarios:
-  //  (a) Live ticks arrive but bar materialisation skipped (gap >90s
-  //      between successive bar slots) — set inside the tick handler.
-  //  (b) Live ticks stopped entirely (no tick for >75s) — set by the
-  //      polling effect below that runs every 10s independent of
-  //      whether new ticks arrive. Without this, a complete tick
-  //      stoppage looks identical to a healthy chart minus updates.
-  // Auto-clears when normal cadence resumes (gap ≤60s or ticks within
-  // the last 30s). Pure observation; no behaviour change.
-  const [barStall, setBarStall] = useState<
-    { gapSec: number; sinceMs: number; prevBarIso: string; newBarIso: string } | null
-  >(null);
-  // Wall-clock of the most recent live tick the chart actually
-  // processed. Updated inside the WS onmessage handler.
-  const lastTickAtMsRef = useRef<number>(0);
-  // Wall-clock of when the chart mounted. Polling fallback when
-  // no tick has been recorded yet — without this the badge would
-  // never fire on a chart that's silent from the start.
-  const mountAtMsRef = useRef<number>(Date.now());
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -2018,26 +1970,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // the previous target's series during the brief window between
     // target change and the new historical load.
     historicalLoadedRef.current = false;
-    // Gate safety-open. The gate above blocks live ticks until the
-    // first historical ``setData`` lands (prevents the empty-series
-    // auto-fit-to-one-point pathology). But if ``load()`` is slow or
-    // failing — a stalled ``/engine/history``, repeated 5xx — the gate
-    // could stay closed for minutes, dropping every live tick and
-    // freezing the chart while the WS keeps delivering frames that
-    // get silently discarded (the 2026-06-09 freeze). Hard ceiling:
-    // after GATE_MAX_CLOSED_MS, force the gate open regardless. By
-    // then the series either has data (timer already cleared) or it's
-    // better to let ticks through and build the series live than to
-    // sit frozen. Cleared on successful setData and on effect unmount.
-    const GATE_MAX_CLOSED_MS = 10_000;
-    let gateSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      if (!cancelled && !historicalLoadedRef.current) {
-        historicalLoadedRef.current = true;
-      }
-    }, GATE_MAX_CLOSED_MS);
-    const clearGateSafetyTimer = () => {
-      if (gateSafetyTimer) { clearTimeout(gateSafetyTimer); gateSafetyTimer = null; }
-    };
     // New target → re-show SR lines (the dismiss state is per-target,
     // not global). The detection itself runs after setData below.
     srHiddenRef.current = false;
@@ -2116,10 +2048,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         series.setData(points);
         // Historical bars are now in the series — safe to let live
         // ticks update past this point without auto-fit-to-one-point
-        // pathology. Gate opened the normal way → cancel the safety
-        // timer so it can't later toggle the gate for a stale closure.
+        // pathology.
         historicalLoadedRef.current = true;
-        clearGateSafetyTimer();
 
         // Volume overlay — green when close >= open, red when down,
         // both at low alpha so the histogram reads as ambient context
@@ -2283,10 +2213,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
     };
 
-    if (!seriesRef.current || !chartRef.current) {
-      clearGateSafetyTimer();
-      return;
-    }
+    if (!seriesRef.current || !chartRef.current) return;
 
     load();
     const id = setInterval(load, REFRESH_INTERVAL_MS);
@@ -2297,7 +2224,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       wakeSubs.delete(wake);
       clearInterval(id);
       if (retryTimer) clearTimeout(retryTimer);
-      clearGateSafetyTimer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes, resyncToken]);
@@ -2482,31 +2408,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const nowSec = localUtcSeconds(new Date());
           const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
             + BAR_SECONDS;
-          // Tick arrived — stamp wall-clock for the polling-based
-          // stall detector below to compare against.
-          lastTickAtMsRef.current = Date.now();
-          // Stall-detection (2026-06-09): if a tick is landing for a
-          // bar more than 90 s past the previously-pushed bar's slot,
-          // the chart's bar materialisation has stalled (the "graph
-          // hasn't drawn for 3 min" symptom). Surface it as a small
-          // amber pill on the chart canvas — no DevTools required.
-          // Clears itself when normal cadence resumes.
-          {
-            const prevBar = lastTickBarSecRef.current ?? 0;
-            const gapSec = barSec - prevBar;
-            if (prevBar > 0 && gapSec > 90) {
-              setBarStall({
-                gapSec,
-                sinceMs: Date.now(),
-                prevBarIso: new Date(prevBar * 1000).toISOString(),
-                newBarIso: new Date(barSec * 1000).toISOString(),
-              });
-            } else if (prevBar > 0 && gapSec <= 60 && barStall) {
-              // Cadence is back to ≤1 min — drop the badge so the
-              // operator knows the chart has recovered.
-              setBarStall(null);
-            }
-          }
           series.update({ time: barSec as UTCTimestamp, value: last });
           lastTickBarSecRef.current = barSec;
           // Mirror the update into the OHLC bars ref so SR pivot
@@ -2587,47 +2488,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
     };
   }, [target?.symbol, target?.secType, chartVersion, resyncToken]);
-
-  // Polling-based stall watchdog. Runs every 10 s. If the most-recent
-  // tick is more than 75 s old, set the stall badge from THIS path
-  // (the tick handler's own gap check can't fire when no tick is
-  // arriving). Auto-clears when ticks resume (last tick within 30 s).
-  // Independent of target — runs for the chart's lifetime, picks up
-  // whatever symbol the parent is currently displaying via the
-  // ``target?.symbol`` closure for the badge tooltip.
-  useEffect(() => {
-    if (!target?.symbol) return;
-    const id = window.setInterval(() => {
-      const last = lastTickAtMsRef.current;
-      const now = Date.now();
-      // Reference: most-recent tick if we've had one, otherwise the
-      // chart's mount time. The latter ensures the badge still fires
-      // for a chart that's been silent since it loaded (the WS
-      // subscription is broken, or ticks are being dropped before
-      // they reach our stamp). Without this, a never-ticking chart
-      // would look identical to a healthy one.
-      const refMs = last > 0 ? last : mountAtMsRef.current;
-      const silenceSec = (now - refMs) / 1000;
-      setBarStall((prev) => {
-        if (silenceSec > 75) {
-          // Don't churn an existing stall badge on every poll — only
-          // overwrite if the gap has materially grown.
-          if (prev && Math.abs(prev.gapSec - silenceSec) < 5) return prev;
-          return {
-            gapSec: silenceSec,
-            sinceMs: now,
-            prevBarIso: last > 0
-              ? new Date(last).toISOString()
-              : `chart mounted ${new Date(mountAtMsRef.current).toISOString()}`,
-            newBarIso: 'no tick yet',
-          };
-        }
-        if (silenceSec < 30 && prev) return null;
-        return prev;
-      });
-    }, 10_000);
-    return () => window.clearInterval(id);
-  }, [target?.symbol]);
 
   useImperativeHandle(ref, () => ({
     resetZoom: () => {
@@ -2791,38 +2651,6 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
-      {barStall && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 6,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 25,
-            pointerEvents: 'none',
-            padding: '2px 10px',
-            borderRadius: 3,
-            background: 'rgba(247,189,92,0.92)',
-            color: '#1a1a1a',
-            fontFamily: 'ui-monospace, monospace',
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: '0.05em',
-            whiteSpace: 'nowrap',
-          }}
-          // Hover tooltip carries the precise bar timestamps for the
-          // operator to read without DevTools, in case the bridged
-          // bar-slot matters (e.g. always at 1-min boundary vs random).
-          title={
-            `gap ${barStall.gapSec}s · prev bar ${barStall.prevBarIso}`
-            + ` · jumped to ${barStall.newBarIso}`
-          }
-        >
-          ⚠ {barStall.newBarIso === 'no tick yet' ? 'NO TICKS' : 'BARS STALLED'}
-          {' · '}
-          {(barStall.gapSec / 60).toFixed(1)} min
-        </div>
-      )}
       {!target && placeholder && (
         <div
           className="flex items-center justify-center text-xs"
