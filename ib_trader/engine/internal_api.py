@@ -524,16 +524,27 @@ async def refresh_position(symbol: str):
 
 
 _HISTORY_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
-# 5-minute TTL. Was 30 s, but the chart pane's parallel fetch pattern
-# (/api/sr + /api/sr/fuzzy + /api/regime + /api/history, each with a
-# different ``(hours, bar_size, include_partial)`` tuple = different
-# cache key) drove 4-5 unique IB historical-data requests per pane
-# every 15 s. With multiple panes per box and TWO boxes (dev + prod)
-# sharing one IB login, this regularly exceeded IB's 60-requests-per-
-# 10-minute pacing limit, surfacing as ``IB_ERROR code=162`` and 502s
-# back to the chart. Bars are 3-min cadence so 5-min stale history is
-# visually invisible; the live tick stream still drives the chart's
-# in-progress bar from a separate WS path.
+# 5-minute TTL. Kept high to respect IB's 60-requests-per-10-minute
+# historical-data pacing limit (shared across dev + prod on one IB
+# login). An earlier 30 s TTL — combined with the chart pane's parallel
+# fetch pattern (/api/sr + /api/sr/fuzzy + /api/regime + /api/history,
+# each a distinct cache key) — drove 4-5 unique IB requests per pane
+# every 15 s and blew the limit, surfacing as ``IB_ERROR code=162`` and
+# 502s back to the chart.
+#
+# IMPORTANT (2026-06-09): this endpoint serves the AUTHORITATIVE base
+# layer (completed bars + volume), NOT chart recency. The original
+# justification "3-min bars make 5-min staleness invisible" broke when
+# the chart migrated to 1-min bars (5 min stale = 5 missing bars) AND
+# because the chart's old destructive ``setData`` discarded the live-
+# tick bars every refresh — together that produced the multi-minute
+# "frozen bars, wiggling price line" freeze. The chart now MERGES its
+# live quote-tick bars on top of this (possibly-stale) history
+# (SymbolChart load(): keep bars newer than the last historical bar),
+# so cache staleness only delays authoritative volume/close backfill —
+# never chart recency. That makes this TTL safe regardless of bar size,
+# and lets it stay high for IB pacing. Do not lower it to "fix
+# freshness" — fix recency on the frontend (the merge), not here.
 _HISTORY_TTL_SECONDS = 300.0
 # How long to serve STALE cache after an IB fetch fails. When IB error
 # 162 (pacing) fires, we'd rather paint slightly older bars than

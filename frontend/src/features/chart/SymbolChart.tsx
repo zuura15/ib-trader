@@ -1997,11 +1997,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         retryDelayMs = 1500;
         if (cancelled) return;
         const fullBars = toBars(bars);
-        const points = fullBars.map((b) => ({ time: b.time, value: b.close }));
+        // ADDITIVE refresh — keep live-tick bars that are AHEAD of the
+        // historical endpoint instead of discarding them. WHY: the
+        // engine's /engine/history caches completed bars for
+        // ``_HISTORY_TTL_SECONDS`` (and IB's reqHistoricalData itself
+        // lags the live quote feed), so ``fullBars`` can end several
+        // 1-min bars behind wall-clock. The live-tick WS path has
+        // already built those recent bars in ``barsRef.current``.
+        // Destructively replacing the series with history-only bars
+        // (the old behaviour) threw them away every 30 s refresh,
+        // snapping the chart backward to the stale endpoint while the
+        // in-progress price line kept wiggling — the 2026-06-09 freeze
+        // ("no new bars for 3-5 min, endpoint moving up/down"). The
+        // duration matched the 300 s history TTL exactly. Restore the
+        // architecture's intent (history = authoritative base, live
+        // ticks = recency): merge any live bar strictly newer than the
+        // last historical bar onto the end. On first load ``barsRef``
+        // is empty so this is a no-op; on target change the effect
+        // resets ``barsRef`` so there's no cross-symbol contamination.
+        const priorBars = barsRef.current;
+        const lastHistTime = fullBars.length
+          ? (fullBars[fullBars.length - 1].time as number)
+          : 0;
+        const liveAhead = priorBars.filter(
+          (b) => (b.time as number) > lastHistTime,
+        );
+        const mergedBars = liveAhead.length ? fullBars.concat(liveAhead) : fullBars;
+        const points = mergedBars.map((b) => ({ time: b.time, value: b.close }));
         // Stash the OHLC-rich bars so SR detection (which needs wick
         // high/low) has access. The lightweight-charts price series
         // only carries close, so we keep this parallel structure.
-        barsRef.current = fullBars;
+        barsRef.current = mergedBars;
         const series = seriesRef.current;
         const rsiSeries = rsiSeriesRef.current;
         const chart = chartRef.current;
@@ -2059,7 +2085,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const volSeries = volumeSeriesRef.current;
         if (volSeries) {
           try {
-            volSeries.setData(fullBars.map((b) => ({
+            // Use mergedBars so the volume histogram stays time-aligned
+            // with the price series. Live-ahead bars carry volume=0
+            // (the quote-tick WS path is price-only); the histogram
+            // simply shows no bar for that recent slot until the next
+            // history refresh backfills the real volume — harmless
+            // ambient context.
+            volSeries.setData(mergedBars.map((b) => ({
               time: b.time,
               value: b.volume ?? 0,
               color: (b.close >= b.open)
@@ -2134,7 +2166,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             && Number.isFinite(sb) && Number.isFinite(sw)
             && sw >= 10   // reject corrupted saves < 30 min wide
           ) {
-            const barCount = fullBars.length;
+            const barCount = mergedBars.length;
             const newTo = (barCount - 1) + sb;
             const newFrom = newTo - sw;
             // Hydrate the in-memory ref too so the in-session
@@ -2169,7 +2201,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // y-axis gap constant; ``widthBars`` keeps the zoom level
           // constant. New bars therefore push the chart left while
           // the right edge stays a fixed distance from the y axis.
-          const barCount = fullBars.length;
+          const barCount = mergedBars.length;
           const lr = userLogicalRangeRef.current;
           const newTo = (barCount - 1) + lr.rightSpaceBars;
           const newFrom = newTo - lr.widthBars;
