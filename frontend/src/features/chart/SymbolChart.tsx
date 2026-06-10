@@ -331,6 +331,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // refs (e.g. ``historicalFires`` at line ~410) can reference it
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
+  // CHART_BAR_STALL diagnostic. Surfaces a thin amber pill in the
+  // top-center of the chart canvas when the live-tick handler sees
+  // a new bar-slot more than 90 s past the previous one (i.e. the
+  // bar-materialisation skipped at least one minute). Visible in the
+  // app — no DevTools required. Clears itself when bars resume
+  // normal cadence. Pure observation; no behaviour change.
+  const [barStall, setBarStall] = useState<
+    { gapSec: number; sinceMs: number; prevBarIso: string; newBarIso: string } | null
+  >(null);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -2410,24 +2419,24 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             + BAR_SECONDS;
           // Stall-detection (2026-06-09): if a tick is landing for a
           // bar more than 90 s past the previously-pushed bar's slot,
-          // the chart's bar materialisation has stalled (we're seeing
-          // the "graph hasn't drawn for 3 min" symptom). Log once per
-          // stall window with context — wall-clock, last pushed bar,
-          // current bar, gap. Pure observation; no behaviour change.
+          // the chart's bar materialisation has stalled (the "graph
+          // hasn't drawn for 3 min" symptom). Surface it as a small
+          // amber pill on the chart canvas — no DevTools required.
+          // Clears itself when normal cadence resumes.
           {
             const prevBar = lastTickBarSecRef.current ?? 0;
             const gapSec = barSec - prevBar;
             if (prevBar > 0 && gapSec > 90) {
-              // eslint-disable-next-line no-console
-              console.warn(
-                '[CHART_BAR_STALL]',
-                target.symbol,
-                'gap_sec=', gapSec,
-                'prev_bar=', new Date(prevBar * 1000).toISOString(),
-                'new_bar=', new Date(barSec * 1000).toISOString(),
-                'wall_clock=', new Date().toISOString(),
-                'bar_size_sec=', BAR_SECONDS,
-              );
+              setBarStall({
+                gapSec,
+                sinceMs: Date.now(),
+                prevBarIso: new Date(prevBar * 1000).toISOString(),
+                newBarIso: new Date(barSec * 1000).toISOString(),
+              });
+            } else if (prevBar > 0 && gapSec <= 60 && barStall) {
+              // Cadence is back to ≤1 min — drop the badge so the
+              // operator knows the chart has recovered.
+              setBarStall(null);
             }
           }
           series.update({ time: barSec as UTCTimestamp, value: last });
@@ -2673,6 +2682,36 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      {barStall && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 6,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 25,
+            pointerEvents: 'none',
+            padding: '2px 10px',
+            borderRadius: 3,
+            background: 'rgba(247,189,92,0.92)',
+            color: '#1a1a1a',
+            fontFamily: 'ui-monospace, monospace',
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: '0.05em',
+            whiteSpace: 'nowrap',
+          }}
+          // Hover tooltip carries the precise bar timestamps for the
+          // operator to read without DevTools, in case the bridged
+          // bar-slot matters (e.g. always at 1-min boundary vs random).
+          title={
+            `gap ${barStall.gapSec}s · prev bar ${barStall.prevBarIso}`
+            + ` · jumped to ${barStall.newBarIso}`
+          }
+        >
+          ⚠ BARS STALLED · gap {(barStall.gapSec / 60).toFixed(1)} min
+        </div>
+      )}
       {!target && placeholder && (
         <div
           className="flex items-center justify-center text-xs"
