@@ -332,14 +332,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
   // CHART_BAR_STALL diagnostic. Surfaces a thin amber pill in the
-  // top-center of the chart canvas when the live-tick handler sees
-  // a new bar-slot more than 90 s past the previous one (i.e. the
-  // bar-materialisation skipped at least one minute). Visible in the
-  // app — no DevTools required. Clears itself when bars resume
-  // normal cadence. Pure observation; no behaviour change.
+  // top-center of the chart canvas in two scenarios:
+  //  (a) Live ticks arrive but bar materialisation skipped (gap >90s
+  //      between successive bar slots) — set inside the tick handler.
+  //  (b) Live ticks stopped entirely (no tick for >75s) — set by the
+  //      polling effect below that runs every 10s independent of
+  //      whether new ticks arrive. Without this, a complete tick
+  //      stoppage looks identical to a healthy chart minus updates.
+  // Auto-clears when normal cadence resumes (gap ≤60s or ticks within
+  // the last 30s). Pure observation; no behaviour change.
   const [barStall, setBarStall] = useState<
     { gapSec: number; sinceMs: number; prevBarIso: string; newBarIso: string } | null
   >(null);
+  // Wall-clock of the most recent live tick the chart actually
+  // processed. Updated inside the WS onmessage handler.
+  const lastTickAtMsRef = useRef<number>(0);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -2417,6 +2424,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const nowSec = localUtcSeconds(new Date());
           const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
             + BAR_SECONDS;
+          // Tick arrived — stamp wall-clock for the polling-based
+          // stall detector below to compare against.
+          lastTickAtMsRef.current = Date.now();
           // Stall-detection (2026-06-09): if a tick is landing for a
           // bar more than 90 s past the previously-pushed bar's slot,
           // the chart's bar materialisation has stalled (the "graph
@@ -2519,6 +2529,41 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
     };
   }, [target?.symbol, target?.secType, chartVersion, resyncToken]);
+
+  // Polling-based stall watchdog. Runs every 10 s. If the most-recent
+  // tick is more than 75 s old, set the stall badge from THIS path
+  // (the tick handler's own gap check can't fire when no tick is
+  // arriving). Auto-clears when ticks resume (last tick within 30 s).
+  // Independent of target — runs for the chart's lifetime, picks up
+  // whatever symbol the parent is currently displaying via the
+  // ``target?.symbol`` closure for the badge tooltip.
+  useEffect(() => {
+    if (!target?.symbol) return;
+    const id = window.setInterval(() => {
+      const last = lastTickAtMsRef.current;
+      // No tick yet — chart is still loading historical data; don't
+      // jump to "stalled" until at least one live tick has arrived.
+      if (last === 0) return;
+      const now = Date.now();
+      const silenceSec = (now - last) / 1000;
+      setBarStall((prev) => {
+        if (silenceSec > 75) {
+          // Don't churn an existing stall badge on every tick — only
+          // overwrite if the gap has materially grown.
+          if (prev && Math.abs(prev.gapSec - silenceSec) < 5) return prev;
+          return {
+            gapSec: silenceSec,
+            sinceMs: now,
+            prevBarIso: new Date(last).toISOString(),
+            newBarIso: 'no tick yet',
+          };
+        }
+        if (silenceSec < 30 && prev) return null;
+        return prev;
+      });
+    }, 10_000);
+    return () => window.clearInterval(id);
+  }, [target?.symbol]);
 
   useImperativeHandle(ref, () => ({
     resetZoom: () => {
@@ -2709,7 +2754,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             + ` · jumped to ${barStall.newBarIso}`
           }
         >
-          ⚠ BARS STALLED · gap {(barStall.gapSec / 60).toFixed(1)} min
+          ⚠ {barStall.newBarIso === 'no tick yet' ? 'NO TICKS' : 'BARS STALLED'}
+          {' · '}
+          {(barStall.gapSec / 60).toFixed(1)} min
         </div>
       )}
       {!target && placeholder && (
