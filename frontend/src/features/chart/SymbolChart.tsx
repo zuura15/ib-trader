@@ -347,6 +347,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // Wall-clock of the most recent live tick the chart actually
   // processed. Updated inside the WS onmessage handler.
   const lastTickAtMsRef = useRef<number>(0);
+  // Wall-clock of when the chart mounted. Polling fallback when
+  // no tick has been recorded yet — without this the badge would
+  // never fire on a chart that's silent from the start.
+  const mountAtMsRef = useRef<number>(Date.now());
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -2541,20 +2545,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!target?.symbol) return;
     const id = window.setInterval(() => {
       const last = lastTickAtMsRef.current;
-      // No tick yet — chart is still loading historical data; don't
-      // jump to "stalled" until at least one live tick has arrived.
-      if (last === 0) return;
       const now = Date.now();
-      const silenceSec = (now - last) / 1000;
+      // Reference: most-recent tick if we've had one, otherwise the
+      // chart's mount time. The latter ensures the badge still fires
+      // for a chart that's been silent since it loaded (the WS
+      // subscription is broken, or ticks are being dropped before
+      // they reach our stamp). Without this, a never-ticking chart
+      // would look identical to a healthy one.
+      const refMs = last > 0 ? last : mountAtMsRef.current;
+      const silenceSec = (now - refMs) / 1000;
       setBarStall((prev) => {
         if (silenceSec > 75) {
-          // Don't churn an existing stall badge on every tick — only
+          // Don't churn an existing stall badge on every poll — only
           // overwrite if the gap has materially grown.
           if (prev && Math.abs(prev.gapSec - silenceSec) < 5) return prev;
           return {
             gapSec: silenceSec,
             sinceMs: now,
-            prevBarIso: new Date(last).toISOString(),
+            prevBarIso: last > 0
+              ? new Date(last).toISOString()
+              : `chart mounted ${new Date(mountAtMsRef.current).toISOString()}`,
             newBarIso: 'no tick yet',
           };
         }
