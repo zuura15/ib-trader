@@ -24,3 +24,7 @@
 # rationale as GCQ6 above. (Until chart panes self-subscribe their
 # own symbols, watchlist is the durable anchor.)
 - NQM6
+# NQU6 (full Nasdaq, Sep) pinned 2026-06-10 — chart-bot-3 was
+# retargeted ESM6 → NQU6. Back-month with no position anchor, so it
+# needs the watchlist pin like every other chart-bot symbol.
+- NQU6
