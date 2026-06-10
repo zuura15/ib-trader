@@ -2408,6 +2408,28 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const nowSec = localUtcSeconds(new Date());
           const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
             + BAR_SECONDS;
+          // Stall-detection (2026-06-09): if a tick is landing for a
+          // bar more than 90 s past the previously-pushed bar's slot,
+          // the chart's bar materialisation has stalled (we're seeing
+          // the "graph hasn't drawn for 3 min" symptom). Log once per
+          // stall window with context — wall-clock, last pushed bar,
+          // current bar, gap. Pure observation; no behaviour change.
+          {
+            const prevBar = lastTickBarSecRef.current ?? 0;
+            const gapSec = barSec - prevBar;
+            if (prevBar > 0 && gapSec > 90) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                '[CHART_BAR_STALL]',
+                target.symbol,
+                'gap_sec=', gapSec,
+                'prev_bar=', new Date(prevBar * 1000).toISOString(),
+                'new_bar=', new Date(barSec * 1000).toISOString(),
+                'wall_clock=', new Date().toISOString(),
+                'bar_size_sec=', BAR_SECONDS,
+              );
+            }
+          }
           series.update({ time: barSec as UTCTimestamp, value: last });
           lastTickBarSecRef.current = barSec;
           // Mirror the update into the OHLC bars ref so SR pivot
