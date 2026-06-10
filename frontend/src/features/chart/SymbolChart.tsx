@@ -204,6 +204,34 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
   });
 
+  // Window-focus wake. ``useVisibilityWake`` covers tab-switch
+  // (document.visibilityState changes); this covers the operator
+  // switching to a DIFFERENT BROWSER WINDOW or another OS window
+  // entirely. In that case the tab stays "visible" per the
+  // Visibility API but Chrome still throttles requestAnimationFrame,
+  // so lightweight-charts' canvas paints pause. Data keeps arriving
+  // and the in-memory series gets updated, but the chart looks
+  // frozen until the operator returns to the browser window —
+  // exactly the symptom the operator reported on 2026-06-09
+  // ("bars and lines appear as soon as I go to another window and
+  // come back"). Trigger the same wake subscribers as
+  // useVisibilityWake so the chart's repaint + history-refresh
+  // logic catches up. Debounced (500 ms) to coalesce rapid
+  // alt-tab-back behaviour.
+  useEffect(() => {
+    let lastFire = 0;
+    const handler = () => {
+      const now = Date.now();
+      if (now - lastFire < 500) return;
+      lastFire = now;
+      for (const fn of wakeSubs) {
+        try { fn(); } catch { /* isolated */ }
+      }
+    };
+    window.addEventListener('focus', handler);
+    return () => window.removeEventListener('focus', handler);
+  }, [wakeSubs]);
+
   // Operator-driven resync (top-header Resync button). Subscribed
   // here so the chart's long-lived effects (WS, history, SR, the
   // sticky-signal-clear at the next useEffect) can include it in
