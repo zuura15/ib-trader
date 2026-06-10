@@ -2018,6 +2018,26 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // the previous target's series during the brief window between
     // target change and the new historical load.
     historicalLoadedRef.current = false;
+    // Gate safety-open. The gate above blocks live ticks until the
+    // first historical ``setData`` lands (prevents the empty-series
+    // auto-fit-to-one-point pathology). But if ``load()`` is slow or
+    // failing — a stalled ``/engine/history``, repeated 5xx — the gate
+    // could stay closed for minutes, dropping every live tick and
+    // freezing the chart while the WS keeps delivering frames that
+    // get silently discarded (the 2026-06-09 freeze). Hard ceiling:
+    // after GATE_MAX_CLOSED_MS, force the gate open regardless. By
+    // then the series either has data (timer already cleared) or it's
+    // better to let ticks through and build the series live than to
+    // sit frozen. Cleared on successful setData and on effect unmount.
+    const GATE_MAX_CLOSED_MS = 10_000;
+    let gateSafetyTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (!cancelled && !historicalLoadedRef.current) {
+        historicalLoadedRef.current = true;
+      }
+    }, GATE_MAX_CLOSED_MS);
+    const clearGateSafetyTimer = () => {
+      if (gateSafetyTimer) { clearTimeout(gateSafetyTimer); gateSafetyTimer = null; }
+    };
     // New target → re-show SR lines (the dismiss state is per-target,
     // not global). The detection itself runs after setData below.
     srHiddenRef.current = false;
@@ -2096,8 +2116,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         series.setData(points);
         // Historical bars are now in the series — safe to let live
         // ticks update past this point without auto-fit-to-one-point
-        // pathology.
+        // pathology. Gate opened the normal way → cancel the safety
+        // timer so it can't later toggle the gate for a stale closure.
         historicalLoadedRef.current = true;
+        clearGateSafetyTimer();
 
         // Volume overlay — green when close >= open, red when down,
         // both at low alpha so the histogram reads as ambient context
@@ -2261,7 +2283,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       }
     };
 
-    if (!seriesRef.current || !chartRef.current) return;
+    if (!seriesRef.current || !chartRef.current) {
+      clearGateSafetyTimer();
+      return;
+    }
 
     load();
     const id = setInterval(load, REFRESH_INTERVAL_MS);
@@ -2272,6 +2297,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       wakeSubs.delete(wake);
       clearInterval(id);
       if (retryTimer) clearTimeout(retryTimer);
+      clearGateSafetyTimer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes, resyncToken]);

@@ -171,12 +171,25 @@ export async function fetchBackendSr(
   if (opts.includeBrokenWedges) {
     params.set('include_broken_wedges', 'true');
   }
+  // Abort timeout: the SR endpoint refreshes every 15 s and can be
+  // heavy (pivot detection + line fitting over the lookback window).
+  // Without a bound, a stalled ``/engine/sr`` hangs the fetch and the
+  // 15 s refresh piles up behind it. 12 s keeps each call below the
+  // refresh interval so aborts don't accumulate. A failed/aborted
+  // fetch returns null (existing behaviour) — the chart keeps its
+  // last-good SR lines until the next successful refresh.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
   try {
-    const r = await fetch(`/api/sr?${params.toString()}`);
+    const r = await fetch(`/api/sr?${params.toString()}`, {
+      signal: controller.signal,
+    });
     if (!r.ok) return null;
     const data = (await r.json()) as BackendSrPayload;
     return data;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }

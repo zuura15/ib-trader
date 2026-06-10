@@ -13,25 +13,69 @@ export function getApiBase(): string {
   return BASE_URL;
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const url = `${BASE_URL}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
+/** Default request timeout. A ``fetch`` with no abort signal hangs
+ *  indefinitely (browser default is minutes) if the server stalls.
+ *  In a live-updating UI a single hung request can freeze a refresh
+ *  loop — notably the chart's 30 s history refresh, where a stalled
+ *  ``/engine/history`` used to trap the chart for 3-5 min while
+ *  ``historicalLoadedRef`` stayed false and live ticks were dropped
+ *  (2026-06-09 chart-freeze investigation). Bounding every request
+ *  to a sane ceiling turns "hang forever" into "fail fast + retry on
+ *  the next interval". */
+const DEFAULT_TIMEOUT_MS = 12_000;
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API ${res.status}: ${body}`);
+type RequestOptions = RequestInit & {
+  /** Override the abort timeout for this call (ms). Heavier endpoints
+   *  (history / SR over a long lookback) pass a larger value; it must
+   *  stay below the caller's refresh interval so aborted calls don't
+   *  pile up behind each other. */
+  timeoutMs?: number;
+};
+
+async function request<T>(path: string, options?: RequestOptions): Promise<T> {
+  const url = `${BASE_URL}${path}`;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...fetchOpts } = options ?? {};
+
+  // Compose the caller's signal (if any) with our timeout signal so
+  // both an external abort and the timeout cancel the fetch.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (fetchOpts.signal) {
+    const ext = fetchOpts.signal;
+    if (ext.aborted) controller.abort();
+    else ext.addEventListener('abort', () => controller.abort(), { once: true });
   }
 
-  // 204 No Content
-  if (res.status === 204) return undefined as T;
+  try {
+    const res = await fetch(url, {
+      ...fetchOpts,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...fetchOpts.headers,
+      },
+    });
 
-  return res.json();
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`API ${res.status}: ${body}`);
+    }
+
+    // 204 No Content
+    if (res.status === 204) return undefined as T;
+
+    return res.json();
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      // Surface as a transient-looking error so callers with retry
+      // logic (e.g. the chart history loader) treat it like a 5xx and
+      // try again on the next cycle rather than giving up.
+      throw new Error(`API timeout after ${timeoutMs}ms: ${path}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- Commands ---
@@ -326,7 +370,12 @@ export function getHistory(opts: {
   if (opts.secType) qs.set('sec_type', opts.secType);
   if (opts.hours != null) qs.set('hours', String(opts.hours));
   if (opts.barSize) qs.set('bar_size', opts.barSize);
-  return request<HistoryBar[]>(`/history?${qs.toString()}`);
+  // 25 s: history can legitimately take several seconds (long lookback,
+  // cold engine cache, IB round-trip), but must abort well before the
+  // chart's 30 s refresh interval so a stalled engine endpoint can't
+  // pile up hung fetches and trap the live-tick gate. See the
+  // DEFAULT_TIMEOUT_MS comment + the chart history-load effect.
+  return request<HistoryBar[]>(`/history?${qs.toString()}`, { timeoutMs: 25_000 });
 }
 
 // --- Regime (ADX/ATR/Donchian — chart top-left badge) ---
