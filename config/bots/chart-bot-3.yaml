@@ -16,7 +16,7 @@ config:
   # (U6 is back-month with wider spreads until rollover). QBALGO
   # twin is dropped by the qualifier (insync_client 46953eb) so the
   # bare ``ESM6`` localSymbol resolves to CME unambiguously.
-  symbol: NQU6
+  symbol: MNQM6
   sec_type: FUT
   # Full E-mini S&P: $50/point (10x micro). Used by P/L math + trail
   # target.
@@ -33,4 +33,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- NQU6
+- MNQM6
