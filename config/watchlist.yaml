@@ -17,3 +17,10 @@
 # last GC position closed) and the chart freezes. ESM6 doesn't
 # need this because the operator currently holds ES.
 - GCQ6
+# NQM6 (full Nasdaq) pinned 2026-06-09 — chart-bot-4 symbol. Its IB
+# quote sub was anchored only by the held position, which lapsed and
+# left the quote stream 17 min stale while the chart sat frozen.
+# Watchlist-pin keeps it streaming regardless of position state, same
+# rationale as GCQ6 above. (Until chart panes self-subscribe their
+# own symbols, watchlist is the durable anchor.)
+- NQM6
