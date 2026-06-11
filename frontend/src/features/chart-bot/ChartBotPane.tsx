@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
@@ -87,7 +87,6 @@ export function ChartBotPane({ slot }: Props) {
   // and the chart's own subscriptions key on primitive strings, so
   // they never re-fire from a parent re-render.
   const chartPnl = useStore((s) => s.chartPnl);
-  const tradeGroups = useStore((s) => s.tradeGroups);
 
   // Resolve symbol + secType from the bot config (operator picks via the
   // YAML; live picker is the Variant H plan, not this round).
@@ -195,31 +194,36 @@ export function ChartBotPane({ slot }: Props) {
     : positionQty > 0 ? `LONG ${positionQty}`
     : `SHORT ${Math.abs(positionQty)}`;
 
-  // 24h realized P&L for this chart's symbol. Pulled from the
-  // ``tradeGroups`` store slice (populated from /api/trades, which
-  // already prefers ``ib_realized_pnl`` over the engine-computed
-  // ``realized_pnl`` per the serializer). Sums CLOSED trades on
-  // this symbol whose ``closed_at`` is within the last 24 h.
-  const pnl24h = useMemo(() => {
-    if (!symbol) return { sum: 0, count: 0 };
-    const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
-    let sum = 0;
-    let count = 0;
-    for (const t of tradeGroups) {
-      const tsym = (t.symbol ?? '').toString();
-      const tdsym = (t.display_symbol ?? '').toString();
-      if (tsym !== symbol && tdsym !== symbol) continue;
-      if (t.status !== 'CLOSED') continue;
-      if (!t.closedAt) continue;
-      const closedMs = new Date(t.closedAt).getTime();
-      if (!Number.isFinite(closedMs) || closedMs < cutoffMs) continue;
-      const v = t.realizedPnl == null ? NaN : Number(t.realizedPnl);
-      if (!Number.isFinite(v)) continue;
-      sum += v;
-      count += 1;
-    }
-    return { sum, count };
-  }, [tradeGroups, symbol]);
+  // Realized-P&L rollup (24h + today/session), IB-authoritative and
+  // account-wide — includes trades placed directly in TWS, not just
+  // orders our system originated. Self-contained per-pane poll of
+  // ``/api/chart/pnl-rollup`` (~30 s, abort-bounded): no shared store,
+  // no WS, nothing the chart canvas depends on. The whole small map is
+  // returned; we read our own symbol's entry. Replaces the old
+  // tradeGroups-based 24h sum, which couldn't see manual TWS fills.
+  const [pnlRollup, setPnlRollup] = useState<
+    Record<string, { pnl_24h: number; pnl_session: number | null; sec_type: string }>
+  >({});
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4000);
+      try {
+        const r = await fetch('/api/chart/pnl-rollup', { signal: ctrl.signal });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!cancelled && data && typeof data === 'object') setPnlRollup(data);
+      } catch { /* transient — keep last good values */ }
+      finally { clearTimeout(timer); }
+    };
+    poll();
+    const id = window.setInterval(poll, 30_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+  const rollupEntry = symbol ? pnlRollup[symbol] : undefined;
+  const pnl24h = rollupEntry ? rollupEntry.pnl_24h : null;
+  const pnlSession = rollupEntry ? rollupEntry.pnl_session : null;
 
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
@@ -290,41 +294,48 @@ export function ChartBotPane({ slot }: Props) {
         }}
         data-testid={`chart-trade-strip-${slot}`}
       >
-        {/* Left: 24h realized P&L for this symbol. ``—`` when there's
-            no closed trade in the last 24h so the slot doesn't look
-            like a stale zero. */}
+        {/* Left: realized P&L — TODAY (since the futures session open,
+            FUT only) and 24H. Both IB-authoritative and account-wide,
+            so trades placed directly in TWS are included. ``—`` when no
+            realized activity so the slot doesn't read as a stale zero. */}
         <span style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6,
+          display: 'inline-flex', alignItems: 'center', gap: 10,
           fontFamily: 'ui-monospace, monospace',
         }}>
-          <span style={{
-            fontSize: 10, letterSpacing: '0.15em',
-            textTransform: 'uppercase', color: 'var(--text-muted)',
-          }}>
-            24h P&L
-          </span>
-          {pnl24h.count > 0 ? (
-            <>
+          {pnlSession != null && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+              <span style={{
+                fontSize: 10, letterSpacing: '0.15em',
+                textTransform: 'uppercase', color: 'var(--text-muted)',
+              }}>
+                Today
+              </span>
               <span style={{
                 fontSize: 12, fontWeight: 700,
-                color: pnl24h.sum >= 0
-                  ? 'var(--accent-green)'
-                  : 'var(--accent-red)',
+                color: pnlSession >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
               }}>
-                {pnl24h.sum >= 0 ? '+$' : '-$'}
-                {Math.abs(pnl24h.sum).toFixed(2)}
+                {pnlSession >= 0 ? '+$' : '-$'}{Math.abs(pnlSession).toFixed(2)}
               </span>
-              <span style={{
-                fontSize: 10, color: 'var(--text-muted)',
-              }}>
-                / {pnl24h.count}
-              </span>
-            </>
-          ) : (
-            <span style={{
-              fontSize: 12, color: 'var(--text-muted)',
-            }}>—</span>
+            </span>
           )}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+            <span style={{
+              fontSize: 10, letterSpacing: '0.15em',
+              textTransform: 'uppercase', color: 'var(--text-muted)',
+            }}>
+              24h
+            </span>
+            {pnl24h != null ? (
+              <span style={{
+                fontSize: 12, fontWeight: 700,
+                color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+              }}>
+                {pnl24h >= 0 ? '+$' : '-$'}{Math.abs(pnl24h).toFixed(2)}
+              </span>
+            ) : (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>—</span>
+            )}
+          </span>
         </span>
 
         {/* Status message (transient — appears for 4s after a click). */}

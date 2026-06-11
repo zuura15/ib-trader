@@ -338,6 +338,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             # Position poll: 30s fallback for when positionEvent stops
             asyncio.create_task(_position_poll_loop(ctx)),
 
+            # Realized-P&L rollup: per-contract 24h + today figures for the
+            # chart panes, swept from IB executions (incl. manual TWS).
+            asyncio.create_task(_pnl_rollup_loop(ctx)),
+
             # Tick-silence watchdog: detect quote-stream stalls within ~60 s
             # instead of waking up hours later to discover stale prices.
             asyncio.create_task(tick_silence_watchdog_loop(ctx)),
@@ -914,6 +918,42 @@ async def _position_poll_loop(ctx: AppContext) -> None:
             logger.debug('{"event": "POSITION_POLL", "count": %d}', count)
         except Exception:
             logger.exception('{"event": "POSITION_POLL_ERROR"}')
+
+
+async def _pnl_rollup_loop(ctx: AppContext) -> None:
+    """Periodically sweep IB executions → per-contract realized-P&L rollup.
+
+    Feeds the chart panes' 24h + today figures. Account-wide (includes
+    manual TWS trades), IB-authoritative. Read-only — deliberately off the
+    order/fill/commission money path, so a failure here degrades a display
+    number and never touches trading. Interval + session boundary are
+    settings tunables (``pnl_rollup_interval_seconds``,
+    ``futures_session_start_hour``).
+    """
+    from datetime import datetime
+    from ib_trader.engine.pnl_rollup import compute_pnl_rollup
+    from ib_trader.redis.state import StateKeys
+
+    interval = float(ctx.settings.get("pnl_rollup_interval_seconds", 60))
+    session_hour = int(ctx.settings.get("futures_session_start_hour", 15))
+    while True:
+        try:
+            execs = await ctx.ib.req_recent_executions(24.0)
+            # tz-aware server-local "now" — session boundary is computed
+            # in this tz (3 PM PT for the operator's Pacific box).
+            now = datetime.now().astimezone()
+            rollup = compute_pnl_rollup(execs, now, session_hour)
+            if ctx.redis is not None:
+                await ctx.redis.set(
+                    StateKeys.chart_pnl_rollup(), json.dumps(rollup),
+                )
+            logger.debug(
+                '{"event": "PNL_ROLLUP_UPDATED", "contracts": %d, '
+                '"executions": %d}', len(rollup), len(execs),
+            )
+        except Exception:
+            logger.exception('{"event": "PNL_ROLLUP_ERROR"}')
+        await asyncio.sleep(interval)
 
 
 def _alert_stuck_order(ctx: AppContext, entry, timeout_seconds: float) -> None:

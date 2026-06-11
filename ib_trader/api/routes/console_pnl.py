@@ -26,6 +26,33 @@ router = APIRouter(prefix="/api", tags=["console"])
 _WINDOW_MS = 24 * 60 * 60 * 1000
 
 
+@router.get("/chart/pnl-rollup")
+async def get_chart_pnl_rollup(redis=Depends(get_redis)):
+    """IB-authoritative per-contract realized-P&L rollup for chart panes.
+
+    Returns ``{ localSymbol: {pnl_24h, pnl_session, sec_type} }`` — produced
+    by the engine's ``_pnl_rollup_loop`` from a periodic ``reqExecutions``
+    sweep, so it includes trades the operator placed directly in TWS, not
+    just orders our system originated. ``pnl_session`` is realized P&L since
+    the most recent futures-session boundary, and is ``null`` for non-FUT.
+    Empty object when nothing's been swept yet / Redis is down — the chart
+    just shows no figure.
+    """
+    if redis is None:
+        return {}
+    try:
+        raw = await redis.get(StateKeys.chart_pnl_rollup())
+    except Exception:
+        logger.exception('{"event": "CHART_PNL_ROLLUP_READ_FAILED"}')
+        return {}
+    if not raw:
+        return {}
+    try:
+        return _json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
 @router.get("/console/pnl/24h")
 async def get_console_pnl_24h(redis=Depends(get_redis)):
     """Sum of console-close realized P&L over the rolling last-24h window.

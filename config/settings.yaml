@@ -89,6 +89,14 @@ prophylactic_resub_startup_delay_seconds: 600
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081
+
+# Chart-pane realized-P&L rollup (per-contract 24h + today figures, swept
+# from IB executions so manual TWS trades are included).
+pnl_rollup_interval_seconds: 60
+# Futures session boundary, in server-local hour (24h). The "today" P&L
+# is measured from the most recent occurrence of this hour. 15 = 3 PM
+# server-local = the CME Globex reopen for a Pacific desk (17:00 CT).
+futures_session_start_hour: 15
 log_level: INFO
 log_file_path: logs/ib_trader.log
 log_rotation_max_bytes: 10485760

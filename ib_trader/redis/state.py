@@ -198,6 +198,19 @@ class StateKeys:
         return "console:pnl:24h"
 
     @staticmethod
+    def chart_pnl_rollup() -> str:
+        """IB-authoritative realized-P&L rollup per contract for chart panes.
+
+        Plain string key holding a JSON map
+        ``{ localSymbol: {pnl_24h, pnl_session, sec_type} }``. Written by the
+        engine's ``_pnl_rollup_loop`` from a periodic ``reqExecutions`` sweep
+        — so it includes trades the operator placed directly in TWS, not just
+        orders our system originated. ``pnl_session`` is realized P&L since
+        the most recent futures-session boundary and is null for non-FUT.
+        """
+        return "chart:pnl:rollup"
+
+    @staticmethod
     def engine_session() -> str:
         """Metadata about the engine's current IB connection.
 

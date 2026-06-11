@@ -1593,6 +1593,68 @@ class InsyncClient(IBClientBase):
             })
         return result
 
+    async def req_recent_executions(self, lookback_hours: float) -> list[dict]:
+        """Account-wide executions over the last ``lookback_hours``.
+
+        Source for the chart-pane realized-P&L rollup, including trades the
+        operator placed directly in TWS (those carry ib_order_id 0 / empty
+        orderRef and never enter our order tables). See base.py docstring.
+        """
+        from ib_async import ExecutionFilter
+
+        await self._throttle()
+        # IB's ExecutionFilter.time is "executions at or after this time",
+        # formatted ``yyyymmdd HH:MM:SS`` in the server-local tz. IB only
+        # retains roughly the current session regardless, so this is a
+        # best-effort floor, not a guarantee of a full N-hour window.
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(hours=lookback_hours)
+        exec_filter = ExecutionFilter(time=since.strftime("%Y%m%d %H:%M:%S"))
+        try:
+            fills = await self.__ib.reqExecutionsAsync(exec_filter)
+        except Exception as e:
+            logger.warning(
+                '{"event": "REQ_EXECUTIONS_FAILED", "error": "%s"}', str(e),
+            )
+            return []
+
+        out: list[dict] = []
+        for fill in fills or []:
+            con = fill.contract
+            execu = fill.execution
+            report = getattr(fill, "commissionReport", None)
+            # realizedPNL: real value on closing fills; ~1.8e308 sentinel
+            # (DBL_MAX) on opening fills = "not applicable". Same filter the
+            # commission callback uses.
+            realized: Decimal | None = None
+            raw_pnl = getattr(report, "realizedPNL", None) if report else None
+            if raw_pnl is not None:
+                try:
+                    if abs(float(raw_pnl)) < 1e15:
+                        realized = Decimal(str(raw_pnl))
+                except (ValueError, TypeError):
+                    pass
+            commission = Decimal("0")
+            raw_comm = getattr(report, "commission", None) if report else None
+            if raw_comm is not None:
+                try:
+                    commission = Decimal(str(raw_comm))
+                except (ValueError, TypeError):
+                    pass
+            # ``time`` on the execution is tz-aware UTC in ib_async.
+            exec_time = getattr(execu, "time", None)
+            out.append({
+                "local_symbol": getattr(con, "localSymbol", "") or getattr(con, "symbol", ""),
+                "symbol": getattr(con, "symbol", "") or "",
+                "sec_type": getattr(con, "secType", "") or "",
+                "realized_pnl": realized,
+                "commission": commission,
+                "exec_time": exec_time,
+                "exec_id": getattr(execu, "execId", "") or "",
+                "side": getattr(execu, "side", "") or "",
+            })
+        return out
+
     def get_order_error(self, ib_order_id: str) -> str | None:
         """Return the stored IB rejection message for this order, or None."""
         return self._order_errors.get(ib_order_id)

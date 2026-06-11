@@ -235,6 +235,12 @@ class MockIBClient(IBClientBase):
         await self._throttle()
         return []
 
+    async def req_recent_executions(self, lookback_hours: float) -> list[dict]:
+        await self._throttle()
+        # Tests set ``mock_executions`` to a list of normalized dicts to
+        # exercise the rollup loop; default empty.
+        return getattr(self, "mock_executions", [])
+
     def get_order_error(self, ib_order_id: str) -> str | None:
         return None  # Mock never injects IB errors by default
 

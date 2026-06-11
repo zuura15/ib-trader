@@ -221,6 +221,28 @@ class IBClientBase(ABC):
         ...
 
     @abstractmethod
+    async def req_recent_executions(self, lookback_hours: float) -> list[dict]:
+        """Return IB executions from the last ``lookback_hours``, account-wide.
+
+        This is the source for the chart panes' realized-P&L rollup. Unlike
+        the engine's own order/transaction records (which only cover orders
+        WE placed), reqExecutions returns every fill on the account that this
+        IB client can see — including trades the operator placed directly in
+        TWS/Gateway. IB caps the lookback at roughly the current trading
+        session regardless of the requested window.
+
+        Each closing execution carries ``realizedPNL`` in its CommissionReport
+        (opening fills carry a ~1.8e308 sentinel that is filtered out here).
+
+        Returns:
+            List of dicts: local_symbol (str), symbol (str), sec_type (str),
+                realized_pnl (Decimal | None — None when not a closing fill),
+                commission (Decimal), exec_time (datetime, tz-aware),
+                exec_id (str), side (str: BOT/SLD).
+        """
+        ...
+
+    @abstractmethod
     def get_order_error(self, ib_order_id: str) -> str | None:
         """Return the stored IB rejection message for this order, or None.
 
