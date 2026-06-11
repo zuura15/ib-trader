@@ -79,7 +79,14 @@ export function ChartBotPane({ slot }: Props) {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
   const addCommand = useStore((s) => s.addCommand);
-  const positions = useStore((s) => s.positions);
+  // Per-contract qty+P&L published by PositionsPanel (the single
+  // calculation — see publishChartPnl there). Empty when the panel
+  // isn't mounted or no positions are held; chart treats "no entry"
+  // as flat (no P&L shown, Close disabled). Updates at the server's
+  // positions-push cadence (~2 Hz max) — re-renders here are cheap
+  // and the chart's own subscriptions key on primitive strings, so
+  // they never re-fire from a parent re-render.
+  const chartPnl = useStore((s) => s.chartPnl);
   const tradeGroups = useStore((s) => s.tradeGroups);
 
   // Resolve symbol + secType from the bot config (operator picks via the
@@ -128,23 +135,13 @@ export function ChartBotPane({ slot }: Props) {
   // multiples (10/20/30 for micros) instead of 1/11/21.
   const qtyStep = qtyStepFor(symbol);
 
-  // Current held qty for this chart's symbol. Signed: positive = LONG,
-  // negative = SHORT, zero = flat. Drives Close button enable + the
-  // close-side computation.
-  const positionQty = useMemo(() => {
-    if (!symbol) return 0;
-    for (const p of positions) {
-      const s = (p.symbol ?? '').toString();
-      const ds = (p.display_symbol ?? '').toString();
-      if (s === symbol || ds === symbol) {
-        const q = typeof p.quantity === 'number'
-          ? p.quantity
-          : Number(p.quantity);
-        return Number.isFinite(q) ? q : 0;
-      }
-    }
-    return 0;
-  }, [positions, symbol]);
+  // Held position for THIS exact contract (map is keyed by localSymbol
+  // on the publisher side, so a plain lookup is the whole match —
+  // NQM6 holdings show on the NQM6 pane only, never on NQU6).
+  // Signed qty: positive = LONG, negative = SHORT, absent = flat.
+  const pnlEntry = symbol ? chartPnl[symbol] : undefined;
+  const positionQty = pnlEntry?.qty ?? 0;
+  const livePnl = pnlEntry?.pnl ?? null;
 
   const fireCommand = async (
     cmd: string, label: 'buy' | 'sell' | 'close',
@@ -239,7 +236,7 @@ export function ChartBotPane({ slot }: Props) {
           with <code>strategy_name: chart_signal</code>.
         </div>
       )}
-      <div className="flex-1" style={{ minHeight: 0 }}>
+      <div className="flex-1" style={{ minHeight: 0, position: 'relative' }}>
         <BotChart
           botId={botId}
           botRef={bot?.ref_id}
@@ -251,6 +248,32 @@ export function ChartBotPane({ slot }: Props) {
           // but we don't surface it on the chart.
           renderHeader={() => null}
         />
+        {/* Live P&L for the open position on this exact contract.
+            Free-floating colored number, bottom-right of the plot
+            area — inset from the right so it clears the price axis,
+            and from the bottom so it clears the time axis.
+            ``pointer-events: none`` so chart pan/zoom/crosshair pass
+            straight through. Hidden when flat or when the publisher
+            (PositionsPanel) isn't mounted. */}
+        {livePnl != null && positionQty !== 0 && (
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 28,
+              right: 72,
+              zIndex: 15,
+              pointerEvents: 'none',
+              fontFamily: 'ui-monospace, monospace',
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.05em',
+              color: livePnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
+            }}
+            data-testid={`chart-live-pnl-${slot}`}
+          >
+            {livePnl >= 0 ? '+$' : '-$'}{Math.abs(livePnl).toFixed(2)}
+          </span>
+        )}
       </div>
       {/* Trade strip. 24h P&L for this chart's symbol on the left,
           qty + BUY/SELL/CLOSE pushed to the right under the price

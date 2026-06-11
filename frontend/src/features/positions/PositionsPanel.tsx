@@ -52,6 +52,45 @@ function computePnl(pos: BrokerPosition): number | null {
        * parseNum(pos.quantity) * validMult;
 }
 
+// CME month codes indexed by month number (1-12). Used to rebuild the
+// IB-paste localSymbol (``NQM6``) from a broker position row, which
+// carries the root (``NQ``) + expiry (``20260618``) separately.
+const MONTH_CODES = [
+  null, 'F', 'G', 'H', 'J', 'K', 'M',
+  'N', 'Q', 'U', 'V', 'X', 'Z',
+] as const;
+
+/** Exact-contract key for the chart-P&L map: futures localSymbol
+ *  (``NQM6``) for FUT rows, plain ticker for everything else. Chart
+ *  panes look their own symbol up directly, so the matching logic
+ *  lives HERE (publisher) and nowhere else. */
+function chartPnlKey(pos: BrokerPosition): string {
+  const root = (pos.symbol ?? '').toUpperCase();
+  if ((pos.sec_type ?? '').toUpperCase() !== 'FUT') return root;
+  const exp = pos.expiry ?? '';
+  if (exp.length >= 6) {
+    const m = parseInt(exp.slice(4, 6), 10);
+    const code = m >= 1 && m <= 12 ? MONTH_CODES[m] : null;
+    // Single-digit year matches the operator-typed form (NQM6, not
+    // NQM26) — same convention the chart-bot YAML symbols use.
+    if (code) return `${root}${code}${exp.slice(3, 4)}`;
+  }
+  return root;
+}
+
+/** Publish the per-contract qty+P&L map for chart panes. One
+ *  calculation (computePnl above), one publisher (this panel), dumb
+ *  lookups everywhere else. */
+function publishChartPnl(rows: BrokerPosition[]): void {
+  const map: Record<string, { qty: number; pnl: number | null }> = {};
+  for (const p of rows) {
+    const qty = parseNum(p.quantity);
+    if (!qty) continue;
+    map[chartPnlKey(p)] = { qty, pnl: computePnl(p) };
+  }
+  useStore.getState().setChartPnl(map);
+}
+
 function sortPositions(positions: BrokerPosition[], key: SortKey, dir: SortDir): BrokerPosition[] {
   const sorted = [...positions];
   const mult = dir === 'asc' ? 1 : -1;
@@ -190,7 +229,12 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'positions' && Array.isArray(msg.data)) {
-            setPositions(msg.data as BrokerPosition[]);
+            const rows = msg.data as BrokerPosition[];
+            setPositions(rows);
+            // Side-publish the derived per-contract P&L for chart
+            // panes (same frames, same computePnl — no second
+            // calculation anywhere).
+            publishChartPnl(rows);
           }
         } catch { /* ignore malformed frames */ }
       };
@@ -217,6 +261,12 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
       wakeRef.current = () => {};
       if (retry) clearTimeout(retry);
       if (ws) { ws.onclose = null; ws.close(); }
+      // Panel unmounting (or resync teardown) — clear the published
+      // chart-P&L map so chart panes hide their number / disable Close
+      // instead of showing stale values. On a resync re-run the server
+      // pushes a fresh snapshot immediately after subscribe, so the
+      // map repopulates in <1 s.
+      useStore.getState().setChartPnl({});
     };
     // Re-run on resyncToken bump (top-header Resync button) so the
     // positions WS subscription is rebuilt from scratch.

@@ -93,6 +93,17 @@ interface AppStore {
   updatePosition: (symbol: string, partial: Partial<Position>) => void;
   setPositions: (positions: Position[]) => void;
 
+  // Per-contract P&L published by PositionsPanel for the chart panes.
+  // Keyed by exact futures localSymbol (``NQM6``) or stock ticker.
+  // PositionsPanel computes these with its own ``computePnl`` on every
+  // positions WS push (server-capped ~2 Hz) and clears the map when it
+  // unmounts — chart panes treat "no entry" as "no P&L / Close
+  // disabled". Deliberately a tiny DERIVED map (qty + pnl only), not
+  // raw position rows: single calculation lives in PositionsPanel,
+  // consumers do a dumb key lookup. See 2026-06-11 chart-P&L design.
+  chartPnl: Record<string, { qty: number; pnl: number | null }>;
+  setChartPnl: (map: Record<string, { qty: number; pnl: number | null }>) => void;
+
 
   // Bots
   bots: Bot[];
@@ -335,6 +346,8 @@ export const useStore = create<AppStore>((set, get) => ({
     positions: s.positions.map((p) => p.symbol === symbol ? { ...p, ...partial } : p),
   })),
   setPositions: (positions) => set({ positions }),
+  chartPnl: {},
+  setChartPnl: (chartPnl) => set({ chartPnl }),
 
   bots: DATA_MODE === 'mock' ? mockBots : [],
   updateBot: (id, partial) => set((s) => ({
