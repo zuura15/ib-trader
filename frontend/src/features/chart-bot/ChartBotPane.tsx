@@ -31,6 +31,25 @@ function loadQty(slot: number): number {
   } catch { return 1; }
 }
 
+// Micro futures roots. The operator trades micros in larger clip
+// sizes (10s) than full-size contracts (1s), so the qty spinner
+// steps by 10 for these and by 1 for everything else.
+const MICRO_ROOTS = new Set([
+  'MES', 'MNQ', 'MGC', 'MCL', 'M2K', 'MYM',
+  'MBT', 'M6E', 'M6A', 'M6B', 'MET', 'MNG', 'MHG',
+]);
+// Futures localSymbol = root + month-letter (F G H J K M N Q U V X Z)
+// + 1-2 digit year, e.g. ``MNQM6`` → root ``MNQ``.
+const FUT_LOCAL_SYM_RE = /^([A-Z][A-Z0-9]{0,4}?)[FGHJKMNQUVXZ]\d{1,2}$/;
+
+/** Step size for the qty spinner: 10 for micro futures, 1 otherwise. */
+function qtyStepFor(symbol: string | null): number {
+  if (!symbol) return 1;
+  const m = symbol.toUpperCase().match(FUT_LOCAL_SYM_RE);
+  const root = m ? m[1] : symbol.toUpperCase();
+  return MICRO_ROOTS.has(root) ? 10 : 1;
+}
+
 /**
  * Desktop Trader-layout chart pane. The bot's FSM lifecycle is
  * intentionally hidden — the chart is always live for manual scanning
@@ -104,6 +123,10 @@ export function ChartBotPane({ slot }: Props) {
     } catch { return null; }
   })();
   const secType = (bot?.sec_type ?? 'STK').toUpperCase() as ChartTarget['secType'];
+  // Qty spinner step: micros click up/down by 10, full-size by 1.
+  // ``min`` is set to the same value so the spinner lands on clean
+  // multiples (10/20/30 for micros) instead of 1/11/21.
+  const qtyStep = qtyStepFor(symbol);
 
   // Current held qty for this chart's symbol. Signed: positive = LONG,
   // negative = SHORT, zero = flat. Drives Close button enable + the
@@ -314,8 +337,8 @@ export function ChartBotPane({ slot }: Props) {
           </span>
           <input
             type="number"
-            min={1}
-            step={1}
+            min={qtyStep}
+            step={qtyStep}
             value={qty}
             onChange={(e) => {
               const n = Number(e.target.value);
