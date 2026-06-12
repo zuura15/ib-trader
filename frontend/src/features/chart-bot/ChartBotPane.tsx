@@ -181,12 +181,13 @@ export function ChartBotPane({ slot }: Props) {
   };
   const onClose = () => {
     if (!symbol || positionQty === 0) return;
-    // Net-flat at IB market price: opposite side for the held qty.
-    // Uses explicit ``market`` strategy to skip the smart_market
-    // walker — Close should be immediate, not patient.
+    // Net-flat with the session-aware smart_market algo (walks toward
+    // the far side then crosses) — same execution the console default
+    // uses, so chart closes match typed closes. Opposite side for the
+    // held qty.
     const absQty = Math.abs(positionQty);
     const side = positionQty > 0 ? 'sell' : 'buy';
-    void fireCommand(`${side} ${symbol} ${absQty} market`, 'close');
+    void fireCommand(`${side} ${symbol} ${absQty} smart_market`, 'close');
   };
 
   const canClose = positionQty !== 0;
