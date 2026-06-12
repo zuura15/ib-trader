@@ -1611,23 +1611,42 @@ class InsyncClient(IBClientBase):
         since = datetime.now() - timedelta(hours=lookback_hours)
         exec_filter = ExecutionFilter(time=since.strftime("%Y%m%d %H:%M:%S"))
         try:
-            fills = await self.__ib.reqExecutionsAsync(exec_filter)
+            # reqExecutions backfills today's executions into ib_async's
+            # maintained fills store (incl. pre-restart + manual TWS) and
+            # triggers IB to (re)send their CommissionReports. We do NOT
+            # use the return value: IB delivers commission reports as a
+            # SEPARATE event that hasn't paired onto the returned Fills
+            # yet, so their ``realizedPNL`` reads as the default 0.0 (the
+            # 2026-06-11 "all P&L shows zero" bug). Instead we read
+            # ``ib.fills()`` below, where ib_async pairs the reports into
+            # the stored Fill objects in place as they arrive.
+            await self.__ib.reqExecutionsAsync(exec_filter)
         except Exception as e:
             logger.warning(
                 '{"event": "REQ_EXECUTIONS_FAILED", "error": "%s"}', str(e),
             )
             return []
 
+        # Give the commission-report burst a moment to pair into the
+        # store. Even if some are still unpaired this run, the next loop
+        # (60 s later) reads a fully-paired store — the paired-check below
+        # keeps unpaired rows from counting as a real 0.0 in the meantime.
+        await asyncio.sleep(3.0)
+
         out: list[dict] = []
-        for fill in fills or []:
+        for fill in self.__ib.fills():
             con = fill.contract
             execu = fill.execution
             report = getattr(fill, "commissionReport", None)
-            # realizedPNL: real value on closing fills; ~1.8e308 sentinel
-            # (DBL_MAX) on opening fills = "not applicable". Same filter the
-            # commission callback uses.
+            # Only trust realizedPNL once the CommissionReport has actually
+            # paired — an unpaired default report has an empty ``execId``
+            # and realizedPNL 0.0, which would otherwise masquerade as a
+            # real scratch trade. realizedPNL on a paired report is the
+            # real value on closing fills; opening fills carry the
+            # ~1.8e308 sentinel (DBL_MAX) = "not applicable".
             realized: Decimal | None = None
-            raw_pnl = getattr(report, "realizedPNL", None) if report else None
+            report_paired = bool(report and getattr(report, "execId", ""))
+            raw_pnl = getattr(report, "realizedPNL", None) if report_paired else None
             if raw_pnl is not None:
                 try:
                     if abs(float(raw_pnl)) < 1e15:
