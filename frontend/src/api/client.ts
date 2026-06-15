@@ -390,3 +390,16 @@ export interface ConsolePnl24h {
 export function getConsolePnl24h() {
   return request<ConsolePnl24h>('/console/pnl/24h');
 }
+
+export interface ChartPnlRollupEntry {
+  pnl_24h: number;
+  pnl_session: number | null;
+  sec_type: string;
+}
+
+/** Per-contract IB-authoritative realized-P&L rollup, keyed by localSymbol. */
+export type ChartPnlRollup = Record<string, ChartPnlRollupEntry>;
+
+export function getChartPnlRollup() {
+  return request<ChartPnlRollup>('/chart/pnl-rollup');
+}

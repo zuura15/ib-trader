@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import { useStore } from '../../data/store';
-import { formatCurrency } from '../../utils/format';
 import { SettingsModal } from '../settings/SettingsModal';
+import { FuturesPnl24hCard } from './FuturesPnl24hCard';
 import { ResyncButton } from './ResyncButton';
 
 export function GlobalHeader() {
   const { global, dataMode, wsConnected } = useStore();
-  const { connectionStatus, accountMode, accountId, serviceHealth, realizedPnl, engineStartedAt } = global;
+  const { connectionStatus, accountMode, accountId, serviceHealth, engineStartedAt } = global;
   // Format "up since" with the engine's start timestamp. The backend
   // writes it as a timezone-aware ISO (server-local PT); ``new Date``
   // honors the offset, ``toLocaleTimeString`` then renders in the
@@ -93,18 +93,8 @@ export function GlobalHeader() {
 
       {/* Right side: P&L + Uptime + Theme + Variant */}
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-3">
-        {/* P&L */}
-        <div className="rounded border px-3 py-1.5" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}>
-          <div
-            style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}
-            title="Sum of NET realized P&L on closed bot trades in the last 24 hours (rolling window) — realized_pnl minus commission per trade. Commission backfills asynchronously after IB's commissionReport, so this can briefly inflate until the report lands."
-          >
-            24h P&L
-          </div>
-          <div className="font-mono" style={{ fontSize: 13, fontWeight: 600, color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-            {formatCurrency(realizedPnl)}
-          </div>
-        </div>
+        {/* 24h futures P&L — IB-authoritative (all futures, incl. manual TWS) */}
+        <FuturesPnl24hCard />
 
         {/* Uptime — static "up since …" only. The running counter was
             removed (2026-05-10) because ``formatDuration(sessionUptime)``
