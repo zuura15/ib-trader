@@ -279,6 +279,36 @@ export function ChartBotPane({ slot }: Props) {
             {livePnl >= 0 ? '+$' : '-$'}{Math.abs(livePnl).toFixed(2)}
           </span>
         )}
+        {/* Transient action status (BUY/SELL/CLOSE click feedback),
+            overlaid just above the live-P&L number — grey and
+            ``pointer-events: none`` so it floats over the plot and never
+            reflows the trade strip or resizes the pane. Right-anchored
+            and clipped to the plot width so a long error can't run off
+            the left edge; ellipsifies instead. */}
+        {statusMsg && (
+          <span
+            style={{
+              position: 'absolute',
+              bottom: 46,
+              right: 72,
+              zIndex: 15,
+              pointerEvents: 'none',
+              display: 'inline-block',
+              maxWidth: 'calc(100% - 84px)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              textAlign: 'right',
+              fontFamily: 'ui-monospace, monospace',
+              fontSize: 10,
+              letterSpacing: '0.03em',
+              color: 'var(--text-muted)',
+            }}
+            data-testid={`chart-status-${slot}`}
+          >
+            {statusMsg}
+          </span>
+        )}
       </div>
       {/* Trade strip. 24h P&L for this chart's symbol on the left,
           qty + BUY/SELL/CLOSE pushed to the right under the price
@@ -338,16 +368,6 @@ export function ChartBotPane({ slot }: Props) {
             )}
           </span>
         </span>
-
-        {/* Status message (transient — appears for 4s after a click). */}
-        {statusMsg && (
-          <span style={{
-            fontSize: 10, color: 'var(--text-muted)',
-            fontFamily: 'ui-monospace, monospace',
-          }}>
-            {statusMsg}
-          </span>
-        )}
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
             ``marginLeft: auto`` pushes the whole cluster against the
