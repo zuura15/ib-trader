@@ -189,7 +189,7 @@ export function MobileLayout() {
   if (unsupported) {
     return (
       <div
-        className="flex items-center justify-center h-screen w-screen p-8"
+        className="flex items-center justify-center h-dvh w-screen p-8"
         style={{ background: 'var(--bg-root)', color: 'var(--text-primary)' }}
       >
         <div className="text-center" style={{ maxWidth: 400 }}>
@@ -211,7 +211,7 @@ export function MobileLayout() {
 
   return (
     <div
-      className="flex flex-col h-screen w-screen overflow-hidden"
+      className="flex flex-col h-dvh w-screen overflow-hidden"
       style={{ background: 'var(--bg-root)' }}
     >
       <MobileHeader />
