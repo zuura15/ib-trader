@@ -1,5 +1,5 @@
 id: chart-bot-3
-name: "Chart Bot 3 · SPX"
+name: "Chart Bot 3 · Micro Nasdaq"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -8,29 +8,29 @@ auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
+  # ref_id kept as ``chart-bot-3-es`` (stable bot identifier from this
+  # pane's ESM6 era) — renaming it would orphan any force-entry orders
+  # already tagged with it at recovery time, for no functional gain.
   ref_id: chart-bot-3-es
-  # ES = full E-mini S&P 500. Switched from micro MESM6 → full ESM6
-  # on 2026-06-07 as the operator scaled into full contracts. Same
-  # June 2026 expiry (M6). E-minis trade quarterly only (H/M/U/Z);
-  # industry roll to U6 is ~June 11, 2026 — roll then, not earlier
-  # (U6 is back-month with wider spreads until rollover). QBALGO
-  # twin is dropped by the qualifier (insync_client 46953eb) so the
-  # bare ``ESM6`` localSymbol resolves to CME unambiguously.
-  symbol: MNQM6
+  # MNQ = micro E-mini Nasdaq-100. This pane ran full ESM6 until
+  # 2026-06-09, then switched to micro MNQM6 — the operator wanted NQ
+  # exposure here but full-NQ U6 was too thin to scan pre-roll. Rolled
+  # MNQM6 → MNQU6 on 2026-06-15: the M6 → U6 roll (2026-06-11) is past
+  # so liquidity now sits in U6, and M6 expires 2026-06-19.
+  symbol: MNQU6
   sec_type: FUT
-  # Full E-mini S&P: $50/point (10x micro). Used by P/L math + trail
-  # target.
-  contract_multiplier: 50
-  # Trailing dip: same percentage as the micro tuning (0.0003). At
-  # ES's notional that's ~$111.30 per contract per dip (vs $11.13
-  # on the micro) — same risk-as-fraction-of-position. Manual mode
-  # in effect so this is dormant until ``manual_entry_only`` flips.
+  # Micro Nasdaq: $2/point (1/10th of full NQ's $20). Used by the
+  # strategy's P/L math + trail target. (Was 50 — a stale ES leftover
+  # from this pane's ESM6 era; corrected 2026-06-15.)
+  contract_multiplier: 2
+  # Trailing dip 0.0003 (the micro tuning — a percentage, so it scales
+  # with notional). Manual mode in effect, so this is dormant until
+  # ``manual_entry_only`` flips.
   trail_width_pct: 0.0003
-  # qty_default reverted to strategy yaml's 1 on the contract scale-
-  # up: 3 full ES = $1M+ notional per fire vs the prior 3-micro
-  # ($110k) intent. Operator picks per-trade size via the console.
+  # qty_default 1 (strategy-yaml default). Operator picks per-trade
+  # size via the console / chart strip regardless.
   qty_default: 1
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MNQM6
+- MNQU6

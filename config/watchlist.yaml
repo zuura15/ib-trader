@@ -25,8 +25,8 @@
 # streaming regardless of position state, same rationale as GCQ6
 # above. (Until chart panes self-subscribe, watchlist is the anchor.)
 - NQU6
-# MNQM6 (micro Nasdaq, June) pinned 2026-06-10 — chart-bot-3 symbol.
-# Switched from NQU6: operator needs NQ exposure on this pane but
-# U6's back-month volume was too thin to scan. Micro front-month is
-# liquid. Pinned so its quote sub doesn't lapse when flat.
-- MNQM6
+# MNQU6 (micro Nasdaq, Sep) pinned 2026-06-15 — chart-bot-3 symbol.
+# Rolled from MNQM6 now the M6 → U6 roll (2026-06-11) is past and
+# liquidity sits in U6; M6 expires 2026-06-19. Pinned so its quote
+# sub doesn't lapse when flat (same anchor rationale as NQU6/GCQ6).
+- MNQU6
