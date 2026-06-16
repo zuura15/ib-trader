@@ -1,5 +1,6 @@
 import { useStore } from '../../data/store';
 import type { ThemeMode } from '../../types';
+import { FuturesPnl24hCard } from './FuturesPnl24hCard';
 import { LayoutToggle } from './LayoutToggle';
 
 const THEME_CYCLE: ThemeMode[] = ['dark', 'charcoal', 'navy', 'mocha', 'light'];
@@ -72,6 +73,9 @@ export function MobileHeader() {
           {dataFresh ? 'live' : 'stale'}
         </span>
       </div>
+
+      {/* Center: single account-wide 24h futures realized P&L */}
+      <FuturesPnl24hCard compact />
 
       {/* Right: layout override + theme cycler */}
       <div className="flex items-center gap-2">

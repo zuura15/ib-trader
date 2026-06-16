@@ -6,6 +6,11 @@ import { useStore } from '../../data/store';
 interface Props {
   /** Trader-layout slot 1..4. Bound to bot id ``chart-bot-<slot>``. */
   slot: number;
+  /** Compact chrome for the mobile two-chart view: B/S/C button labels,
+   *  larger touch targets, and no per-pane realized-P&L strip (that
+   *  figure lives once in the mobile header). Defaults to the full
+   *  desktop chrome. */
+  compact?: boolean;
 }
 
 interface BotApiShape {
@@ -68,7 +73,7 @@ function qtyStepFor(symbol: string | null): number {
  * ``sell N <sym> market`` for the inverse side at the held qty. Button
  * is disabled when no position is held.
  */
-export function ChartBotPane({ slot }: Props) {
+export function ChartBotPane({ slot, compact = false }: Props) {
   const botId = botIdForSlot(slot);
   const [bot, setBot] = useState<BotApiShape | null>(null);
   const [botFetchError, setBotFetchError] = useState<string | null>(null);
@@ -206,6 +211,9 @@ export function ChartBotPane({ slot }: Props) {
     Record<string, { pnl_24h: number; pnl_session: number | null; sec_type: string }>
   >({});
   useEffect(() => {
+    // Compact (mobile) panes show no per-pane P&L — the single 24h
+    // figure lives in the header — so skip the poll entirely.
+    if (compact) return;
     let cancelled = false;
     const poll = async () => {
       const ctrl = new AbortController();
@@ -221,7 +229,7 @@ export function ChartBotPane({ slot }: Props) {
     poll();
     const id = window.setInterval(poll, 30_000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, []);
+  }, [compact]);
   const rollupEntry = symbol ? pnlRollup[symbol] : undefined;
   const pnl24h = rollupEntry ? rollupEntry.pnl_24h : null;
   const pnlSession = rollupEntry ? rollupEntry.pnl_session : null;
@@ -328,7 +336,9 @@ export function ChartBotPane({ slot }: Props) {
         {/* Left: realized P&L — TODAY (since the futures session open,
             FUT only) and 24H. Both IB-authoritative and account-wide,
             so trades placed directly in TWS are included. ``—`` when no
-            realized activity so the slot doesn't read as a stale zero. */}
+            realized activity so the slot doesn't read as a stale zero.
+            Hidden in compact (mobile) — the header carries one 24h. */}
+        {!compact && (
         <span style={{
           display: 'inline-flex', alignItems: 'center', gap: 10,
           fontFamily: 'ui-monospace, monospace',
@@ -368,6 +378,7 @@ export function ChartBotPane({ slot }: Props) {
             )}
           </span>
         </span>
+        )}
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
             ``marginLeft: auto`` pushes the whole cluster against the
@@ -384,12 +395,14 @@ export function ChartBotPane({ slot }: Props) {
               {positionLabel}
             </span>
           )}
-          <span style={{
-            fontSize: 10, letterSpacing: '0.15em',
-            textTransform: 'uppercase', color: 'var(--text-muted)',
-          }}>
-            Qty
-          </span>
+          {!compact && (
+            <span style={{
+              fontSize: 10, letterSpacing: '0.15em',
+              textTransform: 'uppercase', color: 'var(--text-muted)',
+            }}>
+              Qty
+            </span>
+          )}
           <input
             type="number"
             min={qtyStep}
@@ -419,15 +432,17 @@ export function ChartBotPane({ slot }: Props) {
               : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-green)', color: '#fff',
-              border: 'none', borderRadius: 3, padding: '3px 14px',
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              border: 'none', borderRadius: 3,
+              padding: compact ? '9px 0' : '3px 14px',
+              minWidth: compact ? 42 : undefined,
+              fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
               opacity: pendingAction && pendingAction !== 'buy' ? 0.5 : 1,
               fontFamily: 'ui-monospace, monospace',
             }}
             data-testid={`chart-buy-${slot}`}
           >
-            BUY
+            {compact ? 'B' : 'BUY'}
           </button>
           <button
             onClick={onSell}
@@ -437,15 +452,17 @@ export function ChartBotPane({ slot }: Props) {
               : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-red)', color: '#fff',
-              border: 'none', borderRadius: 3, padding: '3px 14px',
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              border: 'none', borderRadius: 3,
+              padding: compact ? '9px 0' : '3px 14px',
+              minWidth: compact ? 42 : undefined,
+              fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
               opacity: pendingAction && pendingAction !== 'sell' ? 0.5 : 1,
               fontFamily: 'ui-monospace, monospace',
             }}
             data-testid={`chart-sell-${slot}`}
           >
-            SELL
+            {compact ? 'S' : 'SELL'}
           </button>
           <button
             onClick={onClose}
@@ -455,8 +472,10 @@ export function ChartBotPane({ slot }: Props) {
               : 'No open position on this symbol'}
             style={{
               background: 'var(--accent-blue)', color: '#fff',
-              border: 'none', borderRadius: 3, padding: '3px 14px',
-              fontSize: 11, fontWeight: 700, letterSpacing: '0.05em',
+              border: 'none', borderRadius: 3,
+              padding: compact ? '9px 0' : '3px 14px',
+              minWidth: compact ? 42 : undefined,
+              fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: (pendingAction || !canClose) ? 'not-allowed' : 'pointer',
               opacity:
                 (pendingAction && pendingAction !== 'close') || !canClose
@@ -465,7 +484,7 @@ export function ChartBotPane({ slot }: Props) {
             }}
             data-testid={`chart-close-${slot}`}
           >
-            CLOSE
+            {compact ? 'C' : 'CLOSE'}
           </button>
         </div>
       </div>

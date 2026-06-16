@@ -1,62 +1,14 @@
-import { useRef, useState, useEffect, useCallback, type PointerEvent as RPointerEvent } from 'react';
+import { useRef, useState, useEffect, useCallback } from 'react';
 import { MobileHeader } from '../features/header/MobileHeader';
-import { CommandConsole } from '../features/console/CommandConsole';
-import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
 import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
 import { TradesPanel } from '../features/trades/TradesPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { LogStream } from '../features/logs/LogStream';
-import { BotsPanel } from '../features/bots/BotsPanel';
-import { BotLogStream } from '../features/bots/BotLogStream';
-import { BotActivity } from '../features/bots/BotActivity';
 import { BotTradesPanel } from '../features/bots/BotTradesPanel';
-import { MobileChartBots } from '../features/chart-bot/MobileChartBots';
-const TABS = ['Trade', 'Watch', 'Orders', 'Charts', 'Bots', 'Trades', 'Activity', 'Logs'] as const;
+import { MobileTradeView } from '../features/chart-bot/MobileTradeView';
+const TABS = ['Trade', 'Watch', 'Orders', 'Trades', 'Logs'] as const;
 
-// ---------------------------------------------------------------------------
-// Vertical resize handle for the mobile Trade tab split
-// ---------------------------------------------------------------------------
-
-const CONSOLE_MIN_H = 80;
-const CONSOLE_MAX_RATIO = 0.6; // never more than 60% of viewport
-
-function useVerticalResize(initialVh: number) {
-  const [height, setHeight] = useState<number | null>(null);
-  const startY = useRef(0);
-  const startH = useRef(0);
-
-  const initHeight = () => {
-    if (height === null) return (window.innerHeight * initialVh) / 100;
-    return height;
-  };
-
-  // Attach move/up listeners on window so dragging works even when the
-  // finger moves outside the narrow handle strip.
-  const onPointerDown = useCallback((e: RPointerEvent) => {
-    e.preventDefault();
-    startY.current = e.clientY;
-    startH.current = height ?? (window.innerHeight * initialVh) / 100;
-
-    const onMove = (ev: globalThis.PointerEvent) => {
-      const delta = ev.clientY - startY.current;
-      const maxH = window.innerHeight * CONSOLE_MAX_RATIO;
-      setHeight(Math.max(CONSOLE_MIN_H, Math.min(maxH, startH.current + delta)));
-    };
-
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onUp);
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
-  }, [height, initialVh]);
-
-  return { height: initHeight(), onPointerDown };
-}
 type Tab = (typeof TABS)[number];
 
 /**
@@ -79,7 +31,6 @@ function isIOSSafari(): boolean {
 export function MobileLayout() {
   // Data initialization (WS / mock) is handled by App.tsx — not duplicated here.
 
-  const resize = useVerticalResize(30);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTabRaw] = useState<Tab>(() => {
     const saved = localStorage.getItem('ib-mobile-tab');
@@ -310,7 +261,8 @@ export function MobileLayout() {
           scrollbarWidth: 'none',       /* Firefox */
         }}
       >
-        {/* Tab 1: Trade — order entry + positions, vertically resizable */}
+        {/* Tab 1: Trade — two stacked chart rows (Gold/Console/Positions
+            over Nasdaq/Micro NQ). See MobileTradeView. */}
         <div
           id="tabpanel-Trade"
           role="tabpanel"
@@ -318,38 +270,7 @@ export function MobileLayout() {
           className="flex flex-col shrink-0 w-screen h-full"
           style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
         >
-          <div style={{ height: resize.height, minHeight: CONSOLE_MIN_H, overflow: 'hidden' }}>
-            <CommandConsole compact />
-          </div>
-
-          {/* Drag handle + separator */}
-          <div
-            onPointerDown={resize.onPointerDown}
-            style={{
-              height: 40,
-              flexShrink: 0,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              cursor: 'row-resize',
-              touchAction: 'none',
-              background: 'var(--bg-root)',
-              borderTop: '1px solid var(--border-default)',
-              borderBottom: '1px solid var(--border-default)',
-            }}
-          >
-            <div style={{
-              width: 48,
-              height: 5,
-              borderRadius: 3,
-              background: 'var(--text-muted)',
-              opacity: 0.5,
-            }} />
-          </div>
-
-          <div className="flex-1 overflow-y-auto">
-            <PositionsPanel />
-          </div>
+          <MobileTradeView />
         </div>
 
         {/* Tab 2: Watch — watchlist */}
@@ -379,34 +300,7 @@ export function MobileLayout() {
           </div>
         </div>
 
-        {/* Tab 4: Charts — chart-bot pane with a 1..4 slot picker */}
-        <div
-          id="tabpanel-Charts"
-          role="tabpanel"
-          aria-labelledby="tab-Charts"
-          className="flex flex-col shrink-0 w-screen h-full"
-          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
-        >
-          <MobileChartBots />
-        </div>
-
-        {/* Tab 5: Bots — bot controls + bot log */}
-        <div
-          id="tabpanel-Bots"
-          role="tabpanel"
-          aria-labelledby="tab-Bots"
-          className="flex flex-col shrink-0 w-screen h-full"
-          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
-        >
-          <div style={{ maxHeight: '30%', overflow: 'auto' }}>
-            <BotsPanel />
-          </div>
-          <div className="flex-1 overflow-hidden">
-            <BotLogStream maxLines={200} />
-          </div>
-        </div>
-
-        {/* Tab 6: Trades — bot round-trip P&L records */}
+        {/* Tab 4: Trades — bot round-trip P&L records */}
         <div
           id="tabpanel-Trades"
           role="tabpanel"
@@ -417,18 +311,7 @@ export function MobileLayout() {
           <BotTradesPanel compact />
         </div>
 
-        {/* Tab 7: Activity — bot buys, sells, starts, stops, errors */}
-        <div
-          id="tabpanel-Activity"
-          role="tabpanel"
-          aria-labelledby="tab-Activity"
-          className="flex flex-col shrink-0 w-screen h-full overflow-hidden"
-          style={{ scrollSnapAlign: 'start' }}
-        >
-          <BotActivity maxLines={200} />
-        </div>
-
-        {/* Tab 6: Logs — alerts + log stream */}
+        {/* Tab 5: Logs — alerts + log stream */}
         <div
           id="tabpanel-Logs"
           role="tabpanel"

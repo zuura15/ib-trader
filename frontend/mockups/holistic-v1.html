@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<!--
+  Variant H ("Holistic") layout mockup — round 1
+  See plan: ~/.claude/plans/vivid-popping-globe.md
+
+  Block → React component mapping (for the implementation pass):
+    .grid > .col-left  .top    → ComponentFactory 'tabbed-group' (Watchlist|Positions|Orders|Trades)
+    .grid > .col-left  .bottom → ComponentFactory 'errors'       (LogStream with levels=ERROR,WARNING)
+    .grid > .col-mid   .top    → ComponentFactory 'chart-bot' slot=1  (ChartBotPane + ChartActionStrip)
+    .grid > .col-mid   .bottom → ComponentFactory 'console'     (CommandConsole, subscribes to consoleDraft)
+    .grid > .col-right .top    → ComponentFactory 'chart-bot' slot=3  (ChartBotPane + ChartActionStrip)
+    .grid > .col-right .bottom → ComponentFactory 'pnl'          (PnlPanel — new)
+
+  This file is intentionally static — no JS framework. CSS comes from
+  ../src/styles/app.css so theme tokens (--bg-primary, --accent-*, etc.)
+  stay in sync with the running app. Open in a browser directly.
+-->
+<html lang="en" data-theme="default">
+<head>
+  <meta charset="utf-8" />
+  <title>IB Trader — Variant H mockup</title>
+  <link rel="stylesheet" href="../src/styles/app.css" />
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg-root);
+      color: var(--text-primary);
+      height: 100vh;
+      overflow: hidden;
+    }
+    /* === Header bar (mirrors GlobalHeader.tsx for visual continuity) === */
+    .mock-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 14px;
+      border-bottom: 1px solid var(--border-default);
+      background: var(--bg-root);
+      height: 50px;
+      box-sizing: border-box;
+    }
+    .mock-header .title {
+      font-size: 11px;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .mock-header .subtitle {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--border-default);
+      background: var(--bg-primary);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .chip .label {
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .chip .value { font-weight: 500; }
+    .chip .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+
+    /* === 3-col × 2-row CSS grid for the body === */
+    .grid {
+      display: grid;
+      grid-template-columns: 18% 1fr 1fr;
+      grid-template-rows: 60% 40%;
+      gap: 6px;
+      padding: 6px;
+      height: calc(100vh - 50px);
+      box-sizing: border-box;
+    }
+    .cell { min-width: 0; min-height: 0; }
+    /* Sub-grid for left column (taller top, shorter bottom — matches main grid rows) */
+    .col-left  { display: contents; }
+    .col-mid   { display: contents; }
+    .col-right { display: contents; }
+
+    .cell-tabbed   { grid-column: 1; grid-row: 1; }
+    .cell-errors   { grid-column: 1; grid-row: 2; }
+    .cell-chart-a  { grid-column: 2; grid-row: 1; }
+    .cell-console  { grid-column: 2; grid-row: 2; }
+    .cell-chart-b  { grid-column: 3; grid-row: 1; }
+    .cell-pnl      { grid-column: 3; grid-row: 2; }
+
+    /* === Tabbed group tabs (mirrors flexlayout's tab strip) === */
+    .tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border-default);
+      background: var(--header-bg);
+      flex-shrink: 0;
+    }
+    .tabs .tab {
+      padding: 6px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-right: 1px solid var(--border-muted);
+    }
+    .tabs .tab.active {
+      color: var(--text-heading);
+      background: var(--bg-primary);
+      border-bottom: 2px solid var(--accent-blue);
+    }
+
+    /* === Chart panel layout: chart area takes most, action strip is pinned === */
+    .chart-body {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+    .chart-canvas {
+      position: relative;
+      flex: 1;
+      background: var(--bg-primary);
+      overflow: hidden;
+    }
+    .position-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+      padding: 4px 8px;
+      background: var(--badge-orange-bg, rgba(247,189,92,0.12));
+      border: 1px solid var(--accent-orange);
+      border-radius: 4px;
+      font-size: 11px;
+      color: var(--text-primary);
+    }
+    .position-badge .qty {
+      font-weight: 700;
+      color: var(--accent-orange);
+      letter-spacing: 0.05em;
+    }
+    .position-badge .pnl {
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .position-badge .pnl.up { color: var(--accent-green); }
+    .position-badge .pnl.down { color: var(--accent-red); }
+    .tp-handle {
+      position: absolute;
+      right: 0;
+      height: 0;
+      border-top: 1.5px dashed var(--accent-yellow);
+      width: 100%;
+      pointer-events: none;
+    }
+    .tp-handle::after {
+      content: '⬤ TP';
+      position: absolute;
+      right: 4px;
+      top: -10px;
+      font-size: 10px;
+      color: var(--accent-yellow);
+      background: var(--bg-primary);
+      padding: 0 4px;
+      letter-spacing: 0.08em;
+    }
+    .entry-line {
+      position: absolute;
+      right: 0;
+      height: 0;
+      border-top: 1.5px solid var(--accent-orange);
+      width: 100%;
+      pointer-events: none;
+    }
+    .entry-line::after {
+      content: 'ENTRY 23410.00';
+      position: absolute;
+      right: 4px;
+      top: -10px;
+      font-size: 10px;
+      color: var(--accent-orange);
+      background: var(--bg-primary);
+      padding: 0 4px;
+      letter-spacing: 0.08em;
+    }
+
+    /* === Button strip (the new piece) === */
+    .action-strip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-top: 1px solid var(--border-default);
+      background: var(--header-bg);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      font-family: ui-monospace, monospace;
+    }
+    .btn-buy {
+      background: var(--badge-green-bg, rgba(22,163,74,0.12));
+      border-color: var(--accent-green);
+      color: var(--accent-green);
+    }
+    .btn-sell {
+      background: var(--badge-red-bg, rgba(220,38,38,0.12));
+      border-color: var(--accent-red);
+      color: var(--accent-red);
+    }
+    .btn-close {
+      background: var(--badge-blue-bg, rgba(37,99,235,0.12));
+      border-color: var(--accent-blue);
+      color: var(--accent-blue);
+    }
+    .btn-tp {
+      background: var(--badge-yellow-bg, rgba(247,189,92,0.12));
+      border-color: var(--accent-yellow);
+      color: var(--accent-yellow);
+    }
+    .btn .tp-price {
+      width: 64px;
+      padding: 1px 4px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--accent-yellow);
+      color: var(--accent-yellow);
+      border-radius: 3px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+    }
+    .divider {
+      width: 1px;
+      align-self: stretch;
+      background: var(--border-default);
+      margin: 0 4px;
+    }
+    /* Tooltip caption shown below the strip so the operator can scan all
+       prefill targets at once (in the real app these live as title= only). */
+    .prefill-captions {
+      display: grid;
+      grid-template-columns: repeat(6, auto);
+      gap: 4px 12px;
+      padding: 4px 10px 6px;
+      border-top: 1px dashed var(--border-muted);
+      background: var(--bg-primary);
+      font-family: ui-monospace, monospace;
+      font-size: 10px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .prefill-captions span code {
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+
+    /* === Console === */
+    .console-body {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      padding: 6px 8px;
+      gap: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+    }
+    .console-history {
+      flex: 1;
+      overflow: auto;
+      color: var(--text-secondary);
+    }
+    .console-history .line { margin: 2px 0; }
+    .console-history .line .ts { color: var(--text-muted); margin-right: 6px; }
+    .console-history .line.cmd { color: var(--accent-blue); }
+    .console-history .line.ok  { color: var(--accent-green); }
+    .console-history .line.err { color: var(--accent-red); }
+    .console-input-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-top: 1px solid var(--border-default);
+      padding-top: 6px;
+    }
+    .console-input-row .prompt { color: var(--accent-green); font-weight: 700; }
+    .console-input-row input {
+      flex: 1;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-default);
+      border-radius: 3px;
+      padding: 4px 8px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .console-input-row input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    /* === Tabbed group inner table (Watchlist active) === */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    .data-table thead th {
+      text-align: left;
+      padding: 4px 8px;
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border-default);
+      background: var(--header-bg);
+      position: sticky;
+      top: 0;
+    }
+    .data-table tbody td {
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--border-muted);
+      color: var(--text-primary);
+    }
+    .data-table tbody tr:hover { background: var(--row-hover); }
+    .data-table .num {
+      text-align: right;
+      font-family: ui-monospace, monospace;
+    }
+    .data-table .up { color: var(--accent-green); }
+    .data-table .down { color: var(--accent-red); }
+
+    /* === Errors panel === */
+    .errors-body {
+      padding: 4px 0;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      overflow: auto;
+      height: 100%;
+    }
+    .errors-body .row {
+      padding: 3px 10px;
+      border-left: 3px solid transparent;
+    }
+    .errors-body .row.err  { border-left-color: var(--accent-red); color: var(--text-primary); }
+    .errors-body .row.warn { border-left-color: var(--accent-yellow); color: var(--text-secondary); }
+    .errors-body .row .ts { color: var(--text-muted); margin-right: 6px; }
+    .errors-body .row .lvl {
+      display: inline-block;
+      width: 50px;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+    }
+    .errors-body .row.err .lvl  { color: var(--accent-red); }
+    .errors-body .row.warn .lvl { color: var(--accent-yellow); }
+
+    /* === P&L pane === */
+    .pnl-body {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+    .pnl-filters {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border-default);
+      background: var(--header-bg);
+      flex-shrink: 0;
+    }
+    .filter-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid var(--border-default);
+      border-radius: 3px;
+      color: var(--text-muted);
+      cursor: pointer;
+      background: var(--bg-primary);
+    }
+    .filter-chip.active {
+      color: var(--accent-blue);
+      border-color: var(--accent-blue);
+      background: var(--badge-blue-bg, rgba(37,99,235,0.12));
+    }
+    .filter-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding-right: 8px;
+      border-right: 1px solid var(--border-muted);
+    }
+    .filter-group:last-child { border-right: none; }
+    .filter-group .label {
+      font-size: 9px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .pnl-table-wrap {
+      flex: 1;
+      overflow: auto;
+      min-height: 0;
+    }
+    .pnl-totals {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 6px 10px;
+      border-top: 1px solid var(--border-default);
+      background: var(--header-bg);
+      flex-shrink: 0;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+    }
+    .pnl-totals .group {
+      display: inline-flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    .pnl-totals .group .lbl {
+      font-size: 9px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-family: ui-sans-serif, sans-serif;
+    }
+    .pnl-totals .group .val { font-weight: 700; }
+    .pnl-totals .up { color: var(--accent-green); }
+    .pnl-totals .down { color: var(--accent-red); }
+
+    /* === SVG candles placeholder === */
+    .placeholder-chart {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ===== Header (light approximation of GlobalHeader.tsx) ===== -->
+  <div class="mock-header">
+    <div style="display:flex; gap:14px; align-items:center;">
+      <div>
+        <div class="title">IB Control Center</div>
+        <div class="subtitle">Trading Workstation</div>
+      </div>
+      <div class="chip">
+        <span class="label">Engine</span>
+        <span class="dot" style="background: var(--accent-green);"></span>
+        <span class="value" style="color: var(--accent-green);">Connected</span>
+      </div>
+      <div class="chip">
+        <span class="label">Account</span>
+        <span class="value" style="color: var(--accent-red);">live</span>
+        <span class="value" style="color: var(--text-muted);">U1234567</span>
+      </div>
+      <div class="chip">
+        <span class="label">Services</span>
+        <span class="value" style="color: var(--accent-green);">8/8</span>
+      </div>
+      <div class="chip">
+        <span class="label">Data</span>
+        <span class="value" style="color: var(--accent-green);">live</span>
+      </div>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center;">
+      <div class="chip">
+        <span class="label">24h P&amp;L</span>
+        <span class="value" style="color: var(--accent-green); font-family: ui-monospace, monospace;">+$4,825.20</span>
+      </div>
+      <div class="chip" title="Resync"><span style="color: var(--text-secondary);">⟳</span></div>
+      <div class="chip" title="Settings"><span style="color: var(--text-secondary);">⚙</span></div>
+    </div>
+  </div>
+
+  <!-- ===== 3×2 main grid ===== -->
+  <div class="grid">
+
+    <!-- ============ Top-left: Tabbed group ============ -->
+    <div class="cell cell-tabbed">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-blue);"></span>
+            <span class="panel-title">Tabbed Group</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">14 symbols</span>
+        </div>
+        <div class="panel-content" style="display:flex; flex-direction:column;">
+          <div class="tabs">
+            <div class="tab active">Watchlist</div>
+            <div class="tab">Positions</div>
+            <div class="tab">Orders</div>
+            <div class="tab">Trades</div>
+          </div>
+          <div style="flex:1; overflow:auto;">
+            <table class="data-table">
+              <thead>
+                <tr><th>Sym</th><th class="num">Last</th><th class="num">Chg %</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>MNQM6</td><td class="num">23,412.50</td><td class="num up">+0.84</td></tr>
+                <tr><td>MESM6</td><td class="num">5,968.25</td><td class="num up">+0.41</td></tr>
+                <tr><td>MGCQ6</td><td class="num">2,418.40</td><td class="num down">−0.22</td></tr>
+                <tr><td>QQQ</td><td class="num">512.34</td><td class="num up">+1.12</td></tr>
+                <tr><td>SPY</td><td class="num">595.78</td><td class="num up">+0.55</td></tr>
+                <tr><td>META</td><td class="num">704.21</td><td class="num up">+2.31</td></tr>
+                <tr><td>NVDA</td><td class="num">142.50</td><td class="num down">−0.41</td></tr>
+                <tr><td>AAPL</td><td class="num">214.96</td><td class="num up">+0.34</td></tr>
+                <tr><td>MSFT</td><td class="num">429.10</td><td class="num up">+0.18</td></tr>
+                <tr><td>GOOGL</td><td class="num">188.40</td><td class="num up">+0.92</td></tr>
+                <tr><td>AMZN</td><td class="num">218.25</td><td class="num down">−0.07</td></tr>
+                <tr><td>CRM</td><td class="num">285.90</td><td class="num up">+0.62</td></tr>
+                <tr><td>USO</td><td class="num">76.12</td><td class="num down">−1.18</td></tr>
+                <tr><td>GLD</td><td class="num">241.84</td><td class="num down">−0.22</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Bottom-left: Errors / Alerts ============ -->
+    <div class="cell cell-errors">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-red);"></span>
+            <span class="panel-title">Errors / Alerts</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">2 errors · 3 warnings</span>
+        </div>
+        <div class="panel-content">
+          <div class="errors-body">
+            <div class="row warn"><span class="ts">10:14:22</span><span class="lvl">WARN</span> IB_THROTTLED qualify_contract MNQM6 (queued 180ms)</div>
+            <div class="row err"><span class="ts">10:09:51</span><span class="lvl">ERROR</span> ENGINE_HISTORY_UNREACHABLE timeout=45s symbol=MGCQ6</div>
+            <div class="row warn"><span class="ts">10:02:14</span><span class="lvl">WARN</span> ORDER_REJECTED 462 cancel pre-routing perm_id=0 (synthesized)</div>
+            <div class="row err"><span class="ts">09:58:30</span><span class="lvl">ERROR</span> WS_DISCONNECT ws=/ws code=1006 reconnect_in=1.2s</div>
+            <div class="row warn"><span class="ts">09:51:07</span><span class="lvl">WARN</span> STREAMING_RESUB_DRIFT symbol=MESM6 silent_s=42</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Top-middle: Chart A (MNQ) ============ -->
+    <div class="cell cell-chart-a">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-green);"></span>
+            <span class="panel-title">Chart · MNQM6 · 1 min</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">slot 1</span>
+        </div>
+        <div class="panel-content">
+          <div class="chart-body">
+            <div class="chart-canvas">
+              <!-- Entry line and TP line rendered as positioned divs (in
+                   the real chart these are lightweight-charts series). -->
+              <div class="entry-line" style="top: 55%;"></div>
+              <div class="tp-handle" style="top: 25%;"></div>
+              <!-- Position badge: top-right -->
+              <div class="position-badge">
+                <span class="qty">LONG 2 MNQM6</span>
+                <span style="color: var(--text-muted); font-size:10px;">entry 23,410.00</span>
+                <span class="pnl up">+$185.00</span>
+              </div>
+              <!-- SVG line/candle placeholder -->
+              <svg class="placeholder-chart" viewBox="0 0 800 300" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id="bgFade" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stop-color="rgba(255,255,255,0.04)"/>
+                    <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+                  </linearGradient>
+                </defs>
+                <!-- Grid -->
+                <g stroke="var(--border-muted)" stroke-width="0.5" opacity="0.5">
+                  <line x1="0" y1="60" x2="800" y2="60"/>
+                  <line x1="0" y1="120" x2="800" y2="120"/>
+                  <line x1="0" y1="180" x2="800" y2="180"/>
+                  <line x1="0" y1="240" x2="800" y2="240"/>
+                </g>
+                <!-- Sample line chart (operator confirmed line, not bars) -->
+                <polyline fill="none" stroke="var(--accent-blue)" stroke-width="1.5"
+                  points="0,200 40,210 80,195 120,180 160,190 200,170 240,150 280,160 320,140 360,135 400,150 440,130 480,110 520,120 560,100 600,95 640,110 680,90 720,80 760,95 800,85"/>
+                <polyline fill="url(#bgFade)" stroke="none"
+                  points="0,200 40,210 80,195 120,180 160,190 200,170 240,150 280,160 320,140 360,135 400,150 440,130 480,110 520,120 560,100 600,95 640,110 680,90 720,80 760,95 800,85 800,300 0,300"/>
+              </svg>
+            </div>
+            <div class="action-strip">
+              <button class="btn btn-buy" title="buy 1 MNQM6 market">BUY MKT</button>
+              <button class="btn btn-sell" title="sell 1 MNQM6 market">SELL MKT</button>
+              <button class="btn btn-buy" title="buy 1 MNQM6 limit 23411.25">BUY LMT</button>
+              <button class="btn btn-sell" title="sell 1 MNQM6 limit 23411.25">SELL LMT</button>
+              <span class="divider"></span>
+              <button class="btn btn-close" title="close MNQM6">CLOSE</button>
+              <button class="btn btn-tp" title="tp MNQM6 23450.00">
+                TP @ <input class="tp-price" value="23450.00" />
+              </button>
+            </div>
+            <div class="prefill-captions">
+              <span>BUY MKT&nbsp;<code>buy 1 MNQM6 market</code></span>
+              <span>SELL MKT&nbsp;<code>sell 1 MNQM6 market</code></span>
+              <span>BUY LMT&nbsp;<code>buy 1 MNQM6 limit 23411.25</code></span>
+              <span>SELL LMT&nbsp;<code>sell 1 MNQM6 limit 23411.25</code></span>
+              <span>CLOSE&nbsp;<code>close MNQM6</code></span>
+              <span>TP&nbsp;<code>tp MNQM6 23450.00</code></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Bottom-middle: Console ============ -->
+    <div class="cell cell-console">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-blue);"></span>
+            <span class="panel-title">Console</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">ready · 0 queued</span>
+        </div>
+        <div class="panel-content">
+          <div class="console-body">
+            <div class="console-history">
+              <div class="line cmd"><span class="ts">10:14:01</span>&gt; buy 1 MNQM6 market</div>
+              <div class="line ok"><span class="ts">10:14:02</span>  filled 2 @ 23410.00 · perm_id 1184763</div>
+              <div class="line cmd"><span class="ts">10:14:18</span>&gt; tp MNQM6 23450.00</div>
+              <div class="line ok"><span class="ts">10:14:18</span>  working · order id 1184781</div>
+              <div class="line cmd"><span class="ts">10:11:42</span>&gt; close MGCQ6</div>
+              <div class="line err"><span class="ts">10:11:43</span>  rejected: no position</div>
+              <div class="line cmd"><span class="ts">10:08:09</span>&gt; status</div>
+              <div class="line ok"><span class="ts">10:08:09</span>  engine up · gateway connected · 8 services</div>
+            </div>
+            <div class="console-input-row">
+              <span class="prompt">$</span>
+              <input type="text" data-testid="console-input"
+                value="tp MNQM6 23450.00"
+                placeholder="type a command — buttons on charts prefill here" />
+              <span style="font-size:10px; color:var(--text-muted);">⏎ to send</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Top-right: Chart B (MES) ============ -->
+    <div class="cell cell-chart-b">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-green);"></span>
+            <span class="panel-title">Chart · MESM6 · 1 min</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">slot 3</span>
+        </div>
+        <div class="panel-content">
+          <div class="chart-body">
+            <div class="chart-canvas">
+              <div class="entry-line" style="top: 60%;"></div>
+              <!-- No TP set on this chart — operator hasn't dragged one yet -->
+              <div class="position-badge">
+                <span class="qty">SHORT 3 MESM6</span>
+                <span style="color: var(--text-muted); font-size:10px;">entry 5,970.50</span>
+                <span class="pnl down">−$33.75</span>
+              </div>
+              <svg class="placeholder-chart" viewBox="0 0 800 300" preserveAspectRatio="none">
+                <g stroke="var(--border-muted)" stroke-width="0.5" opacity="0.5">
+                  <line x1="0" y1="60" x2="800" y2="60"/>
+                  <line x1="0" y1="120" x2="800" y2="120"/>
+                  <line x1="0" y1="180" x2="800" y2="180"/>
+                  <line x1="0" y1="240" x2="800" y2="240"/>
+                </g>
+                <polyline fill="none" stroke="var(--accent-blue)" stroke-width="1.5"
+                  points="0,140 40,135 80,150 120,160 160,145 200,170 240,180 280,170 320,185 360,200 400,180 440,195 480,210 520,200 560,215 600,225 640,210 680,220 720,230 760,225 800,235"/>
+              </svg>
+            </div>
+            <div class="action-strip">
+              <button class="btn btn-buy" title="buy 1 MESM6 market">BUY MKT</button>
+              <button class="btn btn-sell" title="sell 1 MESM6 market">SELL MKT</button>
+              <button class="btn btn-buy" title="buy 1 MESM6 limit 5968.50">BUY LMT</button>
+              <button class="btn btn-sell" title="sell 1 MESM6 limit 5968.50">SELL LMT</button>
+              <span class="divider"></span>
+              <button class="btn btn-close" title="close MESM6">CLOSE</button>
+              <button class="btn btn-tp" title="tp MESM6 5960.00">
+                TP @ <input class="tp-price" value="5960.00" />
+              </button>
+            </div>
+            <div class="prefill-captions">
+              <span>BUY MKT&nbsp;<code>buy 1 MESM6 market</code></span>
+              <span>SELL MKT&nbsp;<code>sell 1 MESM6 market</code></span>
+              <span>BUY LMT&nbsp;<code>buy 1 MESM6 limit 5968.50</code></span>
+              <span>SELL LMT&nbsp;<code>sell 1 MESM6 limit 5968.50</code></span>
+              <span>CLOSE&nbsp;<code>close MESM6</code></span>
+              <span>TP&nbsp;<code>tp MESM6 5960.00</code></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Bottom-right: Interactive P&L ============ -->
+    <div class="cell cell-pnl">
+      <div class="panel-shell">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center;">
+            <span class="accent-dot" style="background: var(--accent-purple);"></span>
+            <span class="panel-title">Interactive P&amp;L</span>
+          </div>
+          <span style="font-size: 11px; color: var(--text-muted);">42 trades · filtered</span>
+        </div>
+        <div class="panel-content">
+          <div class="pnl-body">
+            <div class="pnl-filters">
+              <div class="filter-group">
+                <span class="label">Status</span>
+                <span class="filter-chip">Open</span>
+                <span class="filter-chip">Closed</span>
+                <span class="filter-chip active">All</span>
+              </div>
+              <div class="filter-group">
+                <span class="label">When</span>
+                <span class="filter-chip active">Today</span>
+                <span class="filter-chip">Week</span>
+                <span class="filter-chip">Month</span>
+                <span class="filter-chip">All</span>
+              </div>
+              <div class="filter-group">
+                <span class="label">Symbol</span>
+                <span class="filter-chip active">MNQ</span>
+                <span class="filter-chip active">MES</span>
+                <span class="filter-chip">MGC</span>
+                <span class="filter-chip">+ add</span>
+              </div>
+              <div class="filter-group">
+                <span class="label">Group</span>
+                <span class="filter-chip active">None</span>
+                <span class="filter-chip">Symbol</span>
+                <span class="filter-chip">Day</span>
+              </div>
+            </div>
+            <div class="pnl-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Sym</th>
+                    <th>Side</th>
+                    <th class="num">Qty</th>
+                    <th class="num">Entry</th>
+                    <th class="num">Mark</th>
+                    <th class="num">Realized</th>
+                    <th class="num">Unrealized</th>
+                    <th class="num">Comm</th>
+                    <th>Opened</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>MNQM6</td><td style="color:var(--accent-green);">LONG</td>
+                    <td class="num">2</td><td class="num">23,410.00</td><td class="num">23,412.50</td>
+                    <td class="num">—</td><td class="num up">+185.00</td><td class="num">2.50</td>
+                    <td>10:14:02</td>
+                  </tr>
+                  <tr>
+                    <td>MESM6</td><td style="color:var(--accent-red);">SHORT</td>
+                    <td class="num">3</td><td class="num">5,970.50</td><td class="num">5,968.25</td>
+                    <td class="num">—</td><td class="num down">−33.75</td><td class="num">3.75</td>
+                    <td>09:48:21</td>
+                  </tr>
+                  <tr>
+                    <td>MNQM6</td><td style="color:var(--accent-green);">LONG</td>
+                    <td class="num">1</td><td class="num">23,388.00</td><td class="num">—</td>
+                    <td class="num up">+125.00</td><td class="num">—</td><td class="num">1.25</td>
+                    <td>09:21:08</td>
+                  </tr>
+                  <tr>
+                    <td>MGCQ6</td><td style="color:var(--accent-red);">SHORT</td>
+                    <td class="num">2</td><td class="num">2,420.10</td><td class="num">—</td>
+                    <td class="num up">+34.00</td><td class="num">—</td><td class="num">2.50</td>
+                    <td>09:04:42</td>
+                  </tr>
+                  <tr>
+                    <td>MESM6</td><td style="color:var(--accent-green);">LONG</td>
+                    <td class="num">2</td><td class="num">5,961.00</td><td class="num">—</td>
+                    <td class="num down">−45.00</td><td class="num">—</td><td class="num">2.50</td>
+                    <td>08:42:11</td>
+                  </tr>
+                  <tr>
+                    <td>MNQM6</td><td style="color:var(--accent-green);">LONG</td>
+                    <td class="num">1</td><td class="num">23,402.00</td><td class="num">—</td>
+                    <td class="num up">+212.00</td><td class="num">—</td><td class="num">1.25</td>
+                    <td>08:18:55</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="pnl-totals">
+              <div class="group">
+                <span class="lbl">Realized (filtered)</span>
+                <span class="val up">+$326.00</span>
+              </div>
+              <div class="group">
+                <span class="lbl">Unrealized</span>
+                <span class="val up">+$151.25</span>
+              </div>
+              <div class="group">
+                <span class="lbl">Commissions</span>
+                <span class="val" style="color:var(--text-secondary);">$13.75</span>
+              </div>
+              <div class="group">
+                <span class="lbl">Net</span>
+                <span class="val up">+$463.50</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+</body>
+</html>

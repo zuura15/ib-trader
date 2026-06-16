@@ -13,7 +13,7 @@ const REFRESH_MS = 30_000;
  * and not just bot closes. Options/stock rows are intentionally excluded;
  * this card is futures-only. Label + value render on a single line.
  */
-export function FuturesPnl24hCard() {
+export function FuturesPnl24hCard({ compact = false }: { compact?: boolean } = {}) {
   const [pnl, setPnl] = useState<number | null>(null);
 
   useEffect(() => {
@@ -48,11 +48,36 @@ export function FuturesPnl24hCard() {
       ? 'var(--accent-green)'
       : 'var(--accent-red)';
 
+  const title =
+    'Realized P&L across ALL futures trades in the last 24h, summed from '
+    + 'IB executions — includes trades placed directly in TWS, not just '
+    + 'this app. Options and stock trades are excluded.';
+
+  if (compact) {
+    // Borderless inline form for the tight mobile header.
+    return (
+      <span
+        title={title}
+        style={{
+          display: 'inline-flex', alignItems: 'baseline', gap: 4,
+          whiteSpace: 'nowrap', fontFamily: 'ui-monospace, monospace',
+        }}
+      >
+        <span style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>
+          24h
+        </span>
+        <span style={{ fontSize: 14, fontWeight: 700, color }}>
+          {loaded ? formatCurrency(pnl) : '—'}
+        </span>
+      </span>
+    );
+  }
+
   return (
     <div
       className="rounded border px-3 py-1.5"
       style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}
-      title="Realized P&L across ALL futures trades in the last 24h, summed from IB executions — includes trades placed directly in TWS, not just this app. Options and stock trades are excluded."
+      title={title}
     >
       <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 6, whiteSpace: 'nowrap' }}>
         <span style={{ fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>
