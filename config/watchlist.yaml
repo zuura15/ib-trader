@@ -17,13 +17,14 @@
 # last GC position closed) and the chart freezes. ESM6 doesn't
 # need this because the operator currently holds ES.
 - GCQ6
-# NQM6 (full Nasdaq) pinned 2026-06-09 — chart-bot-4 symbol. Its IB
-# quote sub was anchored only by the held position, which lapsed and
-# left the quote stream 17 min stale while the chart sat frozen.
-# Watchlist-pin keeps it streaming regardless of position state, same
-# rationale as GCQ6 above. (Until chart panes self-subscribe their
-# own symbols, watchlist is the durable anchor.)
-- NQM6
+# NQU6 (full Nasdaq, Sep) pinned 2026-06-15 — chart-bot-4 symbol.
+# Rolled from NQM6 now that the M6 → U6 roll (2026-06-11) is past and
+# liquidity sits in U6; M6 expires 2026-06-19. Its IB quote sub is
+# anchored only by the held position, which lapses and leaves the
+# stream stale while the chart freezes — watchlist-pin keeps it
+# streaming regardless of position state, same rationale as GCQ6
+# above. (Until chart panes self-subscribe, watchlist is the anchor.)
+- NQU6
 # MNQM6 (micro Nasdaq, June) pinned 2026-06-10 — chart-bot-3 symbol.
 # Switched from NQU6: operator needs NQ exposure on this pane but
 # U6's back-month volume was too thin to scan. Micro front-month is

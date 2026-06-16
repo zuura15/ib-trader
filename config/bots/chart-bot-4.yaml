@@ -16,12 +16,13 @@ config:
   strategy_config: config/strategies/chart_signal.yaml
   ref_id: chart-bot-4-nq
   # NQ = full E-mini Nasdaq-100. Switched from micro MNQM6 → full
-  # NQM6 on 2026-06-07. Tried targeting NQU6 on 2026-06-09 ahead
-  # of the M6 → U6 roll but rolled back the same day — U6's after-
-  # hours volume was abysmal, the chart wasn't scannable. Revisit
-  # once U6 picks up actual liquidity (~2026-06-13). QBALGO twin
-  # dropped by the qualifier (insync_client 46953eb).
-  symbol: NQM6
+  # NQM6 on 2026-06-07. Tried NQU6 on 2026-06-09 ahead of the M6 → U6
+  # roll but rolled back same day — U6's after-hours volume was
+  # abysmal then. Switched to NQU6 on 2026-06-15: the roll (Thu
+  # 2026-06-11) is now past, OI/volume have moved to U6, and M6
+  # expires Fri 2026-06-19. QBALGO twin dropped by the qualifier
+  # (insync_client 46953eb).
+  symbol: NQU6
   sec_type: FUT
   # Full Nasdaq: $20/point (10x micro). Used by P/L math + trail
   # target.
@@ -34,4 +35,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- NQM6
+- NQU6
