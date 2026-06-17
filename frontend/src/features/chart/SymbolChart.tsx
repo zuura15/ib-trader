@@ -2,8 +2,9 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, HistogramSeries,
-  type IChartApi, type ISeriesApi, type UTCTimestamp,
+  createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
+  type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
+  type Time, type ISeriesMarkersPluginApi,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -159,6 +160,12 @@ interface Props {
    *  operator a 24 h record of where it fired, even after the
    *  active entry has exited. */
   historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
+  /** Execution markers (account-wide, incl. fills placed directly in
+   *  TWS): one colored circle ON the price line per order, labelled with
+   *  side (B/S) + lot size. Rendered with lightweight-charts' native
+   *  series-markers primitive — fully independent of the SR/fires SVG
+   *  painter. No open/close pairing. */
+  executionMarkers?: Array<{ time: string; side: 'B' | 'S'; qty: number; price: number }>;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -180,6 +187,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     paneBackground = null,
     suppressAutoSignals = false,
     historicalFires,
+    executionMarkers,
   }: Props,
   ref,
 ) {
@@ -526,6 +534,48 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       fillRenderRef.current = [];
     }
   }, [historicalFires, chartVersion]);
+
+  // ── Execution markers (native lightweight-charts) ──────────────────
+  // A colored circle ON the price line per order (B/S + lot size),
+  // account-wide so fills placed directly in TWS show too. Uses the
+  // native series-markers primitive rather than the SR/fires SVG painter
+  // above — fully isolated, so it can never perturb SR rendering.
+  const execMarkersApiRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    const colors = themeColors();
+    const markers: SeriesMarker<Time>[] = [];
+    for (const e of executionMarkers ?? []) {
+      const d = new Date(e.time);
+      if (!Number.isFinite(d.getTime())) continue;
+      // Snap the fill to its 1-min bar's slot-END label (how toBars
+      // keys bars) so the marker lands on an existing data point.
+      const sec = localUtcSeconds(d) as number;
+      const slotEnd = (Math.floor(sec / BAR_SECONDS) * BAR_SECONDS
+        + BAR_SECONDS) as UTCTimestamp;
+      const isBuy = e.side === 'B';
+      const qtyTxt = Number.isInteger(e.qty)
+        ? String(e.qty) : String(Number(e.qty.toFixed(2)));
+      markers.push({
+        time: slotEnd,
+        position: 'inBar',
+        shape: 'circle',
+        color: isBuy ? colors.bullish : colors.bearish,
+        text: `${isBuy ? 'B' : 'S'}+${qtyTxt}`,
+      });
+    }
+    markers.sort((a, b) => (a.time as number) - (b.time as number));
+    try {
+      // Recreate against the current series instance (replaced on a
+      // chartVersion bump); the cleanup detaches it so none stack.
+      execMarkersApiRef.current = createSeriesMarkers(series, markers);
+    } catch { /* chart mid-teardown — next run re-attaches */ }
+    return () => {
+      try { execMarkersApiRef.current?.detach(); } catch { /* already gone */ }
+      execMarkersApiRef.current = null;
+    };
+  }, [executionMarkers, chartVersion]);
 
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;

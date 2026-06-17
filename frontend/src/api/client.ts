@@ -403,3 +403,20 @@ export type ChartPnlRollup = Record<string, ChartPnlRollupEntry>;
 export function getChartPnlRollup() {
   return request<ChartPnlRollup>('/chart/pnl-rollup');
 }
+
+export interface ChartExecutionMarker {
+  /** ISO timestamp (UTC) of the order's (last) fill. */
+  time: string;
+  side: 'B' | 'S';
+  /** Total filled lot size for the order (partial fills summed). */
+  qty: number;
+  /** Qty-weighted average fill price. */
+  price: number;
+}
+
+/** Per-contract execution markers, keyed by localSymbol. */
+export type ChartExecutions = Record<string, ChartExecutionMarker[]>;
+
+export function getChartExecutions() {
+  return request<ChartExecutions>('/chart/executions');
+}

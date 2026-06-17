@@ -7,7 +7,7 @@ import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import type { ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
 // PositionStrip import removed with the 2-row shelf — see chartBody.
-import { getBotTrades } from '../../api/client';
+import { getBotTrades, getChartExecutions, type ChartExecutionMarker } from '../../api/client';
 
 interface Props {
   /** Bot identity. Frontend convention: ``chart-bot-<slot>``. */
@@ -271,6 +271,27 @@ export function BotChart({
     const id = window.setInterval(tick, 30_000);
     return () => { cancelled = true; window.clearInterval(id); };
   }, [botId, symbol]);
+
+  // Execution markers for THIS contract — account-wide (incl. fills
+  // placed directly in TWS), polled from /api/chart/executions on the
+  // same ~30 s cadence as the fires above. Filtered to the chart's
+  // current symbol so a post-roll contract change doesn't surface the
+  // prior contract's fills.
+  const [executionMarkers, setExecutionMarkers] = useState<ChartExecutionMarker[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      if (!symbol) { if (!cancelled) setExecutionMarkers([]); return; }
+      try {
+        const map = await getChartExecutions();
+        if (cancelled) return;
+        setExecutionMarkers(Array.isArray(map[symbol]) ? map[symbol] : []);
+      } catch { /* keep last good value on transient error */ }
+    };
+    tick();
+    const id = window.setInterval(tick, 30_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [symbol]);
 
   const fsmState = (state.state as string | undefined) ?? 'UNKNOWN';
   const target: ChartTarget | null = symbol
@@ -574,6 +595,7 @@ export function BotChart({
           paneBackground={inPosition ? ACTIVE_TINT : null}
           suppressAutoSignals
           historicalFires={historicalFires}
+          executionMarkers={executionMarkers}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
