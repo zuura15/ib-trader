@@ -427,9 +427,6 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           <button
             onClick={onBuy}
             disabled={pendingAction !== null || !symbol}
-            title={symbol
-              ? `buy ${symbol} ${qty} (smart_market) — auto-fires via console`
-              : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-green)', color: '#fff',
               border: 'none', borderRadius: 3,
@@ -447,9 +444,6 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           <button
             onClick={onSell}
             disabled={pendingAction !== null || !symbol}
-            title={symbol
-              ? `sell ${symbol} ${qty} (smart_market) — auto-fires via console`
-              : 'symbol not resolved yet'}
             style={{
               background: 'var(--accent-red)', color: '#fff',
               border: 'none', borderRadius: 3,
@@ -467,9 +461,6 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           <button
             onClick={onClose}
             disabled={pendingAction !== null || !canClose}
-            title={canClose
-              ? `Close ${positionLabel} ${symbol ?? ''} at market — auto-fires via console`
-              : 'No open position on this symbol'}
             style={{
               background: 'var(--accent-blue)', color: '#fff',
               border: 'none', borderRadius: 3,
