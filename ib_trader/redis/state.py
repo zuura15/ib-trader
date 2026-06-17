@@ -211,6 +211,19 @@ class StateKeys:
         return "chart:pnl:rollup"
 
     @staticmethod
+    def chart_exec_markers() -> str:
+        """IB-authoritative execution markers per contract for chart panes.
+
+        Plain string key holding a JSON map
+        ``{ localSymbol: [ {time, side, qty, price}, ... ] }``. Written by
+        the engine's ``_pnl_rollup_loop`` from the same ``reqExecutions``
+        sweep — account-wide, so it includes fills the operator placed
+        directly in TWS. One marker per order (partial fills summed). No
+        open/close pairing.
+        """
+        return "chart:exec:markers"
+
+    @staticmethod
     def engine_session() -> str:
         """Metadata about the engine's current IB connection.
 

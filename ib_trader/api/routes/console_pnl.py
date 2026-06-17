@@ -53,6 +53,31 @@ async def get_chart_pnl_rollup(redis=Depends(get_redis)):
         return {}
 
 
+@router.get("/chart/executions")
+async def get_chart_executions(redis=Depends(get_redis)):
+    """IB-authoritative per-contract execution markers for chart panes.
+
+    Returns ``{ localSymbol: [ {time, side, qty, price}, ... ] }`` — one
+    marker per order (partial fills summed), produced by the engine's
+    ``_pnl_rollup_loop`` from the same ``reqExecutions`` sweep, so it
+    includes fills placed directly in TWS. Empty object when nothing's
+    been swept yet / Redis is down.
+    """
+    if redis is None:
+        return {}
+    try:
+        raw = await redis.get(StateKeys.chart_exec_markers())
+    except Exception:
+        logger.exception('{"event": "CHART_EXEC_MARKERS_READ_FAILED"}')
+        return {}
+    if not raw:
+        return {}
+    try:
+        return _json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
 @router.get("/console/pnl/24h")
 async def get_console_pnl_24h(redis=Depends(get_redis)):
     """Sum of console-close realized P&L over the rolling last-24h window.

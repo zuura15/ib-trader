@@ -932,6 +932,7 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
     """
     from datetime import datetime
     from ib_trader.engine.pnl_rollup import compute_pnl_rollup
+    from ib_trader.engine.exec_markers import compute_exec_markers
     from ib_trader.redis.state import StateKeys
 
     interval = float(ctx.settings.get("pnl_rollup_interval_seconds", 60))
@@ -943,13 +944,20 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
             # in this tz (3 PM PT for the operator's Pacific box).
             now = datetime.now().astimezone()
             rollup = compute_pnl_rollup(execs, now, session_hour)
+            # Per-contract execution markers (B/S + lot size) from the same
+            # sweep — account-wide, so manual TWS fills show on the chart.
+            markers = compute_exec_markers(execs)
             if ctx.redis is not None:
                 await ctx.redis.set(
                     StateKeys.chart_pnl_rollup(), json.dumps(rollup),
                 )
+                await ctx.redis.set(
+                    StateKeys.chart_exec_markers(), json.dumps(markers),
+                )
             logger.debug(
                 '{"event": "PNL_ROLLUP_UPDATED", "contracts": %d, '
-                '"executions": %d}', len(rollup), len(execs),
+                '"executions": %d, "marker_contracts": %d}',
+                len(rollup), len(execs), len(markers),
             )
         except Exception:
             logger.exception('{"event": "PNL_ROLLUP_ERROR"}')

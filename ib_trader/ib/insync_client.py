@@ -1662,6 +1662,23 @@ class InsyncClient(IBClientBase):
                     pass
             # ``time`` on the execution is tz-aware UTC in ib_async.
             exec_time = getattr(execu, "time", None)
+            # Price + filled qty for chart execution markers. Decimal per
+            # the money-handling rule; both are benign-parse (fall back to
+            # None on a bad value — the marker just omits that fill).
+            price: Decimal | None = None
+            raw_price = getattr(execu, "price", None)
+            if raw_price is not None:
+                try:
+                    price = Decimal(str(raw_price))
+                except (ValueError, TypeError):
+                    pass
+            shares: Decimal | None = None
+            raw_shares = getattr(execu, "shares", None)
+            if raw_shares is not None:
+                try:
+                    shares = Decimal(str(raw_shares))
+                except (ValueError, TypeError):
+                    pass
             out.append({
                 "local_symbol": getattr(con, "localSymbol", "") or getattr(con, "symbol", ""),
                 "symbol": getattr(con, "symbol", "") or "",
@@ -1671,6 +1688,12 @@ class InsyncClient(IBClientBase):
                 "exec_time": exec_time,
                 "exec_id": getattr(execu, "execId", "") or "",
                 "side": getattr(execu, "side", "") or "",
+                "price": price,
+                "shares": shares,
+                # permId groups partial fills of one order into a single
+                # marker; 0 for some foreign/old orders, in which case the
+                # marker falls back to the unique execId (no aggregation).
+                "perm_id": getattr(execu, "permId", 0) or 0,
             })
         return out
 
