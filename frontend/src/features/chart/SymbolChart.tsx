@@ -161,8 +161,9 @@ interface Props {
    *  active entry has exited. */
   historicalFires?: Array<{ barTime: string; side: 'long' | 'short'; price: number }>;
   /** Execution markers (account-wide, incl. fills placed directly in
-   *  TWS): one colored circle ON the price line per order, labelled with
-   *  side (B/S) + lot size. Rendered with lightweight-charts' native
+   *  TWS): one colored circle ON the price line per order — green/red
+   *  for buy/sell, labelled with the signed lot size (+n / −n). Rendered
+   *  with lightweight-charts' native
    *  series-markers primitive — fully independent of the SR/fires SVG
    *  painter. No open/close pairing. */
   executionMarkers?: Array<{ time: string; side: 'B' | 'S'; qty: number; price: number }>;
@@ -561,8 +562,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         time: slotEnd,
         position: 'inBar',
         shape: 'circle',
+        // Color already encodes side (green buy / red sell), so the
+        // label is just the signed lot size — +n / −n — to keep the
+        // chart uncluttered.
         color: isBuy ? colors.bullish : colors.bearish,
-        text: `${isBuy ? 'B' : 'S'}+${qtyTxt}`,
+        text: `${isBuy ? '+' : '-'}${qtyTxt}`,
       });
     }
     markers.sort((a, b) => (a.time as number) - (b.time as number));
