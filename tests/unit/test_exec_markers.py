@@ -86,3 +86,32 @@ class TestComputeExecMarkers:
 
     def test_empty(self):
         assert compute_exec_markers([]) == {}
+
+    def test_future_time_rolled_back_by_host_offset(self):
+        # ib_async hands some manual-TWS fills a time shifted +offset into
+        # the future. With a Pacific host (UTC-7), a real 14:37Z fill comes
+        # back as 21:37Z; it must be corrected to 14:37Z, not left floating.
+        pacific = timezone(timedelta(hours=-7))
+        now = datetime(2026, 6, 17, 7, 43, 0, tzinfo=pacific)  # 14:43Z
+        bogus = datetime(2026, 6, 17, 21, 37, 0, tzinfo=timezone.utc)
+        out = compute_exec_markers(
+            [_ex("GCQ6", "BOT", 1, 4378, bogus, perm_id=9)], now=now,
+        )
+        assert out["GCQ6"][0]["time"] == "2026-06-17T14:37:00+00:00"
+
+    def test_naive_time_assumed_utc(self):
+        now = datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc)
+        naive = datetime(2026, 6, 17, 11, 0, 0)  # no tzinfo
+        out = compute_exec_markers(
+            [_ex("NQU6", "BOT", 1, 21000, naive, perm_id=1)], now=now,
+        )
+        assert out["NQU6"][0]["time"] == "2026-06-17T11:00:00+00:00"
+
+    def test_recent_past_not_corrected(self):
+        # A normal fill 10 min ago must be left exactly as-is.
+        now = datetime(2026, 6, 17, 14, 43, 0, tzinfo=timezone.utc)
+        good = datetime(2026, 6, 17, 14, 33, 0, tzinfo=timezone.utc)
+        out = compute_exec_markers(
+            [_ex("NQU6", "SLD", 1, 21000, good, perm_id=1)], now=now,
+        )
+        assert out["NQU6"][0]["time"] == "2026-06-17T14:33:00+00:00"

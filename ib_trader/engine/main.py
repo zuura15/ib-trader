@@ -946,7 +946,8 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
             rollup = compute_pnl_rollup(execs, now, session_hour)
             # Per-contract execution markers (B/S + lot size) from the same
             # sweep — account-wide, so manual TWS fills show on the chart.
-            markers = compute_exec_markers(execs)
+            # ``now`` lets it correct ib_async's future-shifted backfill times.
+            markers = compute_exec_markers(execs, now)
             if ctx.redis is not None:
                 await ctx.redis.set(
                     StateKeys.chart_pnl_rollup(), json.dumps(rollup),
