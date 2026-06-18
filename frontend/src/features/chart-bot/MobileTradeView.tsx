@@ -69,16 +69,28 @@ function SubTabBar<T extends string>({
   );
 }
 
-/** Mounted-always pane; visibility toggled with ``display``. */
+/**
+ * Mounted-always pane, kept at FULL SIZE even when inactive — we toggle
+ * ``visibility``, not ``display``. ``display:none`` zeroes the chart's
+ * container, and the 0→real resize on reveal makes lightweight-charts
+ * re-fit and throw away the user's pan/zoom (the "Micro NQ starts at a
+ * long horizon every time" bug). With ``visibility`` the chart keeps its
+ * size and view across tab switches; the inactive pane is non-interactive
+ * and sits underneath.
+ */
 function Pane({ visible, children }: { visible: boolean; children: ReactNode }) {
   return (
     <div
+      aria-hidden={!visible}
       style={{
         position: 'absolute',
         inset: 0,
-        display: visible ? 'flex' : 'none',
+        display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
+        visibility: visible ? 'visible' : 'hidden',
+        pointerEvents: visible ? 'auto' : 'none',
+        zIndex: visible ? 1 : 0,
       }}
     >
       {children}
