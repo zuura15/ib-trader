@@ -227,17 +227,18 @@ function HistoryButton({
 // ---------------------------------------------------------------------------
 
 /**
- * Collapse the engine's verbose multi-line order output for the compact
- * (mobile) console. The command is already the entry's first line, so:
+ * Collapse the engine's verbose multi-line order output. The command is
+ * already the entry's first line, so:
  *   - drop the redundant ``Order #N — …`` header,
+ *   - drop the debug ``fill notional=…`` line (derivable from qty×price),
  *   - keep every ``[HH:MM:SS] …`` placed/walk step verbatim,
  *   - merge the trailing fill / P&L / commission detail into one summary
  *     line: ``✓ #N · filled Q @ price · P&L ±$X · comm $Y``.
  * Tolerant: anything unrecognized is kept verbatim, and if the fill line
  * can't be parsed the raw detail lines are joined instead — so no
- * information is ever lost, only re-flowed.
+ * information is ever lost, only re-flowed. Applied in both layouts.
  */
-function reformatCompactOutput(output: string): string {
+function collapseConsoleOutput(output: string): string {
   const kept: string[] = [];
   const detail: string[] = [];
   let serial = '';
@@ -246,6 +247,7 @@ function reformatCompactOutput(output: string): string {
     if (!t) continue;
     const hdr = t.match(/^Order #(\d+)\s*[—-]/);
     if (hdr) { serial = hdr[1]; continue; }            // repeated command — drop
+    if (/^fill notional=/i.test(t)) continue;          // debug noise — drop
     if (t.startsWith('[')) { kept.push(t); continue; }  // [HH:MM:SS] step — keep
     if (/^(?:[✓⚠✗❌●]\s*)?(?:FILLED|PARTIAL):|^Commission:|^Serial:|^P&L\b/i.test(t)) {
       detail.push(t);
@@ -425,8 +427,8 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
                     {(() => {
                       const out = cmd.output
                         || (cmd.status === 'failure' ? 'Command failed — check engine logs' : '');
-                      // Compact (mobile): collapse the verbose order block.
-                      return compact && cmd.output ? reformatCompactOutput(out) : out;
+                      // Collapse the verbose order block in both layouts.
+                      return cmd.output ? collapseConsoleOutput(out) : out;
                     })()}
                   </div>
                 )}
