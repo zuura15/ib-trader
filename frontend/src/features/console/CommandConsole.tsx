@@ -425,10 +425,26 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
                     data-testid="console-output"
                   >
                     {(() => {
+                      // Collapse the verbose order block in both layouts,
+                      // then render line-by-line so the ``P&L ±$X`` token
+                      // can be tinted green (gain) / red (loss).
                       const out = cmd.output
-                        || (cmd.status === 'failure' ? 'Command failed — check engine logs' : '');
-                      // Collapse the verbose order block in both layouts.
-                      return cmd.output ? collapseConsoleOutput(out) : out;
+                        ? collapseConsoleOutput(cmd.output)
+                        : (cmd.status === 'failure' ? 'Command failed — check engine logs' : '');
+                      return out.split('\n').map((line, i) => {
+                        const m = line.match(/P&L\s([+-])\$[\d.,]+/);
+                        if (!m) return <div key={i}>{line}</div>;
+                        const start = m.index ?? 0;
+                        const color = m[1] === '-'
+                          ? 'var(--accent-red)' : 'var(--accent-green)';
+                        return (
+                          <div key={i}>
+                            {line.slice(0, start)}
+                            <span style={{ color, fontWeight: 600 }}>{m[0]}</span>
+                            {line.slice(start + m[0].length)}
+                          </div>
+                        );
+                      });
                     })()}
                   </div>
                 )}
