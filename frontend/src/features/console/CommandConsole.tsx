@@ -226,6 +226,49 @@ function HistoryButton({
 // Main component
 // ---------------------------------------------------------------------------
 
+/**
+ * Collapse the engine's verbose multi-line order output for the compact
+ * (mobile) console. The command is already the entry's first line, so:
+ *   - drop the redundant ``Order #N — …`` header,
+ *   - keep every ``[HH:MM:SS] …`` placed/walk step verbatim,
+ *   - merge the trailing fill / P&L / commission detail into one summary
+ *     line: ``✓ #N · filled Q @ price · P&L ±$X · comm $Y``.
+ * Tolerant: anything unrecognized is kept verbatim, and if the fill line
+ * can't be parsed the raw detail lines are joined instead — so no
+ * information is ever lost, only re-flowed.
+ */
+function reformatCompactOutput(output: string): string {
+  const kept: string[] = [];
+  const detail: string[] = [];
+  let serial = '';
+  for (const raw of output.split('\n')) {
+    const t = raw.trim();
+    if (!t) continue;
+    const hdr = t.match(/^Order #(\d+)\s*[—-]/);
+    if (hdr) { serial = hdr[1]; continue; }            // repeated command — drop
+    if (t.startsWith('[')) { kept.push(t); continue; }  // [HH:MM:SS] step — keep
+    if (/^(?:[✓⚠✗❌●]\s*)?(?:FILLED|PARTIAL):|^Commission:|^Serial:|^P&L\b/i.test(t)) {
+      detail.push(t);
+      continue;
+    }
+    kept.push(t);                                        // QUEUED / LIVE / errors — keep
+  }
+  if (detail.length) {
+    const joined = detail.join('  ');
+    const fill = joined.match(/(?:FILLED|PARTIAL):\s*([\d.,]+)[^@]*@\s*(?:avg\s*)?\$?\s*([\d.,]+)/i);
+    const comm = joined.match(/Commission:\s*\$?([\d.,-]+)/i);
+    const pnl = joined.match(/P&L[^:]*:\s*([+-])\$?([\d.,]+)/i);
+    const ser = serial || (joined.match(/Serial:\s*#?(\d+)/i)?.[1] ?? '');
+    const parts: string[] = [];
+    if (ser) parts.push(`#${ser}`);
+    if (fill) parts.push(`filled ${fill[1]} @ ${fill[2]}`);
+    if (pnl) parts.push(`P&L ${pnl[1]}$${pnl[2]}`);
+    if (comm) parts.push(`comm $${comm[1].replace(/^\$/, '')}`);
+    kept.push(parts.length > (ser ? 1 : 0) ? `✓ ${parts.join(' · ')}` : detail.join(' · '));
+  }
+  return kept.join('\n');
+}
+
 export function CommandConsole({ compact = false }: { compact?: boolean }) {
   const { commands, addCommand } = useStore();
   const [input, setInput] = useState('');
@@ -236,7 +279,13 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
+    // Defer to the next frame so the new command's output has been laid
+    // out before we measure scrollHeight — otherwise we scroll to the
+    // pre-render (shorter) height and stop short of the latest entry.
+    const el = scrollRef.current;
+    if (!el) return;
+    const id = requestAnimationFrame(() => el.scrollTo(0, el.scrollHeight));
+    return () => cancelAnimationFrame(id);
   }, [commands]);
 
   // Clean up the copy-indicator timer on unmount
@@ -317,7 +366,7 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
     }>
       <div className="flex flex-col h-full" onClick={() => inputRef.current?.focus()}>
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-2 font-mono text-sm">
-          {commands.map((cmd, idx) => (
+          {commands.map((cmd) => (
             <div
               key={cmd.id}
               data-testid="console-command"
@@ -373,7 +422,12 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
                     }}
                     data-testid="console-output"
                   >
-                    {cmd.output || (cmd.status === 'failure' ? 'Command failed — check engine logs' : '')}
+                    {(() => {
+                      const out = cmd.output
+                        || (cmd.status === 'failure' ? 'Command failed — check engine logs' : '');
+                      // Compact (mobile): collapse the verbose order block.
+                      return compact && cmd.output ? reformatCompactOutput(out) : out;
+                    })()}
                   </div>
                 )}
               </div>
@@ -386,7 +440,7 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
               {isTerminal(cmd.status) && (
                 <div style={{
                   borderBottom: '1px solid var(--border-default)',
-                  margin: '8px 0 10px 0',
+                  margin: compact ? '3px 0 4px 0' : '8px 0 10px 0',
                 }} />
               )}
             </div>
