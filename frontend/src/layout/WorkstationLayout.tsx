@@ -84,7 +84,13 @@ function applyTabSelection(model: Model, map: Record<string, string>): void {
 // tabset that contains `anchor` if the tab isn't already anywhere in the
 // model. Keeps a user's customized layout intact on upgrade rather than
 // forcing a reset.
-const MIGRATED_TABS: Array<{ component: string; name: string; anchor: string }> = [
+// ``slot``/``anchorSlot``/``config`` let a chart-bot tab be migrated by
+// (component, slot) identity rather than component alone — needed because
+// multiple chart-bot tabs coexist and differ only by ``config.slot``.
+const MIGRATED_TABS: Array<{
+  component: string; name: string; anchor: string;
+  config?: Record<string, unknown>; slot?: number; anchorSlot?: number;
+}> = [
   { component: 'errors', name: 'Errors', anchor: 'logs' },
   // Anchor on 'orders' — present in every variant, unlike 'trades'
   // which only appears in variant A. This way users on any variant get
@@ -96,6 +102,13 @@ const MIGRATED_TABS: Array<{ component: string; name: string; anchor: string }> 
   // Stacked-charts panel — anchor next to Bot Log so persisted layouts
   // still pick it up in the right column.
   { component: 'stacked-charts', name: 'Stacked Charts', anchor: 'bot-log' },
+  // ESU6 chart (slot 5) — inject next to the MNQU6 chart (slot 3) for
+  // users whose persisted layout predates it. Matched by slot so the
+  // existing chart-bot tabs don't mask it.
+  {
+    component: 'chart-bot', name: 'Slot 5 · S&P', anchor: 'chart-bot',
+    config: { slot: 5 }, slot: 5, anchorSlot: 3,
+  },
 ];
 
 function migrateLayoutJson(raw: any): any {
@@ -105,14 +118,23 @@ function migrateLayoutJson(raw: any): any {
   const present = new Set<string>();
   const visit = (node: any) => {
     if (!node) return;
-    if (node.type === 'tab' && node.component) present.add(node.component);
+    if (node.type === 'tab' && node.component) {
+      present.add(node.component);
+      // Track chart-bot tabs by slot too, so a slot-specific migration
+      // (e.g. slot 5) isn't masked by the presence of slots 1/3/4.
+      if (node.component === 'chart-bot' && node.config?.slot != null) {
+        present.add(`chart-bot#${node.config.slot}`);
+      }
+    }
     if (Array.isArray(node.children)) node.children.forEach(visit);
   };
   visit(raw.layout);
   if (Array.isArray(raw.borders)) raw.borders.forEach(visit);
 
   for (const mig of MIGRATED_TABS) {
-    if (present.has(mig.component)) continue;
+    const presenceKey = mig.slot != null
+      ? `${mig.component}#${mig.slot}` : mig.component;
+    if (present.has(presenceKey)) continue;
 
     // Find the parent tabset (or border) whose direct children contain the
     // anchor tab, and append the new tab there.
@@ -122,13 +144,15 @@ function migrateLayoutJson(raw: any): any {
         node.type === 'tabset' || node.type === 'border';
       if (isTabContainer && Array.isArray(node.children)) {
         const idx = node.children.findIndex(
-          (c: any) => c && c.type === 'tab' && c.component === mig.anchor,
+          (c: any) => c && c.type === 'tab' && c.component === mig.anchor
+            && (mig.anchorSlot == null || c.config?.slot === mig.anchorSlot),
         );
         if (idx >= 0) {
           node.children.splice(idx + 1, 0, {
             type: 'tab',
             name: mig.name,
             component: mig.component,
+            ...(mig.config ? { config: mig.config } : {}),
           });
           return true;
         }
