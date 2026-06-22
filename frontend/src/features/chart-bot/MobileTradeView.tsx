@@ -20,7 +20,7 @@ import { PositionsPanel } from '../positions/PositionsPanel';
  */
 
 type TopTab = 'gold' | 'console' | 'positions';
-type BottomTab = 'nasdaq' | 'micro';
+type BottomTab = 'nasdaq' | 'micro' | 'es';
 
 function SubTabBar<T extends string>({
   tabs, active, onSelect,
@@ -130,12 +130,13 @@ export function MobileTradeView() {
 
       <div style={{ height: 1, background: 'var(--border-default)', flexShrink: 0 }} />
 
-      {/* Bottom row — Nasdaq chart, with Micro NQ behind it. */}
+      {/* Bottom row — Nasdaq chart, with Micro NQ + S&P behind it. */}
       <div className="flex flex-col" style={{ flex: 1, minHeight: 0 }}>
         <SubTabBar<BottomTab>
           tabs={[
             { id: 'nasdaq', label: 'Nasdaq' },
             { id: 'micro', label: 'Micro NQ' },
+            { id: 'es', label: 'S&P' },
           ]}
           active={bottom}
           onSelect={setBottom}
@@ -146,6 +147,9 @@ export function MobileTradeView() {
           </Pane>
           <Pane visible={bottom === 'micro'}>
             <ChartBotPane slot={3} compact />
+          </Pane>
+          <Pane visible={bottom === 'es'}>
+            <ChartBotPane slot={5} compact />
           </Pane>
         </div>
       </div>

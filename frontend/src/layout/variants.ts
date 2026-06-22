@@ -317,7 +317,8 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 3 · SPX', component: 'chart-bot', config: { slot: 3 } },
+              { type: 'tab', name: 'Slot 3 · Micro NQ', component: 'chart-bot', config: { slot: 3 } },
+              { type: 'tab', name: 'Slot 5 · S&P', component: 'chart-bot', config: { slot: 5 } },
             ],
           },
           {

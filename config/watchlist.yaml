@@ -30,3 +30,6 @@
 # liquidity sits in U6; M6 expires 2026-06-19. Pinned so its quote
 # sub doesn't lapse when flat (same anchor rationale as NQU6/GCQ6).
 - MNQU6
+# ESU6 (full S&P, Sep) pinned 2026-06-22 — chart-bot-5 symbol, tabbed
+# alongside MNQU6. Pinned so its quote sub doesn't lapse when flat.
+- ESU6
