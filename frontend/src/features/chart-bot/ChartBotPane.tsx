@@ -82,6 +82,11 @@ export function ChartBotPane({ slot, compact = false }: Props) {
     'buy' | 'sell' | 'close' | null
   >(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  // True while BotChart's fullscreen overlay is active. When true the
+  // trade strip renders INSIDE that overlay (passed as fullscreenFooter)
+  // rather than in normal flow, so it's not hidden behind the z-9999
+  // cover — and never duplicated.
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const addCommand = useStore((s) => s.addCommand);
   // Per-contract qty+P&L published by PositionsPanel (the single
@@ -260,6 +265,8 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           // background (manual_entry_only=true drops any auto-entries)
           // but we don't surface it on the chart.
           renderHeader={() => null}
+          onFullscreenChange={setIsFullscreen}
+          fullscreenFooter={renderTradeStrip()}
         />
         {/* Live P&L for the open position on this exact contract.
             Free-floating colored number, bottom-right of the plot
@@ -318,11 +325,21 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           </span>
         )}
       </div>
-      {/* Trade strip. 24h P&L for this chart's symbol on the left,
-          qty + BUY/SELL/CLOSE pushed to the right under the price
-          action. Every click routes through ``addCommand`` ->
-          /api/commands so manual chart-pane orders share the same
-          audit / fill / P&L path as console-typed orders. */}
+      {/* Trade strip — in fullscreen it renders inside BotChart's overlay
+          (passed as fullscreenFooter, reachable over the z-9999 cover);
+          here only when not fullscreen, so it's never hidden behind the
+          overlay nor duplicated. */}
+      {!isFullscreen && renderTradeStrip()}
+    </div>
+  );
+
+  // Hoisted so it can be referenced above in both the fullscreenFooter
+  // prop and the normal-flow render. 24h P&L on the left, qty +
+  // BUY/SELL/CLOSE on the right. Every click routes through ``addCommand``
+  // -> /api/commands so manual chart-pane orders share the same audit /
+  // fill / P&L path as console-typed orders.
+  function renderTradeStrip() {
+    return (
       <div
         style={{
           display: 'flex', alignItems: 'center', gap: 10,
@@ -479,6 +496,6 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           </button>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
 }

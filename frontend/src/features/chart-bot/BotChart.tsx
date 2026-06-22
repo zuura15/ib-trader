@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
@@ -29,6 +29,14 @@ interface Props {
   /** Layout chrome — set false to drop the panel header entirely
    *  (mobile uses the tab strip as the title). Defaults true. */
   showHeader?: boolean;
+  /** Optional node pinned to the bottom of the FULLSCREEN overlay
+   *  (e.g. ChartBotPane's BUY/SELL/CLOSE trade strip), so order
+   *  controls remain reachable when the chart covers the viewport. */
+  fullscreenFooter?: ReactNode;
+  /** Fired whenever the fullscreen state toggles, so the parent can
+   *  avoid double-rendering the footer (render it in normal flow only
+   *  when not fullscreen). */
+  onFullscreenChange?: (fullscreen: boolean) => void;
 }
 
 /**
@@ -54,6 +62,7 @@ interface Props {
 export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
+  fullscreenFooter, onFullscreenChange,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -157,6 +166,13 @@ export function BotChart({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [fullscreen, filtersOpen]);
+
+  // Notify the parent so it can move its footer (trade strip) into the
+  // fullscreen overlay rather than leaving it hidden behind the z-9999
+  // cover. Calls a prop callback (not local setState) so it's effect-safe.
+  useEffect(() => {
+    onFullscreenChange?.(fullscreen);
+  }, [fullscreen, onFullscreenChange]);
 
   // Click-outside closes the filter popover (matches ChartPane).
   const filtersWrapRef = useRef<HTMLDivElement>(null);
@@ -631,7 +647,10 @@ export function BotChart({
           }}
         >
           {headerRow}
-          {chartBody}
+          {/* Chart flexes; the footer (trade strip) pins to the bottom
+              so BUY/SELL/CLOSE stay reachable in fullscreen. */}
+          <div style={{ flex: 1, minHeight: 0 }}>{chartBody}</div>
+          {fullscreenFooter}
         </div>
       </>
     );
