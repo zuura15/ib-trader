@@ -211,6 +211,18 @@ class StateKeys:
         return "chart:pnl:rollup"
 
     @staticmethod
+    def chart_exec_accum() -> str:
+        """Durable trailing-24h execution store for the chart rollup.
+
+        Plain string key holding a JSON map ``{exec_id: record}`` (see
+        ``ib_trader.engine.exec_accumulator``). Accumulated across sweeps so
+        executions survive IB's daily Gateway restart, which otherwise
+        drops them from ``reqExecutions`` and undercounts the 24 h P&L.
+        Written only by the engine's ``_pnl_rollup_loop``.
+        """
+        return "chart:exec:accum"
+
+    @staticmethod
     def chart_exec_markers() -> str:
         """IB-authoritative execution markers per contract for chart panes.
 
