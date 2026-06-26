@@ -168,6 +168,10 @@ export function ChartBotPane({ slot, compact = false }: Props) {
     } catch (e) {
       setStatusMsg(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
+      // Reset the qty to this contract's default after every order
+      // button press (1 full-size / 10 micro) so each new order starts
+      // from a known size rather than carrying the last-used quantity.
+      setQty(qtyStepFor(symbol));
       // Small lockout so accidental double-clicks don't fire twice.
       setTimeout(() => {
         setPendingAction(null);
