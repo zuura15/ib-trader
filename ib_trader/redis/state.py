@@ -198,6 +198,17 @@ class StateKeys:
         return "console:pnl:24h"
 
     @staticmethod
+    def watchlist_symbols() -> str:
+        """Durable operator watchlist (JSON list of symbol roots).
+
+        Authoritative live watchlist, edited via the UI / API. Seeded once
+        from ``config/watchlist.yaml`` when absent; runtime never writes
+        the git-tracked YAML, so manual edits don't conflict with
+        ``git pull``. See ``ib_trader.config.watchlist_runtime``.
+        """
+        return "watchlist:symbols"
+
+    @staticmethod
     def chart_pnl_rollup() -> str:
         """IB-authoritative realized-P&L rollup per contract for chart panes.
 

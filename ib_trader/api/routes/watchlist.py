@@ -5,21 +5,17 @@ GET  /api/watchlist/symbols — current symbol list from config
 PUT  /api/watchlist/symbols — update symbol list in config
 """
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ib_trader.api.deps import get_redis
-from ib_trader.config.loader import load_watchlist, save_watchlist
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
-_WATCHLIST_FILE = Path("run/watchlist.json")
-_WATCHLIST_YAML = "config/watchlist.yaml"
 _MAX_SYMBOLS = 50
 
 
@@ -53,8 +49,11 @@ async def _watchlist_from_redis(redis) -> dict | None:
     """Read watchlist quotes from Redis keys."""
     from datetime import datetime, timezone
     from ib_trader.redis.state import StateStore
+    from ib_trader.config.watchlist_runtime import resolve_watchlist_symbols
 
-    symbols = load_watchlist(_WATCHLIST_YAML)
+    # Same authoritative source as GET /symbols (Redis, YAML-seeded) so the
+    # quotes panel matches the operator's live watchlist.
+    symbols = await resolve_watchlist_symbols(redis)
     if not symbols:
         return None
 
@@ -98,17 +97,21 @@ async def _watchlist_from_redis(redis) -> dict | None:
 
 
 @router.get("/symbols")
-def get_symbols():
+async def get_symbols(redis=Depends(get_redis)):
     """Return the current watchlist symbol list.
 
-    For back-compat the ``symbols`` field stays a plain list of roots.
-    The ``entries`` field (Epic 1) carries sec-type-aware dicts for new
-    clients — frontend consumes this when rendering futures in the
-    watchlist panel.
+    Live list comes from Redis (seeded from ``config/watchlist.yaml`` on
+    first run). ``symbols`` stays a plain list of roots; ``entries``
+    carries sec-type-aware dicts (FUT detected from the IB-paste form) for
+    clients that render futures.
     """
-    from ib_trader.config.loader import load_watchlist_entries
-    entries = load_watchlist_entries(_WATCHLIST_YAML)
-    symbols = [e["root"] for e in entries]
+    from ib_trader.config.watchlist_runtime import resolve_watchlist_symbols
+    from ib_trader.repl.commands import _is_futures_local_symbol
+    symbols = await resolve_watchlist_symbols(redis)
+    entries = [
+        {"root": s, "sec_type": "FUT" if _is_futures_local_symbol(s) else "STK"}
+        for s in symbols
+    ]
     return {"symbols": symbols, "entries": entries, "max": _MAX_SYMBOLS}
 
 
@@ -118,18 +121,19 @@ class SymbolsUpdate(BaseModel):
 
 
 @router.put("/symbols")
-def update_symbols(body: SymbolsUpdate):
-    """Update the watchlist symbol list."""
-    # Validate and normalize
-    symbols = list(dict.fromkeys(s.upper().strip() for s in body.symbols if s.strip()))
+async def update_symbols(body: SymbolsUpdate, redis=Depends(get_redis)):
+    """Update the watchlist symbol list.
 
-    if len(symbols) > _MAX_SYMBOLS:
+    Persisted to Redis (``watchlist:symbols``), NOT the git-tracked YAML —
+    so manual/UI edits never conflict with ``git pull``.
+    """
+    if len(body.symbols) > _MAX_SYMBOLS:
         raise HTTPException(
             status_code=400,
-            detail=f"Maximum {_MAX_SYMBOLS} symbols allowed, got {len(symbols)}",
+            detail=f"Maximum {_MAX_SYMBOLS} symbols allowed, got {len(body.symbols)}",
         )
-
-    save_watchlist(_WATCHLIST_YAML, symbols)
+    from ib_trader.config.watchlist_runtime import set_watchlist_symbols
+    symbols = await set_watchlist_symbols(redis, body.symbols)
     logger.info(
         '{"event": "WATCHLIST_SYMBOLS_UPDATED", "count": %d}', len(symbols),
     )

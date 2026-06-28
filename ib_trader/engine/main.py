@@ -297,9 +297,15 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         )
 
         # --- Subscribe to watchlist symbols for tick publishing ---
-        from ib_trader.config.loader import load_watchlist
+        # Live watchlist comes from Redis (seeded from YAML on first run);
+        # chart-bot contracts are auto-anchored so their quote subs never
+        # lapse regardless of the operator watchlist.
+        from ib_trader.config.watchlist_runtime import (
+            resolve_watchlist_symbols, chart_anchor_symbols,
+        )
         from ib_trader.repl.commands import _is_futures_local_symbol
-        watchlist_symbols = load_watchlist("config/watchlist.yaml")
+        _operator_syms = await resolve_watchlist_symbols(ctx.redis)
+        watchlist_symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
         watchlist_subscribed = 0
         for sym in watchlist_symbols:
             try:

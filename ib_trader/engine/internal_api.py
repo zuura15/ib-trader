@@ -386,11 +386,14 @@ async def reload_watchlist():
     if _ctx is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
-    from ib_trader.config.loader import load_watchlist
+    from ib_trader.config.watchlist_runtime import (
+        resolve_watchlist_symbols, chart_anchor_symbols,
+    )
     from ib_trader.repl.commands import _is_futures_local_symbol
 
     try:
-        symbols = load_watchlist("config/watchlist.yaml")
+        _operator_syms = await resolve_watchlist_symbols(_ctx.redis)
+        symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
         subscribed = []
         for sym in symbols:
             try:

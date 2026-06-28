@@ -1,3 +1,12 @@
+# SEED ONLY — the live watchlist is stored in Redis (watchlist:symbols)
+# and edited via the UI / API. This file seeds Redis on first run (when
+# the key is absent); after that Redis is authoritative and this file is
+# never written at runtime, so manual edits never conflict with git pull.
+#
+# Futures chart contracts are NOT listed here: the engine auto-anchors
+# its chart-bot-* symbols (config/bots/*.yaml) so their quote subs never
+# lapse, independent of the operator watchlist. See
+# ib_trader/config/watchlist_runtime.py.
 - QQQ
 - GLD
 - META
@@ -7,30 +16,5 @@
 - SPY
 - GOOGL
 - AMZN
+# Micro gold — discretionary watch (no chart bot), kept in the seed.
 - MGCQ6
-# GCQ6 (full Gold) pinned 2026-06-09 — chart-bot-1 displays it but
-# the operator doesn't always hold a GC position, so without a
-# watchlist anchor the engine's IB sub lapses (~2 min after the
-# last GC position closed) and the chart freezes. ESM6 doesn't
-# need this because the operator currently holds ES.
-- GCQ6
-# NQU6 (full Nasdaq, Sep) pinned 2026-06-15 — chart-bot-4 symbol.
-# Rolled from NQM6 now that the M6 → U6 roll (2026-06-11) is past and
-# liquidity sits in U6; M6 expires 2026-06-19. Its IB quote sub is
-# anchored only by the held position, which lapses and leaves the
-# stream stale while the chart freezes — watchlist-pin keeps it
-# streaming regardless of position state, same rationale as GCQ6
-# above. (Until chart panes self-subscribe, watchlist is the anchor.)
-- NQU6
-# MNQU6 (micro Nasdaq, Sep) pinned 2026-06-15 — chart-bot-3 symbol.
-# Rolled from MNQM6 now the M6 → U6 roll (2026-06-11) is past and
-# liquidity sits in U6; M6 expires 2026-06-19. Pinned so its quote
-# sub doesn't lapse when flat (same anchor rationale as NQU6/GCQ6).
-- MNQU6
-# ESU6 (full S&P, Sep) pinned 2026-06-22 — chart-bot-5 symbol, tabbed
-# alongside MNQU6. Pinned so its quote sub doesn't lapse when flat.
-- ESU6
-# CLQ6 (full WTI Crude, Aug) pinned 2026-06-28 — chart-bot-2 symbol
-# (repurposed from micro MCLM6). Pinned so its quote sub doesn't lapse
-# when flat (same anchor rationale as the other chart contracts).
-- CLQ6
