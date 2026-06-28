@@ -16,6 +16,8 @@ serializers, and tests.
 """
 from __future__ import annotations
 
+import re
+
 
 MONTH_CODES: dict[int, str] = {
     1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
@@ -95,6 +97,28 @@ def format_ib_paste_symbol(root: str, sec_type: str, expiry: str | None) -> str:
         raise ValueError("FUT IB-paste symbol requires an expiry")
     month, yy = expiry_to_month_year(expiry)
     return f"{root}{month_to_code(month)}{yy % 10}"
+
+
+# Month codes, for parsing an IB localSymbol back into a spaced display.
+_LS_MONTH_CODES = "FGHJKMNQUVXZ"
+_LS_RE = re.compile(rf"^([A-Z0-9]+?)([{_LS_MONTH_CODES}])(\d{{1,2}})$")
+
+
+def display_from_local_symbol(local_sym: str | None) -> str | None:
+    """Spaced display (``CL Q26``) from an IB localSymbol (``CLQ6``).
+
+    IB's localSymbol is authoritative for the contract month — unlike
+    deriving it from the expiry date, which is WRONG for energy futures
+    whose contract trades the month before delivery (the Aug crude
+    contract, ``CLQ6``, last-trades in July). Returns None when the input
+    isn't the ``root + month-code + year`` shape (e.g. STK).
+    """
+    m = _LS_RE.match((local_sym or "").upper())
+    if not m:
+        return None
+    root, code, yr = m.group(1), m.group(2), m.group(3)
+    yy = yr if len(yr) == 2 else f"2{yr}"  # 1-digit IB year → 20Xs
+    return f"{root} {code}{yy}"
 
 
 def _widen_single_digit_year(digit: int) -> int:

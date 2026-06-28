@@ -26,6 +26,10 @@ interface BrokerPosition {
   trading_class?: string | null;
   multiplier?: string | null;
   display_symbol?: string | null;
+  // IB's authoritative localSymbol (``CLQ6``). Correct for the contract
+  // month even on energy futures, where deriving from the expiry date
+  // is wrong (Aug crude trades in July).
+  local_symbol?: string | null;
   con_id?: number | null;
 }
 
@@ -67,6 +71,10 @@ const MONTH_CODES = [
 function chartPnlKey(pos: BrokerPosition): string {
   const root = (pos.symbol ?? '').toUpperCase();
   if ((pos.sec_type ?? '').toUpperCase() !== 'FUT') return root;
+  // Prefer IB's localSymbol — authoritative for the contract month, so
+  // it matches the chart-bot symbol (``CLQ6``) on energy futures where
+  // the expiry-derived form would wrongly say ``CLN6``.
+  if (pos.local_symbol) return pos.local_symbol.toUpperCase();
   const exp = pos.expiry ?? '';
   if (exp.length >= 6) {
     const m = parseInt(exp.slice(4, 6), 10);

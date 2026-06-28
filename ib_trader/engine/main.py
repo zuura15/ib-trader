@@ -854,13 +854,23 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
 
+        # IB's localSymbol (e.g. ``CLQ6``) is authoritative for the
+        # contract month; deriving from the expiry date is wrong for
+        # energy futures (Aug crude trades in July). Prefer it for both
+        # the display and the exact-match key the chart panes use.
+        local_symbol = getattr(p.contract, "localSymbol", "") or ""
         display_symbol = sym
-        if sec_type == "FUT" and expiry:
+        if sec_type == "FUT":
             try:
-                from ib_trader.utils.symbol import format_display_symbol
-                display_symbol = format_display_symbol(sym, "FUT", expiry)
+                from ib_trader.utils.symbol import (
+                    display_from_local_symbol, format_display_symbol,
+                )
+                display_symbol = (
+                    display_from_local_symbol(local_symbol)
+                    or (format_display_symbol(sym, "FUT", expiry) if expiry else sym)
+                )
             except Exception:
-                display_symbol = f"{sym} {expiry}"
+                display_symbol = f"{sym} {expiry}" if expiry else sym
 
         positions.append({
             "id": f"{sym}_{sec_type}_{con_id}",
@@ -878,6 +888,7 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
             "trading_class": trading_class,
             "multiplier": multiplier,
             "display_symbol": display_symbol,
+            "local_symbol": local_symbol,
         })
 
         if subscribe_mktdata and sec_type in ("STK", "FUT"):
@@ -1512,13 +1523,21 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
         except Exception as e:
             logger.debug("ticker price enrichment failed", exc_info=e)
 
+        # localSymbol authoritative for contract month (see
+        # _refresh_positions_cache for the energy-futures rationale).
+        local_symbol = getattr(position.contract, "localSymbol", "") or ""
         display_symbol = symbol
-        if sec_type == "FUT" and expiry:
+        if sec_type == "FUT":
             try:
-                from ib_trader.utils.symbol import format_display_symbol
-                display_symbol = format_display_symbol(symbol, "FUT", expiry)
+                from ib_trader.utils.symbol import (
+                    display_from_local_symbol, format_display_symbol,
+                )
+                display_symbol = (
+                    display_from_local_symbol(local_symbol)
+                    or (format_display_symbol(symbol, "FUT", expiry) if expiry else symbol)
+                )
             except Exception:
-                display_symbol = f"{symbol} {expiry}"
+                display_symbol = f"{symbol} {expiry}" if expiry else symbol
 
         entry = {
             "id": f"{symbol}_{sec_type}_{con_id}",
@@ -1535,6 +1554,7 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             "trading_class": trading_class,
             "multiplier": multiplier,
             "display_symbol": display_symbol,
+            "local_symbol": local_symbol,
         }
         new_cache = [p for p in ctx.positions_cache
                      if not (p.get("symbol") == symbol

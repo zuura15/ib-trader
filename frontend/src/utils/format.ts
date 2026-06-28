@@ -84,6 +84,9 @@ export interface Displayable {
   sec_type?: string | null;
   expiry?: string | null;
   display_symbol?: string | null;
+  // IB's authoritative localSymbol (``CLQ6``) — correct for the contract
+  // month even on energy futures where expiry-derivation is wrong.
+  local_symbol?: string | null;
 }
 
 /**
@@ -113,6 +116,9 @@ export function formatInstrument(row: Displayable): string {
 export function formatIbPasteSymbol(row: Displayable): string {
   const sym = row.symbol || '';
   const sec = (row.sec_type || 'STK').toUpperCase();
+  // IB's localSymbol IS the IB-paste form and is authoritative for the
+  // contract month (correct on energy futures, unlike expiry-derivation).
+  if (sec === 'FUT' && row.local_symbol) return row.local_symbol.toUpperCase();
   if (sec !== 'FUT' || !row.expiry) return sym;
   const e = String(row.expiry);
   if (!/^\d{6,8}$/.test(e)) return sym;

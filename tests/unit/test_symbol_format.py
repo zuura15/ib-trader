@@ -94,3 +94,22 @@ class TestFormatIbPasteSymbol:
     def test_future_requires_expiry(self) -> None:
         with pytest.raises(ValueError):
             symbol.format_ib_paste_symbol("ES", "FUT", None)
+
+
+class TestDisplayFromLocalSymbol:
+    def test_energy_future_uses_contract_month_not_expiry(self) -> None:
+        # The Aug crude contract (CLQ6) last-trades in July; deriving from
+        # the expiry date would wrongly say N (July). localSymbol is right.
+        assert symbol.display_from_local_symbol("CLQ6") == "CL Q26"
+
+    def test_multichar_root(self) -> None:
+        assert symbol.display_from_local_symbol("MNQU6") == "MNQ U26"
+        assert symbol.display_from_local_symbol("ESU6") == "ES U26"
+
+    def test_two_digit_year(self) -> None:
+        assert symbol.display_from_local_symbol("CLQ26") == "CL Q26"
+
+    def test_non_future_or_garbage_returns_none(self) -> None:
+        assert symbol.display_from_local_symbol("AAPL") is None
+        assert symbol.display_from_local_symbol("") is None
+        assert symbol.display_from_local_symbol(None) is None
