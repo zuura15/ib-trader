@@ -326,6 +326,7 @@ export const variantT: IJsonModel = {
             weight: 50,
             children: [
               { type: 'tab', name: 'Slot 4 · Nasdaq', component: 'chart-bot', config: { slot: 4 } },
+              { type: 'tab', name: 'Slot 2 · WTI', component: 'chart-bot', config: { slot: 2 } },
             ],
           },
         ],

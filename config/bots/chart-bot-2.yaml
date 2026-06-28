@@ -1,5 +1,5 @@
 id: chart-bot-2
-name: "Chart Bot 2 · Micro Oil"
+name: "Chart Bot 2 · WTI Crude"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -8,15 +8,26 @@ auto_start: false   # operator-driven Start; banner reminds on each `make dev`
 config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
+  # ref_id kept as ``chart-bot-2-mcl`` (stable bot identifier from this
+  # pane's micro-oil era) — renaming would orphan any force-entry orders
+  # tagged with it at recovery, for no functional gain.
   ref_id: chart-bot-2-mcl
-  # MCL = Micro WTI Crude Oil. M6 = June 2026 expiry; roll monthly.
-  symbol: MCLM6
+  # CL = full WTI Crude Oil (NYMEX). Repurposed 2026-06-28 from micro
+  # MCLM6 (June, expired) to full WTI — the operator trades full-size
+  # now. Q6 = Aug 2026, the actively-traded front month (Jul/CLN6
+  # expired ~2026-06-22); roll monthly. QBALGO twin dropped by the
+  # qualifier (insync_client 46953eb) so bare ``CLQ6`` resolves to
+  # NYMEX unambiguously.
+  symbol: CLQ6
   sec_type: FUT
-  # Micro Crude: 100 bbl/contract. Used by P/L math + trail target.
-  contract_multiplier: 100
-  # Trailing dip: 0.13% × $75 × 100 ≈ $9.75 per contract per move.
+  # Full Crude: 1,000 bbl/contract → $1.00 move = $1,000 (10x micro;
+  # tick $0.01 = $10). Used by the strategy's P/L math + trail target.
+  contract_multiplier: 1000
+  # Trailing dip 0.13% (a percentage, scales with notional): at ~$72 ×
+  # 1000 ≈ $93.60 per contract per move. Manual mode in effect, so
+  # dormant until ``manual_entry_only`` flips.
   trail_width_pct: 0.0013
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MCLM6
+- CLQ6

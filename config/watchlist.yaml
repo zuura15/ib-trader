@@ -33,3 +33,7 @@
 # ESU6 (full S&P, Sep) pinned 2026-06-22 — chart-bot-5 symbol, tabbed
 # alongside MNQU6. Pinned so its quote sub doesn't lapse when flat.
 - ESU6
+# CLQ6 (full WTI Crude, Aug) pinned 2026-06-28 — chart-bot-2 symbol
+# (repurposed from micro MCLM6). Pinned so its quote sub doesn't lapse
+# when flat (same anchor rationale as the other chart contracts).
+- CLQ6

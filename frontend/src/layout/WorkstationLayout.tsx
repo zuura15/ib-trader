@@ -109,6 +109,12 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'Slot 5 · S&P', anchor: 'chart-bot',
     config: { slot: 5 }, slot: 5, anchorSlot: 3,
   },
+  // WTI Crude (slot 2) — inject next to the Nasdaq chart (slot 4) in the
+  // bottom-right tabset for users whose persisted layout predates it.
+  {
+    component: 'chart-bot', name: 'Slot 2 · WTI', anchor: 'chart-bot',
+    config: { slot: 2 }, slot: 2, anchorSlot: 4,
+  },
 ];
 
 function migrateLayoutJson(raw: any): any {
