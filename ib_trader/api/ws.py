@@ -699,10 +699,16 @@ def _position_quote_stream_keys(positions: list[dict]) -> set[str]:
         if not sym:
             continue
         if sec == "FUT":
-            try:
-                key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
-            except Exception:
-                continue
+            # Prefer IB's localSymbol (authoritative for the contract
+            # month) — the expiry-derived form is wrong for energy futures
+            # (Aug crude CLQ6 last-trades in July → "CLN6"), so it misses
+            # the publisher's quote:CLQ6 stream and the P&L looks stuck.
+            key_sym = (p.get("local_symbol") or "").upper()
+            if not key_sym:
+                try:
+                    key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
+                except Exception:
+                    continue
         else:
             key_sym = sym
         keys.add(StreamNames.quote(key_sym))
@@ -739,10 +745,16 @@ async def _overlay_live_prices(positions: list[dict], redis) -> None:
         if not sym:
             continue
         if sec == "FUT":
-            try:
-                key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
-            except Exception:
-                continue
+            # localSymbol is authoritative for the contract month; the
+            # expiry-derived form is wrong for energy futures (CLQ6 →
+            # "CLN6"), missing the publisher's quote key (the "stuck CL
+            # P&L" bug).
+            key_sym = (p.get("local_symbol") or "").upper()
+            if not key_sym:
+                try:
+                    key_sym = format_ib_paste_symbol(sym, "FUT", p.get("expiry"))
+                except Exception:
+                    continue
         else:
             key_sym = sym
         targets.append((p, StateKeys.quote_latest(key_sym)))
