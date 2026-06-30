@@ -36,8 +36,8 @@ class TestComputeExecMarkers:
         assert m[0]["qty"] == 5.0
         # qty-weighted avg = (2*21000 + 3*21010)/5 = 21006
         assert m[0]["price"] == 21006.0
-        # marker time = latest partial fill
-        assert m[0]["time"] == (T0 + timedelta(seconds=5)).isoformat()
+        # marker time = EARLIEST partial fill (when the order was placed)
+        assert m[0]["time"] == T0.isoformat()
 
     def test_distinct_perm_ids_separate_markers(self):
         execs = [

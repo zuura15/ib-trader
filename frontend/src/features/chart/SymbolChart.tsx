@@ -340,6 +340,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // refs (e.g. ``historicalFires`` at line ~410) can reference it
   // in their deps without tripping the JS temporal-dead-zone.
   const [chartVersion, setChartVersion] = useState(0);
+  // Bumped whenever the historical bar set is (re)loaded, so the
+  // execution-marker effect re-places markers against the current bars
+  // (e.g. after a session reset reloads a fresh window).
+  const [barsTick, setBarsTick] = useState(0);
   // Track filter toggles via refs so the throttled recompute closure
   // sees fresh values without re-subscribing on every prop change.
   const showBrokenSrRef = useRef(showBrokenSr);
@@ -546,6 +550,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     const series = seriesRef.current;
     if (!series) return;
     const colors = themeColors();
+    // Only place a marker where an actual bar exists. lightweight-charts
+    // snaps a marker whose time has no matching data point to the NEAREST
+    // bar — which, after a session reset, drops 24 h of accumulated
+    // markers onto the new session's bars at bogus times. Requiring an
+    // exact bar-time match scopes markers to the loaded window and pins
+    // each to its real bar.
+    const barTimes = new Set<number>(
+      barsRef.current.map((b) => b.time as number),
+    );
     const markers: SeriesMarker<Time>[] = [];
     for (const e of executionMarkers ?? []) {
       const d = new Date(e.time);
@@ -555,6 +568,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const sec = localUtcSeconds(d) as number;
       const slotEnd = (Math.floor(sec / BAR_SECONDS) * BAR_SECONDS
         + BAR_SECONDS) as UTCTimestamp;
+      if (!barTimes.has(slotEnd as number)) continue;  // no bar → skip
       const isBuy = e.side === 'B';
       const qtyTxt = Number.isInteger(e.qty)
         ? String(e.qty) : String(Number(e.qty.toFixed(2)));
@@ -579,7 +593,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       try { execMarkersApiRef.current?.detach(); } catch { /* already gone */ }
       execMarkersApiRef.current = null;
     };
-  }, [executionMarkers, chartVersion]);
+  }, [executionMarkers, chartVersion, barsTick]);
 
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
@@ -2130,6 +2144,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // ticks update past this point without auto-fit-to-one-point
         // pathology.
         historicalLoadedRef.current = true;
+        // Signal the execution-marker effect to re-place against the
+        // freshly-loaded bar set (so markers only render where a bar
+        // actually exists — see that effect).
+        setBarsTick((t) => t + 1);
 
         // Volume overlay — green when close >= open, red when down,
         // both at low alpha so the histogram reads as ambient context

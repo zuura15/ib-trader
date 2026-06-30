@@ -100,7 +100,11 @@ def compute_exec_markers(
         else:
             g["qty"] += shares_d
             g["notional"] += price_d * shares_d
-            if t > g["time"]:
+            # Anchor the marker at the EARLIEST fill — i.e. when the order
+            # was placed — so a multi-fill order that straggles across a
+            # minute boundary still tags the bar the operator traded on,
+            # not a bar or two later.
+            if t < g["time"]:
                 g["time"] = t
 
     by_sym: dict[str, list[dict[str, Any]]] = {}
