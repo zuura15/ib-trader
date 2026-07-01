@@ -572,9 +572,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const isBuy = e.side === 'B';
       const qtyTxt = Number.isInteger(e.qty)
         ? String(e.qty) : String(Number(e.qty.toFixed(2)));
+      // ``atPriceMiddle`` + ``price`` pins the marker at the actual FILL
+      // price (v5 price-anchored marker) rather than on the bar's close —
+      // so a sell @ 7571 sits at 7571, not wherever the bar happened to
+      // close. ``slotEnd`` still fixes the x (bar) position.
+      const priceOk = Number.isFinite(e.price) && e.price > 0;
       markers.push({
         time: slotEnd,
-        position: 'inBar',
+        ...(priceOk
+          ? { position: 'atPriceMiddle' as const, price: e.price }
+          : { position: 'inBar' as const }),
         shape: 'circle',
         // Color already encodes side (green buy / red sell), so the
         // label is just the signed lot size — +n / −n — to keep the
