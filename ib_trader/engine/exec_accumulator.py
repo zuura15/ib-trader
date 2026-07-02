@@ -26,6 +26,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+
+# ib_async returns some execution times shifted +host-offset into the
+# future (the IB "implied timezone" bug). A fill can never be in the
+# future, so at INGEST (when we first see it) any time past now is that
+# shift — roll it back by the host offset and freeze the corrected value.
+# Doing it here (frozen at first-seen) rather than against the live clock
+# is what makes it durable: a shifted time drifts into the past as the
+# day advances, which a live-clock check would then stop correcting.
+_FUTURE_GRACE = timedelta(minutes=2)
 from typing import Any
 
 # JSON-safe record fields kept per execution.
@@ -65,6 +74,24 @@ def _to_record(ex: dict[str, Any]) -> dict[str, Any] | None:
     return rec
 
 
+def _deshift_time(iso: str | None, future_cutoff: datetime,
+                  host_offset: timedelta) -> str | None:
+    """Roll an ib_async future-shifted execution time back by the host
+    offset. A fill can't be in the future, so a time past ``future_cutoff``
+    is the +offset shift; corrected once here and frozen. Left untouched
+    (past times) otherwise."""
+    if not iso:
+        return iso
+    try:
+        d = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return iso
+    d = d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+    if d > future_cutoff:
+        return (d + host_offset).isoformat()
+    return iso
+
+
 def merge_executions(
     stored: dict[str, dict],
     fresh: list[dict],
@@ -82,6 +109,10 @@ def merge_executions(
       - otherwise the stored record is kept (IB's realized P&L is final).
     Entries older than ``window_hours`` before ``now`` are dropped.
     """
+    now_utc = now.astimezone(timezone.utc)
+    host_offset = now.utcoffset() or timedelta(0)
+    future_cutoff = now_utc + _FUTURE_GRACE
+
     out = dict(stored)
     for ex in fresh:
         rec = _to_record(ex)
@@ -89,6 +120,11 @@ def merge_executions(
             continue
         prev = out.get(rec["exec_id"])
         if prev is None:
+            # Correct the ib_async +offset time shift at first-seen, using
+            # ingest time as the "can't be future" reference, and freeze it.
+            rec["exec_time"] = _deshift_time(
+                rec.get("exec_time"), future_cutoff, host_offset,
+            )
             out[rec["exec_id"]] = rec
         elif prev.get("realized_pnl") is None and rec.get("realized_pnl") is not None:
             # Pairing completed since we first saw it — take the paired

@@ -71,6 +71,35 @@ class TestMerge:
         assert s == {}
 
 
+class TestDeshiftAtIngest:
+    def test_future_shifted_time_corrected_and_frozen(self):
+        # ib_async hands back the fill +7h in the future; at ingest we roll
+        # it back by the host offset and store the REAL time — permanently,
+        # so it doesn't drift once the shifted stamp ages into the past.
+        pt = timezone(timedelta(hours=-7))
+        ingest = datetime(2026, 7, 1, 8, 49, 0, tzinfo=pt)      # real fill time
+        shifted = ingest + timedelta(hours=7)                    # what ib_async returns
+        s = merge_executions(
+            {}, [_ex("e1", "ESU6", "SLD", 2, 7570.75, shifted, realized=100)], ingest,
+        )
+        stored = datetime.fromisoformat(s["e1"]["exec_time"]).astimezone(timezone.utc)
+        assert stored == ingest.astimezone(timezone.utc)
+        # Re-merging much later (shifted stamp now in the past) keeps it.
+        later = ingest + timedelta(hours=12)
+        s2 = merge_executions(s, [], later)
+        assert s2["e1"]["exec_time"] == s["e1"]["exec_time"]
+
+    def test_past_time_left_untouched(self):
+        pt = timezone(timedelta(hours=-7))
+        ingest = datetime(2026, 7, 1, 8, 49, 0, tzinfo=pt)
+        past = ingest - timedelta(hours=2)
+        s = merge_executions(
+            {}, [_ex("e2", "ESU6", "BOT", 2, 7557.25, past, realized=None)], ingest,
+        )
+        stored = datetime.fromisoformat(s["e2"]["exec_time"]).astimezone(timezone.utc)
+        assert stored == past.astimezone(timezone.utc)
+
+
 class TestRoundTrip:
     def test_records_to_execs_types_and_rollup(self):
         old = NOW - timedelta(hours=2)
