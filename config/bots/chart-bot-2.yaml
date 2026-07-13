@@ -13,12 +13,12 @@ config:
   # tagged with it at recovery, for no functional gain.
   ref_id: chart-bot-2-mcl
   # CL = full WTI Crude Oil (NYMEX). Repurposed 2026-06-28 from micro
-  # MCLM6 (June, expired) to full WTI — the operator trades full-size
-  # now. Q6 = Aug 2026, the actively-traded front month (Jul/CLN6
-  # expired ~2026-06-22); roll monthly. QBALGO twin dropped by the
-  # qualifier (insync_client 46953eb) so bare ``CLQ6`` resolves to
-  # NYMEX unambiguously.
-  symbol: CLQ6
+  # MCLM6 to full WTI. Rolled Q6 (Aug) → U6 (Sep) on 2026-07-12: OI had
+  # already crossed to U6 (245k vs 145k) with Q6 last-trade 2026-07-21
+  # only 9 days out, so U6 is the live contract. Roll monthly. QBALGO
+  # twin dropped by the qualifier (insync_client 46953eb) so bare
+  # ``CLU6`` resolves to NYMEX unambiguously.
+  symbol: CLU6
   sec_type: FUT
   # Full Crude: 1,000 bbl/contract → $1.00 move = $1,000 (10x micro;
   # tick $0.01 = $10). Used by the strategy's P/L math + trail target.
@@ -30,4 +30,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- CLQ6
+- CLU6
