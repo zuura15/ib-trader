@@ -1,6 +1,7 @@
 import { useRef, useCallback } from 'react';
-import { Layout, Model, Actions } from 'flexlayout-react';
+import { Layout, Model, Actions, type TabNode, type ITabRenderValues } from 'flexlayout-react';
 import { useStore } from '../data/store';
+import { useChartBotSymbols } from '../data/useChartBotSymbols';
 import { componentFactory } from './ComponentFactory';
 import { variantA, variantB, variantC, variantD, variantT } from './variants';
 import type { LayoutVariant } from '../types';
@@ -114,6 +115,11 @@ const MIGRATED_TABS: Array<{
   {
     component: 'chart-bot', name: 'Slot 2 · WTI', anchor: 'chart-bot',
     config: { slot: 2 }, slot: 2, anchorSlot: 4,
+  },
+  // Micro S&P (slot 6) — inject next to the full S&P chart (slot 5).
+  {
+    component: 'chart-bot', name: 'MESU6', anchor: 'chart-bot',
+    config: { slot: 6 }, slot: 6, anchorSlot: 5,
   },
 ];
 
@@ -250,6 +256,9 @@ function getModel(variant: LayoutVariant): Model {
 export function WorkstationLayout() {
   const activeVariant = useStore((s) => s.activeVariant);
   const prevVariant = useRef(activeVariant);
+  // Live slot → symbol map so each chart tab shows its actual contract
+  // (``CLU6``) and follows rolls, regardless of the persisted layout name.
+  const botSymbols = useChartBotSymbols();
 
   // Reset model when variant changes
   if (prevVariant.current !== activeVariant) {
@@ -280,6 +289,14 @@ export function WorkstationLayout() {
         factory={componentFactory}
         realtimeResize={true}
         onModelChange={onModelChange}
+        onRenderTab={(node: TabNode, rv: ITabRenderValues) => {
+          // Label chart tabs with the actual contract symbol (overrides
+          // the persisted tab name; falls back to it until the map loads).
+          if (node.getComponent() !== 'chart-bot') return;
+          const slot = (node.getConfig() as { slot?: number } | undefined)?.slot;
+          const sym = slot != null ? botSymbols[slot] : undefined;
+          if (sym) rv.content = sym;
+        }}
       />
     </div>
   );

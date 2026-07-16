@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { ChartBotPane } from './ChartBotPane';
 import { CommandConsole } from '../console/CommandConsole';
 import { PositionsPanel } from '../positions/PositionsPanel';
+import { useChartBotSymbols } from '../../data/useChartBotSymbols';
 
 /**
  * Mobile primary view — two chart rows stacked vertically, each its own
@@ -20,7 +21,7 @@ import { PositionsPanel } from '../positions/PositionsPanel';
  */
 
 type TopTab = 'gold' | 'console' | 'positions';
-type BottomTab = 'nasdaq' | 'micro' | 'es' | 'wti';
+type BottomTab = 'nasdaq' | 'micro' | 'es' | 'wti' | 'mes';
 
 function SubTabBar<T extends string>({
   tabs, active, onSelect,
@@ -101,6 +102,9 @@ function Pane({ visible, children }: { visible: boolean; children: ReactNode }) 
 export function MobileTradeView() {
   const [top, setTop] = useState<TopTab>('gold');
   const [bottom, setBottom] = useState<BottomTab>('nasdaq');
+  // Live slot → symbol so each chart tab shows its actual contract and
+  // follows rolls; falls back to a plain label until the map loads.
+  const sym = useChartBotSymbols();
 
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
@@ -108,7 +112,7 @@ export function MobileTradeView() {
       <div className="flex flex-col" style={{ flex: 1, minHeight: 0 }}>
         <SubTabBar<TopTab>
           tabs={[
-            { id: 'gold', label: 'Gold' },
+            { id: 'gold', label: sym[1] ?? 'Gold' },
             { id: 'console', label: 'Console' },
             { id: 'positions', label: 'Positions' },
           ]}
@@ -130,14 +134,15 @@ export function MobileTradeView() {
 
       <div style={{ height: 1, background: 'var(--border-default)', flexShrink: 0 }} />
 
-      {/* Bottom row — Nasdaq chart, with Micro NQ + S&P + WTI behind it. */}
+      {/* Bottom row — Nasdaq + Micro NQ + S&P + WTI + Micro S&P. */}
       <div className="flex flex-col" style={{ flex: 1, minHeight: 0 }}>
         <SubTabBar<BottomTab>
           tabs={[
-            { id: 'nasdaq', label: 'Nasdaq' },
-            { id: 'micro', label: 'Micro NQ' },
-            { id: 'es', label: 'S&P' },
-            { id: 'wti', label: 'WTI' },
+            { id: 'nasdaq', label: sym[4] ?? 'Nasdaq' },
+            { id: 'micro', label: sym[3] ?? 'Micro NQ' },
+            { id: 'es', label: sym[5] ?? 'S&P' },
+            { id: 'wti', label: sym[2] ?? 'WTI' },
+            { id: 'mes', label: sym[6] ?? 'Micro S&P' },
           ]}
           active={bottom}
           onSelect={setBottom}
@@ -154,6 +159,9 @@ export function MobileTradeView() {
           </Pane>
           <Pane visible={bottom === 'wti'}>
             <ChartBotPane slot={2} compact />
+          </Pane>
+          <Pane visible={bottom === 'mes'}>
+            <ChartBotPane slot={6} compact />
           </Pane>
         </div>
       </div>

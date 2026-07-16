@@ -296,7 +296,7 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 1 · Gold', component: 'chart-bot', config: { slot: 1 } },
+              { type: 'tab', name: 'GCQ6', component: 'chart-bot', config: { slot: 1 } },
             ],
           },
           {
@@ -317,16 +317,17 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 3 · Micro NQ', component: 'chart-bot', config: { slot: 3 } },
-              { type: 'tab', name: 'Slot 5 · S&P', component: 'chart-bot', config: { slot: 5 } },
+              { type: 'tab', name: 'MNQU6', component: 'chart-bot', config: { slot: 3 } },
+              { type: 'tab', name: 'ESU6', component: 'chart-bot', config: { slot: 5 } },
+              { type: 'tab', name: 'MESU6', component: 'chart-bot', config: { slot: 6 } },
             ],
           },
           {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'Slot 4 · Nasdaq', component: 'chart-bot', config: { slot: 4 } },
-              { type: 'tab', name: 'Slot 2 · WTI', component: 'chart-bot', config: { slot: 2 } },
+              { type: 'tab', name: 'NQU6', component: 'chart-bot', config: { slot: 4 } },
+              { type: 'tab', name: 'CLU6', component: 'chart-bot', config: { slot: 2 } },
             ],
           },
         ],
