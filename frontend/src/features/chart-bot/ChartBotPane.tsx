@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
@@ -89,6 +89,13 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const addCommand = useStore((s) => s.addCommand);
+  // Command list — watched so an order button stays locked until the
+  // order it fired reaches a terminal state (fill / reject), giving real
+  // feedback and preventing the "no response → mash SELL 5× → 5 orders"
+  // incident. Cleared by the effect below on terminal, or a safety timer.
+  const commands = useStore((s) => s.commands);
+  const pendingCmdIdRef = useRef<string | null>(null);
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Per-contract qty+P&L published by PositionsPanel (the single
   // calculation — see publishChartPnl there). Empty when the panel
   // isn't mounted or no positions are held; chart treats "no entry"
@@ -155,29 +162,53 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   const fireCommand = async (
     cmd: string, label: 'buy' | 'sell' | 'close',
   ) => {
+    // Hard-block while an order from this pane is still in flight. This
+    // is the core guard: buttons stay disabled (see below) until the
+    // order terminalizes, so a stuck/unresponsive engine can't be
+    // spammed into placing duplicate orders.
     if (pendingAction || !symbol) return;
     setPendingAction(label);
-    setStatusMsg(`${label}: ${cmd}`);
+    setStatusMsg(`${label}: working…`);
     try {
-      // ``addCommand`` returns synchronously after the optimistic add;
-      // the POST + WS subscription happen in the store. We don't await
-      // the actual fill here — the operator's feedback for the order
-      // status lives in the console pane via the normal channel.
-      addCommand(cmd);
-      setStatusMsg(`sent: ${cmd}`);
-    } catch (e) {
-      setStatusMsg(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      // Qty is retained between orders (persisted per slot) — the
-      // operator usually reuses the same size, so carrying it over beats
-      // resetting to the default each time.
-      // Small lockout so accidental double-clicks don't fire twice.
-      setTimeout(() => {
+      // ``addCommand`` returns the command id synchronously (optimistic
+      // add); the POST + WS status updates happen in the store. We track
+      // that id and release the lock only when it reaches a terminal
+      // state (the watch effect below) — not on a fixed timer.
+      const id = addCommand(cmd);
+      pendingCmdIdRef.current = id;
+      // Safety net only: if no terminal status ever arrives (dropped
+      // update / engine down), re-enable after a window LONGER than the
+      // max order-wait so it never races a legitimately-walking order.
+      clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = setTimeout(() => {
+        if (pendingCmdIdRef.current !== id) return;
+        pendingCmdIdRef.current = null;
         setPendingAction(null);
-      }, 250);
-      setTimeout(() => setStatusMsg(null), 4000);
+        setStatusMsg('no confirmation — check console before re-sending');
+      }, 150_000);
+    } catch (e) {
+      pendingCmdIdRef.current = null;
+      setPendingAction(null);
+      setStatusMsg(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
+
+  // Release the in-flight lock as soon as the order this pane fired
+  // reaches a terminal state, and surface the outcome.
+  useEffect(() => {
+    const id = pendingCmdIdRef.current;
+    if (!id) return;
+    const c = commands.find((x) => x.id === id);
+    if (!c || (c.status !== 'success' && c.status !== 'failure')) return;
+    pendingCmdIdRef.current = null;
+    clearTimeout(pendingTimerRef.current);
+    setPendingAction(null);
+    setStatusMsg(c.status === 'success' ? `done: ${c.command}` : `failed: ${c.command}`);
+    setTimeout(() => setStatusMsg(null), 4000);
+  }, [commands]);
+
+  // Clear the safety timer if the pane unmounts mid-order.
+  useEffect(() => () => clearTimeout(pendingTimerRef.current), []);
 
   // Command grammar is ``<verb> SYMBOL QTY [STRATEGY] [PROFIT]`` —
   // SYMBOL goes BEFORE qty (see ``ib_trader/repl/commands.py``
