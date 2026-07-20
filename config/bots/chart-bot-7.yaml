@@ -1,0 +1,28 @@
+id: chart-bot-7
+name: "Chart Bot 7 · Micro Gold"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: true
+# auto_start kept off intentionally — operator picks when each chart
+# slot resumes.
+auto_start: false
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  # Per-bot ref_id keeps the WS state subscription unique across the
+  # shared chart_signal strategy yaml.
+  ref_id: chart-bot-7-mgc
+  # MGC = Micro Gold (10 oz, 1/10th of GC). Same August 2026 expiry
+  # (Q6) as the full GCQ6 in slot 1 — roll both together (next: V6).
+  symbol: MGCQ6
+  sec_type: FUT
+  # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
+  contract_multiplier: 10
+  # Same fractional trail width as the GC tuning — risk scales with
+  # notional. Dormant while manual_entry_only is set.
+  trail_width_pct: 0.0005
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- MGCQ6

@@ -121,6 +121,11 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'MESU6', anchor: 'chart-bot',
     config: { slot: 6 }, slot: 6, anchorSlot: 5,
   },
+  // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
+  {
+    component: 'chart-bot', name: 'MGCQ6', anchor: 'chart-bot',
+    config: { slot: 7 }, slot: 7, anchorSlot: 1,
+  },
 ];
 
 function migrateLayoutJson(raw: any): any {

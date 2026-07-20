@@ -20,7 +20,7 @@ import { useChartBotSymbols } from '../../data/useChartBotSymbols';
  * live-P&L the charts read, even while it sits behind the Gold tab.
  */
 
-type TopTab = 'gold' | 'console' | 'positions';
+type TopTab = 'gold' | 'mgc' | 'console' | 'positions';
 type BottomTab = 'nasdaq' | 'micro' | 'es' | 'wti' | 'mes';
 
 function SubTabBar<T extends string>({
@@ -113,6 +113,7 @@ export function MobileTradeView() {
         <SubTabBar<TopTab>
           tabs={[
             { id: 'gold', label: sym[1] ?? 'Gold' },
+            { id: 'mgc', label: sym[7] ?? 'Micro GC' },
             { id: 'console', label: 'Console' },
             { id: 'positions', label: 'Positions' },
           ]}
@@ -122,6 +123,9 @@ export function MobileTradeView() {
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           <Pane visible={top === 'gold'}>
             <ChartBotPane slot={1} compact />
+          </Pane>
+          <Pane visible={top === 'mgc'}>
+            <ChartBotPane slot={7} compact />
           </Pane>
           <Pane visible={top === 'console'}>
             <CommandConsole compact />
