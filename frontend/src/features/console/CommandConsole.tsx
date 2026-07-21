@@ -352,6 +352,18 @@ export function CommandConsole({ compact = false }: { compact?: boolean }) {
     requestAnimationFrame(() => inputRef.current?.focus());
   }, []);
 
+  // Chart click-to-close strip drafts land here: fill the input and
+  // focus, but never submit — the operator's Enter is the arm/fire
+  // step. The nonce ref skips any draft that predates this mount so a
+  // console remount (layout change) can't resurrect an old draft.
+  const consoleDraft = useStore((s) => s.consoleDraft);
+  const seenDraftNonceRef = useRef(consoleDraft?.nonce ?? 0);
+  useEffect(() => {
+    if (!consoleDraft || consoleDraft.nonce === seenDraftNonceRef.current) return;
+    seenDraftNonceRef.current = consoleDraft.nonce;
+    prefillInput(consoleDraft.text);
+  }, [consoleDraft, prefillInput]);
+
   const [voiceOpen, setVoiceOpen] = useState(false);
   const speechAvailable = isSpeechAvailable();
 

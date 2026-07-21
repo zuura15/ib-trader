@@ -167,6 +167,16 @@ interface Props {
    *  series-markers primitive — fully independent of the SR/fires SVG
    *  painter. No open/close pairing. */
   executionMarkers?: Array<{ time: string; side: 'B' | 'S'; qty: number; price: number }>;
+  /** Click-to-pick price strip. When set, a narrow vertical strip is
+   *  rendered inside the chart just left of the price-axis labels;
+   *  hovering shows the tick-rounded price at the cursor and clicking
+   *  fires this callback with that price. Used by chart-bot panes to
+   *  draft a closing limit order into the console input. The strip
+   *  never transmits anything itself. */
+  onPricePick?: (price: number) => void;
+  /** Tick size used to round strip hover/click prices (e.g. 0.25 for
+   *  ES/NQ, 0.1 for GC). Defaults to 0.01. */
+  pickTickSize?: number;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -189,6 +199,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     suppressAutoSignals = false,
     historicalFires,
     executionMarkers,
+    onPricePick,
+    pickTickSize = 0.01,
   }: Props,
   ref,
 ) {
@@ -601,6 +613,68 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       execMarkersApiRef.current = null;
     };
   }, [executionMarkers, chartVersion, barsTick]);
+
+  // ── Click-to-pick price strip ──────────────────────────────────────
+  // A narrow band inside the chart hugging the price axis. Geometry
+  // (axis width, price-pane height) is sampled on a slow interval —
+  // axis width only changes when the price's digit count does, so
+  // polling beats wiring into every relayout path. Hover shows the
+  // tick-rounded price at the cursor; click hands it to onPricePick.
+  const hasPricePick = !!onPricePick;
+  const [stripGeom, setStripGeom] = useState<
+    { right: number; height: number } | null
+  >(null);
+  const [stripHover, setStripHover] = useState<
+    { y: number; price: number } | null
+  >(null);
+  useEffect(() => {
+    if (!hasPricePick) { setStripGeom(null); return; }
+    const measure = () => {
+      const chart = chartRef.current;
+      const el = containerRef.current;
+      if (!chart || !el || el.clientHeight === 0) return;
+      try {
+        const axisW = chart.priceScale('right').width();
+        // Bound the strip to the PRICE pane: coordinateToPrice is
+        // pane-relative, and pane 0 starts at the container top, so
+        // clipping the strip's height keeps every hover/click y valid
+        // even when an RSI sub-pane sits below.
+        let paneH = el.clientHeight - chart.timeScale().height();
+        try {
+          const h = chart.panes()[0]?.getHeight();
+          if (typeof h === 'number' && h > 0) paneH = h;
+        } catch { /* panes API unavailable — container-minus-axis is fine */ }
+        if (axisW > 0 && paneH > 0) {
+          setStripGeom((prev) =>
+            prev && prev.right === axisW && prev.height === paneH
+              ? prev : { right: axisW, height: paneH });
+        }
+      } catch { /* chart mid-teardown — next tick re-measures */ }
+    };
+    measure();
+    const id = window.setInterval(measure, 1000);
+    return () => window.clearInterval(id);
+  }, [hasPricePick, chartVersion]);
+
+  // Decimals implied by the tick (0.25 → 2, 0.1 → 1) so the hover tag
+  // and the drafted command show the exchange's own price format.
+  const pickDecimals = (() => {
+    const s = String(pickTickSize);
+    const dot = s.indexOf('.');
+    return dot < 0 ? 0 : s.length - dot - 1;
+  })();
+  const stripPriceAt = (clientY: number): number | null => {
+    const el = containerRef.current;
+    const ser = seriesRef.current;
+    if (!el || !ser) return null;
+    const y = clientY - el.getBoundingClientRect().top;
+    const raw = ser.coordinateToPrice(y);
+    if (raw == null || !Number.isFinite(raw as number)) return null;
+    const snapped = Math.round((raw as number) / pickTickSize) * pickTickSize;
+    // Re-round through the tick's decimal places to kill float dust
+    // (0.30000000000000004-style) before it reaches the command text.
+    return Number(snapped.toFixed(pickDecimals));
+  };
 
   useEffect(() => {
     showBrokenSrRef.current = showBrokenSr;
@@ -2762,6 +2836,68 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      {hasPricePick && target && stripGeom && (
+        <div
+          data-testid="price-pick-strip"
+          title="Click to draft a closing limit order at this price"
+          onMouseMove={(e) => {
+            const p = stripPriceAt(e.clientY);
+            if (p == null) { setStripHover(null); return; }
+            const top = e.currentTarget.getBoundingClientRect().top;
+            setStripHover({ y: e.clientY - top, price: p });
+          }}
+          onMouseLeave={() => setStripHover(null)}
+          onClick={(e) => {
+            const p = stripPriceAt(e.clientY);
+            if (p != null) onPricePick?.(p);
+          }}
+          style={{
+            position: 'absolute',
+            top: 0,
+            right: stripGeom.right,
+            width: 16,
+            height: stripGeom.height,
+            zIndex: 20,
+            cursor: 'crosshair',
+            background: stripHover
+              ? 'rgba(59,130,246,0.16)' : 'rgba(59,130,246,0.05)',
+            borderLeft: '1px dashed rgba(59,130,246,0.35)',
+          }}
+        >
+          {stripHover && (
+            <>
+              {/* Tick mark at the exact pick y, so the eye can line the
+                  price tag up with the polyline. */}
+              <div
+                style={{
+                  position: 'absolute', right: 0, width: 16, height: 0,
+                  top: stripHover.y,
+                  borderTop: '1px solid var(--accent-blue, #3b82f6)',
+                  pointerEvents: 'none',
+                }}
+              />
+              <div
+                style={{
+                  position: 'absolute',
+                  right: 18,
+                  top: stripHover.y - 10,
+                  padding: '1px 5px',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  fontVariantNumeric: 'tabular-nums',
+                  whiteSpace: 'nowrap',
+                  color: '#fff',
+                  background: 'var(--accent-blue, #3b82f6)',
+                  borderRadius: 3,
+                  pointerEvents: 'none',
+                }}
+              >
+                {stripHover.price.toFixed(pickDecimals)}
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {!target && placeholder && (
         <div
           className="flex items-center justify-center text-xs"

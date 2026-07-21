@@ -121,6 +121,14 @@ interface AppStore {
   addCommand: (cmd: string) => string;
   updateCommand: (id: string, partial: Partial<CommandEntry>) => void;
 
+  // Console draft — a command staged into the console INPUT (not
+  // transmitted) by another pane, e.g. the chart click-to-close price
+  // strip. The operator reviews and hits Enter to send; the console is
+  // the single arm/fire point by design. ``nonce`` bumps on every set
+  // so consumers react even when the same text is drafted twice.
+  consoleDraft: { text: string; nonce: number } | null;
+  setConsoleDraft: (text: string) => void;
+
   // Templates
   templates: OrderTemplate[];
   addTemplate: (t: OrderTemplate) => void;
@@ -574,6 +582,11 @@ export const useStore = create<AppStore>((set, get) => ({
   },
   updateCommand: (id, partial) => set((s) => ({
     commands: s.commands.map((c) => c.id === id ? { ...c, ...partial } : c),
+  })),
+
+  consoleDraft: null,
+  setConsoleDraft: (text) => set((s) => ({
+    consoleDraft: { text, nonce: (s.consoleDraft?.nonce ?? 0) + 1 },
   })),
 
   watchlist: [],

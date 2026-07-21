@@ -55,6 +55,26 @@ function qtyStepFor(symbol: string | null): number {
   return MICRO_ROOTS.has(root) ? 10 : 1;
 }
 
+// Exchange tick sizes by futures root — drives the click-to-close
+// strip's price rounding so a drafted limit is always on-tick (IB
+// rejects off-tick limits). Extend as new contracts get chart slots;
+// unknown roots fall back to 0.01, the safest common denominator.
+const TICK_SIZE_BY_ROOT: Record<string, number> = {
+  GC: 0.1, MGC: 0.1,
+  ES: 0.25, MES: 0.25,
+  NQ: 0.25, MNQ: 0.25,
+  CL: 0.01, MCL: 0.01,
+  SI: 0.005, RTY: 0.1, M2K: 0.1, YM: 1, MYM: 1,
+};
+
+/** Tick size for the click-to-close strip's price rounding. */
+function tickSizeFor(symbol: string | null): number {
+  if (!symbol) return 0.01;
+  const m = symbol.toUpperCase().match(FUT_LOCAL_SYM_RE);
+  const root = m ? m[1] : symbol.toUpperCase();
+  return TICK_SIZE_BY_ROOT[root] ?? 0.01;
+}
+
 /**
  * Desktop Trader-layout chart pane. The bot's FSM lifecycle is
  * intentionally hidden — the chart is always live for manual scanning
@@ -89,6 +109,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const addCommand = useStore((s) => s.addCommand);
+  const setConsoleDraft = useStore((s) => s.setConsoleDraft);
   // Command list — watched so an order button stays locked until the
   // order it fired reaches a terminal state (fill / reject), giving real
   // feedback and preventing the "no response → mash SELL 5× → 5 orders"
@@ -234,6 +255,31 @@ export function ChartBotPane({ slot, compact = false }: Props) {
     void fireCommand(`${side} ${symbol} ${absQty} smart_market`, 'close');
   };
 
+  // Click-to-close price strip (SymbolChart renders it hugging the
+  // price axis). A click DRAFTS the full-position closing limit at the
+  // picked price into the console input — never transmits. The console
+  // is the single arm/fire point; the operator reviews and hits Enter.
+  const pickTickSize = tickSizeFor(symbol);
+  const onPricePick = (price: number) => {
+    if (!symbol) return;
+    if (positionQty === 0) {
+      setStatusMsg('no position — nothing to close');
+      setTimeout(() => setStatusMsg(null), 3000);
+      return;
+    }
+    const decimals = (() => {
+      const s = String(pickTickSize);
+      const dot = s.indexOf('.');
+      return dot < 0 ? 0 : s.length - dot - 1;
+    })();
+    const side = positionQty > 0 ? 'sell' : 'buy';
+    const absQty = Math.abs(positionQty);
+    const priceTxt = price.toFixed(decimals);
+    setConsoleDraft(`${side} ${symbol} ${absQty} limit ${priceTxt}`);
+    setStatusMsg(`drafted: ${side} ${absQty} @ ${priceTxt} — Enter in console to send`);
+    setTimeout(() => setStatusMsg(null), 5000);
+  };
+
   const canClose = positionQty !== 0;
   const positionLabel = positionQty === 0 ? null
     : positionQty > 0 ? `LONG ${positionQty}`
@@ -301,6 +347,8 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           renderHeader={() => null}
           onFullscreenChange={setIsFullscreen}
           fullscreenFooter={renderTradeStrip()}
+          onPricePick={onPricePick}
+          pickTickSize={pickTickSize}
         />
         {/* Live P&L for the open position on this exact contract.
             Free-floating colored number, bottom-right of the plot

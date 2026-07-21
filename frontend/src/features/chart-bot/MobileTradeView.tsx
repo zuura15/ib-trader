@@ -1,8 +1,9 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChartBotPane } from './ChartBotPane';
 import { CommandConsole } from '../console/CommandConsole';
 import { PositionsPanel } from '../positions/PositionsPanel';
 import { useChartBotSymbols } from '../../data/useChartBotSymbols';
+import { useStore } from '../../data/store';
 
 /**
  * Mobile primary view — two chart rows stacked vertically, each its own
@@ -105,6 +106,18 @@ export function MobileTradeView() {
   // Live slot → symbol so each chart tab shows its actual contract and
   // follows rolls; falls back to a plain label until the map loads.
   const sym = useChartBotSymbols();
+
+  // A chart-strip click drafted a command into the console input —
+  // flip the top row to the Console tab so the draft is immediately
+  // visible for review + Enter. Nonce ref skips any draft that
+  // predates this mount.
+  const consoleDraft = useStore((s) => s.consoleDraft);
+  const seenDraftNonceRef = useRef(consoleDraft?.nonce ?? 0);
+  useEffect(() => {
+    if (!consoleDraft || consoleDraft.nonce === seenDraftNonceRef.current) return;
+    seenDraftNonceRef.current = consoleDraft.nonce;
+    setTop('console');
+  }, [consoleDraft]);
 
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>

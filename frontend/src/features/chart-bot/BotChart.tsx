@@ -37,6 +37,12 @@ interface Props {
    *  avoid double-rendering the footer (render it in normal flow only
    *  when not fullscreen). */
   onFullscreenChange?: (fullscreen: boolean) => void;
+  /** Click-to-pick price strip — forwarded to SymbolChart. See its
+   *  ``onPricePick`` doc. ChartBotPane supplies the handler that turns
+   *  the picked price into a drafted closing limit command. */
+  onPricePick?: (price: number) => void;
+  /** Tick size for strip price rounding — forwarded to SymbolChart. */
+  pickTickSize?: number;
 }
 
 /**
@@ -63,6 +69,7 @@ export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
   fullscreenFooter, onFullscreenChange,
+  onPricePick, pickTickSize,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -612,6 +619,8 @@ export function BotChart({
           suppressAutoSignals
           historicalFires={historicalFires}
           executionMarkers={executionMarkers}
+          onPricePick={onPricePick}
+          pickTickSize={pickTickSize}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
