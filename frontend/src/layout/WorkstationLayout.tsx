@@ -110,12 +110,6 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'Slot 5 · S&P', anchor: 'chart-bot',
     config: { slot: 5 }, slot: 5, anchorSlot: 3,
   },
-  // WTI Crude (slot 2) — inject next to the Nasdaq chart (slot 4) in the
-  // bottom-right tabset for users whose persisted layout predates it.
-  {
-    component: 'chart-bot', name: 'Slot 2 · WTI', anchor: 'chart-bot',
-    config: { slot: 2 }, slot: 2, anchorSlot: 4,
-  },
   // Micro S&P (slot 6) — inject next to the full S&P chart (slot 5).
   {
     component: 'chart-bot', name: 'MESU6', anchor: 'chart-bot',
@@ -123,13 +117,51 @@ const MIGRATED_TABS: Array<{
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
   {
-    component: 'chart-bot', name: 'MGCQ6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'MGCV6', anchor: 'chart-bot',
     config: { slot: 7 }, slot: 7, anchorSlot: 1,
   },
 ];
 
+// Chart-bot slots RETIRED from the default layout. Persisted layouts
+// still carry their tabs, which would render a dead "bot not
+// configured" pane after the matching config/bots/*.yaml is deleted —
+// so migration prunes them. Inverse of MIGRATED_TABS, matched by
+// (component='chart-bot', config.slot).
+const REMOVED_CHART_SLOTS = new Set<number>([
+  2,  // WTI Crude — dropped 2026-07-21 with the CL chart removal.
+]);
+
 function migrateLayoutJson(raw: any): any {
   if (!raw || typeof raw !== 'object') return raw;
+
+  // Prune retired chart-bot slots BEFORE the presence scan, so a
+  // removed slot never masks (or anchors) an injection. Empty tabsets
+  // left behind are dropped from their parent row; borders may be
+  // empty, so only tabsets are removed.
+  const prune = (node: any) => {
+    if (!node || !Array.isArray(node.children)) return;
+    const isTabContainer = node.type === 'tabset' || node.type === 'border';
+    if (isTabContainer) {
+      const before = node.children.length;
+      node.children = node.children.filter(
+        (c: any) => !(c && c.type === 'tab' && c.component === 'chart-bot'
+          && REMOVED_CHART_SLOTS.has(Number(c.config?.slot))),
+      );
+      if (node.children.length !== before
+          && typeof node.selected === 'number'
+          && node.selected >= node.children.length) {
+        node.selected = Math.max(0, node.children.length - 1);
+      }
+    } else {
+      node.children.forEach(prune);
+      node.children = node.children.filter(
+        (c: any) => !(c && c.type === 'tabset'
+          && Array.isArray(c.children) && c.children.length === 0),
+      );
+    }
+  };
+  prune(raw.layout);
+  if (Array.isArray(raw.borders)) raw.borders.forEach(prune);
 
   // Collect every tab component present anywhere in the model.
   const present = new Set<string>();

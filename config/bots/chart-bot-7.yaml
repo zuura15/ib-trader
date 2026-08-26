@@ -13,9 +13,10 @@ config:
   # Per-bot ref_id keeps the WS state subscription unique across the
   # shared chart_signal strategy yaml.
   ref_id: chart-bot-7-mgc
-  # MGC = Micro Gold (10 oz, 1/10th of GC). Same August 2026 expiry
-  # (Q6) as the full GCQ6 in slot 1 — roll both together (next: V6).
-  symbol: MGCQ6
+  # MGC = Micro Gold (10 oz, 1/10th of GC). Same October 2026 expiry
+  # (V6) as the full GCV6 in slot 1 — roll both together (next: Z6).
+  # Rolled Q6 → V6 with GC on 2026-07-21.
+  symbol: MGCV6
   sec_type: FUT
   # Micro Gold: 10 oz/contract. Used by P/L math + trail target.
   contract_multiplier: 10
@@ -25,4 +26,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- MGCQ6
+- MGCV6

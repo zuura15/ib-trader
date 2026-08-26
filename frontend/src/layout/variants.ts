@@ -296,8 +296,8 @@ export const variantT: IJsonModel = {
             type: 'tabset',
             weight: 50,
             children: [
-              { type: 'tab', name: 'GCQ6', component: 'chart-bot', config: { slot: 1 } },
-              { type: 'tab', name: 'MGCQ6', component: 'chart-bot', config: { slot: 7 } },
+              { type: 'tab', name: 'GCV6', component: 'chart-bot', config: { slot: 1 } },
+              { type: 'tab', name: 'MGCV6', component: 'chart-bot', config: { slot: 7 } },
             ],
           },
           {
@@ -328,7 +328,6 @@ export const variantT: IJsonModel = {
             weight: 50,
             children: [
               { type: 'tab', name: 'NQU6', component: 'chart-bot', config: { slot: 4 } },
-              { type: 'tab', name: 'CLU6', component: 'chart-bot', config: { slot: 2 } },
             ],
           },
         ],
