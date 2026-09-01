@@ -1578,11 +1578,31 @@ class InsyncClient(IBClientBase):
             # with empty string status).  Filter out orders with no status.
             if not status or status == "":
                 continue
+            # ib_async uses UNSET_DOUBLE sentinels (~1.8e308) for absent
+            # prices; treat those as None. Benign parse — fall back to
+            # None, never raise.
+            try:
+                _lmt = trade.order.lmtPrice
+                limit_price = (
+                    Decimal(str(_lmt))
+                    if _lmt and 0 < float(_lmt) < 1e300 else None
+                )
+            except (TypeError, ValueError, ArithmeticError):
+                limit_price = None
             result.append({
                 "ib_order_id": str(trade.order.orderId),
                 "symbol": trade.contract.symbol,
+                # localSymbol is authoritative for the contract month
+                # (GCV6 vs root GC) — the close-by-ticker sweep matches
+                # on it. Falls back to the root symbol for STK.
+                "local_symbol": (
+                    getattr(trade.contract, "localSymbol", "")
+                    or trade.contract.symbol
+                ),
                 "side": trade.order.action,
                 "qty": Decimal(str(trade.order.totalQuantity)),
+                "order_type": trade.order.orderType,
+                "limit_price": limit_price,
                 "status": status,
                 "qty_filled": Decimal(str(trade.orderStatus.filled)),
                 "avg_fill_price": (

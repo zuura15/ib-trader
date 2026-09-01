@@ -3,6 +3,30 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-01
+
+### Added
+- **`close SYMBOL` — ticker-wide cancel sweep + net flat (#96).** New
+  console form (`close GCV6`, `close GCV6 limit 4470.0`): cancels ALL
+  working IB orders on that contract — including orders placed directly
+  in TWS — echoing each cancellation to the console and recording
+  CANCEL_ATTEMPT/CANCELLED transaction rows, then nets the IB position
+  flat via the requested strategy (default smart_market) through the
+  standard order path. Flat + pending orders → sweep still runs. A
+  single failed cancel raises a WARNING alert and continues (halting
+  mid-close is worse). `close SERIAL` is unchanged. The chart CLOSE
+  button now sends `close <symbol>` so button closes sweep too.
+  `get_open_orders()` gained `local_symbol` / `order_type` /
+  `limit_price` fields (localSymbol is authoritative for the futures
+  month).
+
+### Fixed
+- **Mock IB drift: `place_limit_order(oca_group=…)`.** The engine's
+  profit-taker path passes `oca_group`, but `ib/base.py`'s abstract
+  signature, the test mock, and two local test stubs never gained the
+  parameter — 6 integration tests failed on any PT-placing flow. Base
+  contract + mocks now match `insync_client`.
+
 ## 2026-06-05
 
 ### Added

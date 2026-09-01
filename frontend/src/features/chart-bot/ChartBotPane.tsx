@@ -246,13 +246,11 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   };
   const onClose = () => {
     if (!symbol || positionQty === 0) return;
-    // Net-flat with the session-aware smart_market algo (walks toward
-    // the far side then crosses) — same execution the console default
-    // uses, so chart closes match typed closes. Opposite side for the
-    // held qty.
-    const absQty = Math.abs(positionQty);
-    const side = positionQty > 0 ? 'sell' : 'buy';
-    void fireCommand(`${side} ${symbol} ${absQty} smart_market`, 'close');
+    // Close verb (issue #96): the engine first cancels ALL working IB
+    // orders on this ticker (each cancellation echoed to the console),
+    // then nets the position flat with smart_market — same execution
+    // path as typed orders.
+    void fireCommand(`close ${symbol}`, 'close');
   };
 
   // Click-to-close price strip (SymbolChart renders it hugging the

@@ -177,14 +177,15 @@ class MockIBClient(IBClientBase):
         return self._market_snapshot
 
     async def place_limit_order(self, con_id, symbol, side, qty, price,
-                                outside_rth=True, tif="GTC", order_ref=None) -> str:
+                                outside_rth=True, tif="GTC", order_ref=None,
+                                oca_group=None) -> str:
         await self._throttle()
         ib_id = str(self._next_order_id)
         self._next_order_id += 1
         self.placed_orders.append({
             "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
             "side": side, "qty": qty, "price": price, "tif": tif,
-            "order_ref": order_ref,
+            "order_ref": order_ref, "oca_group": oca_group,
         })
         self._order_statuses[ib_id] = {
             "status": "Submitted",
@@ -233,7 +234,9 @@ class MockIBClient(IBClientBase):
 
     async def get_open_orders(self) -> list[dict]:
         await self._throttle()
-        return []
+        # Tests set ``mock_open_orders`` to exercise the close-by-symbol
+        # cancel sweep; default empty.
+        return list(getattr(self, "mock_open_orders", []))
 
     async def req_recent_executions(self, lookback_hours: float) -> list[dict]:
         await self._throttle()

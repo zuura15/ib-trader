@@ -3461,8 +3461,111 @@ async def _handle_close_partial(
     )
 
 
+async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
+    """Close-by-ticker (``close GCV6``) — issue #96.
+
+    Cancels ALL working IB orders on the contract — including orders
+    placed outside this system (TWS) — echoing each cancellation to the
+    console, then nets the IB position flat via the requested strategy
+    (default smart_market) through the standard ``execute_order`` path.
+
+    A single failed cancel is surfaced (WARNING alert + console line)
+    but doesn't abort the sweep or the close — halting mid-close leaves
+    the operator worse off. Deliberate WARNING per the severity tenet.
+    """
+    from ib_trader.logging_.alerts import log_and_alert
+
+    sym = (cmd.symbol or "").upper()
+
+    # Snapshot BEFORE placing our own closing order, so the sweep can
+    # never cancel the close itself. A listing failure propagates: we
+    # must not fire a close on top of unknown pending orders.
+    open_orders = await ctx.ib.get_open_orders()
+    matches = [
+        o for o in open_orders
+        if (o.get("local_symbol") or o.get("symbol") or "").upper() == sym
+    ]
+
+    cancelled = 0
+    for o in matches:
+        oid = str(o.get("ib_order_id"))
+        side = (o.get("side") or "?").upper()
+        qty = o.get("qty") or Decimal("0")
+        order_type = o.get("order_type") or "?"
+        limit_price = o.get("limit_price")
+        desc = f"#{oid} {side} {qty} {sym} {order_type}" + (
+            f" @ {limit_price}" if limit_price is not None else ""
+        )
+        _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, sym, side,
+                   order_type, qty, ib_order_id=_safe_int(oid),
+                   ib_status=o.get("status"), limit_price=limit_price,
+                   security_type=cmd.security_type)
+        try:
+            await ctx.ib.cancel_order(oid)
+        except Exception as e:
+            await log_and_alert(
+                redis=ctx.redis, trigger="CLOSE_SYMBOL_CANCEL_FAILED",
+                message=f"cancel failed for {desc}: {e}",
+                severity="WARNING", symbol=sym, ib_order_id=oid,
+            )
+            ctx.router.emit(
+                f"\u26a0 Cancel failed for {desc} \u2014 {e}",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+            )
+            continue
+        _write_txn(ctx, TransactionAction.CANCELLED, sym, side,
+                   order_type, qty, ib_order_id=_safe_int(oid),
+                   is_terminal=True, ib_responded_at=_now_utc(),
+                   security_type=cmd.security_type)
+        cancelled += 1
+        ctx.router.emit(f"\u2717 Cancelled {desc}", pane=OutputPane.COMMAND)
+        logger.info(
+            '{"event": "CLOSE_SYMBOL_ORDER_CANCELLED", "symbol": "%s", '
+            '"ib_order_id": "%s"}', sym, oid,
+        )
+    if matches:
+        ctx.router.emit(
+            f"Cancelled {cancelled}/{len(matches)} working order(s) on {sym}",
+            pane=OutputPane.COMMAND,
+        )
+    else:
+        ctx.router.emit(
+            f"No working IB orders on {sym}", pane=OutputPane.COMMAND,
+        )
+
+    # Net flat from the engine's IB-fed positions cache (positionEvent
+    # + 30s poll — same IB-authoritative source the TUI reads).
+    pos_qty = Decimal("0")
+    for p in ctx.positions_cache:
+        key = (p.get("local_symbol") or p.get("symbol") or "").upper()
+        if key == sym:
+            try:
+                pos_qty = Decimal(str(p.get("quantity") or "0"))
+            except (TypeError, ValueError, ArithmeticError):
+                pos_qty = Decimal("0")
+            break
+    if pos_qty == 0:
+        ctx.router.emit(
+            f"No open position on {sym} \u2014 nothing to close.",
+            pane=OutputPane.COMMAND,
+        )
+        return
+
+    close_cls = SellCommand if pos_qty > 0 else BuyCommand
+    order_cmd = close_cls(
+        symbol=sym, qty=abs(pos_qty), dollars=None, strategy=cmd.strategy,
+        profit_amount=None, take_profit_price=None, stop_loss=None,
+        limit_price=cmd.limit_price, bot_ref=cmd.bot_ref,
+        security_type=cmd.security_type,
+    )
+    await execute_order(order_cmd, ctx)
+
+
 async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
-    """Close an open position by serial number.
+    """Close an open position by serial number, or by ticker.
+
+    ``close SYMBOL`` (cmd.symbol set) routes to
+    ``_execute_close_symbol`` — ticker-wide cancel sweep + net-flat.
 
     - Looks up the trade group by serial number.
     - Cancels all linked open IB orders (profit taker, stop loss).
@@ -3473,6 +3576,10 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
         cmd: Parsed CloseCommand.
         ctx: Application context.
     """
+    if getattr(cmd, "symbol", None):
+        await _execute_close_symbol(cmd, ctx)
+        return
+
     trade_group = ctx.trades.get_by_serial(cmd.serial)
     if not trade_group:
         ctx.router.emit(

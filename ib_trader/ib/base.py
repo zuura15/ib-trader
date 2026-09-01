@@ -118,6 +118,7 @@ class IBClientBase(ABC):
         outside_rth: bool = True,
         tif: str = "GTC",
         order_ref: str | None = None,
+        oca_group: str | None = None,
     ) -> str:
         """Place a GTC limit order.
 
@@ -132,6 +133,8 @@ class IBClientBase(ABC):
             order_ref: Optional orderRef tag for IB order identification.
                        Format: "IBT:{bot_ref}:{symbol}:{side}:{serial}".
                        Set on the IB Order object before placement.
+            oca_group: Optional OCA group name — orders sharing it are
+                       one-cancels-all at IB (profit taker vs stop).
 
         Returns:
             IB order ID as a string. Write to SQLite immediately on return.
@@ -215,8 +218,11 @@ class IBClientBase(ABC):
 
         Returns:
             List of dicts with keys: ib_order_id (str), symbol (str),
-                status (str), qty_filled (Decimal),
-                avg_fill_price (Decimal | None).
+                local_symbol (str — IB localSymbol, authoritative for
+                the futures contract month; == symbol for STK),
+                side (str), qty (Decimal), order_type (str),
+                limit_price (Decimal | None), status (str),
+                qty_filled (Decimal), avg_fill_price (Decimal | None).
         """
         ...
 

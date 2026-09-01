@@ -136,13 +136,21 @@ class SellCommand:
 
 @dataclass
 class CloseCommand:
-    """Parsed 'close' command."""
-    serial: int
+    """Parsed 'close' command.
+
+    Two forms: ``close SERIAL`` targets a trade group (``symbol`` is
+    None); ``close SYMBOL`` targets a ticker (``serial`` is None) —
+    cancel every working IB order on the contract, then net the IB
+    position flat. See issue #96.
+    """
+    serial: int | None
     strategy: Strategy               # default "smart_market"
     profit_amount: Decimal | None
     take_profit_price: Decimal | None
     limit_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
+    symbol: str | None = None        # close-by-ticker form
+    security_type: str = "STK"       # inferred for the symbol form
 
 
 @dataclass
@@ -467,6 +475,12 @@ def parse_close(
 
     Grammar:
         close SERIAL [STRATEGY] [--take-profit-price N]
+        close SYMBOL [STRATEGY] [PRICE]
+
+    The SYMBOL form cancels ALL working IB orders on that ticker
+    (including orders placed directly in TWS), then nets the position
+    flat via STRATEGY (default smart_market). PRICE is required when
+    STRATEGY is ``limit``.
 
     Args:
         tokens: List including 'close' as tokens[0].
@@ -508,14 +522,34 @@ def parse_close(
         i += 1
 
     if not positional:
-        _emit_error("\u2717 Error: usage: close SERIAL [STRATEGY] [PROFIT]", router)
+        _emit_error("\u2717 Error: usage: close SERIAL|SYMBOL [STRATEGY] [PROFIT]", router)
         return None
 
+    serial: int | None = None
+    symbol: str | None = None
+    security_type = "STK"
     try:
         serial = int(positional[0])
     except ValueError:
-        _emit_error(f"\u2717 Error: SERIAL must be an integer, got {positional[0]!r}", router)
-        return None
+        # close SYMBOL form — same IB-paste tokens buy/sell accept
+        # (``GCV6``, ``MESU6``, ``F``). Anything non-alphanumeric is a
+        # typo, not a ticker.
+        token = positional[0].upper()
+        if not token.isalnum():
+            _emit_error(
+                f"\u2717 Error: expected a trade SERIAL or a SYMBOL, "
+                f"got {positional[0]!r}", router,
+            )
+            return None
+        symbol = token
+        if _is_futures_local_symbol(symbol):
+            security_type = "FUT"
+        if take_profit_price is not None:
+            _emit_error(
+                "\u2717 Error: --take-profit-price is not supported with "
+                "close SYMBOL", router,
+            )
+            return None
 
     if len(positional) >= 2:
         try:
@@ -547,6 +581,14 @@ def parse_close(
         next_pos = 3
 
     if len(positional) > next_pos:
+        if symbol is not None:
+            # PROFIT targets a trade group's P&L — meaningless for the
+            # ticker-wide form.
+            _emit_error(
+                "\u2717 Error: PROFIT is not supported with close SYMBOL",
+                router,
+            )
+            return None
         try:
             profit_amount = _parse_decimal(positional[next_pos], "PROFIT")
         except ValueError as e:
@@ -559,6 +601,8 @@ def parse_close(
         profit_amount=profit_amount,
         take_profit_price=take_profit_price,
         limit_price=limit_price,
+        symbol=symbol,
+        security_type=security_type,
     )
 
 

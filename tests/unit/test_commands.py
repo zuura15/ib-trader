@@ -227,7 +227,9 @@ class TestParseClose:
         assert cmd.limit_price == Decimal("450.00")
 
     def test_invalid_serial(self, capsys):
-        cmd = parse_close(["close", "abc"])
+        # A bare word now parses as the close-SYMBOL form (#96) — only
+        # non-alphanumeric tokens are rejected.
+        cmd = parse_close(["close", "a$c"])
         assert cmd is None
         assert "Error" in capsys.readouterr().out
 
@@ -294,3 +296,47 @@ class TestParseCommand:
         cmd = parse_command("foobar")
         assert cmd is None
         assert "Error" in capsys.readouterr().out
+
+
+class TestParseCloseSymbol:
+    """close SYMBOL form — ticker-wide cancel sweep + net flat (#96)."""
+
+    def test_symbol_form_futures(self):
+        from ib_trader.repl.commands import Strategy
+        cmd = parse_close(["close", "GCV6"])
+        assert cmd is not None
+        assert cmd.serial is None
+        assert cmd.symbol == "GCV6"
+        assert cmd.security_type == "FUT"
+        assert cmd.strategy == Strategy.SMART_MARKET
+
+    def test_symbol_form_lowercase_and_stock(self):
+        cmd = parse_close(["close", "f"])
+        assert cmd is not None
+        assert cmd.symbol == "F"
+        assert cmd.security_type == "STK"
+
+    def test_symbol_form_limit_price(self):
+        from ib_trader.repl.commands import Strategy
+        cmd = parse_close(["close", "gcv6", "limit", "4470.0"])
+        assert cmd is not None
+        assert cmd.symbol == "GCV6"
+        assert cmd.strategy == Strategy.LIMIT
+        assert cmd.limit_price == Decimal("4470.0")
+
+    def test_symbol_form_rejects_take_profit(self):
+        assert parse_close(
+            ["close", "GCV6", "--take-profit-price", "5"]
+        ) is None
+
+    def test_symbol_form_rejects_profit_positional(self):
+        assert parse_close(["close", "GCV6", "market", "5"]) is None
+
+    def test_symbol_form_rejects_garbage_token(self):
+        assert parse_close(["close", "GC-V6!"]) is None
+
+    def test_serial_form_unchanged(self):
+        cmd = parse_close(["close", "4"])
+        assert cmd is not None
+        assert cmd.serial == 4
+        assert cmd.symbol is None

@@ -154,6 +154,7 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
             "  buy SYMBOL QTY STRATEGY [--profit N] [--stop-loss N]\n"
             "  sell SYMBOL QTY STRATEGY [--profit N] [--stop-loss N]\n"
             "  close SERIAL [STRATEGY]\n"
+            "  close SYMBOL [STRATEGY] [PRICE]   (cancels ALL working IB orders on the ticker, then nets flat)\n"
             "  status    — show system status\n"
             "  stats     — show trading statistics\n"
             "  orders    — list open orders\n"

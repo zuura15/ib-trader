@@ -126,3 +126,94 @@ class TestCloseCommand:
         assert close_order["side"] == "SELL"
         # Price should be mid = (100.00 + 100.10) / 2 = 100.05
         assert close_order["price"] == Decimal("100.0500")
+
+
+def _open_order(oid: str, local_symbol: str, side: str = "SELL",
+                qty: str = "2", order_type: str = "LMT",
+                limit_price: str | None = "4470.0") -> dict:
+    return {
+        "ib_order_id": oid,
+        "symbol": local_symbol[:2],
+        "local_symbol": local_symbol,
+        "side": side,
+        "qty": Decimal(qty),
+        "order_type": order_type,
+        "limit_price": Decimal(limit_price) if limit_price else None,
+        "status": "Submitted",
+        "qty_filled": Decimal("0"),
+        "avg_fill_price": None,
+    }
+
+
+class TestCloseSymbol:
+    """close SYMBOL — ticker-wide cancel sweep + net flat (#96)."""
+
+    def _cmd(self, symbol: str = "GCV6", strategy: str = "market",
+             security_type: str = "FUT"):
+        from ib_trader.repl.commands import Strategy
+        return CloseCommand(
+            serial=None, strategy=Strategy(strategy), profit_amount=None,
+            take_profit_price=None, symbol=symbol,
+            security_type=security_type,
+        )
+
+    async def test_sweep_cancels_only_matching_ticker(self, ctx):
+        from ib_trader.engine.order import execute_close
+        ctx.ib.mock_open_orders = [
+            _open_order("9001", "GCV6"),
+            _open_order("9002", "MGCV6"),   # other ticker — untouched
+            _open_order("9003", "GCV6", side="BUY", order_type="STP",
+                        limit_price=None),
+        ]
+        ctx.positions_cache = []            # flat — sweep only
+        await execute_close(self._cmd(), ctx)
+
+        assert ctx.ib.canceled_orders == ["9001", "9003"]
+        # One CANCEL_ATTEMPT + one CANCELLED row per swept order; the
+        # other ticker's order got no rows at all.
+        for oid in (9001, 9003):
+            rows = ctx.transactions.get_by_ib_order_id(oid)
+            actions = [r.action for r in rows]
+            assert actions.count(TransactionAction.CANCEL_ATTEMPT) == 1
+            assert actions.count(TransactionAction.CANCELLED) == 1
+            cancelled_row = [r for r in rows
+                             if r.action == TransactionAction.CANCELLED][0]
+            assert cancelled_row.is_terminal
+            assert cancelled_row.symbol == "GCV6"
+        assert ctx.transactions.get_by_ib_order_id(9002) == []
+
+    async def test_flat_reports_nothing_to_close(self, ctx):
+        from ib_trader.engine.order import execute_close
+        ctx.ib.mock_open_orders = []
+        ctx.positions_cache = []
+        await execute_close(self._cmd(), ctx)
+        assert ctx.ib.canceled_orders == []
+
+    async def test_short_position_places_buy_close(self, ctx):
+        # STK keeps the mock qualify fixture simple (FUT requires an
+        # expiry there); the sweep + net-flat flow is sec-type agnostic.
+        from ib_trader.engine.order import execute_close
+        ctx.ib.mock_open_orders = [
+            _open_order("9010", "MSFT", limit_price="410.0"),
+        ]
+        ctx.positions_cache = [{
+            "symbol": "MSFT", "local_symbol": "MSFT", "sec_type": "STK",
+            "quantity": "-2", "avg_cost": "400.0", "con_id": 1,
+        }]
+        await execute_close(
+            self._cmd(symbol="MSFT", security_type="STK"), ctx,
+        )
+
+        assert ctx.ib.canceled_orders == ["9010"]
+        # The net-flat leg went through execute_order → exactly one
+        # BUY 2 MSFT PLACE_ATTEMPT row exists (inverse of the short).
+        session = ctx.transactions._session()
+        placed = (
+            session.query(TransactionEvent)
+            .filter(TransactionEvent.symbol == "MSFT",
+                    TransactionEvent.action == TransactionAction.PLACE_ATTEMPT)
+            .all()
+        )
+        assert len(placed) == 1
+        assert placed[0].side == "BUY"
+        assert placed[0].quantity == Decimal("2")
