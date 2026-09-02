@@ -95,9 +95,19 @@ class OrderResponse(BaseModel):
 
 
 class CloseRequest(BaseModel):
-    """Request body for closing a position."""
+    """Request body for closing a position.
 
-    serial: int
+    Preferred: ``raw`` — the operator's close command verbatim
+    (``close GCV6 limit 4470``); the engine parses it with the full
+    grammar, so the SYMBOL form (#96) and limit prices survive the
+    API relay. ``serial``/``strategy``/``profit`` remain for callers
+    (bots) that still build the request field-wise.
+    """
+
+    raw: Optional[str] = Field(
+        default=None, description="Verbatim close command text",
+    )
+    serial: Optional[int] = None
     # Default matches parse_close + the API route handler. See
     # ib_trader/repl/commands.py:parse_close for rationale.
     strategy: str = "smart_market"
@@ -246,9 +256,16 @@ async def close_position(req: CloseRequest):
 
     from ib_trader.engine.service import execute_single_command
 
-    cmd_text = f"close {req.serial} {req.strategy}"
-    if req.profit:
-        cmd_text += f" {req.profit}"
+    if req.raw:
+        cmd_text = req.raw
+    elif req.serial is not None:
+        cmd_text = f"close {req.serial} {req.strategy}"
+        if req.profit:
+            cmd_text += f" {req.profit}"
+    else:
+        raise HTTPException(
+            status_code=422, detail="close requires 'raw' or 'serial'",
+        )
 
     try:
         result = await execute_single_command(

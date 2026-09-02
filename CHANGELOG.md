@@ -21,6 +21,12 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   month).
 
 ### Fixed
+- **`close GCV6` 500 through the UI (`invalid literal for int()`).**
+  The API route re-parsed close commands field-wise and the engine
+  rebuilt the text from `serial`/`strategy` — the SYMBOL form crashed
+  and limit prices were silently dropped on serial closes. The relay
+  now passes the operator's text verbatim (`CloseRequest.raw`); the
+  field-wise form remains for bot callers. Contract tests pin both.
 - **Mock IB drift: `place_limit_order(oca_group=…)`.** The engine's
   profit-taker path passes `oca_group`, but `ib/base.py`'s abstract
   signature, the test mock, and two local test stubs never gained the

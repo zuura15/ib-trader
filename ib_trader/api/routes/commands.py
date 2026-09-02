@@ -121,13 +121,12 @@ async def submit_command(body: CommandRequest):
 
                 resp = await client.post(f"{engine_url}/engine/orders", json=payload)
             elif verb == "close":
-                serial = int(parts[1]) if len(parts) > 1 else 0
-                # Default matches parse_close + CloseRequest pydantic
-                # model — see ib_trader/repl/commands.py:parse_close.
-                strategy = parts[2] if len(parts) > 2 else "smart_market"
+                # Relay the operator's text verbatim — the engine owns
+                # the close grammar (serial AND symbol forms, strategy,
+                # limit price). The old field-wise relay int()-crashed
+                # on ``close GCV6`` and silently dropped limit prices.
                 resp = await client.post(f"{engine_url}/engine/close", json={
-                    "serial": serial,
-                    "strategy": strategy,
+                    "raw": cmd_text,
                     "cmd_id": body.command_id,
                 })
             else:
