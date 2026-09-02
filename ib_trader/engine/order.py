@@ -292,8 +292,12 @@ def _write_txn(
 async def execute_order(
     cmd: "BuyCommand | SellCommand",
     ctx: AppContext,
-) -> None:
+) -> str:
     """Place and manage an entry order (buy or sell).
+
+    Returns the order's ``correlation_id`` so callers can inspect the
+    transactions ledger for the outcome (close-by-symbol gates its
+    cancel sweep on a FILLED/PARTIAL_FILL row — issue #96).
 
     Sequence:
     1. Validate safety limits.
@@ -491,6 +495,8 @@ async def execute_order(
             order_ctx.correlation_id, str(e), exc_info=True,
         )
         raise
+
+    return order_ctx.correlation_id
 
 
 async def _get_contract(
@@ -3464,14 +3470,22 @@ async def _handle_close_partial(
 async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
     """Close-by-ticker (``close GCV6``) — issue #96.
 
-    Cancels ALL working IB orders on the contract — including orders
-    placed outside this system (TWS) — echoing each cancellation to the
-    console, then nets the IB position flat via the requested strategy
-    (default smart_market) through the standard ``execute_order`` path.
+    Nets the IB position flat via the requested strategy (default
+    smart_market) through the standard ``execute_order`` path, THEN
+    cancels ALL other working IB orders on the contract — including
+    orders placed outside this system (TWS) — echoing each
+    cancellation to the console after the order output. The sweep
+    targets a snapshot taken BEFORE the close is placed, so it can
+    never cancel the close order itself; and it runs ONLY when the
+    close actually executed (a FILLED/PARTIAL_FILL row on the close
+    leg) — a failed, timed-out, or still-resting close leaves resting
+    orders untouched. Flat position → sweep-only (there is no close
+    to succeed; cancelling is the command's only effect).
 
     A single failed cancel is surfaced (WARNING alert + console line)
-    but doesn't abort the sweep or the close — halting mid-close leaves
-    the operator worse off. Deliberate WARNING per the severity tenet.
+    but doesn't abort the sweep — an order that filled or died during
+    the close simply reports as failed-to-cancel. Deliberate WARNING
+    per the severity tenet.
     """
     from ib_trader.logging_.alerts import log_and_alert
 
@@ -3486,52 +3500,52 @@ async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
         if (o.get("local_symbol") or o.get("symbol") or "").upper() == sym
     ]
 
-    cancelled = 0
-    for o in matches:
-        oid = str(o.get("ib_order_id"))
-        side = (o.get("side") or "?").upper()
-        qty = o.get("qty") or Decimal("0")
-        order_type = o.get("order_type") or "?"
-        limit_price = o.get("limit_price")
-        desc = f"#{oid} {side} {qty} {sym} {order_type}" + (
-            f" @ {limit_price}" if limit_price is not None else ""
-        )
-        _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, sym, side,
-                   order_type, qty, ib_order_id=_safe_int(oid),
-                   ib_status=o.get("status"), limit_price=limit_price,
-                   security_type=cmd.security_type)
-        try:
-            await ctx.ib.cancel_order(oid)
-        except Exception as e:
-            await log_and_alert(
-                redis=ctx.redis, trigger="CLOSE_SYMBOL_CANCEL_FAILED",
-                message=f"cancel failed for {desc}: {e}",
-                severity="WARNING", symbol=sym, ib_order_id=oid,
+    async def _sweep() -> None:
+        cancelled = 0
+        for o in matches:
+            oid = str(o.get("ib_order_id"))
+            side = (o.get("side") or "?").upper()
+            qty = o.get("qty") or Decimal("0")
+            order_type = o.get("order_type") or "?"
+            limit_price = o.get("limit_price")
+            desc = f"#{oid} {side} {qty} {sym} {order_type}" + (
+                f" @ {limit_price}" if limit_price is not None else ""
             )
+            _write_txn(ctx, TransactionAction.CANCEL_ATTEMPT, sym, side,
+                       order_type, qty, ib_order_id=_safe_int(oid),
+                       ib_status=o.get("status"), limit_price=limit_price,
+                       security_type=cmd.security_type)
+            try:
+                await ctx.ib.cancel_order(oid)
+            except Exception as e:
+                await log_and_alert(
+                    redis=ctx.redis, trigger="CLOSE_SYMBOL_CANCEL_FAILED",
+                    message=f"cancel failed for {desc}: {e}",
+                    severity="WARNING", symbol=sym, ib_order_id=oid,
+                )
+                ctx.router.emit(
+                    f"\u26a0 Cancel failed for {desc} \u2014 {e}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                )
+                continue
+            _write_txn(ctx, TransactionAction.CANCELLED, sym, side,
+                       order_type, qty, ib_order_id=_safe_int(oid),
+                       is_terminal=True, ib_responded_at=_now_utc(),
+                       security_type=cmd.security_type)
+            cancelled += 1
             ctx.router.emit(
-                f"\u26a0 Cancel failed for {desc} \u2014 {e}",
-                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                f"\u2717 Cancelled {desc}", pane=OutputPane.COMMAND,
             )
-            continue
-        _write_txn(ctx, TransactionAction.CANCELLED, sym, side,
-                   order_type, qty, ib_order_id=_safe_int(oid),
-                   is_terminal=True, ib_responded_at=_now_utc(),
-                   security_type=cmd.security_type)
-        cancelled += 1
-        ctx.router.emit(f"\u2717 Cancelled {desc}", pane=OutputPane.COMMAND)
-        logger.info(
-            '{"event": "CLOSE_SYMBOL_ORDER_CANCELLED", "symbol": "%s", '
-            '"ib_order_id": "%s"}', sym, oid,
-        )
-    if matches:
-        ctx.router.emit(
-            f"Cancelled {cancelled}/{len(matches)} working order(s) on {sym}",
-            pane=OutputPane.COMMAND,
-        )
-    else:
-        ctx.router.emit(
-            f"No working IB orders on {sym}", pane=OutputPane.COMMAND,
-        )
+            logger.info(
+                '{"event": "CLOSE_SYMBOL_ORDER_CANCELLED", "symbol": "%s", '
+                '"ib_order_id": "%s"}', sym, oid,
+            )
+        if matches:
+            ctx.router.emit(
+                f"Cancelled {cancelled}/{len(matches)} working order(s) "
+                f"on {sym}",
+                pane=OutputPane.COMMAND,
+            )
 
     # Net flat from the engine's IB-fed positions cache (positionEvent
     # + 30s poll — same IB-authoritative source the TUI reads).
@@ -3549,8 +3563,17 @@ async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
             f"No open position on {sym} \u2014 nothing to close.",
             pane=OutputPane.COMMAND,
         )
+        if matches:
+            await _sweep()
+        else:
+            ctx.router.emit(
+                f"No working IB orders on {sym}", pane=OutputPane.COMMAND,
+            )
         return
 
+    # Close FIRST. On failure this raises — command reports FAILURE and
+    # the resting orders stay untouched (operator asked: cancel only if
+    # the close succeeds).
     close_cls = SellCommand if pos_qty > 0 else BuyCommand
     order_cmd = close_cls(
         symbol=sym, qty=abs(pos_qty), dollars=None, strategy=cmd.strategy,
@@ -3558,7 +3581,26 @@ async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
         limit_price=cmd.limit_price, bot_ref=cmd.bot_ref,
         security_type=cmd.security_type,
     )
-    await execute_order(order_cmd, ctx)
+    close_corr = await execute_order(order_cmd, ctx)
+
+    # Sweep ONLY when the close actually executed — the ledger for the
+    # close leg shows a fill. A close that errored, timed out, or is
+    # still resting leaves every working order untouched (operator
+    # asked: cancel only if the close succeeds). Printed after the
+    # order output by construction.
+    close_rows = ctx.transactions.get_by_correlation_id(close_corr)
+    close_filled = any(
+        r.action in (TransactionAction.FILLED, TransactionAction.PARTIAL_FILL)
+        for r in close_rows
+    )
+    if close_filled:
+        await _sweep()
+    elif matches:
+        ctx.router.emit(
+            f"\u26a0 Close did not fill \u2014 leaving {len(matches)} "
+            f"working order(s) on {sym} untouched",
+            pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+        )
 
 
 async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:

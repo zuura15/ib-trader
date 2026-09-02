@@ -20,6 +20,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   `limit_price` fields (localSymbol is authoritative for the futures
   month).
 
+### Changed
+- **`close SYMBOL` order of operations.** The close now runs FIRST and
+  the ticker-wide cancel sweep runs after it — and only when the close
+  actually filled (FILLED/PARTIAL_FILL on the close leg's ledger). A
+  failed, timed-out, or resting close leaves every working order
+  untouched and prints a WARNING. Cancellation lines print after the
+  order output. The sweep still targets the pre-close snapshot, so it
+  can never cancel the close order itself.
+
 ### Fixed
 - **`close GCV6` 500 through the UI (`invalid literal for int()`).**
   The API route re-parsed close commands field-wise and the engine

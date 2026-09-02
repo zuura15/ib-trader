@@ -193,6 +193,22 @@ class TestCloseSymbol:
         # STK keeps the mock qualify fixture simple (FUT requires an
         # expiry there); the sweep + net-flat flow is sec-type agnostic.
         from ib_trader.engine.order import execute_close
+
+        # Place-and-fill stubs (both market and the session-gated
+        # marketable-limit route): the sweep is gated on the close
+        # leg's FILLED row, so the close must actually fill.
+        async def place_and_fill(con_id, symbol, side, qty, *a, **kw):
+            ib_id = str(ctx.ib._next_order_id)
+            ctx.ib._next_order_id += 1
+            ctx.ib._order_statuses[ib_id] = {
+                "status": "Filled", "qty_filled": qty,
+                "avg_fill_price": Decimal("405.0"),
+                "commission": Decimal("1.00"),
+            }
+            return ib_id
+        ctx.ib.place_market_order = place_and_fill
+        ctx.ib.place_limit_order = place_and_fill
+
         ctx.ib.mock_open_orders = [
             _open_order("9010", "MSFT", limit_price="410.0"),
         ]
@@ -217,3 +233,32 @@ class TestCloseSymbol:
         assert len(placed) == 1
         assert placed[0].side == "BUY"
         assert placed[0].quantity == Decimal("2")
+
+    async def test_failed_close_leaves_orders_untouched(self, ctx):
+        # Cancel-only-if-close-succeeds: an order-placement failure
+        # propagates and the pre-close snapshot is NOT swept.
+        from ib_trader.engine.order import execute_close
+
+        async def _boom(*a, **kw):
+            raise RuntimeError("IB rejected")
+        # Patch BOTH placement routes — outside RTH the market strategy
+        # takes the marketable-limit path.
+        ctx.ib.place_market_order = _boom
+        ctx.ib.place_limit_order = _boom
+
+        ctx.ib.mock_open_orders = [
+            _open_order("9020", "MSFT", limit_price="410.0"),
+        ]
+        ctx.positions_cache = [{
+            "symbol": "MSFT", "local_symbol": "MSFT", "sec_type": "STK",
+            "quantity": "-2", "avg_cost": "400.0", "con_id": 1,
+        }]
+        with pytest.raises(Exception):
+            await execute_close(
+                self._cmd(symbol="MSFT", security_type="STK"), ctx,
+            )
+        assert ctx.ib.canceled_orders == []
+        # No CANCELLED rows either — the sweep never ran.
+        rows = ctx.transactions.get_by_ib_order_id(9020)
+        assert [r for r in rows
+                if r.action == TransactionAction.CANCELLED] == []
