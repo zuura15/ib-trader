@@ -103,17 +103,13 @@ const MIGRATED_TABS: Array<{
   // Stacked-charts panel — anchor next to Bot Log so persisted layouts
   // still pick it up in the right column.
   { component: 'stacked-charts', name: 'Stacked Charts', anchor: 'bot-log' },
-  // ESU6 chart (slot 5) — inject next to the MNQU6 chart (slot 3) for
-  // users whose persisted layout predates it. Matched by slot so the
-  // existing chart-bot tabs don't mask it.
+  // Slot 5 chart (CLV6 since 2026-09-02, previously ESU6) — inject
+  // next to the MNQU6 chart (slot 3) for users whose persisted layout
+  // predates it. Matched by slot so existing chart-bot tabs don't
+  // mask it.
   {
-    component: 'chart-bot', name: 'Slot 5 · S&P', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'CLV6', anchor: 'chart-bot',
     config: { slot: 5 }, slot: 5, anchorSlot: 3,
-  },
-  // Micro S&P (slot 6) — inject next to the full S&P chart (slot 5).
-  {
-    component: 'chart-bot', name: 'MESU6', anchor: 'chart-bot',
-    config: { slot: 6 }, slot: 6, anchorSlot: 5,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
   {
@@ -129,6 +125,8 @@ const MIGRATED_TABS: Array<{
 // (component='chart-bot', config.slot).
 const REMOVED_CHART_SLOTS = new Set<number>([
   2,  // WTI Crude — dropped 2026-07-21 with the CL chart removal.
+  6,  // Micro S&P — dropped 2026-09-02 with the ES charts (slot 5
+      // repurposed ESU6 → CLV6).
 ]);
 
 function migrateLayoutJson(raw: any): any {

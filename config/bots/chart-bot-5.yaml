@@ -1,5 +1,5 @@
 id: chart-bot-5
-name: "Chart Bot 5 · S&P 500"
+name: "Chart Bot 5 · WTI Crude"
 strategy: strategy_bot
 broker: ib
 tick_interval_seconds: 10
@@ -11,22 +11,27 @@ auto_start: false   # operator-driven Start
 config:
   strategy_name: chart_signal
   strategy_config: config/strategies/chart_signal.yaml
+  # ref_id kept as ``chart-bot-5-es`` (stable bot identifier from this
+  # pane's ES era) — renaming would orphan any force-entry orders
+  # tagged with it at recovery, for no functional gain. Precedent:
+  # chart-bot-2 kept ``-mcl`` through its micro-oil → WTI repurpose.
   ref_id: chart-bot-5-es
-  # ES = full E-mini S&P 500, Sep 2026. Added 2026-06-22 as a tabbed
-  # chart alongside MNQU6 (the operator trades ES intraday). U6 is the
-  # front month (M6 → U6 roll was 2026-06-11). QBALGO twin dropped by
-  # the qualifier (insync_client 46953eb) so bare ``ESU6`` resolves to
-  # CME unambiguously.
-  symbol: ESU6
+  # CL = full WTI Crude Oil (NYMEX), Oct 2026. Repurposed 2026-09-02
+  # from ESU6 (operator dropped the ES charts in favor of WTI). V6 is
+  # the front month; roll monthly (next: X6 before late-Sep expiry).
+  # QBALGO twin dropped by the qualifier (insync_client 46953eb) so
+  # bare ``CLV6`` resolves to NYMEX unambiguously.
+  symbol: CLV6
   sec_type: FUT
-  # Full E-mini S&P: $50/point (10x micro). Used by the strategy's
-  # P/L math + trail target.
-  contract_multiplier: 50
-  # Trailing dip 0.0003 (a percentage, scales with notional). Manual
-  # mode in effect, so dormant until ``manual_entry_only`` flips.
-  trail_width_pct: 0.0003
+  # Full Crude: 1,000 bbl/contract → $1.00 move = $1,000 (tick $0.01
+  # = $10). Used by the strategy's P/L math + trail target.
+  contract_multiplier: 1000
+  # Trailing dip 0.13% (a percentage, scales with notional) — same
+  # tuning the retired chart-bot-2 WTI pane used. Manual mode in
+  # effect, so dormant until ``manual_entry_only`` flips.
+  trail_width_pct: 0.0013
   qty_default: 1
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- ESU6
+- CLV6

@@ -22,7 +22,7 @@ import { useStore } from '../../data/store';
  */
 
 type TopTab = 'gold' | 'mgc' | 'console' | 'positions';
-type BottomTab = 'nasdaq' | 'micro' | 'es' | 'mes';
+type BottomTab = 'nasdaq' | 'micro' | 'wti';
 
 function SubTabBar<T extends string>({
   tabs, active, onSelect,
@@ -151,14 +151,13 @@ export function MobileTradeView() {
 
       <div style={{ height: 1, background: 'var(--border-default)', flexShrink: 0 }} />
 
-      {/* Bottom row — Nasdaq + Micro NQ + S&P + Micro S&P. */}
+      {/* Bottom row — Nasdaq + Micro NQ + WTI Crude. */}
       <div className="flex flex-col" style={{ flex: 1, minHeight: 0 }}>
         <SubTabBar<BottomTab>
           tabs={[
             { id: 'nasdaq', label: sym[4] ?? 'Nasdaq' },
             { id: 'micro', label: sym[3] ?? 'Micro NQ' },
-            { id: 'es', label: sym[5] ?? 'S&P' },
-            { id: 'mes', label: sym[6] ?? 'Micro S&P' },
+            { id: 'wti', label: sym[5] ?? 'WTI' },
           ]}
           active={bottom}
           onSelect={setBottom}
@@ -170,11 +169,8 @@ export function MobileTradeView() {
           <Pane visible={bottom === 'micro'}>
             <ChartBotPane slot={3} compact />
           </Pane>
-          <Pane visible={bottom === 'es'}>
+          <Pane visible={bottom === 'wti'}>
             <ChartBotPane slot={5} compact />
-          </Pane>
-          <Pane visible={bottom === 'mes'}>
-            <ChartBotPane slot={6} compact />
           </Pane>
         </div>
       </div>
