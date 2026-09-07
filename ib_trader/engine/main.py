@@ -318,6 +318,18 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
                 # subscription (no paired unsubscribe), so don't take
                 # a refcount slot.
                 await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
+                if sec_type == "STK":
+                    # Overnight twin (IBEOS): SMART streams nothing
+                    # Sun 8 PM – 3:30 AM ET; the twin fills that gap.
+                    try:
+                        await ctx.ib.subscribe_overnight_market_data(
+                            info["con_id"], sym,
+                        )
+                    except Exception:
+                        logger.warning(
+                            '{"event": "WATCHLIST_OVERNIGHT_SUB_FAILED", '
+                            '"symbol": "%s"}', sym,
+                        )
                 watchlist_subscribed += 1
             except Exception:
                 logger.warning('{"event": "WATCHLIST_SUB_FAILED", "symbol": "%s"}', sym)
@@ -660,7 +672,6 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
     Idempotent — safe to call multiple times (subscribe_market_data
     short-circuits when the symbol is already in _streaming).
     """
-    from ib_trader.config.loader import load_watchlist
     from ib_trader.repl.commands import _is_futures_local_symbol
 
     started = asyncio.get_event_loop().time()
@@ -682,7 +693,14 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
             logger.exception('{"event": "POSTRECONNECT_RESUB_PENDING_FAILED"}')
 
     try:
-        symbols = load_watchlist("config/watchlist.yaml")
+        # Redis watchlist + chart anchors — the same authoritative list
+        # the startup loop uses. Previously read the YAML SEED, which
+        # goes stale the moment the operator edits the list in the UI.
+        from ib_trader.config.watchlist_runtime import (
+            resolve_watchlist_symbols, chart_anchor_symbols,
+        )
+        _operator_syms = await resolve_watchlist_symbols(ctx.redis)
+        symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
     except Exception:
         logger.exception('{"event": "POSTRECONNECT_WATCHLIST_LOAD_FAILED"}')
         symbols = []
@@ -691,6 +709,16 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
             sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
             info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
             await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
+            if sec_type == "STK":
+                try:
+                    await ctx.ib.subscribe_overnight_market_data(
+                        info["con_id"], sym,
+                    )
+                except Exception:
+                    logger.warning(
+                        '{"event": "POSTRECONNECT_OVERNIGHT_SUB_FAILED", '
+                        '"symbol": "%s"}', sym,
+                    )
             watchlist_ok += 1
         except Exception:
             watchlist_fail += 1
@@ -1680,7 +1708,12 @@ async def _tick_publisher_loop(ctx: AppContext) -> None:
             bid = data.get("bid")
             ask = data.get("ask")
             last = data.get("last")
-            if bid is None and ask is None and last is None:
+            if (bid is None and ask is None and last is None
+                    and data.get("close") is None):
+                # Nothing displayable at all. Close-only ticks DO
+                # publish — IB pushes close/prevClose on subscribe even
+                # when a session is closed, and dropping them left the
+                # watchlist fully blank on weekends.
                 return
 
             # No price-tuple dedup. Identical prices across ticks are

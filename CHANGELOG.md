@@ -3,6 +3,19 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-06
+
+### Fixed
+- **Watchlist blank on Sunday evenings.** SMART streaming market data
+  carries nothing during IB's overnight session (IBEOS, Sun 8 PM – Fri
+  3:30 AM ET), so stock quotes vanished after the weekend TTL expiry
+  even though subscriptions were healthy. Each STK watchlist symbol now
+  gets a second subscription on exchange=OVERNIGHT whose bid/ask/last
+  backfill the quote when SMART is silent; close-only snapshot ticks
+  also publish now (previously dropped). Post-reconnect resubscribe
+  fixed to use the Redis watchlist + chart anchors instead of the
+  stale YAML seed.
+
 ## 2026-09-01
 
 ### Added

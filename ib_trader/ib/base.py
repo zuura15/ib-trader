@@ -299,6 +299,16 @@ class IBClientBase(ABC):
         """
         ...
 
+    async def subscribe_overnight_market_data(
+        self, con_id: int, symbol: str,
+    ) -> None:
+        """Optionally subscribe a second stream on IB's overnight venue
+        (IBEOS, exchange="OVERNIGHT") for a stock — SMART streaming
+        carries no data Sun 8:00 PM – Fri 3:30 AM ET, so this twin
+        keeps watchlist quotes alive through the overnight session.
+        Default: no-op (mock layer and non-IB brokers)."""
+        return None
+
     @abstractmethod
     async def unsubscribe_market_data(self, con_id: int) -> None:
         """Unsubscribe from streaming market data for a contract.

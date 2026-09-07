@@ -73,6 +73,7 @@ async def test_resubscribe_all_cancels_and_reissues_every_streaming_sub(client):
     assert result == {
         "mkt_ok": 3, "mkt_fail": 0, "mkt_total": 3,
         "bar_ok": 0, "bar_fail": 0, "bar_total": 0,
+        "overnight_ok": 0, "overnight_fail": 0,
     }
 
 
@@ -136,6 +137,7 @@ async def test_resubscribe_all_no_op_when_dicts_empty(client):
     assert result == {
         "mkt_ok": 0, "mkt_fail": 0, "mkt_total": 0,
         "bar_ok": 0, "bar_fail": 0, "bar_total": 0,
+        "overnight_ok": 0, "overnight_fail": 0,
     }
     assert client._InsyncClient__ib.reqMktData.call_count == 0
     assert client._InsyncClient__ib.cancelMktData.call_count == 0

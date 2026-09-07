@@ -326,6 +326,12 @@ class InsyncClient(IBClientBase):
         # Ref-counted streaming market data subscriptions.
         # Key: con_id, Value: {"ticker": Ticker, "refs": int, "contract": Contract}
         self._streaming: dict[int, dict] = {}
+        # Overnight-venue (IBEOS) twin subscriptions, keyed by conId.
+        # Kept OUT of ``_streaming``: the overnight contract shares the
+        # SMART contract's conId (conId is instrument-level), so the two
+        # streams would collide there. ``get_ticker`` merges these
+        # fields as a fallback when the SMART stream is silent.
+        self._overnight_streaming: dict[int, dict] = {}
         # Ref-counted 5-second real-time bar subscriptions.
         self._realtime_bars: dict[int, dict] = {}
         # Snapshots captured at disconnect so that bot-owned subscriptions
@@ -1810,6 +1816,35 @@ class InsyncClient(IBClientBase):
             con_id, symbol,
         )
 
+    async def subscribe_overnight_market_data(
+        self, con_id: int, symbol: str,
+    ) -> None:
+        """Subscribe a SECOND market-data stream for a stock on IB's
+        overnight venue (exchange="OVERNIGHT" / IBEOS, Sun 8:00 PM –
+        Fri 3:30 AM ET).
+
+        SMART streaming data does NOT cover the overnight session (IB
+        documents that overnight data "does not coincide with regular
+        SMART routed data"), so without this twin the watchlist goes
+        blank from Sunday 5 PM PT until pre-market. Idempotent per
+        conId; overnight market data is free per IB. STK only.
+        """
+        if con_id in self._overnight_streaming:
+            return
+        await self._throttle()
+        contract = Contract(
+            conId=con_id, symbol=symbol, secType="STK",
+            exchange="OVERNIGHT", currency="USD",
+        )
+        ticker = self.__ib.reqMktData(contract, "", False, False)
+        self._overnight_streaming[con_id] = {
+            "ticker": ticker, "contract": contract,
+        }
+        logger.info(
+            '{"event": "OVERNIGHT_SUB_ADDED", "con_id": %d, "symbol": "%s"}',
+            con_id, symbol,
+        )
+
     async def unsubscribe_market_data(
         self, con_id: int, *, count_ref: bool = True,
     ) -> None:
@@ -1997,6 +2032,38 @@ class InsyncClient(IBClientBase):
             if stagger_s > 0:
                 await asyncio.sleep(stagger_s)
 
+        # Overnight twins (IBEOS) — same cancel/re-issue treatment,
+        # separate ledger (they never carry refs).
+        on_items: list[tuple[int, str]] = [
+            (con_id, entry["contract"].symbol)
+            for con_id, entry in self._overnight_streaming.items()
+        ]
+        on_ok = on_fail = 0
+        for con_id, symbol in on_items:
+            entry = self._overnight_streaming.get(con_id)
+            try:
+                if entry is not None:
+                    try:
+                        self.__ib.cancelMktData(entry["contract"])
+                    except Exception as e:
+                        logger.debug(
+                            "cancelMktData failed during prophylactic (overnight)",
+                            exc_info=e,
+                        )
+                    self._overnight_streaming.pop(con_id, None)
+                await asyncio.sleep(0.25)
+                await self.subscribe_overnight_market_data(con_id, symbol)
+                on_ok += 1
+            except Exception:
+                on_fail += 1
+                logger.warning(
+                    '{"event": "PROPHYLACTIC_OVERNIGHT_FAILED", '
+                    '"con_id": %d, "symbol": "%s"}',
+                    con_id, symbol,
+                )
+            if stagger_s > 0:
+                await asyncio.sleep(stagger_s)
+
         bar_ok = bar_fail = 0
         for con_id, symbol, what_to_show, callbacks, refs in bar_items:
             entry = self._realtime_bars.get(con_id)
@@ -2036,6 +2103,7 @@ class InsyncClient(IBClientBase):
         return {
             "mkt_ok": mkt_ok, "mkt_fail": mkt_fail, "mkt_total": len(mkt_items),
             "bar_ok": bar_ok, "bar_fail": bar_fail, "bar_total": len(bar_items),
+            "overnight_ok": on_ok, "overnight_fail": on_fail,
         }
 
     def get_ticker(self, con_id: int) -> dict | None:
@@ -2051,8 +2119,24 @@ class InsyncClient(IBClientBase):
                 return None
             return float(v)
 
+        bid = _val(t.bid)
+        ask = _val(t.ask)
         last = _val(t.last)
         close = _val(t.close)
+
+        # Overnight-venue fallback (IBEOS twin, same conId): SMART
+        # streams nothing Sun 8 PM – 3:30 AM ET, so fill bid/ask/last
+        # from the overnight ticker when the SMART stream is silent.
+        # SMART values always win when present.
+        on_entry = self._overnight_streaming.get(con_id)
+        if on_entry is not None:
+            ot = on_entry["ticker"]
+            if bid is None:
+                bid = _val(getattr(ot, "bid", None))
+            if ask is None:
+                ask = _val(getattr(ot, "ask", None))
+            if last is None:
+                last = _val(getattr(ot, "last", None))
 
         # IB often doesn't stream previous close for ETFs (QQQ, GLD, SPY)
         # outside regular hours. Fall back to prevClose or halted last price
@@ -2074,8 +2158,8 @@ class InsyncClient(IBClientBase):
         ticker_time = getattr(t, 'time', None)
 
         return {
-            "bid": _val(t.bid),
-            "ask": _val(t.ask),
+            "bid": bid,
+            "ask": ask,
             "last": last,
             "open": _val(t.open),
             "high": _val(t.high),
