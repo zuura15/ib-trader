@@ -3,6 +3,22 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-09
+
+### Fixed
+- **Watchlist quotes dying mid-RTH (bid/ask −1, frozen last) — overnight
+  twin reverted.** ib_async keys Tickers by ``hash(contract)`` (= conId)
+  and ``ticker2ReqId`` holds ONE reqId per Ticker, so the IBEOS twin
+  subscription (same conId as SMART) overwrote the SMART reqId mapping;
+  every hourly prophylactic cancel then popped whichever reqId was
+  registered last — a cancel-roulette that left ~half the stock symbols
+  with only the (closed) overnight venue subscribed during RTH. The twin
+  (2026-09-06) is fully reverted. KEPT from that change: close-only
+  snapshot ticks publish, and the post-reconnect resubscribe reads the
+  Redis watchlist + chart anchors instead of the stale YAML seed. Live
+  overnight stock quotes need a second IB client connection (own ticker
+  registry) — future work.
+
 ## 2026-09-06
 
 ### Fixed

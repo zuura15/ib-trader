@@ -318,18 +318,6 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
                 # subscription (no paired unsubscribe), so don't take
                 # a refcount slot.
                 await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
-                if sec_type == "STK":
-                    # Overnight twin (IBEOS): SMART streams nothing
-                    # Sun 8 PM – 3:30 AM ET; the twin fills that gap.
-                    try:
-                        await ctx.ib.subscribe_overnight_market_data(
-                            info["con_id"], sym,
-                        )
-                    except Exception:
-                        logger.warning(
-                            '{"event": "WATCHLIST_OVERNIGHT_SUB_FAILED", '
-                            '"symbol": "%s"}', sym,
-                        )
                 watchlist_subscribed += 1
             except Exception:
                 logger.warning('{"event": "WATCHLIST_SUB_FAILED", "symbol": "%s"}', sym)
@@ -709,16 +697,6 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
             sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
             info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
             await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
-            if sec_type == "STK":
-                try:
-                    await ctx.ib.subscribe_overnight_market_data(
-                        info["con_id"], sym,
-                    )
-                except Exception:
-                    logger.warning(
-                        '{"event": "POSTRECONNECT_OVERNIGHT_SUB_FAILED", '
-                        '"symbol": "%s"}', sym,
-                    )
             watchlist_ok += 1
         except Exception:
             watchlist_fail += 1
