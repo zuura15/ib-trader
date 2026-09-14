@@ -78,5 +78,8 @@ class TestChartAnchors:
         assert "NQU6" in syms
         assert "MGCV6" in syms
         assert "CLV6" in syms
+        # Dec Nasdaq pair added 2026-09-13 alongside the Sep contracts.
+        assert "NQZ6" in syms
+        assert "MNQZ6" in syms
         assert "ESU6" not in syms
         assert "MESU6" not in syms

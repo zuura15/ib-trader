@@ -22,7 +22,7 @@ import { useStore } from '../../data/store';
  */
 
 type TopTab = 'gold' | 'mgc' | 'console' | 'positions';
-type BottomTab = 'nasdaq' | 'micro' | 'wti';
+type BottomTab = 'nasdaq' | 'micro' | 'nqz' | 'mnqz' | 'wti';
 
 function SubTabBar<T extends string>({
   tabs, active, onSelect,
@@ -157,6 +157,8 @@ export function MobileTradeView() {
           tabs={[
             { id: 'nasdaq', label: sym[4] ?? 'Nasdaq' },
             { id: 'micro', label: sym[3] ?? 'Micro NQ' },
+            { id: 'nqz', label: sym[8] ?? 'NQ Dec' },
+            { id: 'mnqz', label: sym[9] ?? 'MNQ Dec' },
             { id: 'wti', label: sym[5] ?? 'WTI' },
           ]}
           active={bottom}
@@ -168,6 +170,12 @@ export function MobileTradeView() {
           </Pane>
           <Pane visible={bottom === 'micro'}>
             <ChartBotPane slot={3} compact />
+          </Pane>
+          <Pane visible={bottom === 'nqz'}>
+            <ChartBotPane slot={8} compact />
+          </Pane>
+          <Pane visible={bottom === 'mnqz'}>
+            <ChartBotPane slot={9} compact />
           </Pane>
           <Pane visible={bottom === 'wti'}>
             <ChartBotPane slot={5} compact />

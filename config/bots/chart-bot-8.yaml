@@ -1,0 +1,26 @@
+id: chart-bot-8
+name: "Chart Bot 8 · Nasdaq Dec"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: true
+auto_start: false   # operator-driven Start
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-8-nqz
+  # NQ = full E-mini Nasdaq-100, Dec 2026 (Z6). Added 2026-09-13
+  # ALONGSIDE the Sep NQU6 chart (slot 4) for the roll week — U6
+  # last-trades 2026-09-18; operator keeps both until liquidity
+  # fully migrates, then slot 4 retires or rolls. QBALGO twin
+  # dropped by the qualifier (insync_client 46953eb).
+  symbol: NQZ6
+  sec_type: FUT
+  # Full Nasdaq: $20/point. Used by P/L math + trail target.
+  contract_multiplier: 20
+  # Same tuning as slot 4 (NQU6).
+  trail_width_pct: 0.0002
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- NQZ6

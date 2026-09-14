@@ -1,0 +1,24 @@
+id: chart-bot-9
+name: "Chart Bot 9 · Micro Nasdaq Dec"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: true
+auto_start: false   # operator-driven Start
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-9-mnqz
+  # MNQ = Micro Nasdaq (1/10th of NQ), Dec 2026 (Z6). Added
+  # 2026-09-13 alongside the Sep MNQU6 chart (slot 3) for the roll
+  # week — same rationale as slot 8 / NQZ6.
+  symbol: MNQZ6
+  sec_type: FUT
+  # Micro Nasdaq: $2/point. Used by P/L math + trail target.
+  contract_multiplier: 2
+  # Same tuning as slot 3 (MNQU6).
+  trail_width_pct: 0.0003
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- MNQZ6

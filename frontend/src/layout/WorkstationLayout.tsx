@@ -116,6 +116,17 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'MGCV6', anchor: 'chart-bot',
     config: { slot: 7 }, slot: 7, anchorSlot: 1,
   },
+  // Dec Nasdaq (slot 8) — inject next to the Sep NQ chart (slot 4);
+  // both live through the Sep→Dec roll week (added 2026-09-13).
+  {
+    component: 'chart-bot', name: 'NQZ6', anchor: 'chart-bot',
+    config: { slot: 8 }, slot: 8, anchorSlot: 4,
+  },
+  // Dec Micro Nasdaq (slot 9) — inject next to the Sep MNQ chart (slot 3).
+  {
+    component: 'chart-bot', name: 'MNQZ6', anchor: 'chart-bot',
+    config: { slot: 9 }, slot: 9, anchorSlot: 3,
+  },
 ];
 
 // Chart-bot slots RETIRED from the default layout. Persisted layouts
