@@ -79,6 +79,10 @@ class Strategy(StrEnum):
     BID = "bid"
     ASK = "ask"
     LIMIT = "limit"
+    # Native IB STP — fire-and-forget stop at a user trigger price
+    # (auxPrice). BUY stops trigger at/above, SELL at/below. GTC; never
+    # tagged includeOvernight (IBEOS overnight venue is LMT-only). #97.
+    STOP = "stop"
     # Session-aware aggressive-mid execution. RTH: reprice fast toward
     # the far side for a fixed duration, then cross to MKT for any
     # residual. ETH/overnight: reprice fast toward the far side but cap
@@ -98,6 +102,8 @@ class BuyCommand:
     take_profit_price: Decimal | None
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
+    # Native STP trigger price — set when STRATEGY == stop. #97.
+    stop_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
     # Epic 1 additions — explicit sec-type fields produced by the parser.
     # Never inferred downstream; CLI shorthand writes them here.
@@ -125,6 +131,8 @@ class SellCommand:
     take_profit_price: Decimal | None
     stop_loss: Decimal | None
     limit_price: Decimal | None = None
+    # Native STP trigger price — set when STRATEGY == stop. #97.
+    stop_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
     security_type: str = "STK"
     expiry: str | None = None
@@ -148,6 +156,8 @@ class CloseCommand:
     profit_amount: Decimal | None
     take_profit_price: Decimal | None
     limit_price: Decimal | None = None
+    # Native STP trigger — set when STRATEGY == stop (SYMBOL form only). #97.
+    stop_price: Decimal | None = None
     bot_ref: str | None = None  # Bot reference for orderRef tagging
     symbol: str | None = None        # close-by-ticker form
     security_type: str = "STK"       # inferred for the symbol form
@@ -191,6 +201,8 @@ def parse_buy_sell(
     Grammar:
         buy/sell SYMBOL QTY [STRATEGY] [PROFIT] [--take-profit-price N]
                                                  [--stop-loss N] [--dollars N]
+        buy/sell SYMBOL QTY limit PRICE [PROFIT]
+        buy/sell SYMBOL QTY stop  PRICE [PROFIT]   (native IB STP, #97)
 
     STRATEGY is optional. When omitted (only SYMBOL + QTY positionals),
     it defaults to ``smart_market`` — the session-aware aggressive-mid
@@ -217,6 +229,8 @@ def parse_buy_sell(
     stop_loss = None
     trail_percent: Decimal | None = None
     trail_amount: Decimal | None = None
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
 
     positional = []
     explicit_sec_type: str | None = None
@@ -287,6 +301,30 @@ def parse_buy_sell(
                         )
                         return None
                     trail_amount = amt
+            except ValueError as e:
+                _emit_error(f"\u2717 Error: {e}", router)
+                return None
+        elif tok == "--price":
+            # Explicit limit-price flag — the synthesised internal-API
+            # cmd_text form (bot callers). Console users type the
+            # positional (``buy SYM 1 limit 42``); both land here.
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --price requires a value", router)
+                return None
+            try:
+                limit_price = _parse_decimal(args[i], "--price")
+            except ValueError as e:
+                _emit_error(f"\u2717 Error: {e}", router)
+                return None
+        elif tok == "--stop-price":
+            # Explicit STP trigger-price flag (parity with --price).
+            i += 1
+            if i >= len(args):
+                _emit_error("\u2717 Error: --stop-price requires a value", router)
+                return None
+            try:
+                stop_price = _parse_decimal(args[i], "--stop-price")
             except ValueError as e:
                 _emit_error(f"\u2717 Error: {e}", router)
                 return None
@@ -387,10 +425,11 @@ def parse_buy_sell(
             return None
         next_pos = 3
 
-    # For 'limit' strategy, the next positional is the required limit price
-    limit_price = None
-
-    if strategy == Strategy.LIMIT:
+    # Price-bearing strategies: 'limit' and 'stop' take their price as
+    # the next positional (console form) or via --price / --stop-price
+    # (synthesised internal-API form). When a flag already supplied the
+    # price, the next positional is PROFIT as usual.
+    if strategy == Strategy.LIMIT and limit_price is None:
         if len(positional) < 4:
             _emit_error(
                 f"\u2717 Error: 'limit' strategy requires a price: {verb} SYMBOL QTY limit PRICE",
@@ -406,6 +445,36 @@ def parse_buy_sell(
             _emit_error(f"\u2717 Error: {e}", router)
             return None
         next_pos = 4
+
+    if strategy == Strategy.STOP and stop_price is None:
+        if len(positional) < 4:
+            _emit_error(
+                f"\u2717 Error: 'stop' strategy requires a trigger price: {verb} SYMBOL QTY stop PRICE",
+                router,
+            )
+            return None
+        try:
+            stop_price = _parse_decimal(positional[3], "STOP_PRICE")
+            if stop_price <= 0:
+                _emit_error("\u2717 Error: STOP_PRICE must be a positive number", router)
+                return None
+        except ValueError as e:
+            _emit_error(f"\u2717 Error: {e}", router)
+            return None
+        next_pos = 4
+
+    if limit_price is not None and strategy != Strategy.LIMIT:
+        _emit_error("\u2717 Error: --price is only valid with the 'limit' strategy", router)
+        return None
+    if stop_price is not None and strategy != Strategy.STOP:
+        _emit_error("\u2717 Error: --stop-price is only valid with the 'stop' strategy", router)
+        return None
+    if limit_price is not None and limit_price <= 0:
+        _emit_error("\u2717 Error: LIMIT_PRICE must be a positive number", router)
+        return None
+    if stop_price is not None and stop_price <= 0:
+        _emit_error("\u2717 Error: STOP_PRICE must be a positive number", router)
+        return None
 
     if len(positional) > next_pos:
         try:
@@ -442,6 +511,7 @@ def parse_buy_sell(
             take_profit_price=take_profit_price,
             stop_loss=stop_loss,
             limit_price=limit_price,
+            stop_price=stop_price,
             security_type=security_type,
             expiry=expiry_yyyymm,
             trading_class=trading_class,
@@ -459,6 +529,7 @@ def parse_buy_sell(
             take_profit_price=take_profit_price,
             stop_loss=stop_loss,
             limit_price=limit_price,
+            stop_price=stop_price,
             security_type=security_type,
             expiry=expiry_yyyymm,
             trading_class=trading_class,
@@ -476,6 +547,7 @@ def parse_close(
     Grammar:
         close SERIAL [STRATEGY] [--take-profit-price N]
         close SYMBOL [STRATEGY] [PRICE]
+        close SYMBOL stop PRICE     (net flat via native IB STP, #97)
 
     The SYMBOL form cancels ALL working IB orders on that ticker
     (including orders placed directly in TWS), then nets the position
@@ -580,6 +652,34 @@ def parse_close(
             return None
         next_pos = 3
 
+    stop_price = None
+    if strategy == Strategy.STOP:
+        # SYMBOL form only: it nets flat through the standard
+        # execute_order path, which owns the stop lifecycle. The
+        # SERIAL close path has its own placement flow that doesn't
+        # speak STP yet.
+        if symbol is None:
+            _emit_error(
+                "\u2717 Error: 'stop' close is only supported in the "
+                "close SYMBOL form (e.g. close GCV6 stop 3300)", router,
+            )
+            return None
+        if len(positional) < 3:
+            _emit_error(
+                "\u2717 Error: 'stop' strategy requires a trigger price: "
+                "close SYMBOL stop PRICE", router,
+            )
+            return None
+        try:
+            stop_price = _parse_decimal(positional[2], "STOP_PRICE")
+            if stop_price <= 0:
+                _emit_error("\u2717 Error: STOP_PRICE must be a positive number", router)
+                return None
+        except ValueError as e:
+            _emit_error(f"\u2717 Error: {e}", router)
+            return None
+        next_pos = 3
+
     if len(positional) > next_pos:
         if symbol is not None:
             # PROFIT targets a trade group's P&L — meaningless for the
@@ -601,6 +701,7 @@ def parse_close(
         profit_amount=profit_amount,
         take_profit_price=take_profit_price,
         limit_price=limit_price,
+        stop_price=stop_price,
         symbol=symbol,
         security_type=security_type,
     )

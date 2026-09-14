@@ -160,7 +160,7 @@ def _handle_builtin(verb: str, ctx: AppContext) -> str:
             "  orders    — list open orders\n"
             "  help      — show this message\n"
             "\n"
-            "Strategies: mid, market, bid, ask, limit PRICE"
+            "Strategies: mid, market, bid, ask, smart_market, limit PRICE, stop PRICE"
         )
 
     if verb in ("status", "stats"):

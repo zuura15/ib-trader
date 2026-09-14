@@ -168,6 +168,43 @@ class IBClientBase(ABC):
         ...
 
     @abstractmethod
+    async def place_stop_order(
+        self,
+        con_id: int,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        stop_price: Decimal,
+        outside_rth: bool = True,
+        tif: str = "GTC",
+        order_ref: str | None = None,
+        oca_group: str | None = None,
+    ) -> str:
+        """Place a native IB STP (stop) order.
+
+        Args:
+            con_id: IB contract ID.
+            symbol: Ticker symbol (for logging).
+            side: "BUY" or "SELL".
+            qty: Order quantity.
+            stop_price: Trigger price (IB ``auxPrice``). BUY stops
+                        trigger at/above it, SELL stops at/below.
+            outside_rth: If True, STK-simulated stops may also trigger
+                         in pre/post market (4am–8pm ET). Stops can
+                         NEVER work the IBEOS overnight venue (LMT-only)
+                         — implementations must not tag includeOvernight
+                         on STP. FUT stops are native Globex (~24h).
+            tif: Time-in-force ("GTC" default).
+            order_ref: Optional orderRef tag for IB order identification.
+            oca_group: Optional OCA group — orders sharing it are
+                       one-cancels-all at IB (profit taker vs stop).
+
+        Returns:
+            IB order ID as a string. Write to SQLite immediately on return.
+        """
+        ...
+
+    @abstractmethod
     async def amend_order(self, ib_order_id: str, new_price: Decimal) -> None:
         """Amend an existing limit order to a new price.
 

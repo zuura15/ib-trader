@@ -111,6 +111,8 @@ async def submit_command(body: CommandRequest):
                     payload["stop_loss"] = str(cmd.stop_loss)
                 if cmd.limit_price is not None:
                     payload["price"] = str(cmd.limit_price)
+                if getattr(cmd, "stop_price", None) is not None:
+                    payload["stop_price"] = str(cmd.stop_price)
                 # FUT-only trailing stop (parser already gates STK at
                 # parse time). Exactly one of trail_percent / trail_amount
                 # is set when --trail was supplied.

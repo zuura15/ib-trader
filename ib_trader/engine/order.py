@@ -351,16 +351,22 @@ async def execute_order(
                 pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
             )
 
-    # Reject off-tick user-supplied limit price post-qualify (Epic 1 D5).
-    limit_price = getattr(cmd, "limit_price", None)
-    if limit_price is not None and tick_size > 0:
+    # Reject off-tick user-supplied prices post-qualify (Epic 1 D5).
+    # Applies alike to the limit price, the STP trigger (stop strategy),
+    # and the protective --stop-loss price (#97).
+    if tick_size > 0:
         from ib_trader.engine.ticks import is_on_tick
-        if not is_on_tick(limit_price, tick_size):
-            ctx.router.emit(
-                f"\u2717 Error: price {limit_price} not on tick ({tick_size}) for {cmd.symbol}",
-                pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
-            )
-            return
+        for _px_label, _px in (
+            ("price", getattr(cmd, "limit_price", None)),
+            ("stop price", getattr(cmd, "stop_price", None)),
+            ("stop-loss price", getattr(cmd, "stop_loss", None)),
+        ):
+            if _px is not None and not is_on_tick(_px, tick_size):
+                ctx.router.emit(
+                    f"\u2717 Error: {_px_label} {_px} not on tick ({tick_size}) for {cmd.symbol}",
+                    pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
+                )
+                return
 
     if cmd.dollars is not None:
         bid, ask, _ = await _fresh_prices(ctx, con_id, cmd.symbol)
@@ -466,12 +472,6 @@ async def execute_order(
         pre_position_avg_cost=pre_avg,
     )
 
-    if cmd.stop_loss:
-        logger.info(
-            '{"event": "STOP_LOSS_STUB_RECEIVED", "correlation_id": "%s", "value": "%s"}',
-            order_ctx.correlation_id, cmd.stop_loss,
-        )
-
     logger.info(
         '{"event": "ORDER_CREATED", "trade_id": "%s", "serial": %d, "symbol": "%s", '
         '"side": "%s", "qty": "%s", "strategy": "%s"}',
@@ -481,6 +481,8 @@ async def execute_order(
     try:
         if cmd.strategy == Strategy.LIMIT:
             await _execute_limit_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
+        elif cmd.strategy == Strategy.STOP:
+            await _execute_stop_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         elif cmd.strategy == Strategy.MID:
             await _execute_mid_order(cmd, order_ctx, trade_group, con_id, side, qty, ctx)
         elif cmd.strategy in (Strategy.BID, Strategy.ASK):
@@ -704,6 +706,151 @@ async def _execute_limit_order(
     )
     logger.info(
         '{"event": "LIMIT_ORDER_LIVE", "correlation_id": "%s", "serial": %d, '
+        '"symbol": "%s", "price": "%s", "ib_order_id": "%s"}',
+        order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, price, ib_order_id,
+    )
+
+    # Don't unregister tracker — callbacks stay active for the app session.
+    # Daemon reconciliation handles fills that occur after app restart.
+
+
+async def _execute_stop_order(
+    cmd, order_ctx: _OrderContext, trade_group: TradeGroup, con_id: int,
+    side: str, qty: Decimal, ctx: AppContext,
+) -> None:
+    """Place a fire-and-forget native STP order at a user trigger price.
+
+    Same lifecycle as ``_execute_limit_order``: GTC, ack-poll, then
+    fire-and-forget — fills via callbacks + daemon reconciliation. A
+    resting stop parks in PreSubmitted at IB, which the ack-poll counts
+    as acknowledged. Never tagged ``includeOvernight`` (the IBEOS
+    overnight venue is LMT-only), so STK stops cannot trigger during
+    8 PM–4 AM ET; FUT stops are native Globex and run ~24h. #97
+
+    ``limit_price=`` kwargs below are the transactions-table price
+    column — for a STOP row it carries the trigger price.
+    """
+    price = cmd.stop_price
+
+    ctx.router.emit(
+        f"Order #{trade_group.serial_number} — {side} {qty} {cmd.symbol} @ stop ${price}",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.INFO,
+        event="ORDER_PLACED_STOP",
+    )
+
+    _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, cmd.symbol, side, "STOP",
+               qty, limit_price=price, trade_serial=trade_group.serial_number,
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
+
+    ib_order_id = await ctx.ib.place_stop_order(
+        con_id, cmd.symbol, side, qty, price, outside_rth=True, tif=_session_tif(),
+        order_ref=order_ctx.order_ref,
+    )
+
+    order_ctx.ib_order_id = str(ib_order_id)
+    ctx.router.update_order_row(
+        order_ctx.trade_serial, {"ib_order_id": str(ib_order_id)}
+    )
+
+    _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, cmd.symbol, side, "STOP",
+               qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
+               trade_serial=trade_group.serial_number, ib_responded_at=_now_utc(),
+               trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+               correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type,
+               price_placed=price,
+               raw_response=json.dumps({
+                   "ib_order_id": ib_order_id, "price": str(price), "strategy": "stop",
+                   "order_ref": order_ctx.order_ref,
+               }))
+
+    # Register fill/status callbacks so SQLite gets updated on fill
+    ctx.tracker.register(order_ctx.correlation_id, ib_order_id, cmd.symbol)
+
+    async def on_fill(fill_ib_id: str, _qty: Decimal, _avg: Decimal, commission: Decimal):
+        if fill_ib_id == ib_order_id:
+            ctx.tracker.notify_filled(fill_ib_id)
+
+    async def on_status(status_ib_id: str, status: str):
+        if status_ib_id == ib_order_id and status in ("Cancelled", "Inactive"):
+            ctx.tracker.notify_canceled(status_ib_id)
+
+    ctx.ib.register_fill_callback(on_fill, ib_order_id=ib_order_id)
+    ctx.ib.register_status_callback(on_status, ib_order_id=ib_order_id)
+
+    # Wait briefly for IB to acknowledge (transition out of PendingSubmit)
+    _SUBMIT_POLL_INTERVAL = 0.5
+    _SUBMIT_POLL_STEPS = 20  # 10s max
+    _pending_statuses = {"", "PendingSubmit"}
+    _ib_rejection_reason: str | None = None
+
+    for _ in range(_SUBMIT_POLL_STEPS):
+        _st = await ctx.ib.get_order_status(ib_order_id)
+        _ib_status = _st["status"]
+        _ib_rejection_reason = ctx.ib.get_order_error(ib_order_id)
+        if _ib_rejection_reason and _ib_status in _pending_statuses:
+            break
+        if _ib_status not in _pending_statuses:
+            break
+        await asyncio.sleep(_SUBMIT_POLL_INTERVAL)
+    else:
+        _st = await ctx.ib.get_order_status(ib_order_id)
+        _ib_status = _st["status"]
+        _ib_rejection_reason = ctx.ib.get_order_error(ib_order_id)
+
+    # Handle rejection / failure to acknowledge
+    if _ib_status in _pending_statuses or _ib_status in ("Cancelled", "Inactive"):
+        await ctx.ib.cancel_order(ib_order_id)
+        ctx.trades.update_status(trade_group.id, TradeStatus.CLOSED)
+        ctx.tracker.unregister(ib_order_id)
+        if _ib_rejection_reason:
+            reason = _ib_rejection_reason
+        elif _ib_status in ("Cancelled", "Inactive"):
+            reason = f"IB cancelled order immediately (status: {_ib_status!r})"
+        else:
+            reason = (
+                f"IB did not acknowledge order {ib_order_id} within "
+                f"{_SUBMIT_POLL_STEPS * _SUBMIT_POLL_INTERVAL:.0f}s "
+                f"(final status: {_ib_status!r})"
+            )
+        _write_txn(ctx, TransactionAction.PLACE_REJECTED, cmd.symbol, side, "STOP",
+                   qty, limit_price=price, ib_order_id=_safe_int(ib_order_id),
+                   ib_status=_ib_status, ib_error_message=reason,
+                   trade_serial=trade_group.serial_number, is_terminal=True,
+                   ib_responded_at=_now_utc(),
+                   trade_id=order_ctx.trade_id, leg_type=order_ctx.leg_type,
+                   correlation_id=order_ctx.correlation_id, security_type=order_ctx.security_type)
+        logger.error(
+            '{"event": "STOP_ORDER_REJECTED", "correlation_id": "%s", '
+            '"serial": %d, "ib_order_id": "%s", "reason": "%s"}',
+            order_ctx.correlation_id, trade_group.serial_number, ib_order_id, reason,
+        )
+        raise IBOrderRejectedError(reason)
+
+    # Check for immediate fill (stop already penetrated at placement)
+    status = await ctx.ib.get_order_status(ib_order_id)
+    qty_filled = status["qty_filled"]
+    avg_price = status["avg_fill_price"]
+    commission = status["commission"] or Decimal("0")
+
+    if qty_filled > 0 and avg_price is not None and qty_filled >= qty:
+        # Fully filled immediately — handle like any other fill
+        await _handle_fill(order_ctx, trade_group, qty_filled, avg_price, commission, cmd, con_id, ctx)
+        ctx.tracker.unregister(ib_order_id)
+        return
+
+    # Order is live in IB — fire and forget.
+    # Fills are handled by the registered callbacks and daemon reconciliation.
+    ctx.router.emit(
+        f"● STOP ORDER LIVE: {side} {qty} {cmd.symbol} triggers @ ${price} — "
+        f"GTC order active in IB\n"
+        f"  Serial: #{trade_group.serial_number}  |  IB ID: {ib_order_id}\n"
+        f"  Order will persist until filled or manually cancelled.",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
+        event="STOP_ORDER_LIVE_DISPLAY",
+    )
+    logger.info(
+        '{"event": "STOP_ORDER_LIVE", "correlation_id": "%s", "serial": %d, '
         '"symbol": "%s", "price": "%s", "ib_order_id": "%s"}',
         order_ctx.correlation_id, trade_group.serial_number, cmd.symbol, price, ib_order_id,
     )
@@ -2271,9 +2418,13 @@ async def _handle_fill(
     entry_side = "BUY" if isinstance(cmd, BC) else "SELL"
     has_profit = bool(cmd.take_profit_price or cmd.profit_amount)
     has_trail = bool(getattr(cmd, "trail_percent", None) or getattr(cmd, "trail_amount", None))
+    has_stop = getattr(cmd, "stop_loss", None) is not None
+    # Exit legs (profit taker / trailing stop / stop loss) share one
+    # OCA group whenever two or more are present so IB cancels the
+    # survivors atomically when any of them fills. #97
     oca_group = (
         f"trade_{trade_group.serial_number}_exit"
-        if has_profit and has_trail else None
+        if (int(has_profit) + int(has_trail) + int(has_stop)) >= 2 else None
     )
 
     if has_profit:
@@ -2311,6 +2462,39 @@ async def _handle_fill(
                 '{"event": "TRAIL_STOP_PLACE_FAILED", "trade_id": "%s", '
                 '"serial": %d, "symbol": "%s"}',
                 trade_group.id, trade_group.serial_number, order_ctx.symbol,
+            )
+
+    if has_stop:
+        try:
+            await place_stop_loss(
+                trade_id=trade_group.id,
+                entry_side=entry_side,
+                avg_fill_price=avg_price,
+                qty_filled=qty_filled,
+                stop_price=cmd.stop_loss,
+                con_id=con_id,
+                symbol=order_ctx.symbol,
+                ctx=ctx,
+                trade_serial=trade_group.serial_number,
+                multiplier=order_ctx.multiplier,
+                oca_group=oca_group,
+                security_type=order_ctx.security_type,
+            )
+        except Exception as e:
+            # Deliberate WARNING (not CATASTROPHIC) — same reasoning as
+            # the #96 cancel sweep: the entry is filled and healthy; a
+            # daemon halt would strand the operator mid-position. The
+            # alert + console line make the missing protection loud.
+            from ib_trader.logging_.alerts import log_and_alert
+            await log_and_alert(
+                redis=ctx.redis, trigger="STOP_LOSS_PLACE_FAILED",
+                message=f"stop-loss placement failed for {order_ctx.symbol}: {e}",
+                severity="WARNING", symbol=order_ctx.symbol,
+            )
+            ctx.router.emit(
+                f"\u26a0 STOP LOSS PLACEMENT FAILED for {order_ctx.symbol} \u2014 "
+                f"position is UNPROTECTED: {e}",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
             )
 
 
@@ -3082,6 +3266,98 @@ async def place_profit_taker(
     )
 
 
+async def place_stop_loss(
+    trade_id: str,
+    entry_side: str,
+    avg_fill_price: Decimal,
+    qty_filled: Decimal,
+    stop_price: Decimal,
+    con_id: int,
+    symbol: str,
+    ctx: AppContext,
+    trade_serial: int | None = None,
+    multiplier: Decimal | None = None,
+    oca_group: str | None = None,
+    security_type: str = "STK",
+) -> None:
+    """Place a protective GTC STP after an entry fill (``--stop-loss``).
+
+    Exit side is the inverse of the entry side; ``stop_price`` is the
+    absolute trigger (parity with ``--take-profit-price``). Wrong-side
+    guard: a stop already penetrated at the fill (BUY entry with stop
+    at/above it, SELL entry with stop at/below) would trigger
+    instantly — an accidental market order — so it is refused with a
+    WARNING alert instead of placed. Leg type STOP_LOSS: autonomous
+    late fills flow through ``handle_autonomous_close_fill`` for P&L +
+    console disclosure like profit takers. #97
+
+    ``limit_price=`` kwargs below are the transactions-table price
+    column — for a STOP row it carries the trigger price.
+    """
+    from ib_trader.logging_.alerts import log_and_alert
+
+    sl_side = "SELL" if entry_side == "BUY" else "BUY"
+    wrong_side = (
+        stop_price >= avg_fill_price if entry_side == "BUY"
+        else stop_price <= avg_fill_price
+    )
+    if wrong_side:
+        rel = "at/above" if entry_side == "BUY" else "at/below"
+        await log_and_alert(
+            redis=ctx.redis, trigger="STOP_LOSS_WRONG_SIDE",
+            message=(
+                f"--stop-loss {stop_price} is {rel} the {symbol} entry fill "
+                f"{avg_fill_price} \u2014 would trigger instantly; NOT placed. "
+                f"Position is unprotected."
+            ),
+            severity="WARNING", symbol=symbol, exc_info=False,
+        )
+        ctx.router.emit(
+            f"\u26a0 STOP LOSS NOT PLACED: {stop_price} is {rel} the fill "
+            f"{avg_fill_price} \u2014 would trigger instantly. Position unprotected.",
+            pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+        )
+        return
+
+    sl_correlation_id = str(uuid.uuid4())
+    sl_multiplier_str = (
+        str(multiplier) if multiplier and multiplier != Decimal("1") else None
+    )
+
+    _write_txn(ctx, TransactionAction.PLACE_ATTEMPT, symbol, sl_side, "STOP",
+               qty_filled, limit_price=stop_price,
+               trade_id=trade_id, leg_type=LegType.STOP_LOSS,
+               correlation_id=sl_correlation_id, security_type=security_type,
+               trade_serial=trade_serial, multiplier=sl_multiplier_str,
+               con_id=con_id)
+
+    ib_order_id = await ctx.ib.place_stop_order(
+        con_id, symbol, sl_side, qty_filled, stop_price,
+        outside_rth=True, tif=_session_tif(),
+        order_ref=f"sl_{trade_serial}" if trade_serial is not None else None,
+        oca_group=oca_group,
+    )
+
+    _write_txn(ctx, TransactionAction.PLACE_ACCEPTED, symbol, sl_side, "STOP",
+               qty_filled, limit_price=stop_price, ib_order_id=_safe_int(ib_order_id),
+               ib_responded_at=_now_utc(),
+               trade_id=trade_id, leg_type=LegType.STOP_LOSS,
+               correlation_id=sl_correlation_id, security_type=security_type,
+               price_placed=stop_price, trade_serial=trade_serial,
+               multiplier=sl_multiplier_str, con_id=con_id)
+
+    ctx.router.emit(
+        f"  Stop loss placed @ ${stop_price}",
+        pane=OutputPane.COMMAND, severity=OutputSeverity.SUCCESS,
+        event="STOP_LOSS_PLACED_DISPLAY",
+    )
+    logger.info(
+        '{"event": "STOP_LOSS_PLACED", "trade_id": "%s", "symbol": "%s", '
+        '"side": "%s", "stop_price": "%s", "ib_order_id": "%s"}',
+        trade_id, symbol, sl_side, stop_price, ib_order_id,
+    )
+
+
 async def _handle_close_fill(
     close_ctx: _OrderContext, trade_group: TradeGroup,
     qty_filled: Decimal, avg_price: Decimal, commission: Decimal,
@@ -3578,7 +3854,9 @@ async def _execute_close_symbol(cmd: "CloseCommand", ctx: AppContext) -> None:
     order_cmd = close_cls(
         symbol=sym, qty=abs(pos_qty), dollars=None, strategy=cmd.strategy,
         profit_amount=None, take_profit_price=None, stop_loss=None,
-        limit_price=cmd.limit_price, bot_ref=cmd.bot_ref,
+        limit_price=cmd.limit_price,
+        stop_price=getattr(cmd, "stop_price", None),
+        bot_ref=cmd.bot_ref,
         security_type=cmd.security_type,
     )
     close_corr = await execute_order(order_cmd, ctx)

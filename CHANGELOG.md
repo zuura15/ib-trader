@@ -3,6 +3,26 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-14
+
+### Added
+- **Native stop orders (STP) at limit parity (#97).** New ``stop``
+  strategy: ``buy|sell SYMBOL QTY stop PRICE`` places a fire-and-forget
+  GTC IB STP (auxPrice trigger). ``--stop-loss PRICE`` is now real —
+  after the entry fills, a protective STP is placed at the given
+  absolute price (parity with ``--take-profit-price``); wrong-side
+  values (SELL stop at/above fill, BUY stop at/below) are refused with
+  a WARNING alert instead of placed, since they would trigger
+  instantly. Exit legs (profit taker / trailing stop / stop loss)
+  share an OCA group whenever two or more are present. After-market
+  handling: ``outsideRth=True`` always (STK simulated stops trigger
+  4am–8pm ET; FUT native Globex ~24h); ``includeOvernight`` is never
+  tagged — the IBEOS overnight venue is LMT-only and rejects STP.
+  Stop prices are tick-validated like limit prices. Parser also gains
+  ``--price`` / ``--stop-price`` flags, fixing a latent bug where the
+  synthesised bot cmd_text emitted ``--price`` that the parser
+  rejected as unknown.
+
 ## 2026-09-09
 
 ### Fixed

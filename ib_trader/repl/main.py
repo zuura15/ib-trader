@@ -356,6 +356,12 @@ ORDER ENTRY
     STRATEGY    mid     — GTC limit order starting at mid, repriced toward ask
                           over the reprice window (default 10s, 10 steps)
                 market  — immediate market order, no repricing
+                limit   — GTC limit at PRICE (fire-and-forget)
+                stop    — native IB STP; triggers at PRICE (fire-and-forget)
+                          FUT: native Globex, ~24h. STK: simulated, triggers
+                          4am–8pm ET (never on the overnight venue — LMT only)
+                bid/ask — GTC limit pegged to bid/ask
+                smart_market — session-aware aggressive mid (default)
     PROFIT      Optional. Total dollar profit target for a profit taker order.
                   e.g. "500" places a GTC limit sell at avg_fill + $500/qty
 
@@ -365,8 +371,9 @@ ORDER ENTRY
                               capped at max_order_size_shares (default 10)
       --take-profit-price N Place a profit taker at this exact price instead of
                               calculating from PROFIT amount
-      --stop-loss N         Record a stop-loss price (stub — logged only,
-                              no IB stop order placed yet)
+      --stop-loss N         Protective STP at trigger price N, placed after
+                              the entry fills; OCA-linked with the profit
+                              taker / --trail so IB cancels the survivor
 
     Examples:
       buy MSFT 1 mid

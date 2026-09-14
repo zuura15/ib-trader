@@ -213,6 +213,29 @@ class MockIBClient(IBClientBase):
         }
         return ib_id
 
+    async def place_stop_order(self, con_id, symbol, side, qty, stop_price,
+                               outside_rth=True, tif="GTC", order_ref=None,
+                               oca_group=None) -> str:
+        await self._throttle()
+        ib_id = str(self._next_order_id)
+        self._next_order_id += 1
+        self.placed_orders.append({
+            "ib_order_id": ib_id, "con_id": con_id, "symbol": symbol,
+            "side": side, "qty": qty, "type": "STOP",
+            "stop_price": stop_price, "tif": tif,
+            "order_ref": order_ref, "oca_group": oca_group,
+        })
+        # Real IB parks a resting STP in PreSubmitted — which the
+        # engine's ack-poll treats as acknowledged (only "" and
+        # PendingSubmit are pending). Mirror that here.
+        self._order_statuses[ib_id] = {
+            "status": "PreSubmitted",
+            "qty_filled": Decimal("0"),
+            "avg_fill_price": None,
+            "commission": None,
+        }
+        return ib_id
+
     async def amend_order(self, ib_order_id: str, new_price: Decimal) -> None:
         await self._throttle()
         self.amended_orders.append({"ib_order_id": ib_order_id, "new_price": new_price})

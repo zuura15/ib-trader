@@ -1264,6 +1264,73 @@ class InsyncClient(IBClientBase):
         )
         return ib_order_id
 
+    async def place_stop_order(
+        self,
+        con_id: int,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        stop_price: Decimal,
+        outside_rth: bool = True,
+        tif: str = "GTC",
+        order_ref: str | None = None,
+        oca_group: str | None = None,
+    ) -> str:
+        """Place a native IB STP order. Returns the IB order id.
+
+        ``auxPrice`` carries the trigger: BUY stops trigger at/above it,
+        SELL stops at/below. On FUT this is a native Globex stop and
+        runs ~24h with the exchange session. On STK it is IB-simulated;
+        with ``outsideRth=True`` it can trigger in pre/post market
+        (4am–8pm ET) but NOT overnight — the IBEOS venue accepts limit
+        orders only, so unlike place_limit_order / place_market_order
+        this method deliberately never tags ``includeOvernight`` (IB
+        rejects it on STP). See issue #97.
+        """
+        await self._throttle()
+        contract = self._contract_cache.get(con_id) or Contract(
+            conId=con_id, exchange="SMART", currency="USD",
+        )
+        order = Order()
+        order.action = side.upper()
+        order.totalQuantity = float(qty)
+        order.orderType = "STP"
+        order.auxPrice = float(stop_price)
+        order.tif = tif
+        # STK: allow trigger in pre/post market. FUT: the attribute is
+        # ignored by the exchange (harmless), same as our TRAIL orders.
+        order.outsideRth = outside_rth
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # CANCEL_WITH_BLOCK
+        if order_ref:
+            order.orderRef = order_ref
+        if self._account_id:
+            order.account = self._account_id
+
+        trade = self.__ib.placeOrder(contract, order)
+        ib_order_id = str(trade.order.orderId)
+        self.__active_trades[ib_order_id] = trade
+        self._fire_order_placed(
+            ib_order_id, symbol, contract.secType or "STK",
+            int(contract.conId or 0), side, qty, order_ref or "",
+        )
+        logger.info(
+            '{"event": "STOP_ORDER_PLACED", "symbol": "%s", "side": "%s", '
+            '"qty": "%s", "stop_price": "%s", "tif": "%s", "oca_group": "%s", '
+            '"ib_order_id": "%s"}',
+            symbol, side, qty, stop_price, order.tif, oca_group or "", ib_order_id,
+        )
+        logger.debug(
+            '{"event": "ORDER_PLACED_DETAIL", "ib_order_id": "%s", '
+            '"exchange": "%s", "tif": "%s", "outsideRth": %s, '
+            '"orderType": "%s", "account": "%s", "conId": %s}',
+            ib_order_id, contract.exchange, order.tif,
+            "true" if order.outsideRth else "false",
+            order.orderType, order.account, contract.conId,
+        )
+        return ib_order_id
+
     async def place_trailing_stop_order(
         self,
         con_id: int,

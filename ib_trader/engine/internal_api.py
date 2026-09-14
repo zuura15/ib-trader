@@ -52,10 +52,11 @@ class OrderRequest(BaseModel):
         description=f"Order strategy: one of {{{_VALID_ORDER_TYPES_DOC}}}",
     )
     price: Optional[str] = Field(default=None, description="Limit price (required for limit orders)")
+    stop_price: Optional[str] = Field(default=None, description="STP trigger price (required for stop orders)")
     bot_ref: Optional[str] = Field(default=None, description="Bot reference ID for orderRef tagging")
     serial: Optional[int] = Field(default=None, description="Trade serial number")
     profit: Optional[str] = Field(default=None, description="Profit target in dollars")
-    stop_loss: Optional[str] = Field(default=None, description="Stop loss in dollars")
+    stop_loss: Optional[str] = Field(default=None, description="Protective stop trigger price (absolute) — STP placed after entry fill")
     cmd_id: Optional[str] = Field(default=None, description="Caller-supplied command id; keys the Redis live-output stream")
     # Epic 1 additions:
     security_type: str = Field(default="STK", description="STK / ETF / FUT / OPT")
@@ -212,6 +213,8 @@ async def place_order(req: OrderRequest):
             cmd_text += f" --stop-loss {req.stop_loss}"
         if req.price:
             cmd_text += f" --price {req.price}"
+        if req.stop_price:
+            cmd_text += f" --stop-price {req.stop_price}"
         sec_type_u = (req.security_type or "STK").upper()
         if sec_type_u != "STK":
             cmd_text += f" --sec-type {sec_type_u}"

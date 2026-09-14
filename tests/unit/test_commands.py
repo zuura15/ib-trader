@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from ib_trader.repl.commands import (
     parse_command, parse_buy_sell, parse_close, parse_modify,
-    BuyCommand, SellCommand, CloseCommand, ModifyCommand,
+    BuyCommand, SellCommand, CloseCommand, ModifyCommand, Strategy,
 )
 
 
@@ -166,6 +166,65 @@ class TestParseBuySell:
         cmd = parse_buy_sell(["buy", "MSFT", "10", "mid", "--unknown", "val"])
         assert cmd is None
         assert "Error" in capsys.readouterr().out
+
+
+class TestParseStop:
+    """'stop' strategy — native IB STP entry/exit (#97)."""
+
+    def test_buy_stop_with_price(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "stop", "420"])
+        assert cmd.strategy == Strategy.STOP
+        assert cmd.stop_price == Decimal("420")
+        assert cmd.limit_price is None
+
+    def test_sell_stop_futures_symbol(self):
+        cmd = parse_buy_sell(["sell", "GCV6", "2", "stop", "3300.5"])
+        assert cmd.strategy == Strategy.STOP
+        assert cmd.stop_price == Decimal("3300.5")
+        assert cmd.security_type == "FUT"
+
+    def test_stop_missing_price_returns_none(self, capsys):
+        assert parse_buy_sell(["buy", "MSFT", "1", "stop"]) is None
+        assert "trigger price" in capsys.readouterr().out
+
+    def test_stop_negative_price_returns_none(self, capsys):
+        assert parse_buy_sell(["buy", "MSFT", "1", "stop", "-5"]) is None
+
+    def test_stop_with_profit_positional(self):
+        cmd = parse_buy_sell(["sell", "MSFT", "1", "stop", "400", "250"])
+        assert cmd.stop_price == Decimal("400")
+        assert cmd.profit_amount == Decimal("250")
+
+    def test_stop_price_flag_form(self):
+        # Synthesised internal-API form: flag instead of positional.
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "stop", "--stop-price", "420"])
+        assert cmd.strategy == Strategy.STOP
+        assert cmd.stop_price == Decimal("420")
+
+    def test_price_flag_form_for_limit(self):
+        # --price previously rejected as unknown (latent bot-path bug).
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "limit", "--price", "412.50"])
+        assert cmd.strategy == Strategy.LIMIT
+        assert cmd.limit_price == Decimal("412.50")
+
+    def test_stop_price_flag_wrong_strategy_returns_none(self, capsys):
+        assert parse_buy_sell(["buy", "MSFT", "1", "mid", "--stop-price", "420"]) is None
+        assert "only valid" in capsys.readouterr().out
+
+    def test_price_flag_wrong_strategy_returns_none(self, capsys):
+        assert parse_buy_sell(["buy", "MSFT", "1", "stop", "420", "--price", "1"]) is None
+
+    def test_non_stop_strategy_has_no_stop_price(self):
+        cmd = parse_buy_sell(["buy", "MSFT", "1", "mid"])
+        assert cmd.stop_price is None
+
+    def test_stop_with_dollar_prefix(self):
+        cmd = parse_buy_sell(["sell", "MSFT", "1", "stop", "$400.10"])
+        assert cmd.stop_price == Decimal("400.10")
+
+    def test_stop_loss_flag_still_parses(self):
+        cmd = parse_buy_sell(["buy", "GCV6", "1", "market", "--stop-loss", "3300"])
+        assert cmd.stop_loss == Decimal("3300")
 
 
 class TestParseClose:
@@ -340,3 +399,24 @@ class TestParseCloseSymbol:
         assert cmd is not None
         assert cmd.serial == 4
         assert cmd.symbol is None
+
+
+class TestParseCloseStop:
+    """close SYMBOL stop PRICE (#97)."""
+
+    def test_close_symbol_stop(self):
+        cmd = parse_close(["close", "GCV6", "stop", "3300"])
+        assert cmd.symbol == "GCV6"
+        assert cmd.strategy == Strategy.STOP
+        assert cmd.stop_price == Decimal("3300")
+
+    def test_close_serial_stop_rejected(self, capsys):
+        assert parse_close(["close", "3", "stop", "3300"]) is None
+        assert "SYMBOL form" in capsys.readouterr().out
+
+    def test_close_symbol_stop_missing_price(self, capsys):
+        assert parse_close(["close", "GCV6", "stop"]) is None
+        assert "trigger price" in capsys.readouterr().out
+
+    def test_close_symbol_stop_negative_price(self, capsys):
+        assert parse_close(["close", "GCV6", "stop", "-1"]) is None
