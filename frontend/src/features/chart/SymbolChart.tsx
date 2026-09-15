@@ -4,7 +4,7 @@ import {
 import {
   createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
   type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
-  type Time, type ISeriesMarkersPluginApi,
+  type Time, type ISeriesMarkersPluginApi, type IPriceLine,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -177,6 +177,16 @@ interface Props {
   /** Tick size used to round strip hover/click prices (e.g. 0.25 for
    *  ES/NQ, 0.1 for GC). Defaults to 0.01. */
   pickTickSize?: number;
+  /** Live last-price callback — fires on every live tick and once per
+   *  historical load, so pane headers can show the current price
+   *  without opening a second quote socket. */
+  onLastPrice?: (price: number) => void;
+  /** Working-order price lines (#98): one dashed horizontal line per
+   *  open IB order on this contract, with a short axis label
+   *  (lim / sl / trl). lightweight-charts renders the line + label
+   *  only while the price is inside the visible range — exactly the
+   *  wanted "marker when visible in frame" behavior. */
+  orderLines?: Array<{ price: number; label: string; side: 'BUY' | 'SELL' }>;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -201,11 +211,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     executionMarkers,
     onPricePick,
     pickTickSize = 0.01,
+    onLastPrice,
+    orderLines,
   }: Props,
   ref,
 ) {
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
+
+  // Ref-tunneled so the tick handler / history loader never re-subscribe
+  // when the parent passes a fresh closure.
+  const onLastPriceRef = useRef(onLastPrice);
+  useEffect(() => { onLastPriceRef.current = onLastPrice; }, [onLastPrice]);
 
   // Visibility-wake plumbing. Each data-source useEffect (historical
   // load, SR, fuzzy, regime, live-tick WS) pushes a callback onto this
@@ -613,6 +630,37 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       execMarkersApiRef.current = null;
     };
   }, [executionMarkers, chartVersion, barsTick]);
+
+  // ── Working-order price lines (#98) ────────────────────────────────
+  // One dashed horizontal line per open IB order on this contract with
+  // a short axis label (lim / sl / trl), side-colored like fills. The
+  // series is replaced on a chartVersion bump, so recreate against the
+  // current instance; cleanup removes every line so none stack.
+  const orderLinesApiRef = useRef<IPriceLine[]>([]);
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series) return;
+    const colors = themeColors();
+    for (const ln of orderLines ?? []) {
+      if (!Number.isFinite(ln.price) || ln.price <= 0) continue;
+      try {
+        orderLinesApiRef.current.push(series.createPriceLine({
+          price: ln.price,
+          color: ln.side === 'BUY' ? colors.bullish : colors.bearish,
+          lineWidth: 1,
+          lineStyle: 2,          // dashed
+          axisLabelVisible: true,
+          title: ln.label,
+        }));
+      } catch { /* chart mid-teardown — next run re-attaches */ }
+    }
+    return () => {
+      for (const pl of orderLinesApiRef.current) {
+        try { series.removePriceLine(pl); } catch { /* torn down */ }
+      }
+      orderLinesApiRef.current = [];
+    };
+  }, [orderLines, chartVersion]);
 
   // ── Click-to-pick price strip ──────────────────────────────────────
   // A narrow band inside the chart hugging the price axis. Geometry
@@ -2221,6 +2269,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           }
         }
         series.setData(points);
+        {
+          const lastPt = points[points.length - 1];
+          if (lastPt && Number.isFinite(lastPt.value)) {
+            onLastPriceRef.current?.(lastPt.value);
+          }
+        }
         // Historical bars are now in the series — safe to let live
         // ticks update past this point without auto-fit-to-one-point
         // pathology.
@@ -2594,6 +2648,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
             + BAR_SECONDS;
           series.update({ time: barSec as UTCTimestamp, value: last });
+          onLastPriceRef.current?.(last);
           lastTickBarSecRef.current = barSec;
           // Mirror the update into the OHLC bars ref so SR pivot
           // detection (which reads bar.high / bar.low) sees the live

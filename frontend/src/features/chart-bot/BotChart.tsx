@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
 import { VISIBLE_MINUTES } from '../chart/chartUtils';
 import { setUserSetting, useUserSetting } from '../../data/userSettings';
-import type { ChartTarget } from '../../data/store';
+import { useStore, type ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
 // PositionStrip import removed with the 2-row shelf — see chartBody.
 import { getBotTrades, getChartExecutions, type ChartExecutionMarker } from '../../api/client';
@@ -73,6 +73,100 @@ export function BotChart({
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
+
+  // ── Header price + open-order awareness (#98) ─────────────────────
+  // Last price is pushed up by SymbolChart (live ticks + history load);
+  // open IB orders for THIS contract come from /api/orders (the
+  // engine-maintained orders:open Redis hash — IB-authoritative, no
+  // SQLite). Polled on a slow 5s interval plus the same triggers the
+  // Orders panel uses (command completion, resync).
+  const [lastPrice, setLastPrice] = useState<number | null>(null);
+  const [openOrders, setOpenOrders] = useState<Array<{
+    id: string; side: string; qty: number; orderType: string;
+    limitPrice: number | null; stopPrice: number | null;
+    trailingPercent: number | null;
+  }>>([]);
+  const [ordersHover, setOrdersHover] = useState(false);
+  const lastOrdersSigRef = useRef<string>('[]');
+  const refreshTick = useStore((st) => st.positionRefreshTick);
+  const resyncToken = useStore((st) => st.resyncToken);
+
+  useEffect(() => {
+    if (!symbol) { setOpenOrders([]); return; }
+    let cancelled = false;
+    const TERMINAL = new Set(
+      ['filled', 'cancelled', 'canceled', 'abandoned', 'rejected', 'error'],
+    );
+    const load = async () => {
+      try {
+        const r = await fetch('/api/orders');
+        if (!r.ok) return;
+        const rows = await r.json();
+        if (cancelled || !Array.isArray(rows)) return;
+        const sym = symbol.toUpperCase();
+        const next = rows
+          .filter((o: any) =>
+            String(o.symbol ?? '').toUpperCase() === sym
+            && !TERMINAL.has(String(o.status ?? '').toLowerCase()))
+          .map((o: any) => ({
+            id: String(o.ib_order_id ?? ''),
+            side: String(o.side ?? '').toUpperCase(),
+            qty: Number(o.target_qty ?? 0),
+            orderType: String(o.order_type ?? ''),
+            limitPrice: o.limit_price != null ? Number(o.limit_price) : null,
+            stopPrice: o.stop_price != null ? Number(o.stop_price) : null,
+            trailingPercent:
+              o.trailing_percent != null ? Number(o.trailing_percent) : null,
+          }));
+        // Only commit on real change — otherwise every 5s poll would
+        // recreate the chart's price lines (axis-label churn) and
+        // re-render the header for identical data.
+        const sig = JSON.stringify(next);
+        if (sig !== lastOrdersSigRef.current) {
+          lastOrdersSigRef.current = sig;
+          setOpenOrders(next);
+        }
+      } catch { /* transient — keep last good list */ }
+    };
+    void load();
+    const t = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [symbol, refreshTick, resyncToken]);
+
+  // Axis markers for SymbolChart: label by order kind — lim / sl / trl.
+  // TRAIL uses IB's live trailStopPrice (the engine re-reads it on
+  // every status event, so the marker walks with the trail).
+  const orderLines = useMemo(() => {
+    const out: Array<{ price: number; label: string; side: 'BUY' | 'SELL' }> = [];
+    for (const o of openOrders) {
+      const type = o.orderType.toUpperCase();
+      const isTrail = type.includes('TRAIL') || o.trailingPercent != null;
+      const isStop = isTrail || type.includes('STP');
+      const price = isStop
+        ? (o.stopPrice ?? o.limitPrice)
+        : (o.limitPrice ?? o.stopPrice);
+      if (price == null || !Number.isFinite(price) || price <= 0) continue;
+      out.push({
+        price,
+        label: isTrail ? 'trl' : isStop ? 'sl' : type === 'LMT' ? 'lim'
+          : type.toLowerCase() || '?',
+        side: o.side === 'BUY' ? 'BUY' : 'SELL',
+      });
+    }
+    return out;
+  }, [openOrders]);
+
+  // Price rendered at the contract's tick precision (0.25 → 2dp etc.).
+  const priceDecimals = useMemo(() => {
+    const t = String(pickTickSize ?? 0.01);
+    const i = t.indexOf('.');
+    return i === -1 ? 0 : t.length - i - 1;
+  }, [pickTickSize]);
+
+  const fmtOrderPrice = (o: { limitPrice: number | null; stopPrice: number | null }) => {
+    const px = o.limitPrice ?? o.stopPrice;
+    return px != null ? `@ ${px.toFixed(priceDecimals)}` : '';
+  };
   // Outer ref used by the screenshot button — html2canvas captures
   // this node which wraps the chart, the toolbar header, and the
   // PositionStrip strip below. The fullscreen overlay also points
@@ -583,8 +677,76 @@ export function BotChart({
         minHeight: 28,
       }}
     >
-      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>
-        {renderTitle ? renderTitle(state) : (symbol ?? '—')}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        fontSize: 12, fontWeight: 600, color: 'var(--text-primary)',
+      }}>
+        <span>{renderTitle ? renderTitle(state) : (symbol ?? '—')}</span>
+        {/* Current price right after the ticker name (#98). */}
+        {lastPrice != null && (
+          <span
+            style={{
+              fontFamily: 'ui-monospace, monospace', fontWeight: 600,
+              color: 'var(--text-secondary)',
+            }}
+            data-testid={`chart-header-price-${botId}`}
+          >
+            {lastPrice.toFixed(priceDecimals)}
+          </span>
+        )}
+        {/* Binary open-orders indicator — amber dot when IB holds ≥1
+            working order on this contract; hover lists the orders. */}
+        {openOrders.length > 0 && (
+          <span
+            style={{ position: 'relative', display: 'inline-flex' }}
+            onMouseEnter={() => setOrdersHover(true)}
+            onMouseLeave={() => setOrdersHover(false)}
+          >
+            <span
+              title={ordersHover ? undefined : `${openOrders.length} working order(s)`}
+              style={{
+                width: 8, height: 8, borderRadius: '50%',
+                background: 'var(--accent-yellow)',
+                display: 'inline-block', cursor: 'default',
+              }}
+              data-testid={`chart-orders-dot-${botId}`}
+            />
+            {ordersHover && (
+              <div
+                style={{
+                  position: 'absolute', top: 'calc(100% + 6px)', left: -4,
+                  zIndex: 60,
+                  background: 'var(--bg-primary)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 4, padding: '6px 8px',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.35)',
+                  whiteSpace: 'nowrap',
+                  fontWeight: 400, fontSize: 11,
+                  fontFamily: 'ui-monospace, monospace',
+                }}
+                data-testid={`chart-orders-tooltip-${botId}`}
+              >
+                {openOrders.map((o) => (
+                  <div
+                    key={o.id}
+                    style={{
+                      display: 'flex', gap: 6, lineHeight: 1.6,
+                      color: o.side === 'BUY'
+                        ? 'var(--accent-green)' : 'var(--accent-red)',
+                    }}
+                  >
+                    <span>{o.side}</span>
+                    <span>{o.qty}</span>
+                    <span>{o.orderType}</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {fmtOrderPrice(o)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </span>
+        )}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         {vocToolbar}
@@ -621,6 +783,8 @@ export function BotChart({
           executionMarkers={executionMarkers}
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
+          onLastPrice={setLastPrice}
+          orderLines={orderLines}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
