@@ -343,6 +343,9 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
 
             # Position poll: 30s fallback for when positionEvent stops
             asyncio.create_task(_position_poll_loop(ctx)),
+            # orders:open ⇄ IB truth sweep (#98): catches missed status
+            # events, TWS-placed orders, and purges zombie rows.
+            asyncio.create_task(_orders_open_ib_sync_loop(ctx)),
 
             # Realized-P&L rollup: per-contract 24h + today figures for the
             # chart panes, swept from IB executions (incl. manual TWS).
@@ -917,6 +920,128 @@ async def _refresh_positions_cache(ctx: AppContext, *, subscribe_mktdata: bool =
     return len(positions)
 
 
+async def sync_orders_open_from_ib(ctx: AppContext, redis) -> tuple[int, int]:
+    """Reconcile the ``orders:open`` Redis hash against IB's live open
+    orders (``reqAllOpenOrders``). IB is the source of truth for
+    broker-held state — the event-driven updater gives low latency, and
+    this sweep corrects any drift it misses: dropped status events,
+    orders placed directly in TWS, engine restarts, and zombie rows
+    whose terminal event never landed (observed on prod: rows from
+    June still "open" in September). #98
+
+    Returns ``(upserts, removals)``.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from ib_trader.redis.state import StateKeys
+
+    key = StateKeys.orders_open()
+    ib_orders = await ctx.ib.get_open_orders()
+    raw = await redis.hgetall(key)
+    existing: dict[str, dict] = {}
+    for k, v in raw.items():
+        oid_s = k.decode() if isinstance(k, bytes) else str(k)
+        try:
+            existing[oid_s] = _json.loads(v)
+        except (_json.JSONDecodeError, TypeError):
+            existing[oid_s] = {}
+
+    def _f(v: object) -> float | None:
+        """Benign numeric coercion — sentinel/None-safe."""
+        if v is None:
+            return None
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return f if 0 < f < 1e300 else None
+
+    upserts = 0
+    seen: set[str] = set()
+    for o in ib_orders:
+        oid = str(o.get("ib_order_id") or "")
+        sym = (o.get("local_symbol") or o.get("symbol") or "").upper()
+        if not oid or oid == "0" or not sym:
+            continue
+        seen.add(oid)
+        prev = existing.get(oid) or {}
+        # Merge over the event-path row so enrichment keys it added
+        # (orderRef, fill telemetry) survive; IB values win.
+        row = dict(prev)
+        sec_type = o.get("sec_type") or row.get("sec_type") or "STK"
+        expiry = o.get("expiry") or row.get("expiry")
+        display = row.get("display_symbol")
+        if not display:
+            display = sym
+            if sec_type == "FUT" and expiry:
+                try:
+                    from ib_trader.utils.symbol import format_display_symbol
+                    display = format_display_symbol(
+                        o.get("symbol") or sym, "FUT", str(expiry),
+                    )
+                except Exception:
+                    display = f"{o.get('symbol') or sym} {expiry}"
+        row.update({
+            "ib_order_id": oid,
+            "symbol": sym,
+            "side": (o.get("side") or "").upper(),
+            "status": o.get("status") or "Submitted",
+            "terminal": False,
+            "target_qty": str(o.get("qty") or "0"),
+            "filled_qty": str(o.get("qty_filled") or "0"),
+            "avg_price": (
+                str(o["avg_fill_price"]) if o.get("avg_fill_price") else None
+            ),
+            "order_type": o.get("order_type") or row.get("order_type"),
+            "limit_price": _f(o.get("limit_price")),
+            "stop_price": _f(o.get("stop_price")),
+            "trailing_percent": _f(o.get("trailing_percent")),
+            "sec_type": sec_type,
+            "con_id": o.get("con_id") or row.get("con_id"),
+            "expiry": expiry,
+            "trading_class": o.get("trading_class") or row.get("trading_class"),
+            "multiplier": o.get("multiplier") or row.get("multiplier"),
+            "display_symbol": display,
+            "ts": row.get("ts") or datetime.now(timezone.utc).isoformat(),
+        })
+        row.setdefault("orderRef", o.get("order_ref") or "")
+        if row != prev:
+            await redis.hset(key, oid, _json.dumps(row))
+            upserts += 1
+
+    removals = 0
+    for oid in list(existing):
+        if oid not in seen:
+            await redis.hdel(key, oid)
+            removals += 1
+    return upserts, removals
+
+
+async def _orders_open_ib_sync_loop(ctx: AppContext) -> None:
+    """Periodic orders:open ⇄ IB reconcile. Interval is the
+    ``orders_open_sync_seconds`` tunable (default 20s). One
+    reqAllOpenOrders per cycle, behind the global rate limiter."""
+    redis = ctx.redis
+    if redis is None:
+        return
+    interval = float(ctx.settings.get("orders_open_sync_seconds", 20))
+    from ib_trader.redis.streams import publish_activity
+    while True:
+        try:
+            upserts, removals = await sync_orders_open_from_ib(ctx, redis)
+            if upserts or removals:
+                await publish_activity(redis, "orders")
+                logger.info(
+                    '{"event": "ORDERS_OPEN_IB_SYNC", "upserts": %d, '
+                    '"removals": %d}', upserts, removals,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('{"event": "ORDERS_OPEN_IB_SYNC_ERROR"}')
+        await asyncio.sleep(interval)
+
+
 async def _position_poll_loop(ctx: AppContext) -> None:
     """Refresh the in-memory positions cache periodically as a fallback.
 
@@ -1090,7 +1215,7 @@ async def _event_relay_loop(ctx: AppContext) -> None:
         dropped during venue re-routes against the broker-truth diff."""
         try:
             pre_qty = _live_position_qty(symbol, sec_type)
-            ledger.register(
+            events = ledger.register(
                 ib_order_id=ib_order_id,
                 order_ref=order_ref,
                 symbol=symbol,
@@ -1100,6 +1225,25 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 target_qty=Decimal(str(qty)),
                 pre_position=pre_qty,
             )
+
+            # Relay the register event (status=Submitted) into the
+            # order-updates stream + orders:open hash. Previously the
+            # return value was DROPPED — a resting order that never got
+            # another status transition (a parked GTC stop, exactly)
+            # never appeared in orders:open at all. #98
+            async def _relay_register(evts: list[dict] = events) -> None:
+                try:
+                    for event in evts:
+                        await order_writer.add(event)
+                    await _update_orders_open(evts)
+                    from ib_trader.redis.streams import publish_activity
+                    await publish_activity(redis, "orders")
+                except Exception:
+                    logger.exception(
+                        '{"event": "REGISTER_RELAY_ERROR", "ib_order_id": "%s"}',
+                        ib_order_id,
+                    )
+            asyncio.create_task(_relay_register())
         except Exception:
             logger.exception(
                 '{"event": "LEDGER_REGISTER_FAILED", "ib_order_id": "%s"}',
@@ -1296,6 +1440,11 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                 await order_writer.add(event)
             await _update_orders_open(events)
 
+            logger.debug(
+                '{"event": "STATUS_RELAYED", "ib_order_id": "%s", '
+                '"status": "%s", "events": %d}',
+                ib_order_id, status, len(events),
+            )
             from ib_trader.redis.streams import publish_activity
             await publish_activity(redis, "orders")
         except Exception:

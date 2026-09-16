@@ -3,6 +3,25 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-15
+
+### Added
+- **Chart header order awareness (#98).** Each chart pane's top-left
+  now shows the live last price next to the ticker, plus an amber dot
+  when IB holds working orders on that contract (hover lists them);
+  dashed price-axis markers (lim / sl / trl) render at each order's
+  price while it is in the visible range.
+
+### Fixed
+- **orders:open Redis hash stale/incomplete (#98).** Two structural
+  fixes: (1) the ledger's register event was dropped on placement, so
+  a resting order with no later status transition (a parked GTC stop)
+  never appeared in orders:open; (2) a new periodic IB-truth sweep
+  (``orders_open_sync_seconds``, default 20s) reconciles the hash
+  against reqAllOpenOrders — upserting live IB working orders
+  (including ones placed directly in TWS) and purging zombie rows
+  (prod carried June/July rows on expired contracts as "open").
+
 ## 2026-09-14
 
 ### Added

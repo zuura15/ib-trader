@@ -27,6 +27,12 @@ market_order_wait_seconds: 30
 # take tens of seconds). The hard cap below is a safety net for a silent IB —
 # hitting it logs a WARNING and proceeds with whatever status IB has reported.
 cancel_settle_timeout_seconds: 120
+
+# orders:open ⇄ IB reconcile cadence (#98). Each cycle is one
+# reqAllOpenOrders behind the global rate limiter; upserts live IB
+# working orders (incl. TWS-placed) into the Redis hash and purges
+# rows IB no longer holds.
+orders_open_sync_seconds: 20
 # SMART_MARKET execution algo (session-aware aggressive-mid).
 # RTH: reprice every N ms toward the far side (bid for SELL, ask for BUY)
 #      for `duration` seconds, then cross to MKT for any residual.

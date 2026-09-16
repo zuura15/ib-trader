@@ -1635,6 +1635,16 @@ class InsyncClient(IBClientBase):
                 for trade in open_trades
             ),
         )
+        def _cleanf(v: object) -> float | None:
+            """UNSET_DOUBLE-guarded float: IB uses ~1.8e308 for unset."""
+            try:
+                f = float(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+            if f == 0.0 or f > 1e300:
+                return None
+            return f
+
         result = []
         for trade in open_trades:
             status = trade.orderStatus.status
@@ -1676,6 +1686,25 @@ class InsyncClient(IBClientBase):
                     Decimal(str(trade.orderStatus.avgFillPrice))
                     if trade.orderStatus.avgFillPrice
                     else None
+                ),
+                # Contract + stop metadata for the orders:open IB-truth
+                # sweep and the chart order markers (#98). TRAIL surfaces
+                # the live trailStopPrice as IB walks it; STP/STP LMT
+                # carry the trigger in auxPrice.
+                "order_ref": getattr(trade.order, "orderRef", "") or "",
+                "sec_type": getattr(trade.contract, "secType", "") or "STK",
+                "con_id": int(getattr(trade.contract, "conId", 0) or 0),
+                "expiry": getattr(
+                    trade.contract, "lastTradeDateOrContractMonth", None,
+                ) or None,
+                "trading_class": getattr(trade.contract, "tradingClass", None) or None,
+                "multiplier": getattr(trade.contract, "multiplier", None) or None,
+                "stop_price": (
+                    _cleanf(getattr(trade.order, "trailStopPrice", None))
+                    or _cleanf(getattr(trade.order, "auxPrice", None))
+                ),
+                "trailing_percent": _cleanf(
+                    getattr(trade.order, "trailingPercent", None),
                 ),
             })
         return result
