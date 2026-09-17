@@ -186,7 +186,18 @@ interface Props {
    *  (lim / sl / trl). lightweight-charts renders the line + label
    *  only while the price is inside the visible range — exactly the
    *  wanted "marker when visible in frame" behavior. */
-  orderLines?: Array<{ price: number; label: string; side: 'BUY' | 'SELL' }>;
+  orderLines?: Array<{
+    price: number; label: string; side: 'BUY' | 'SELL';
+    /** Hash key (ib_order_id) — required for drag-to-amend. */
+    id?: string;
+    /** Whether the order can be price-amended from this session
+     *  (false for TRAIL and TWS-bound orders). */
+    draggable?: boolean;
+  }>;
+  /** Drag-to-amend callback (#99): fired when the user confirms a
+   *  dragged order label at its new tick-rounded price. Resolve true
+   *  on a successful backend amend; false reverts the line. */
+  onOrderAmend?: (id: string, price: number) => Promise<boolean>;
 }
 
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
@@ -213,6 +224,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     pickTickSize = 0.01,
     onLastPrice,
     orderLines,
+    onOrderAmend,
   }: Props,
   ref,
 ) {
@@ -636,16 +648,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // a short axis label (lim / sl / trl), side-colored like fills. The
   // series is replaced on a chartVersion bump, so recreate against the
   // current instance; cleanup removes every line so none stack.
-  const orderLinesApiRef = useRef<IPriceLine[]>([]);
+  const orderLinesApiRef = useRef<Map<string, IPriceLine>>(new Map());
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
     const colors = themeColors();
-    for (const ln of orderLines ?? []) {
+    for (const [i, ln] of (orderLines ?? []).entries()) {
       if (!Number.isFinite(ln.price) || ln.price <= 0) continue;
+      const key = ln.id ?? `i${i}`;
+      // A drag / confirm-chip in flight owns this line's price — honor
+      // it so the 5s orders poll doesn't snap the line back mid-gesture.
+      const flow = amendFlowRef.current;
+      const price = flow && flow.id === key ? flow.price : ln.price;
       try {
-        orderLinesApiRef.current.push(series.createPriceLine({
-          price: ln.price,
+        orderLinesApiRef.current.set(key, series.createPriceLine({
+          price,
           color: ln.side === 'BUY' ? colors.bullish : colors.bearish,
           lineWidth: 1,
           lineStyle: 2,          // dashed
@@ -655,12 +672,129 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       } catch { /* chart mid-teardown — next run re-attaches */ }
     }
     return () => {
-      for (const pl of orderLinesApiRef.current) {
+      for (const pl of orderLinesApiRef.current.values()) {
         try { series.removePriceLine(pl); } catch { /* torn down */ }
       }
-      orderLinesApiRef.current = [];
+      orderLinesApiRef.current = new Map();
     };
   }, [orderLines, chartVersion]);
+
+  // ── Drag-to-amend working orders (#99) ─────────────────────────────
+  // Grab handles sit at the right edge next to the axis labels (the
+  // line itself stays passive so chart pan/crosshair are untouched).
+  // Drag → line follows tick-rounded; drop → ✓/✕ confirm chip; ✓ sends
+  // the amend, ✕ or a 6s timeout reverts.
+  type AmendFlow = {
+    id: string; origPrice: number; price: number; y: number;
+    stage: 'drag' | 'confirm' | 'busy' | 'error';
+  };
+  const [amendFlow, setAmendFlow] = useState<AmendFlow | null>(null);
+  const amendFlowRef = useRef<AmendFlow | null>(null);
+  useEffect(() => { amendFlowRef.current = amendFlow; }, [amendFlow]);
+
+  const [orderHandles, setOrderHandles] = useState<Array<{
+    id: string; y: number; side: 'BUY' | 'SELL'; price: number; label: string;
+  }>>([]);
+  const hasDraggableOrders = !!onOrderAmend
+    && (orderLines ?? []).some((l) => l.id && l.draggable);
+  useEffect(() => {
+    if (!hasDraggableOrders) { setOrderHandles([]); return; }
+    const measure = () => {
+      const ser = seriesRef.current;
+      if (!ser) return;
+      const flow = amendFlowRef.current;
+      const hs: Array<{ id: string; y: number; side: 'BUY' | 'SELL';
+                        price: number; label: string }> = [];
+      for (const ln of orderLines ?? []) {
+        if (!ln.id || !ln.draggable) continue;
+        if (flow && flow.id === ln.id) continue;  // dragged handle renders from flow
+        const y = ser.priceToCoordinate(ln.price);
+        if (y == null || (y as number) < 0) continue;
+        if (stripGeom && (y as number) > stripGeom.height) continue;
+        hs.push({ id: ln.id, y: y as number, side: ln.side,
+                  price: ln.price, label: ln.label });
+      }
+      setOrderHandles((prev) =>
+        JSON.stringify(prev) === JSON.stringify(hs) ? prev : hs);
+    };
+    measure();
+    const t = window.setInterval(measure, 300);
+    return () => window.clearInterval(t);
+  }, [orderLines, hasDraggableOrders, chartVersion, stripGeom, amendFlow?.id]);
+
+  const revertAmendFlow = () => {
+    const f = amendFlowRef.current;
+    if (!f) return;
+    try {
+      orderLinesApiRef.current.get(f.id)?.applyOptions({ price: f.origPrice });
+    } catch { /* torn down */ }
+    setAmendFlow(null);
+  };
+
+  const confirmAmendFlow = async () => {
+    const f = amendFlowRef.current;
+    if (!f || f.stage !== 'confirm') return;
+    setAmendFlow({ ...f, stage: 'busy' });
+    let ok = false;
+    try { ok = (await onOrderAmend?.(f.id, f.price)) === true; } catch { ok = false; }
+    if (ok) {
+      setAmendFlow(null);          // line stays; next poll confirms from IB
+    } else {
+      try {
+        orderLinesApiRef.current.get(f.id)?.applyOptions({ price: f.origPrice });
+      } catch { /* torn down */ }
+      setAmendFlow({ ...f, stage: 'error' });
+      window.setTimeout(() => {
+        setAmendFlow((cur) =>
+          cur && cur.id === f.id && cur.stage === 'error' ? null : cur);
+      }, 2500);
+    }
+  };
+
+  // 6s unconfirmed-drop timeout.
+  useEffect(() => {
+    if (amendFlow?.stage !== 'confirm') return;
+    const t = window.setTimeout(revertAmendFlow, 6000);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [amendFlow?.stage, amendFlow?.id, amendFlow?.price]);
+
+  const startOrderDrag = (
+    h: { id: string; y: number; price: number }, e: React.MouseEvent,
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = containerRef.current;
+    if (!el || amendFlowRef.current) return;   // one gesture at a time
+    setAmendFlow({ id: h.id, origPrice: h.price, price: h.price,
+                   y: h.y, stage: 'drag' });
+    const move = (ev: MouseEvent) => {
+      const p = stripPriceAt(ev.clientY);
+      if (p == null) return;
+      const y = ev.clientY - el.getBoundingClientRect().top;
+      try {
+        orderLinesApiRef.current.get(h.id)?.applyOptions({ price: p });
+      } catch { /* torn down */ }
+      setAmendFlow((f) => (f && f.id === h.id ? { ...f, price: p, y } : f));
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      setAmendFlow((f) => {
+        if (!f || f.id !== h.id) return f;
+        if (Math.abs(f.price - f.origPrice) < pickTickSize / 2) {
+          try {
+            orderLinesApiRef.current.get(h.id)
+              ?.applyOptions({ price: f.origPrice });
+          } catch { /* torn down */ }
+          return null;               // no real move — treat as a slip
+        }
+        return { ...f, stage: 'confirm' };
+      });
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  };
 
   // ── Click-to-pick price strip ──────────────────────────────────────
   // A narrow band inside the chart hugging the price axis. Geometry
@@ -676,7 +810,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     { y: number; price: number } | null
   >(null);
   useEffect(() => {
-    if (!hasPricePick) { setStripGeom(null); return; }
+    if (!hasPricePick && !hasDraggableOrders) { setStripGeom(null); return; }
     const measure = () => {
       const chart = chartRef.current;
       const el = containerRef.current;
@@ -702,7 +836,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     measure();
     const id = window.setInterval(measure, 1000);
     return () => window.clearInterval(id);
-  }, [hasPricePick, chartVersion]);
+  }, [hasPricePick, hasDraggableOrders, chartVersion]);
 
   // Decimals implied by the tick (0.25 → 2, 0.1 → 1) so the hover tag
   // and the drafted command show the exchange's own price format.
@@ -2950,6 +3084,87 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                 {stripHover.price.toFixed(pickDecimals)}
               </div>
             </>
+          )}
+        </div>
+      )}
+      {stripGeom && onOrderAmend && orderHandles.map((h) => (
+        <div
+          key={h.id}
+          data-testid={`order-drag-handle-${h.id}`}
+          title={`drag to move ${h.label} @ ${h.price.toFixed(pickDecimals)}`}
+          onMouseDown={(e) => startOrderDrag(h, e)}
+          style={{
+            position: 'absolute',
+            right: stripGeom.right + 1,
+            top: h.y - 5,
+            width: 22,
+            height: 11,
+            zIndex: 22,
+            cursor: 'ns-resize',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: h.side === 'BUY'
+              ? 'rgba(22,163,74,0.85)' : 'rgba(220,38,38,0.85)',
+            color: '#fff', fontSize: 8, lineHeight: 1, letterSpacing: 0.5,
+            borderRadius: 3, userSelect: 'none',
+          }}
+        >
+          ≡
+        </div>
+      ))}
+      {stripGeom && amendFlow && (
+        <div
+          data-testid="order-amend-chip"
+          style={{
+            position: 'absolute',
+            right: stripGeom.right + 26,
+            top: amendFlow.y - 11,
+            zIndex: 30,
+            display: 'flex', alignItems: 'center', gap: 4,
+            fontFamily: 'ui-monospace, monospace',
+          }}
+        >
+          <span style={{
+            padding: '1px 5px', fontSize: 11, fontWeight: 700,
+            fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+            color: '#fff', borderRadius: 3,
+            background: amendFlow.stage === 'error'
+              ? 'var(--accent-red, #dc2626)' : 'var(--accent-blue, #3b82f6)',
+          }}>
+            {amendFlow.stage === 'error'
+              ? 'amend failed'
+              : amendFlow.price.toFixed(pickDecimals)}
+          </span>
+          {amendFlow.stage === 'confirm' && (
+            <>
+              <button
+                onClick={confirmAmendFlow}
+                title="Send amend to IB"
+                style={{
+                  width: 20, height: 20, border: 'none', borderRadius: 3,
+                  background: 'var(--accent-green, #16a34a)', color: '#fff',
+                  fontSize: 12, fontWeight: 700, cursor: 'pointer', padding: 0,
+                }}
+              >
+                ✓
+              </button>
+              <button
+                onClick={revertAmendFlow}
+                title="Revert"
+                style={{
+                  width: 20, height: 20, border: 'none', borderRadius: 3,
+                  background: 'var(--bg-secondary, #444)',
+                  color: 'var(--text-secondary, #ccc)',
+                  fontSize: 12, fontWeight: 700, cursor: 'pointer', padding: 0,
+                }}
+              >
+                ✕
+              </button>
+            </>
+          )}
+          {amendFlow.stage === 'busy' && (
+            <span style={{ fontSize: 11, color: 'var(--text-muted, #999)' }}>
+              …
+            </span>
           )}
         </div>
       )}

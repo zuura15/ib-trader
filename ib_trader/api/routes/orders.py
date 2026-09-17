@@ -58,6 +58,23 @@ async def get_order(ib_order_id: str, redis=Depends(get_redis)):
         raise HTTPException(status_code=500, detail="Corrupt order data") from e
 
 
+@router.post("/amend")
+async def amend_order(body: dict):
+    """Amend a working order's price — chart drag-to-move (#99). Proxy to engine."""
+    ib_order_id = str(body.get("ib_order_id") or "")
+    price = str(body.get("price") or "")
+    if not ib_order_id or not price:
+        raise HTTPException(status_code=422, detail="ib_order_id and price required")
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{_engine_url()}/engine/amend-order",
+            json={"ib_order_id": ib_order_id, "price": price},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return resp.json()
+
+
 @router.post("/cancel-by-symbol")
 async def cancel_by_symbol(body: dict):
     """Cancel every open IB order for a symbol — proxy to engine."""

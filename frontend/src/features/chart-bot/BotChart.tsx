@@ -84,9 +84,10 @@ export function BotChart({
   const [openOrders, setOpenOrders] = useState<Array<{
     id: string; side: string; qty: number; orderType: string;
     limitPrice: number | null; stopPrice: number | null;
-    trailingPercent: number | null;
+    trailingPercent: number | null; permId: string | null;
   }>>([]);
   const [ordersHover, setOrdersHover] = useState(false);
+  const [ordersPollNonce, setOrdersPollNonce] = useState(0);
   const lastOrdersSigRef = useRef<string>('[]');
   const refreshTick = useStore((st) => st.positionRefreshTick);
   const resyncToken = useStore((st) => st.resyncToken);
@@ -117,6 +118,7 @@ export function BotChart({
             stopPrice: o.stop_price != null ? Number(o.stop_price) : null,
             trailingPercent:
               o.trailing_percent != null ? Number(o.trailing_percent) : null,
+            permId: o.perm_id != null ? String(o.perm_id) : null,
           }));
         // Only commit on real change — otherwise every 5s poll would
         // recreate the chart's price lines (axis-label churn) and
@@ -131,13 +133,16 @@ export function BotChart({
     void load();
     const t = setInterval(load, 5000);
     return () => { cancelled = true; clearInterval(t); };
-  }, [symbol, refreshTick, resyncToken]);
+  }, [symbol, refreshTick, resyncToken, ordersPollNonce]);
 
   // Axis markers for SymbolChart: label by order kind — lim / sl / trl.
   // TRAIL uses IB's live trailStopPrice (the engine re-reads it on
   // every status event, so the marker walks with the trail).
   const orderLines = useMemo(() => {
-    const out: Array<{ price: number; label: string; side: 'BUY' | 'SELL' }> = [];
+    const out: Array<{
+      id: string; price: number; label: string;
+      side: 'BUY' | 'SELL'; draggable: boolean;
+    }> = [];
     for (const o of openOrders) {
       const type = o.orderType.toUpperCase();
       const isTrail = type.includes('TRAIL') || o.trailingPercent != null;
@@ -146,15 +151,38 @@ export function BotChart({
         ? (o.stopPrice ?? o.limitPrice)
         : (o.limitPrice ?? o.stopPrice);
       if (price == null || !Number.isFinite(price) || price <= 0) continue;
+      // A row keyed by its permId is a foreign/unbound order
+      // (TWS-placed or TWS-modified) — IB refuses amends from this
+      // session, so its handle is drag-locked. TRAIL is server-managed.
+      const foreign = o.permId != null && o.permId === o.id;
       out.push({
+        id: o.id,
         price,
         label: isTrail ? 'trl' : isStop ? 'sl' : type === 'LMT' ? 'lim'
           : type.toLowerCase() || '?',
         side: o.side === 'BUY' ? 'BUY' : 'SELL',
+        draggable: !isTrail && !foreign,
       });
     }
     return out;
   }, [openOrders]);
+
+  // Drag-to-amend (#99): confirm chip ✓ lands here. True → the chart
+  // keeps the moved line and the next poll re-syncs from IB truth.
+  const handleOrderAmend = async (id: string, price: number): Promise<boolean> => {
+    try {
+      const r = await fetch('/api/orders/amend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ib_order_id: id, price: String(price) }),
+      });
+      if (!r.ok) return false;
+      setOrdersPollNonce((n) => n + 1);   // immediate re-poll
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   // Price rendered at the contract's tick precision (0.25 → 2dp etc.).
   const priceDecimals = useMemo(() => {
@@ -785,6 +813,7 @@ export function BotChart({
           pickTickSize={pickTickSize}
           onLastPrice={setLastPrice}
           orderLines={orderLines}
+          onOrderAmend={handleOrderAmend}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

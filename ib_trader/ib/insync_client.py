@@ -1406,15 +1406,45 @@ class InsyncClient(IBClientBase):
         return ib_order_id
 
     async def amend_order(self, ib_order_id: str, new_price: Decimal) -> None:
-        """Amend an existing limit order to a new price in place."""
+        """Amend a working order's price in place.
+
+        LMT moves ``lmtPrice``; STP (and STP LMT) move the trigger
+        ``auxPrice``. TRAIL is server-managed and refuses. Orders bound
+        to another client (orderId=0 — TWS-placed/modified) refuse:
+        IB only accepts modifications from the owning client. #99
+        """
         await self._throttle()
         trade = self.__active_trades.get(ib_order_id)
+        if trade is None:
+            # Engine restarted, or the caller keys by permId (orders:open
+            # sweep rows) — find it in the live open-trades store.
+            for t in self.__ib.openTrades():
+                oid = str(t.order.orderId or "")
+                pid = str(getattr(t.order, "permId", 0) or "")
+                if ib_order_id in (oid, pid) and ib_order_id not in ("", "0"):
+                    trade = t
+                    break
         if trade is None:
             logger.warning(
                 '{"event": "ORDER_AMENDED", "warning": "trade not in active cache", '
                 '"ib_order_id": "%s"}', ib_order_id
             )
             return
+        otype = (trade.order.orderType or "").upper()
+        if "TRAIL" in otype:
+            raise RuntimeError(
+                "TRAIL orders are IB-server-managed — the trigger walks on "
+                "its own and cannot be price-amended",
+            )
+        if not trade.order.orderId:
+            logger.warning(
+                '{"event": "ORDER_AMEND_FOREIGN_UNSUPPORTED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            raise RuntimeError(
+                "IB rejects amends from a non-owning client — this order "
+                "is bound to another session (TWS); modify it there",
+            )
         # Wait for IB to acknowledge the order (assign permId) before amending.
         # Amending while still PendingSubmit causes error 103 (duplicate order id)
         # because IB hasn't recorded the order yet and treats the amendment as a
@@ -1430,7 +1460,13 @@ class InsyncClient(IBClientBase):
                 '"ib_order_id": "%s"}', ib_order_id
             )
             return
-        trade.order.lmtPrice = float(new_price)
+        if otype.startswith("STP"):
+            # Stop / stop-limit: the drag target is the TRIGGER.
+            trade.order.auxPrice = float(new_price)
+            if otype == "STP LMT":
+                trade.order.lmtPrice = float(new_price)
+        else:
+            trade.order.lmtPrice = float(new_price)
         trade.order.outsideRth = True  # ib_async resets this on TWS echo-back (GitHub #141)
         # Preserve includeOvernight + DAY tif on amendments during overnight.
         # STK only — IB rejects includeOvernight on FUT/OPT/FOP (error 10362).

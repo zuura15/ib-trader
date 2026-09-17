@@ -3,6 +3,29 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-17
+
+### Added
+- **Drag-to-move working orders on the chart (#99).** Each draggable
+  order line gets a grab handle at the price-axis edge (the line
+  itself stays passive so pan/crosshair are unaffected). Drag moves
+  the line tick-rounded; drop shows a ✓/✕ confirm chip (6s timeout
+  reverts); ✓ amends the order at IB via
+  ``/api/orders/amend`` → ``/engine/amend-order``. LMT amends
+  lmtPrice, STP amends the auxPrice trigger; TRAIL (server-managed)
+  and TWS-bound orders (IB refuses non-owning-client modifies) are
+  drag-locked. AMENDED transaction row for audit.
+
+### Fixed
+- **Working orders modified in TWS vanished from orders:open.** A TWS
+  replace re-binds the order to TWS's client, so it returns from
+  reqAllOpenOrders with orderId=0; the sweep skipped it and purged
+  its row. get_open_orders now binds this client's prior-session
+  orders (reqOpenOrders) and keys unbound orders by IB's stable
+  permId; the sweep migrates rows across re-keys; cancel_order falls
+  back to the live open-trades store and reports an honest failure
+  on truly foreign orders instead of a phantom CANCELLED.
+
 ## 2026-09-15
 
 ### Added

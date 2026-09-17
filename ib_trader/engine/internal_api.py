@@ -283,6 +283,89 @@ async def close_position(req: CloseRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+class AmendOrderRequest(BaseModel):
+    """Request body for amending a working order's price (#99)."""
+
+    ib_order_id: str = Field(description="Client orderId, or permId for sweep-keyed rows")
+    price: str = Field(description="New price as string (Decimal-safe); STP moves the trigger")
+
+
+@app.post("/engine/amend-order")
+async def amend_order_endpoint(req: AmendOrderRequest):
+    """Amend a working order to a new price — chart drag-to-move (#99).
+
+    LMT → lmtPrice, STP → auxPrice; TRAIL and foreign (TWS-bound)
+    orders are refused by the IB layer and surface as 409 here.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    from decimal import Decimal, InvalidOperation
+    try:
+        price = Decimal(req.price)
+    except InvalidOperation:
+        raise HTTPException(status_code=422, detail=f"invalid price: {req.price!r}")
+    if price <= 0:
+        raise HTTPException(status_code=422, detail="price must be positive")
+
+    # Locate the working order (audit detail + 404 for unknown ids).
+    row = None
+    try:
+        for o in await _ctx.ib.get_open_orders():
+            if req.ib_order_id in (
+                str(o.get("ib_order_id") or ""), str(o.get("perm_id") or ""),
+            ):
+                row = o
+                break
+    except Exception:
+        logger.exception('{"event": "AMEND_LOOKUP_FAILED"}')
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no working order {req.ib_order_id!r} at IB",
+        )
+
+    try:
+        await _ctx.ib.amend_order(req.ib_order_id, price)
+    except RuntimeError as e:
+        # TRAIL / foreign-client refusal — expected, user-actionable.
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        logger.exception('{"event": "AMEND_ORDER_FAILED", "ib_order_id": "%s"}', req.ib_order_id)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    # Observational audit row — never gates the amend (tenet).
+    try:
+        from datetime import datetime, timezone
+        from decimal import Decimal as _D
+        from ib_trader.data.models import TransactionAction
+        from ib_trader.engine.order import _write_txn
+        _write_txn(
+            _ctx, TransactionAction.AMENDED,
+            (row.get("local_symbol") or row.get("symbol") or "?"),
+            row.get("side") or "?",
+            row.get("order_type") or "?",
+            _D(str(row.get("qty") or "0")),
+            limit_price=price,
+            ib_order_id=int(req.ib_order_id) if req.ib_order_id.isdigit() else None,
+            ib_responded_at=datetime.now(timezone.utc),
+        )
+    except Exception:
+        logger.exception('{"event": "AMEND_TXN_WRITE_FAILED", "ib_order_id": "%s"}', req.ib_order_id)
+
+    if getattr(_ctx, "redis", None) is not None:
+        try:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(_ctx.redis, "orders")
+        except Exception:
+            logger.exception('{"event": "AMEND_ACTIVITY_PUBLISH_FAILED"}')
+
+    logger.info(
+        '{"event": "ORDER_AMEND_API", "ib_order_id": "%s", "price": "%s"}',
+        req.ib_order_id, price,
+    )
+    return {"status": "ok", "ib_order_id": req.ib_order_id, "price": str(price)}
+
+
 @app.post("/engine/cancel-by-symbol")
 async def cancel_by_symbol(req: dict):
     """Cancel every open IB order for a given symbol.
