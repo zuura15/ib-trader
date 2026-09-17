@@ -1460,11 +1460,35 @@ class InsyncClient(IBClientBase):
         await self._throttle()
         trade = self.__active_trades.get(ib_order_id)
         if trade is None:
+            # Not in this session's placement cache — engine restarted,
+            # or the caller keys by permId (orders:open sweep rows).
+            # Find it in the live open-trades store by either identity.
+            for t in self.__ib.openTrades():
+                oid = str(t.order.orderId or "")
+                pid = str(getattr(t.order, "permId", 0) or "")
+                if ib_order_id in (oid, pid) and ib_order_id not in ("", "0"):
+                    trade = t
+                    break
+        if trade is None:
             logger.warning(
                 '{"event": "ORDER_CANCELED", "warning": "trade not in active cache", '
                 '"ib_order_id": "%s"}', ib_order_id
             )
             return
+        if not trade.order.orderId:
+            # IB only accepts a cancel from the owning client. An
+            # unbound (orderId=0) order — TWS-placed or TWS-modified —
+            # cannot be cancelled from this session; raise so callers
+            # (close-symbol sweep) surface it instead of counting a
+            # phantom CANCELLED.
+            logger.warning(
+                '{"event": "ORDER_CANCEL_FOREIGN_UNSUPPORTED", "ib_order_id": "%s"}',
+                ib_order_id,
+            )
+            raise RuntimeError(
+                "IB rejects cancels from a non-owning client — this order "
+                "is bound to another session (TWS); cancel it there",
+            )
         # Skip if order is already in a terminal state — sending a cancel in that
         # case causes IB error 10147 "OrderId not found for cancellation".
         terminal = {"Cancelled", "Filled", "Inactive"}
@@ -1624,6 +1648,19 @@ class InsyncClient(IBClientBase):
         Filters out terminal statuses (Cancelled, Filled, Inactive) since
         IB keeps them in the open orders list until session reset.
         """
+        # Bind THIS client's orders from prior sessions first: after a
+        # reconnect reqOpenOrders re-delivers them with their real
+        # orderIds. Orders owned by another client — TWS-placed, or
+        # TWS-MODIFIED (a replace re-binds ownership to TWS; observed
+        # live 2026-09-17 on a resting MNQZ6 stop) — still arrive from
+        # reqAllOpenOrders with orderId=0 and are keyed by permId below.
+        await self._throttle()
+        try:
+            await self.__ib.reqOpenOrdersAsync()
+        except Exception as e:
+            logger.warning(
+                '{"event": "REQ_OPEN_ORDERS_BIND_FAILED", "error": "%s"}', str(e),
+            )
         await self._throttle()
         open_trades = await self.__ib.reqAllOpenOrdersAsync()
         logger.debug(
@@ -1666,8 +1703,15 @@ class InsyncClient(IBClientBase):
                 )
             except (TypeError, ValueError, ArithmeticError):
                 limit_price = None
+            oid_int = int(trade.order.orderId or 0)
+            perm_id = int(getattr(trade.order, "permId", 0) or 0)
+            if not oid_int and not perm_id:
+                continue  # nothing stable to key on
             result.append({
-                "ib_order_id": str(trade.order.orderId),
+                # Stable key: client orderId when bound; else IB's
+                # session-stable permId (foreign / unbound orders).
+                "ib_order_id": str(oid_int or perm_id),
+                "perm_id": perm_id or None,
                 "symbol": trade.contract.symbol,
                 # localSymbol is authoritative for the contract month
                 # (GCV6 vs root GC) — the close-by-ticker sweep matches
@@ -1707,7 +1751,25 @@ class InsyncClient(IBClientBase):
                     getattr(trade.order, "trailingPercent", None),
                 ),
             })
-        return result
+        # The same order can appear twice across the bind + all-clients
+        # snapshots (bound with its orderId, and foreign with 0). Keep
+        # one row per permId, preferring the bound copy.
+        seen_perm: dict[int, dict] = {}
+        deduped: list[dict] = []
+        for row in result:
+            pid = row.get("perm_id")
+            if not pid:
+                deduped.append(row)
+                continue
+            prior = seen_perm.get(pid)
+            if prior is None:
+                seen_perm[pid] = row
+                deduped.append(row)
+            elif (str(prior["ib_order_id"]) == str(pid)
+                  and str(row["ib_order_id"]) != str(pid)):
+                prior.clear()
+                prior.update(row)  # replace foreign copy with bound copy
+        return deduped
 
     async def req_recent_executions(self, lookback_hours: float) -> list[dict]:
         """Account-wide executions over the last ``lookback_hours``.

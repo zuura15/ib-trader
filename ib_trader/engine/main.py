@@ -956,6 +956,19 @@ async def sync_orders_open_from_ib(ctx: AppContext, redis) -> tuple[int, int]:
             return None
         return f if 0 < f < 1e300 else None
 
+    # permId → hash-key map for cross-session identity. After an engine
+    # restart IB can deliver the same working order under a different —
+    # or zero — client orderId (observed live 2026-09-17: a resting
+    # MNQZ6 stop came back as id 0 and the sweep purged its row).
+    # permId is IB's stable order identity; when a live order matches
+    # an existing row's perm_id under a different key, migrate the row
+    # instead of duplicating + purging.
+    perm_to_key: dict[str, str] = {}
+    for k2, v2 in existing.items():
+        pid = v2.get("perm_id")
+        if pid:
+            perm_to_key[str(pid)] = k2
+
     upserts = 0
     seen: set[str] = set()
     for o in ib_orders:
@@ -964,7 +977,15 @@ async def sync_orders_open_from_ib(ctx: AppContext, redis) -> tuple[int, int]:
         if not oid or oid == "0" or not sym:
             continue
         seen.add(oid)
-        prev = existing.get(oid) or {}
+        pid = o.get("perm_id")
+        old_key = perm_to_key.get(str(pid)) if pid else None
+        if old_key and old_key != oid:
+            # Same order, new key (restart re-bind) — carry the old
+            # row's enrichment over and drop the stale key.
+            prev = existing.pop(old_key, None) or {}
+            await redis.hdel(key, old_key)
+        else:
+            prev = existing.get(oid) or {}
         # Merge over the event-path row so enrichment keys it added
         # (orderRef, fill telemetry) survive; IB values win.
         row = dict(prev)
@@ -1005,6 +1026,8 @@ async def sync_orders_open_from_ib(ctx: AppContext, redis) -> tuple[int, int]:
             "ts": row.get("ts") or datetime.now(timezone.utc).isoformat(),
         })
         row.setdefault("orderRef", o.get("order_ref") or "")
+        if pid:
+            row["perm_id"] = pid
         if row != prev:
             await redis.hset(key, oid, _json.dumps(row))
             upserts += 1

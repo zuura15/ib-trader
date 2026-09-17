@@ -117,6 +117,33 @@ class TestOrdersOpenSync:
         assert r.h == {}
 
     @pytest.mark.asyncio
+    async def test_permid_rekey_migrates_row(self):
+        # Restart / TWS-modify re-bind: same working order returns under
+        # a different key (permId) — the old row must migrate, keeping
+        # event-path enrichment, with no duplicate and no zombie purge.
+        prev = json.dumps({
+            "ib_order_id": "198019", "symbol": "MNQZ6", "side": "BUY",
+            "status": "PreSubmitted", "perm_id": 1647017791,
+            "orderRef": "IBT:console:MNQZ6:BUY:12",
+            "ts": "2026-09-17T04:47:10+00:00",
+        })
+        r = FakeRedis({"198019": prev})
+        row_ib = {
+            **_ib_stop_row(oid="1647017791", local="MNQZ6"),
+            "perm_id": 1647017791,
+        }
+        upserts, removals = await sync_orders_open_from_ib(_ctx([row_ib]), r)
+        assert upserts == 1
+        assert removals == 0                  # migration, not purge
+        assert "198019" not in r.h
+        assert set(r.h) == {"1647017791"}     # exactly one row
+        row = json.loads(r.h["1647017791"])
+        assert row["orderRef"] == "IBT:console:MNQZ6:BUY:12"
+        assert row["ts"] == "2026-09-17T04:47:10+00:00"
+        assert row["perm_id"] == 1647017791
+        assert row["stop_price"] == 4300.0
+
+    @pytest.mark.asyncio
     async def test_empty_ib_clears_hash(self):
         r = FakeRedis({"1": json.dumps({"ib_order_id": "1", "symbol": "X"})})
         upserts, removals = await sync_orders_open_from_ib(_ctx([]), r)
