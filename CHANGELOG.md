@@ -5,6 +5,16 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-09-17
 
+### Fixed (later)
+- **Phantom stop line after cancelling an order in TWS.** The IB
+  Gateway session never receives cancels for orders owned by another
+  client, so a TWS-cancelled order is re-reported as open
+  ("PreSubmitted", orderId 0) in every reqAllOpenOrders snapshot —
+  the sweep faithfully kept it in orders:open and the chart kept
+  drawing its sl marker. get_open_orders now cross-checks
+  reqCompletedOrders (authoritative account-wide): any permId that
+  appears among completed orders is filtered as a Gateway ghost.
+
 ### Added
 - **Drag-to-move working orders on the chart (#99).** Each draggable
   order line gets a grab handle at the price-axis edge (the line

@@ -1699,6 +1699,26 @@ class InsyncClient(IBClientBase):
             )
         await self._throttle()
         open_trades = await self.__ib.reqAllOpenOrdersAsync()
+        # Gateway staleness cross-check (#98): the Gateway session never
+        # receives cancels for orders it doesn't own, so an order
+        # cancelled from ANOTHER client (TWS) keeps being re-reported
+        # here as open with a non-terminal status (observed live
+        # 2026-09-17: a TWS-cancelled MNQZ6 stop stayed "PreSubmitted"
+        # in every snapshot for hours). Completed orders are
+        # authoritative — any permId that shows up there is done,
+        # whatever the open-orders snapshot claims.
+        completed_perms: set[int] = set()
+        await self._throttle()
+        try:
+            completed = await self.__ib.reqCompletedOrdersAsync(apiOnly=False)
+            for t in completed:
+                pid = int(getattr(t.order, "permId", 0) or 0)
+                if pid:
+                    completed_perms.add(pid)
+        except Exception as e:
+            logger.warning(
+                '{"event": "REQ_COMPLETED_ORDERS_FAILED", "error": "%s"}', str(e),
+            )
         logger.debug(
             '{"event": "OPEN_ORDERS_RAW", "count": %d, "orders": [%s]}',
             len(open_trades),
@@ -1743,6 +1763,12 @@ class InsyncClient(IBClientBase):
             perm_id = int(getattr(trade.order, "permId", 0) or 0)
             if not oid_int and not perm_id:
                 continue  # nothing stable to key on
+            if perm_id and perm_id in completed_perms:
+                logger.debug(
+                    '{"event": "OPEN_ORDER_GHOST_FILTERED", "perm_id": %d, '
+                    '"symbol": "%s"}', perm_id, trade.contract.symbol,
+                )
+                continue  # cancelled/filled at IB — Gateway ghost
             result.append({
                 # Stable key: client orderId when bound; else IB's
                 # session-stable permId (foreign / unbound orders).
