@@ -87,6 +87,56 @@ export function BotChart({
     trailingPercent: number | null; permId: string | null;
   }>>([]);
   const [ordersHover, setOrdersHover] = useState(false);
+  const [ordersPollNonce, setOrdersPollNonce] = useState(0);
+  const lastOrdersSigRef = useRef<string>('[]');
+  const refreshTick = useStore((st) => st.positionRefreshTick);
+  const resyncToken = useStore((st) => st.resyncToken);
+
+  // Open-orders poll (#98) — restored 2026-09-21: the Direction-Lab
+  // chip removal accidentally cut this whole block, which blanked
+  // every order line/dot on the charts. 5s cadence + command
+  // completion + resync + post-amend nonce.
+  useEffect(() => {
+    if (!symbol) { setOpenOrders([]); return; }
+    let cancelled = false;
+    const TERMINAL = new Set(
+      ['filled', 'cancelled', 'canceled', 'abandoned', 'rejected', 'error'],
+    );
+    const load = async () => {
+      try {
+        const r = await fetch('/api/orders');
+        if (!r.ok) return;
+        const rows = await r.json();
+        if (cancelled || !Array.isArray(rows)) return;
+        const sym = symbol.toUpperCase();
+        const next = rows
+          .filter((o: any) =>
+            String(o.symbol ?? '').toUpperCase() === sym
+            && !TERMINAL.has(String(o.status ?? '').toLowerCase()))
+          .map((o: any) => ({
+            id: String(o.ib_order_id ?? ''),
+            side: String(o.side ?? '').toUpperCase(),
+            qty: Number(o.target_qty ?? 0),
+            orderType: String(o.order_type ?? ''),
+            limitPrice: o.limit_price != null ? Number(o.limit_price) : null,
+            stopPrice: o.stop_price != null ? Number(o.stop_price) : null,
+            trailingPercent:
+              o.trailing_percent != null ? Number(o.trailing_percent) : null,
+            permId: o.perm_id != null ? String(o.perm_id) : null,
+          }));
+        // Only commit on real change — otherwise every 5s poll would
+        // recreate the chart's price lines (axis-label churn).
+        const sig = JSON.stringify(next);
+        if (sig !== lastOrdersSigRef.current) {
+          lastOrdersSigRef.current = sig;
+          setOpenOrders(next);
+        }
+      } catch { /* transient — keep last good list */ }
+    };
+    void load();
+    const t = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [symbol, refreshTick, resyncToken, ordersPollNonce]);
 
   // Axis markers for SymbolChart: label by order kind — lim / sl / trl.
   // TRAIL uses IB's live trailStopPrice (the engine re-reads it on
