@@ -3,6 +3,16 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-20
+
+### Removed
+- **Expired futures cleanup.** Sep Nasdaq charts (MNQU6 slot 3, NQU6
+  slot 4 — last traded 2026-09-18) deleted: bot YAMLs, desktop/mobile
+  tabs, and persisted-layout pruning via REMOVED_CHART_SLOTS; the
+  CLV6 / NQZ6 / MNQZ6 layout migrations re-anchored off the retired
+  slots. Expired MGCQ6 removed from the live watchlist (API PUT).
+  CLV6 (last trade ~2026-09-22) kept — roll to CLX6 imminent.
+
 ## 2026-09-17
 
 ### Fixed (later)

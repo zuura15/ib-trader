@@ -103,29 +103,29 @@ const MIGRATED_TABS: Array<{
   // Stacked-charts panel — anchor next to Bot Log so persisted layouts
   // still pick it up in the right column.
   { component: 'stacked-charts', name: 'Stacked Charts', anchor: 'bot-log' },
-  // Slot 5 chart (CLV6 since 2026-09-02, previously ESU6) — inject
-  // next to the MNQU6 chart (slot 3) for users whose persisted layout
-  // predates it. Matched by slot so existing chart-bot tabs don't
-  // mask it.
+  // Slot 5 chart (CLV6 since 2026-09-02, previously ESU6) — anchored
+  // on Gold (slot 1) since 2026-09-20: its old anchor (Sep MNQ, slot 3)
+  // is pruned as expired, and prune runs before injection. Matched by
+  // slot so existing chart-bot tabs don't mask it.
   {
     component: 'chart-bot', name: 'CLV6', anchor: 'chart-bot',
-    config: { slot: 5 }, slot: 5, anchorSlot: 3,
+    config: { slot: 5 }, slot: 5, anchorSlot: 1,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
   {
     component: 'chart-bot', name: 'MGCV6', anchor: 'chart-bot',
     config: { slot: 7 }, slot: 7, anchorSlot: 1,
   },
-  // Dec Nasdaq (slot 8) — inject next to the Sep NQ chart (slot 4);
-  // both live through the Sep→Dec roll week (added 2026-09-13).
+  // Dec Nasdaq (slot 8) — re-anchored on CLV6 (slot 5, present or
+  // injected just above) after the Sep NQ anchor expired 2026-09-18.
   {
     component: 'chart-bot', name: 'NQZ6', anchor: 'chart-bot',
-    config: { slot: 8 }, slot: 8, anchorSlot: 4,
+    config: { slot: 8 }, slot: 8, anchorSlot: 5,
   },
-  // Dec Micro Nasdaq (slot 9) — inject next to the Sep MNQ chart (slot 3).
+  // Dec Micro Nasdaq (slot 9) — anchored on its Dec sibling (slot 8).
   {
     component: 'chart-bot', name: 'MNQZ6', anchor: 'chart-bot',
-    config: { slot: 9 }, slot: 9, anchorSlot: 3,
+    config: { slot: 9 }, slot: 9, anchorSlot: 8,
   },
 ];
 
@@ -138,6 +138,8 @@ const REMOVED_CHART_SLOTS = new Set<number>([
   2,  // WTI Crude — dropped 2026-07-21 with the CL chart removal.
   6,  // Micro S&P — dropped 2026-09-02 with the ES charts (slot 5
       // repurposed ESU6 → CLV6).
+  3,  // Sep Micro NQ (MNQU6) — expired 2026-09-18; Dec pair remains.
+  4,  // Sep NQ (NQU6) — expired 2026-09-18.
 ]);
 
 function migrateLayoutJson(raw: any): any {

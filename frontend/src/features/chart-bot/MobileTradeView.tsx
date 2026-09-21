@@ -22,7 +22,7 @@ import { useStore } from '../../data/store';
  */
 
 type TopTab = 'gold' | 'mgc' | 'console' | 'positions';
-type BottomTab = 'nasdaq' | 'micro' | 'nqz' | 'mnqz' | 'wti';
+type BottomTab = 'nqz' | 'mnqz' | 'wti';
 
 function SubTabBar<T extends string>({
   tabs, active, onSelect,
@@ -102,7 +102,7 @@ function Pane({ visible, children }: { visible: boolean; children: ReactNode }) 
 
 export function MobileTradeView() {
   const [top, setTop] = useState<TopTab>('gold');
-  const [bottom, setBottom] = useState<BottomTab>('nasdaq');
+  const [bottom, setBottom] = useState<BottomTab>('nqz');
   // Live slot → symbol so each chart tab shows its actual contract and
   // follows rolls; falls back to a plain label until the map loads.
   const sym = useChartBotSymbols();
@@ -151,26 +151,19 @@ export function MobileTradeView() {
 
       <div style={{ height: 1, background: 'var(--border-default)', flexShrink: 0 }} />
 
-      {/* Bottom row — Nasdaq + Micro NQ + WTI Crude. */}
+      {/* Bottom row — Dec Nasdaq pair + WTI Crude. Sep contracts
+          (slots 3/4) removed 2026-09-20 after the 9/18 expiry. */}
       <div className="flex flex-col" style={{ flex: 1, minHeight: 0 }}>
         <SubTabBar<BottomTab>
           tabs={[
-            { id: 'nasdaq', label: sym[4] ?? 'Nasdaq' },
-            { id: 'micro', label: sym[3] ?? 'Micro NQ' },
-            { id: 'nqz', label: sym[8] ?? 'NQ Dec' },
-            { id: 'mnqz', label: sym[9] ?? 'MNQ Dec' },
+            { id: 'nqz', label: sym[8] ?? 'Nasdaq' },
+            { id: 'mnqz', label: sym[9] ?? 'Micro NQ' },
             { id: 'wti', label: sym[5] ?? 'WTI' },
           ]}
           active={bottom}
           onSelect={setBottom}
         />
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          <Pane visible={bottom === 'nasdaq'}>
-            <ChartBotPane slot={4} compact />
-          </Pane>
-          <Pane visible={bottom === 'micro'}>
-            <ChartBotPane slot={3} compact />
-          </Pane>
           <Pane visible={bottom === 'nqz'}>
             <ChartBotPane slot={8} compact />
           </Pane>

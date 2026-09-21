@@ -72,14 +72,15 @@ class TestChartAnchors:
         # Reads the real config/bots/*.yaml — chart contracts must appear.
         syms = wr.chart_anchor_symbols()
         assert isinstance(syms, list)
-        # GCV6 / NQU6 / MGCV6 / CLV6 are current chart-bot symbols
-        # (chart-bot-1 / -4 / -7 / -5). ES charts dropped 2026-09-02.
+        # GCV6 / MGCV6 / CLV6 / NQZ6 / MNQZ6 are current chart-bot
+        # symbols (chart-bot-1 / -7 / -5 / -8 / -9).
         assert "GCV6" in syms
-        assert "NQU6" in syms
         assert "MGCV6" in syms
         assert "CLV6" in syms
-        # Dec Nasdaq pair added 2026-09-13 alongside the Sep contracts.
         assert "NQZ6" in syms
         assert "MNQZ6" in syms
+        # Sep Nasdaq pair removed 2026-09-20 after the 9/18 expiry;
+        # ES charts dropped 2026-09-02.
+        assert "NQU6" not in syms
+        assert "MNQU6" not in syms
         assert "ESU6" not in syms
-        assert "MESU6" not in syms
