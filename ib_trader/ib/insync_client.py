@@ -387,6 +387,21 @@ class InsyncClient(IBClientBase):
             clientId=self._client_id,
             timeout=self._connect_timeout,
         )
+        # Client 0 auto-bind (#100 follow-up): orders owned by TWS —
+        # placed there, or API orders the operator modified there —
+        # get real API order ids assigned, which makes them modifiable
+        # from this session (drag-to-amend on TWS-managed stops).
+        # Client-0-only per IB; re-applied on every reconnect since
+        # binding is session-scoped.
+        if self._client_id == 0:
+            try:
+                self.__ib.reqAutoOpenOrders(True)
+                logger.info('{"event": "AUTO_OPEN_ORDERS_BIND", "client_id": 0}')
+            except Exception as e:
+                logger.warning(
+                    '{"event": "AUTO_OPEN_ORDERS_BIND_FAILED", "error": "%s"}',
+                    str(e),
+                )
         # Bind ib_async events exactly once per process. Re-calling
         # ``connect()`` after an unexpected drop (the engine's reconnect
         # loop) would otherwise stack a duplicate handler each cycle.
