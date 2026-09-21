@@ -1091,15 +1091,12 @@ async def _direction_callout_loop(ctx: AppContext) -> None:
     sample_s = float(ctx.settings.get("direction_sample_seconds", 2))
     lookback_s = float(ctx.settings.get("direction_lookback_minutes", 30)) * 60
     flat_tpm = float(ctx.settings.get("direction_flat_ticks_per_min", 0.5))
-    bar_s = int(ctx.settings.get("direction_llm_bar_seconds", 180))
-    grok_key = os.environ.get("XAI_API_KEY", "")
-    grok_base = str(ctx.settings.get("direction_grok_base_url", "https://api.x.ai/v1"))
-    grok_model = str(ctx.settings.get("direction_grok_model", "grok-4-fast"))
-    jev_key = os.environ.get("JEV_API_KEY", "")
-    jev_base = str(ctx.settings.get("direction_jev_base_url", "") or "")
-    jev_model = str(ctx.settings.get("direction_jev_model", "") or "")
-    grok_on = bool(grok_key)
-    jev_on = bool(jev_key and jev_base and jev_model)
+    grok_on = bool(os.environ.get("XAI_API_KEY", ""))
+    jev_on = bool(
+        os.environ.get("JEV_API_KEY", "")
+        and ctx.settings.get("direction_jev_base_url")
+        and ctx.settings.get("direction_jev_model")
+    )
     if not grok_on:
         logger.warning('{"event": "DIRECTION_PROVIDER_OFF", "provider": "grok", '
                        '"reason": "XAI_API_KEY not set"}')
@@ -1127,36 +1124,19 @@ async def _direction_callout_loop(ctx: AppContext) -> None:
             await asyncio.sleep(15)
 
     samples: dict[str, deque] = {sym: deque() for sym in symbols}
-    provider_state: dict[str, dict] = {
-        sym: {
-            "grok": {"status": "warmup" if grok_on else "off"},
-            "jev": {"status": "warmup" if jev_on else "off"},
-            "last_bucket": 0,
-        }
+    # Shared with /engine/direction/compute (#100 iteration 2 — the
+    # Direction Lab button): the endpoint reads the live sample buffer
+    # and records its last LLM verdicts here so the loop keeps
+    # republishing them between invocations. LLM providers are ONLY
+    # called from the button path now — the loop itself never spends.
+    ctx._direction_samples = samples
+    ctx._direction_contracts = contracts
+    last_llm: dict[str, dict] = {
+        sym: {"grok": {"status": "idle" if grok_on else "off"},
+              "jev": {"status": "idle" if jev_on else "off"}}
         for sym in symbols
     }
-
-    async def _ask(sym: str, st: dict, provider: str, base: str, key: str,
-                   model: str, sys_p: str, user_p: str) -> None:
-        try:
-            ans = await dsig.query_openai_compatible(
-                base, key, model, sys_p, user_p, timeout=8.0)
-            d = dsig.parse_llm_answer(ans)
-            st[provider] = {
-                "status": "ok" if d else "unparsed",
-                "dir": d or "FLAT",
-                "asof": datetime.now(timezone.utc).isoformat(),
-            }
-        except Exception:
-            # Provider outage is advisory-path only; ERROR w/ stack per
-            # the no-silent-except tenet, no alert (not broker-facing).
-            logger.exception(
-                '{"event": "DIRECTION_LLM_FAILED", "provider": "%s", '
-                '"symbol": "%s"}', provider, sym)
-            st[provider] = {
-                "status": "err",
-                "asof": datetime.now(timezone.utc).isoformat(),
-            }
+    ctx._direction_last_llm = last_llm
 
     while True:
         try:
@@ -1179,31 +1159,11 @@ async def _direction_callout_loop(ctx: AppContext) -> None:
                 local = dsig.compute_local_direction(
                     list(dq), tick_size=tick_size, flat_ticks_per_min=flat_tpm)
 
-                st = provider_state[sym]
-                cur_bucket = int(wall // bar_s)
-                if (px and cur_bucket != st["last_bucket"]
-                        and len(dq) >= 60 and (grok_on or jev_on)):
-                    st["last_bucket"] = cur_bucket
-                    closes = dsig.bucket_closes(
-                        list(dq), bucket_seconds=bar_s, max_buckets=40)
-                    if closes:
-                        sys_p, user_p = dsig.build_llm_prompt(
-                            sym, closes, float(px), bar_seconds=bar_s)
-                        calls = []
-                        if grok_on:
-                            calls.append(_ask(sym, st, "grok", grok_base,
-                                              grok_key, grok_model, sys_p, user_p))
-                        if jev_on:
-                            calls.append(_ask(sym, st, "jev", jev_base,
-                                              jev_key, jev_model, sys_p, user_p))
-                        if calls:
-                            await asyncio.gather(*calls)
-
                 payload = {
                     "symbol": sym,
                     "local": local,
-                    "grok": st["grok"],
-                    "jev": st["jev"],
+                    "grok": last_llm[sym]["grok"],
+                    "jev": last_llm[sym]["jev"],
                     "asof": datetime.now(timezone.utc).isoformat(),
                 }
                 await redis.set(

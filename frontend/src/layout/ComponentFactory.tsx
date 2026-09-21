@@ -18,6 +18,7 @@ import { ChartPane } from '../features/chart/ChartPane';
 import { StackedChartsPane } from '../features/chart/StackedChartsPane';
 import { ChartBotPane } from '../features/chart-bot/ChartBotPane';
 import { AuditFeedPane } from '../features/audit-feed/AuditFeedPane';
+import { DirectionLabPanel } from '../features/direction/DirectionLabPanel';
 import { ErrorBoundary } from '../app/ErrorBoundary';
 
 function buildComponent(node: TabNode): ReactElement {
@@ -61,6 +62,8 @@ function buildComponent(node: TabNode): ReactElement {
       return <StackedChartsPane />;
     case 'chart-bot':
       return <ChartBotPane slot={Number(config.slot) || 1} />;
+    case 'direction-lab':
+      return <DirectionLabPanel />;
     case 'audit-feed':
       return <AuditFeedPane />;
     default:

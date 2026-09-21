@@ -283,6 +283,7 @@ export const variantT: IJsonModel = {
               { type: 'tab', name: 'Logs', component: 'logs' },
               { type: 'tab', name: 'Errors', component: 'errors' },
               { type: 'tab', name: 'Bots', component: 'bots' },
+              { type: 'tab', name: 'Direction Lab', component: 'direction-lab' },
             ],
           },
         ],

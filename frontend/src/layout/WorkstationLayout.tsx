@@ -103,6 +103,9 @@ const MIGRATED_TABS: Array<{
   // Stacked-charts panel — anchor next to Bot Log so persisted layouts
   // still pick it up in the right column.
   { component: 'stacked-charts', name: 'Stacked Charts', anchor: 'bot-log' },
+  // Direction Lab (#100) — isolated playground tab; anchor on Bots
+  // (present in the variant-T stash tabset and most others).
+  { component: 'direction-lab', name: 'Direction Lab', anchor: 'bots' },
   // Slot 5 chart (CLV6 since 2026-09-02, previously ESU6) — anchored
   // on Gold (slot 1) since 2026-09-20: its old anchor (Sep MNQ, slot 3)
   // is pruned as expired, and prune runs before injection. Matched by

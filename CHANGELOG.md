@@ -3,6 +3,19 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-21
+
+### Changed
+- **Direction callout moved to a dedicated Direction Lab tab (#100
+  iteration 2).** The always-on chart-header chips are gone; a new
+  "Direction Lab" tab (variant T stash tabset + layout migration)
+  carries a Compute button that POSTs /api/direction/compute →
+  /engine/direction/compute. The engine keeps only the free local
+  sampling loop; LLM tokens are spent ONLY on button press. Each run
+  shows LOC (slope + accel), GROK and JEV verdicts with raw reply,
+  per-provider latency and the exact prompt sent — built for
+  iterating without touching the trading panes.
+
 ## 2026-09-20
 
 ### Added

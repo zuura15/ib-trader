@@ -283,6 +283,116 @@ async def close_position(req: CloseRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+class DirectionComputeRequest(BaseModel):
+    """Request body for a button-invoked direction computation (#100)."""
+
+    symbol: str = Field(description="Symbol with a live sample buffer (direction_symbols)")
+
+
+@app.post("/engine/direction/compute")
+async def direction_compute(req: DirectionComputeRequest):
+    """On-demand directional callout: local slope/curvature from the
+    live sample buffer plus one LLM round per configured provider.
+    Only path that spends LLM tokens — the sampling loop never does.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    import os
+    import time as _time
+    import json as _json
+    from datetime import datetime, timezone
+    from ib_trader.signals import direction as dsig
+
+    sym = req.symbol.upper()
+    buffers = getattr(_ctx, "_direction_samples", None) or {}
+    if sym not in buffers:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"no live sample buffer for {sym!r} — add it to "
+                    "direction_symbols in settings.yaml and restart the engine"),
+        )
+    samples = list(buffers[sym])
+    info = (getattr(_ctx, "_direction_contracts", None) or {}).get(sym) or {}
+    tick_size = float(info.get("tick_size") or 0.01)
+    flat_tpm = float(_ctx.settings.get("direction_flat_ticks_per_min", 0.5))
+    bar_s = int(_ctx.settings.get("direction_llm_bar_seconds", 180))
+
+    local = dsig.compute_local_direction(
+        samples, tick_size=tick_size, flat_ticks_per_min=flat_tpm)
+    closes = dsig.bucket_closes(samples, bucket_seconds=bar_s, max_buckets=40)
+    last_px = samples[-1][1] if samples else None
+
+    providers: list[tuple[str, str, str, str]] = []
+    grok_key = os.environ.get("XAI_API_KEY", "")
+    if grok_key:
+        providers.append((
+            "grok",
+            str(_ctx.settings.get("direction_grok_base_url", "https://api.x.ai/v1")),
+            grok_key,
+            str(_ctx.settings.get("direction_grok_model", "grok-4-fast")),
+        ))
+    jev_key = os.environ.get("JEV_API_KEY", "")
+    jev_base = str(_ctx.settings.get("direction_jev_base_url", "") or "")
+    jev_model = str(_ctx.settings.get("direction_jev_model", "") or "")
+    if jev_key and jev_base and jev_model:
+        providers.append(("jev", jev_base, jev_key, jev_model))
+
+    results: dict[str, dict] = {"grok": {"status": "off"}, "jev": {"status": "off"}}
+    prompt_user: str | None = None
+    if providers and closes and last_px is not None:
+        sys_p, prompt_user = dsig.build_llm_prompt(
+            sym, closes, float(last_px), bar_seconds=bar_s)
+
+        async def _ask(name: str, base: str, key: str, model: str) -> None:
+            t0 = _time.monotonic()
+            try:
+                raw = await dsig.query_openai_compatible(
+                    base, key, model, sys_p, prompt_user, timeout=10.0)
+                d = dsig.parse_llm_answer(raw)
+                results[name] = {
+                    "status": "ok" if d else "unparsed",
+                    "dir": d or "FLAT",
+                    "raw": raw.strip()[:120],
+                    "ms": int((_time.monotonic() - t0) * 1000),
+                    "model": model,
+                    "asof": datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception as e:
+                logger.exception(
+                    '{"event": "DIRECTION_LLM_FAILED", "provider": "%s", '
+                    '"symbol": "%s"}', name, sym)
+                results[name] = {
+                    "status": "err",
+                    "error": str(e)[:200],
+                    "ms": int((_time.monotonic() - t0) * 1000),
+                }
+        await asyncio.gather(*(_ask(*p) for p in providers))
+    elif providers:
+        for name, *_ in providers:
+            results[name] = {"status": "warmup"}
+
+    # Keep the sampling loop republishing this verdict between clicks.
+    last_llm = getattr(_ctx, "_direction_last_llm", None)
+    if last_llm and sym in last_llm:
+        last_llm[sym]["grok"] = results["grok"]
+        last_llm[sym]["jev"] = results["jev"]
+    if getattr(_ctx, "redis", None) is not None:
+        try:
+            from ib_trader.redis.state import StateKeys
+            await _ctx.redis.set(
+                StateKeys.direction_callout(sym),
+                _json.dumps({"symbol": sym, "local": local,
+                             "grok": results["grok"], "jev": results["jev"],
+                             "asof": datetime.now(timezone.utc).isoformat()}),
+            )
+        except Exception:
+            logger.exception('{"event": "DIRECTION_PUBLISH_FAILED"}')
+
+    return {"symbol": sym, "local": local, "grok": results["grok"],
+            "jev": results["jev"], "prompt": prompt_user,
+            "closes": len(closes), "samples": len(samples)}
+
+
 class AmendOrderRequest(BaseModel):
     """Request body for amending a working order's price (#99)."""
 
