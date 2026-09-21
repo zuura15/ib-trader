@@ -154,6 +154,11 @@ class StateKeys:
     # ---- Live-state hashes (replace SQLite reads for UI) ----
 
     @staticmethod
+    def direction_callout(symbol: str) -> str:
+        """Directional callout payload (#100) for one chart symbol."""
+        return f"direction:callout:{symbol.upper()}"
+
+    @staticmethod
     def orders_open() -> str:
         """Redis hash: currently open orders keyed by ib_order_id."""
         return "orders:open"

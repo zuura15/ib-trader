@@ -87,6 +87,59 @@ export function BotChart({
     trailingPercent: number | null; permId: string | null;
   }>>([]);
   const [ordersHover, setOrdersHover] = useState(false);
+
+  // Directional callout chips (#100) — LOC (engine slope/curvature),
+  // GROK, JEV. Rendered only when the backend publishes a payload for
+  // this symbol (pilot: NQZ6 via direction_symbols in settings.yaml).
+  const [direction, setDirection] = useState<any | null>(null);
+  useEffect(() => {
+    if (!symbol) { setDirection(null); return; }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await fetch(`/api/direction/${symbol}`);
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled) setDirection(j && j.local ? j : null);
+      } catch { /* transient — keep last reading */ }
+    };
+    void load();
+    const t = setInterval(load, 2000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [symbol, resyncToken]);
+
+  const dirChip = (tag: string, d: any) => {
+    const status = d?.status ?? 'off';
+    const dir = d?.dir;
+    const glyph =
+      status === 'ok' ? (dir === 'UP' ? '▲' : dir === 'DOWN' ? '▼' : '—')
+      : status === 'warmup' ? '…'
+      : status === 'err' || status === 'unparsed' ? '!'
+      : '·';
+    const color =
+      status !== 'ok' ? 'var(--text-muted)'
+      : dir === 'UP' ? 'var(--accent-green)'
+      : dir === 'DOWN' ? 'var(--accent-red)'
+      : 'var(--text-secondary)';
+    const bits = [tag.toLowerCase(), status];
+    if (d?.slope_ticks_per_min != null) bits.push(`${d.slope_ticks_per_min} t/min`);
+    if (d?.accel && d.accel !== 'STEADY') bits.push(d.accel.toLowerCase());
+    if (d?.asof) bits.push(`asof ${String(d.asof).slice(11, 19)}Z`);
+    return (
+      <span
+        key={tag}
+        title={bits.join(' · ')}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 3,
+          fontFamily: 'ui-monospace, monospace', fontSize: 10,
+          fontWeight: 700, color,
+        }}
+      >
+        <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>{tag}</span>
+        {glyph}
+      </span>
+    );
+  };
   const [ordersPollNonce, setOrdersPollNonce] = useState(0);
   const lastOrdersSigRef = useRef<string>('[]');
   const refreshTick = useStore((st) => st.positionRefreshTick);
@@ -720,6 +773,16 @@ export function BotChart({
             data-testid={`chart-header-price-${botId}`}
           >
             {lastPrice.toFixed(priceDecimals)}
+          </span>
+        )}
+        {direction && (
+          <span
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
+            data-testid={`chart-direction-${botId}`}
+          >
+            {dirChip('LOC', direction.local)}
+            {dirChip('GROK', direction.grok)}
+            {dirChip('JEV', direction.jev)}
           </span>
         )}
         {/* Binary open-orders indicator — amber dot when IB holds ≥1

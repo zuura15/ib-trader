@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import scoped_session
 
 from ib_trader.api.deps import set_session_factory
-from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, bot_trades, templates, positions, logs, watchlist, instruments, history, sr, regime, debug, audit, console_pnl
+from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, bot_trades, templates, positions, logs, watchlist, instruments, history, sr, regime, debug, audit, console_pnl, direction
 from ib_trader.api import ws
 
 logger = logging.getLogger(__name__)
@@ -196,6 +196,7 @@ def create_app(
     app.include_router(history.router)
     app.include_router(sr.router)
     app.include_router(regime.router)
+    app.include_router(direction.router)
     app.include_router(debug.router)
     app.include_router(ws.router)
     app.include_router(console_pnl.router)

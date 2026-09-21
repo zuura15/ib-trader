@@ -1,1 +1,1 @@
-"""Pure-Python signal modules shared by the bots and the backtest."""
+"""Advisory market-signal computations (chart callouts, never order-gating)."""

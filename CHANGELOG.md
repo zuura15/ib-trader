@@ -5,6 +5,16 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-09-20
 
+### Added
+- **Directional callout chips on the NQ chart (#100, pilot).** Chart
+  header shows three advisory readouts: LOC (engine-computed
+  regression slope + curvature over the last 30min, ~2s refresh),
+  GROK (xAI grok-4-fast) and JEV (TypeSafe Jev) — the LLMs get a bare
+  CSV of 3-min closes once per completed bar and must answer one word
+  (UP/DOWN/FLAT). Keys via .env (XAI_API_KEY, JEV_API_KEY); a missing
+  key renders the chip as off. Backend-only calls; tunables in
+  settings.yaml (direction_*). Never order-gating.
+
 ### Removed
 - **Expired futures cleanup.** Sep Nasdaq charts (MNQU6 slot 3, NQU6
   slot 4 — last traded 2026-09-18) deleted: bot YAMLs, desktop/mobile

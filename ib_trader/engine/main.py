@@ -346,6 +346,9 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             # orders:open ⇄ IB truth sweep (#98): catches missed status
             # events, TWS-placed orders, and purges zombie rows.
             asyncio.create_task(_orders_open_ib_sync_loop(ctx)),
+            # Directional callout pilot (#100) — no-ops unless
+            # direction_symbols is configured.
+            asyncio.create_task(_direction_callout_loop(ctx)),
 
             # Realized-P&L rollup: per-contract 24h + today figures for the
             # chart panes, swept from IB executions (incl. manual TWS).
@@ -1063,6 +1066,153 @@ async def _orders_open_ib_sync_loop(ctx: AppContext) -> None:
         except Exception:
             logger.exception('{"event": "ORDERS_OPEN_IB_SYNC_ERROR"}')
         await asyncio.sleep(interval)
+
+
+async def _direction_callout_loop(ctx: AppContext) -> None:
+    """Directional callout pilot (#100). Samples the ticker cache for
+    each configured symbol, classifies slope/curvature locally every
+    pass, asks the configured LLM providers once per completed bucket,
+    and publishes the merged payload to Redis for the chart-header
+    chips. Advisory display only — nothing order-gating reads this.
+    """
+    import json as _json
+    import os
+    import time as _time
+    from collections import deque
+    from datetime import datetime, timezone
+
+    from ib_trader.redis.state import StateKeys
+    from ib_trader.signals import direction as dsig
+
+    redis = ctx.redis
+    symbols = [str(x).upper() for x in (ctx.settings.get("direction_symbols") or [])]
+    if redis is None or not symbols:
+        return
+    sample_s = float(ctx.settings.get("direction_sample_seconds", 2))
+    lookback_s = float(ctx.settings.get("direction_lookback_minutes", 30)) * 60
+    flat_tpm = float(ctx.settings.get("direction_flat_ticks_per_min", 0.5))
+    bar_s = int(ctx.settings.get("direction_llm_bar_seconds", 180))
+    grok_key = os.environ.get("XAI_API_KEY", "")
+    grok_base = str(ctx.settings.get("direction_grok_base_url", "https://api.x.ai/v1"))
+    grok_model = str(ctx.settings.get("direction_grok_model", "grok-4-fast"))
+    jev_key = os.environ.get("JEV_API_KEY", "")
+    jev_base = str(ctx.settings.get("direction_jev_base_url", "") or "")
+    jev_model = str(ctx.settings.get("direction_jev_model", "") or "")
+    grok_on = bool(grok_key)
+    jev_on = bool(jev_key and jev_base and jev_model)
+    if not grok_on:
+        logger.warning('{"event": "DIRECTION_PROVIDER_OFF", "provider": "grok", '
+                       '"reason": "XAI_API_KEY not set"}')
+    if not jev_on:
+        logger.warning('{"event": "DIRECTION_PROVIDER_OFF", "provider": "jev", '
+                       '"reason": "JEV_API_KEY / direction_jev_base_url / '
+                       'direction_jev_model not all set"}')
+
+    # Qualify each symbol once (retry until IB is reachable). Local
+    # imports to keep engine.main's import graph acyclic.
+    from ib_trader.engine.order import _get_contract
+    from ib_trader.repl.commands import _is_futures_local_symbol
+    contracts: dict[str, dict] = {}
+    while len(contracts) < len(symbols):
+        for sym in symbols:
+            if sym in contracts:
+                continue
+            try:
+                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
+                contracts[sym] = await _get_contract(sym, ctx, sec_type=sec_type)
+            except Exception:
+                logger.exception(
+                    '{"event": "DIRECTION_QUALIFY_FAILED", "symbol": "%s"}', sym)
+        if len(contracts) < len(symbols):
+            await asyncio.sleep(15)
+
+    samples: dict[str, deque] = {sym: deque() for sym in symbols}
+    provider_state: dict[str, dict] = {
+        sym: {
+            "grok": {"status": "warmup" if grok_on else "off"},
+            "jev": {"status": "warmup" if jev_on else "off"},
+            "last_bucket": 0,
+        }
+        for sym in symbols
+    }
+
+    async def _ask(sym: str, st: dict, provider: str, base: str, key: str,
+                   model: str, sys_p: str, user_p: str) -> None:
+        try:
+            ans = await dsig.query_openai_compatible(
+                base, key, model, sys_p, user_p, timeout=8.0)
+            d = dsig.parse_llm_answer(ans)
+            st[provider] = {
+                "status": "ok" if d else "unparsed",
+                "dir": d or "FLAT",
+                "asof": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception:
+            # Provider outage is advisory-path only; ERROR w/ stack per
+            # the no-silent-except tenet, no alert (not broker-facing).
+            logger.exception(
+                '{"event": "DIRECTION_LLM_FAILED", "provider": "%s", '
+                '"symbol": "%s"}', provider, sym)
+            st[provider] = {
+                "status": "err",
+                "asof": datetime.now(timezone.utc).isoformat(),
+            }
+
+    while True:
+        try:
+            wall = _time.time()
+            for sym in symbols:
+                info = contracts[sym]
+                t = ctx.ib.get_ticker(int(info["con_id"]))
+                px = None
+                if t:
+                    px = t.get("last") or (
+                        (t["bid"] + t["ask"]) / 2
+                        if t.get("bid") and t.get("ask") else None
+                    )
+                dq = samples[sym]
+                if px:
+                    dq.append((wall, float(px)))
+                    while dq and dq[0][0] < wall - lookback_s:
+                        dq.popleft()
+                tick_size = float(info.get("tick_size") or 0.01)
+                local = dsig.compute_local_direction(
+                    list(dq), tick_size=tick_size, flat_ticks_per_min=flat_tpm)
+
+                st = provider_state[sym]
+                cur_bucket = int(wall // bar_s)
+                if (px and cur_bucket != st["last_bucket"]
+                        and len(dq) >= 60 and (grok_on or jev_on)):
+                    st["last_bucket"] = cur_bucket
+                    closes = dsig.bucket_closes(
+                        list(dq), bucket_seconds=bar_s, max_buckets=40)
+                    if closes:
+                        sys_p, user_p = dsig.build_llm_prompt(
+                            sym, closes, float(px), bar_seconds=bar_s)
+                        calls = []
+                        if grok_on:
+                            calls.append(_ask(sym, st, "grok", grok_base,
+                                              grok_key, grok_model, sys_p, user_p))
+                        if jev_on:
+                            calls.append(_ask(sym, st, "jev", jev_base,
+                                              jev_key, jev_model, sys_p, user_p))
+                        if calls:
+                            await asyncio.gather(*calls)
+
+                payload = {
+                    "symbol": sym,
+                    "local": local,
+                    "grok": st["grok"],
+                    "jev": st["jev"],
+                    "asof": datetime.now(timezone.utc).isoformat(),
+                }
+                await redis.set(
+                    StateKeys.direction_callout(sym), _json.dumps(payload))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('{"event": "DIRECTION_LOOP_ERROR"}')
+        await asyncio.sleep(sample_s)
 
 
 async def _position_poll_loop(ctx: AppContext) -> None:

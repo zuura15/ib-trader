@@ -33,6 +33,21 @@ cancel_settle_timeout_seconds: 120
 # working orders (incl. TWS-placed) into the Redis hash and purges
 # rows IB no longer holds.
 orders_open_sync_seconds: 20
+
+# Directional callout pilot (#100) — advisory chart-header chips only,
+# never order-gating. Local slope readout samples the engine ticker
+# cache; LLM opinions fire once per completed bucket. API keys live in
+# .env (XAI_API_KEY, JEV_API_KEY) — never here.
+direction_symbols: [NQZ6]
+direction_sample_seconds: 2
+direction_lookback_minutes: 30
+direction_flat_ticks_per_min: 0.5
+direction_llm_bar_seconds: 180
+direction_grok_base_url: https://api.x.ai/v1
+direction_grok_model: grok-4-fast
+direction_jev_base_url: ""
+direction_jev_model: ""
+
 # SMART_MARKET execution algo (session-aware aggressive-mid).
 # RTH: reprice every N ms toward the far side (bid for SELL, ask for BUY)
 #      for `duration` seconds, then cross to MKT for any residual.
