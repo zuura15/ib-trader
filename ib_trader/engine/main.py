@@ -1460,11 +1460,15 @@ async def _event_relay_loop(ctx: AppContext) -> None:
                         return f
                     enriched.setdefault("order_type", order_type)
                     enriched.setdefault("limit_price", _clean(lmt))
-                    # For TRAIL orders IB updates trailStopPrice as it
-                    # walks; for STP/STP_LMT the trigger lives in auxPrice.
-                    # Surface whichever is set as ``stop_price``.
+                    # ORDER-TYPE AWARE (stale-SL root cause 2026-09-22):
+                    # the cached trailStopPrice never refreshes on
+                    # re-reports, auxPrice does — prefer trailStopPrice
+                    # only for TRAIL, whose live trigger walks there.
+                    _is_trail = "TRAIL" in (order_type or "").upper()
                     enriched.setdefault(
-                        "stop_price", _clean(trail_stop) or _clean(aux),
+                        "stop_price",
+                        (_clean(trail_stop) or _clean(aux)) if _is_trail
+                        else (_clean(aux) or _clean(trail_stop)),
                     )
                     enriched.setdefault("trailing_percent", _clean(trail_pct))
                 await redis.hset(orders_open_key, oid, _json.dumps(enriched))

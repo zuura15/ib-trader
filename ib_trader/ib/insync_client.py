@@ -1820,9 +1820,21 @@ class InsyncClient(IBClientBase):
                 ) or None,
                 "trading_class": getattr(trade.contract, "tradingClass", None) or None,
                 "multiplier": getattr(trade.contract, "multiplier", None) or None,
+                # Stop trigger, ORDER-TYPE AWARE — the stale-SL root
+                # cause (2026-09-22): ib_async's openOrder merge
+                # refreshes auxPrice on every re-report but NEVER
+                # trailStopPrice, so preferring trailStopPrice froze
+                # TWS-edited stops at the engine's first sight of the
+                # order. (The Gateway was innocent — every engine
+                # restart snapshotted the then-correct price.) TRAIL
+                # is the one type whose live trigger genuinely walks
+                # in trailStopPrice.
                 "stop_price": (
-                    _cleanf(getattr(trade.order, "trailStopPrice", None))
-                    or _cleanf(getattr(trade.order, "auxPrice", None))
+                    (_cleanf(getattr(trade.order, "trailStopPrice", None))
+                     or _cleanf(getattr(trade.order, "auxPrice", None)))
+                    if "TRAIL" in (trade.order.orderType or "").upper()
+                    else (_cleanf(getattr(trade.order, "auxPrice", None))
+                          or _cleanf(getattr(trade.order, "trailStopPrice", None)))
                 ),
                 "trailing_percent": _cleanf(
                     getattr(trade.order, "trailingPercent", None),

@@ -3,6 +3,20 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-22
+
+### Fixed
+- **Stale stop-loss prices on TWS-edited orders — root cause found
+  and fixed.** Not the Gateway (operator correctly challenged that
+  hypothesis): ib_async's openOrder cache merge refreshes auxPrice on
+  every re-report but never trailStopPrice, and both stop_price
+  extraction sites preferred trailStopPrice — freezing the displayed
+  trigger at the engine's first sight of the order while qty and
+  fills kept flowing. Extraction is now order-type aware: TRAIL reads
+  trailStopPrice (its live walking trigger), everything else reads
+  auxPrice first. Verified by the restart-snapshot signature: every
+  engine restart captured the then-correct price, then froze.
+
 ## 2026-09-21
 
 ### Added
