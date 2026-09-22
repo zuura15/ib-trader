@@ -1608,6 +1608,19 @@ async def _event_relay_loop(ctx: AppContext) -> None:
             order_id_int = int(ib_order_id)
         except (TypeError, ValueError):
             return
+        if order_id_int <= 0:
+            # Client-0 side effect (2026-09-22): manual/TWS fills now
+            # stream commission reports to us too — ib_order_id 0, or
+            # negative for bound TWS orders. They never have FILLED
+            # transaction rows (the account-wide executions pull owns
+            # their P&L), so skip the retry dance and the per-fill
+            # COMMISSION_UNMATCHED warning spam they were causing.
+            logger.debug(
+                '{"event": "COMMISSION_FOREIGN_FILL_SKIPPED", '
+                '"ib_order_id": "%s", "exec_id": "%s", "commission": "%s"}',
+                ib_order_id, exec_id, commission,
+            )
+            return
         try:
             txn_rows = 0
             # Backoff: 50, 100, 200, 400, 800, 1600 ms (~3.15 s total).
