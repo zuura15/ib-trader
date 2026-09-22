@@ -1,0 +1,23 @@
+id: chart-bot-10
+name: "Chart Bot 10 · Dow Dec"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+manual_entry_only: true
+auto_start: false   # operator-driven Start
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-10-ymz
+  # YM = E-mini Dow ($5), Dec 2026 (Z6), CBOT. Added 2026-09-21 per
+  # operator request; manual-entry-only like the other chart panes.
+  symbol: YMZ6
+  sec_type: FUT
+  # E-mini Dow: $5/point. Used by P/L math + trail target.
+  contract_multiplier: 5
+  # Same relative tuning as the Nasdaq slots.
+  trail_width_pct: 0.0002
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- YMZ6

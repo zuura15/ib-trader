@@ -130,6 +130,11 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'MNQZ6', anchor: 'chart-bot',
     config: { slot: 9 }, slot: 9, anchorSlot: 8,
   },
+  // Dec Dow (slot 10, added 2026-09-21) — next to the Dec NQ chart.
+  {
+    component: 'chart-bot', name: 'YMZ6', anchor: 'chart-bot',
+    config: { slot: 10 }, slot: 10, anchorSlot: 8,
+  },
 ];
 
 // Chart-bot slots RETIRED from the default layout. Persisted layouts

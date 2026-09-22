@@ -79,6 +79,7 @@ class TestChartAnchors:
         assert "CLV6" in syms
         assert "NQZ6" in syms
         assert "MNQZ6" in syms
+        assert "YMZ6" in syms  # Dec Dow, slot 10 (2026-09-21)
         # Sep Nasdaq pair removed 2026-09-20 after the 9/18 expiry;
         # ES charts dropped 2026-09-02.
         assert "NQU6" not in syms

@@ -5,6 +5,14 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-09-21
 
+### Added
+- **YMZ6 chart (slot 10) + watchlist entry.** E-mini Dow Dec ($5/pt,
+  CBOT) tabbed next to NQZ6 on desktop and mobile; chart-bot-10 YAML
+  (manual-entry-only). Watchlist updated live via API. Subscription
+  safety: the engine subscribes from a deduped union of watchlist +
+  chart anchors, so the symbol appearing in both never double-
+  subscribes one conId (the 2026-09-09 cancel-roulette class).
+
 ### Changed
 - **Direction callout moved to a dedicated Direction Lab tab (#100
   iteration 2).** The always-on chart-header chips are gone; a new
