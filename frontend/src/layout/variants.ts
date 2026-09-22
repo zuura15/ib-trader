@@ -320,7 +320,7 @@ export const variantT: IJsonModel = {
             weight: 50,
             children: [
               { type: 'tab', name: 'MNQZ6', component: 'chart-bot', config: { slot: 9 } },
-              { type: 'tab', name: 'CLV6', component: 'chart-bot', config: { slot: 5 } },
+              { type: 'tab', name: 'CLX6', component: 'chart-bot', config: { slot: 5 } },
             ],
           },
           {

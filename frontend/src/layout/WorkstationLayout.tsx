@@ -106,12 +106,14 @@ const MIGRATED_TABS: Array<{
   // Direction Lab (#100) — isolated playground tab; anchor on Bots
   // (present in the variant-T stash tabset and most others).
   { component: 'direction-lab', name: 'Direction Lab', anchor: 'bots' },
-  // Slot 5 chart (CLV6 since 2026-09-02, previously ESU6) — anchored
-  // on Gold (slot 1) since 2026-09-20: its old anchor (Sep MNQ, slot 3)
-  // is pruned as expired, and prune runs before injection. Matched by
-  // slot so existing chart-bot tabs don't mask it.
+  // Slot 5 chart (CLX6 since the 2026-09-22 roll; CLV6 before that,
+  // ESU6 originally) — anchored on Gold (slot 1) since 2026-09-20: its
+  // old anchor (Sep MNQ, slot 3) is pruned as expired, and prune runs
+  // before injection. Matched by slot so existing chart-bot tabs don't
+  // mask it. On contract rolls just update ``name`` here — the rename
+  // pass in migrateLayoutJson pushes it into persisted layouts.
   {
-    component: 'chart-bot', name: 'CLV6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'CLX6', anchor: 'chart-bot',
     config: { slot: 5 }, slot: 5, anchorSlot: 1,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
@@ -192,6 +194,14 @@ function migrateLayoutJson(raw: any): any {
       // (e.g. slot 5) isn't masked by the presence of slots 1/3/4.
       if (node.component === 'chart-bot' && node.config?.slot != null) {
         present.add(`chart-bot#${node.config.slot}`);
+        // Rename pass: contract rolls keep the slot but change the
+        // symbol (e.g. CLV6 → CLX6). Persisted layouts carry the old
+        // tab name forever without this — sync it to the MIGRATED_TABS
+        // entry, the single source for slot → current-contract names.
+        const mig = MIGRATED_TABS.find(
+          (m) => m.component === 'chart-bot' && m.slot === node.config.slot,
+        );
+        if (mig && node.name !== mig.name) node.name = mig.name;
       }
     }
     if (Array.isArray(node.children)) node.children.forEach(visit);

@@ -40,8 +40,9 @@ orders_open_sync_seconds: 20
 # .env (XAI_API_KEY, JEV_API_KEY) — never here.
 # Direction Lab sampling set — chart-anchored futures only (their quote
 # subs never lapse). Sampling is cache-reads every 2s; LLM spend stays
-# button-only. NB: roll CLV6 -> CLX6 here alongside chart-bot-5.
-direction_symbols: [NQZ6, YMZ6, MGCV6, CLV6]
+# button-only. NB: on contract rolls, update here alongside the
+# chart-bot YAML (CLV6 -> CLX6 rolled 2026-09-22).
+direction_symbols: [NQZ6, YMZ6, MGCV6, CLX6]
 direction_sample_seconds: 2
 direction_lookback_minutes: 30
 direction_flat_ticks_per_min: 0.5

@@ -16,12 +16,14 @@ config:
   # tagged with it at recovery, for no functional gain. Precedent:
   # chart-bot-2 kept ``-mcl`` through its micro-oil → WTI repurpose.
   ref_id: chart-bot-5-es
-  # CL = full WTI Crude Oil (NYMEX), Oct 2026. Repurposed 2026-09-02
-  # from ESU6 (operator dropped the ES charts in favor of WTI). V6 is
-  # the front month; roll monthly (next: X6 before late-Sep expiry).
-  # QBALGO twin dropped by the qualifier (insync_client 46953eb) so
-  # bare ``CLV6`` resolves to NYMEX unambiguously.
-  symbol: CLV6
+  # CL = full WTI Crude Oil (NYMEX), Nov 2026. Repurposed 2026-09-02
+  # from ESU6 (operator dropped the ES charts in favor of WTI). X6 is
+  # the front month since the 2026-09-22 roll (V6 expired); roll
+  # monthly (next: Z6 before late-Oct expiry) — update
+  # direction_symbols in settings.yaml alongside. QBALGO twin dropped
+  # by the qualifier (insync_client 46953eb) so bare ``CLX6`` resolves
+  # to NYMEX unambiguously.
+  symbol: CLX6
   sec_type: FUT
   # Full Crude: 1,000 bbl/contract → $1.00 move = $1,000 (tick $0.01
   # = $10). Used by the strategy's P/L math + trail target.
@@ -34,4 +36,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- CLV6
+- CLX6

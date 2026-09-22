@@ -72,11 +72,12 @@ class TestChartAnchors:
         # Reads the real config/bots/*.yaml — chart contracts must appear.
         syms = wr.chart_anchor_symbols()
         assert isinstance(syms, list)
-        # GCV6 / MGCV6 / CLV6 / NQZ6 / MNQZ6 are current chart-bot
+        # GCV6 / MGCV6 / CLX6 / NQZ6 / MNQZ6 are current chart-bot
         # symbols (chart-bot-1 / -7 / -5 / -8 / -9).
         assert "GCV6" in syms
         assert "MGCV6" in syms
-        assert "CLV6" in syms
+        assert "CLX6" in syms
+        assert "CLV6" not in syms  # rolled 2026-09-22 (V6 expired)
         assert "NQZ6" in syms
         assert "MNQZ6" in syms
         assert "YMZ6" in syms  # Dec Dow, slot 10 (2026-09-21)

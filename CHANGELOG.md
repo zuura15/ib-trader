@@ -31,6 +31,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   ⟳ compute button. Run history with raw replies/latency/prompt
   moves below the chart.
 
+### Changed
+- **CL rolled CLV6 → CLX6 (Nov 2026) — V6 expired 2026-09-22.**
+  chart-bot-5 symbol/symbols, `direction_symbols`, and the layout tab
+  name all updated. New: a rename pass in the layout migration syncs
+  persisted chart-bot tab labels to the current contract per slot, so
+  future rolls only touch the MIGRATED_TABS entry (previously a
+  rolled slot kept its stale tab name forever). Bot id/ref_id
+  unchanged, so no SQLite bootstrap cleanup is needed.
+
 ### Fixed
 - **`.env` secrets never reached `os.environ` in the engine.**
   `dotenv_values` returns a dict without touching the process env,
