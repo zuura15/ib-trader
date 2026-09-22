@@ -2,7 +2,9 @@
 import os
 import pytest
 
-from ib_trader.config.loader import load_env, load_settings, load_symbols
+from ib_trader.config.loader import (
+    export_env_to_process, load_env, load_settings, load_symbols,
+)
 from ib_trader.engine.exceptions import ConfigurationError
 
 
@@ -34,6 +36,26 @@ class TestLoadEnv:
         os.chmod(str(env_file), 0o600)
         with pytest.raises(ConfigurationError, match="missing required keys"):
             load_env(str(env_file))
+
+
+class TestExportEnvToProcess:
+    def test_exports_new_keys(self, monkeypatch):
+        monkeypatch.delenv("JEV_API_KEY", raising=False)
+        export_env_to_process({"JEV_API_KEY": "abc"})
+        try:
+            assert os.environ["JEV_API_KEY"] == "abc"
+        finally:
+            os.environ.pop("JEV_API_KEY", None)
+
+    def test_existing_process_env_wins(self, monkeypatch):
+        monkeypatch.setenv("JEV_API_KEY", "from-process")
+        export_env_to_process({"JEV_API_KEY": "from-dotenv"})
+        assert os.environ["JEV_API_KEY"] == "from-process"
+
+    def test_none_values_skipped(self, monkeypatch):
+        monkeypatch.delenv("EMPTY_KEY", raising=False)
+        export_env_to_process({"EMPTY_KEY": None})
+        assert "EMPTY_KEY" not in os.environ
 
 
 class TestLoadSettingsEdgeCases:

@@ -86,6 +86,11 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
 
     # Load configuration (same pattern as REPL and daemon)
     env_vars = load_env(env)
+    # .env secrets must also reach os.environ — the direction
+    # providers (and anything else reading the process env) never saw
+    # keys that lived only in the env_vars dict. Process env wins.
+    from ib_trader.config.loader import export_env_to_process
+    export_env_to_process(env_vars)
     settings = load_settings(settings_path)
     symbols = load_symbols(symbols_path)
 

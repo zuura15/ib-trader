@@ -16,7 +16,20 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   in prod `.env`; base URL and model (`jev-latest`) ship in
   settings.yaml.
 
+- **Direction Lab chart + on-demand verdict overlay.** The lab tab
+  now embeds a live SymbolChart (SR/RSI off) for the entered symbol
+  with a top-left overlay: LOC (slope ticks/min + accel) and JEV
+  (probability % + confidence) up/down glyphs, symbol input, and the
+  ⟳ compute button. Run history with raw replies/latency/prompt
+  moves below the chart.
+
 ### Fixed
+- **`.env` secrets never reached `os.environ` in the engine.**
+  `dotenv_values` returns a dict without touching the process env,
+  but the direction endpoint reads provider keys via
+  `os.environ.get` — so XAI/JEV keys in `.env` were invisible and
+  both providers stayed "off". Engine startup now exports .env
+  values into the process env (existing process env wins).
 - **LLM direction prompts truncated NQ/YM-scale prices.** The closes
   CSV used 6-significant-digit `%g` formatting, so 23456.25 went to
   Grok as 23456.2. Now `.10g`; Jev gets raw floats via JSON.

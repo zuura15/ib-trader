@@ -109,6 +109,21 @@ def load_env(env_path: str = ".env") -> dict:
     return dict(env)
 
 
+def export_env_to_process(env: dict) -> None:
+    """Export .env values into ``os.environ`` (existing values win).
+
+    ``dotenv_values`` returns a plain dict and never touches the
+    process environment, so any code reading ``os.environ`` directly
+    — e.g. the direction providers' API keys (XAI_API_KEY /
+    JEV_API_KEY) — saw nothing even with the key present in .env.
+    Values already set in the process environment keep precedence,
+    matching ``load_dotenv``'s no-override semantics.
+    """
+    for k, v in env.items():
+        if v is not None and k not in os.environ:
+            os.environ[k] = v
+
+
 def load_symbols(symbols_path: str = "config/symbols.yaml") -> list[str]:
     """Load the symbol whitelist from symbols.yaml.
 
