@@ -45,8 +45,8 @@ direction_flat_ticks_per_min: 0.5
 direction_llm_bar_seconds: 180
 direction_grok_base_url: https://api.x.ai/v1
 direction_grok_model: grok-4-fast
-direction_jev_base_url: ""
-direction_jev_model: ""
+direction_jev_base_url: https://api.typesafe.ai
+direction_jev_model: jev-latest
 
 # SMART_MARKET execution algo (session-aware aggressive-mid).
 # RTH: reprice every N ms toward the far side (bid for SELL, ask for BUY)

@@ -346,6 +346,33 @@ async def direction_compute(req: DirectionComputeRequest):
         async def _ask(name: str, base: str, key: str, model: str) -> None:
             t0 = _time.monotonic()
             try:
+                if name == "jev":
+                    # TypeSafe System One: typed Choice with probabilities,
+                    # not an OpenAI-compatible chat completion.
+                    jev = await dsig.query_typesafe_jev(
+                        base, key, model,
+                        dsig.build_jev_state(
+                            sym, closes, float(last_px), bar_seconds=bar_s),
+                        timeout=10.0)
+                    d = jev["choice"] if jev["choice"] in ("UP", "DOWN", "FLAT") else None
+                    probs = {k: round(float(v), 3)
+                             for k, v in jev["probabilities"].items()}
+                    conf = jev.get("confidence")
+                    raw = " ".join(f"{k}={v:g}" for k, v in sorted(
+                        probs.items(), key=lambda kv: -kv[1]))
+                    if conf is not None:
+                        raw += f" conf={float(conf):g}"
+                    results[name] = {
+                        "status": "ok" if d else "unparsed",
+                        "dir": d or "FLAT",
+                        "raw": raw[:120],
+                        "probs": probs,
+                        "confidence": conf,
+                        "ms": int((_time.monotonic() - t0) * 1000),
+                        "model": jev["model"],
+                        "asof": datetime.now(timezone.utc).isoformat(),
+                    }
+                    return
                 raw = await dsig.query_openai_compatible(
                     base, key, model, sys_p, prompt_user, timeout=10.0)
                 d = dsig.parse_llm_answer(raw)

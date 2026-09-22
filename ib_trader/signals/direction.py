@@ -109,9 +109,11 @@ def build_llm_prompt(
     symbol: str, closes: list[float], last: float, *, bar_seconds: int = 180,
 ) -> tuple[str, str]:
     """Return (system, user) — user is a bare CSV to keep tokens minimal."""
-    csv = ",".join(f"{c:g}" for c in closes)
+    # .10g not :g — default 6 sig figs truncates NQ/YM-scale prices
+    # (23456.25 -> "23456.2"), silently corrupting the series.
+    csv = ",".join(f"{c:.10g}" for c in closes)
     mins = bar_seconds // 60
-    user = f"{symbol} {mins}m closes oldest first:{csv} last:{last:g}"
+    user = f"{symbol} {mins}m closes oldest first:{csv} last:{last:.10g}"
     return SYSTEM_PROMPT, user
 
 
@@ -121,6 +123,68 @@ def parse_llm_answer(text: str) -> str | None:
         return None
     word = "".join(ch for ch in text.strip().split()[0] if ch.isalpha()).upper()
     return _ANSWER_MAP.get(word)
+
+
+# TypeSafe Jev is not a chat model: it answers typed "Choice" questions
+# with a probability distribution (POST /v1/systemone). The criteria
+# mirror the one-word contract so all three readouts stay comparable.
+_JEV_CRITERIA = {
+    "UP": "Price is trending higher and likely to keep rising short-term",
+    "DOWN": "Price is trending lower and likely to keep falling short-term",
+    "FLAT": "No clear short-term trend; price is ranging or directionless",
+}
+
+
+def build_jev_state(
+    symbol: str, closes: list[float], last: float, *, bar_seconds: int = 180,
+) -> dict:
+    """Structured state for a Jev direction question (named fields per docs)."""
+    return {
+        "symbol": symbol,
+        "bar_minutes": bar_seconds // 60,
+        "closes_oldest_first": list(closes),
+        "last_price": last,
+    }
+
+
+async def query_typesafe_jev(
+    base_url: str, api_key: str, model: str,
+    state: dict, *, timeout: float = 8.0,
+) -> dict:
+    """One Choice judgment against TypeSafe's System One endpoint.
+
+    Returns {"choice", "probabilities", "confidence", "model"}. The key
+    travels only in the Authorization header — callers must never log it.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{base_url.rstrip('/')}/v1/systemone",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "state": state,
+                "model": model,
+                "questions": {
+                    "direction": {
+                        "type": "choice",
+                        "instructions": (
+                            "Short-term price direction of this futures "
+                            "series over the next few minutes, for a scalper"),
+                        "criteria": _JEV_CRITERIA,
+                    },
+                },
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        ans = data["answers"]["direction"]
+        return {
+            "choice": str(ans.get("choice") or ""),
+            "probabilities": ans.get("probabilities") or {},
+            "confidence": ans.get("confidence"),
+            "model": str(data.get("model") or model),
+        }
 
 
 async def query_openai_compatible(

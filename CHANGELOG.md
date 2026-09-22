@@ -5,7 +5,21 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-09-22
 
+### Added
+- **Direction Lab: TypeSafe Jev wired via its native typed API.** Jev
+  is not an OpenAI-compatible chat model — it answers typed "Choice"
+  questions (`POST /v1/systemone`) with a probability distribution.
+  The jev provider now sends structured state (symbol, bar size,
+  closes, last) and one UP/DOWN/FLAT Choice question, and the lab
+  card shows the full distribution + confidence instead of a one-word
+  reply. Grok's chat path is unchanged. Activation needs JEV_API_KEY
+  in prod `.env`; base URL and model (`jev-latest`) ship in
+  settings.yaml.
+
 ### Fixed
+- **LLM direction prompts truncated NQ/YM-scale prices.** The closes
+  CSV used 6-significant-digit `%g` formatting, so 23456.25 went to
+  Grok as 23456.2. Now `.10g`; Jev gets raw floats via JSON.
 - **Stale stop-loss prices on TWS-edited orders — root cause found
   and fixed.** Not the Gateway (operator correctly challenged that
   hypothesis): ib_async's openOrder cache merge refreshes auxPrice on
