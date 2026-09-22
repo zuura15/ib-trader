@@ -15,6 +15,24 @@ def _engine_url() -> str:
 router = APIRouter(prefix="/api/direction", tags=["direction"])
 
 
+# Declared before /{symbol} — FastAPI matches routes in order.
+@router.get("/symbols")
+async def get_direction_symbols():
+    """Symbols with live engine sample buffers (Direction Lab dropdown).
+
+    [] when the engine is down/unreachable — same safe-sentinel
+    convention as get_direction's {}.
+    """
+    async with httpx.AsyncClient(timeout=5) as client:
+        try:
+            resp = await client.get(f"{_engine_url()}/engine/direction/symbols")
+        except httpx.HTTPError:
+            return {"symbols": []}
+    if resp.status_code != 200:
+        return {"symbols": []}
+    return resp.json()
+
+
 @router.get("/{symbol}")
 async def get_direction(symbol: str, redis=Depends(get_redis)):
     """Latest callout payload for a symbol; {} when absent/unavailable."""

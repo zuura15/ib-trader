@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { PanelShell } from '../../components/PanelShell';
 import { SymbolChart } from '../chart/SymbolChart';
 import type { ChartTarget } from '../../data/store';
@@ -31,7 +31,8 @@ type Run = {
 };
 
 // Futures month-code pattern (root + FGHJKMNQUVXZ + year digit) —
-// the lab is free-form, so sec type is inferred for chart resolution.
+// sec type is inferred for chart resolution since the dropdown list
+// arrives as bare symbol strings from /api/direction/symbols.
 const FUT_RE = /^[A-Z]{1,3}[FGHJKMNQUVXZ]\d$/;
 
 const glyph = (d?: string) =>
@@ -115,6 +116,27 @@ export function DirectionLabPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
+  // Dropdown options come from the engine's live sample buffers
+  // (settings.yaml direction_symbols) so the lab can never offer a
+  // symbol the compute endpoint would 409 on. NQZ6 fallback keeps the
+  // panel usable while the engine is down.
+  const [symbols, setSymbols] = useState<string[]>(['NQZ6']);
+  useEffect(() => {
+    let alive = true;
+    void fetch('/api/direction/symbols')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (alive && Array.isArray(j?.symbols) && j.symbols.length > 0) {
+          setSymbols(j.symbols);
+          if (!j.symbols.includes('NQZ6')) {
+            setSymbol(j.symbols[0]);
+            setChartSymbol(j.symbols[0]);
+          }
+        }
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   const target = useMemo<ChartTarget>(() => ({
     symbol: chartSymbol,
@@ -206,19 +228,26 @@ export function DirectionLabPanel() {
               }
             />
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <input
+              <select
                 value={symbol}
-                onChange={(e) => setSymbol(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') void invoke(); }}
-                spellCheck={false}
+                onChange={(e) => {
+                  // Chart switches immediately; compute stays on-demand.
+                  setSymbol(e.target.value);
+                  setChartSymbol(e.target.value);
+                  setError(null);
+                }}
                 style={{
-                  width: 62, padding: '2px 6px', fontSize: 11,
+                  padding: '2px 4px', fontSize: 11,
                   fontFamily: 'ui-monospace, monospace',
                   background: 'var(--bg-primary)',
                   color: 'var(--text-primary)',
                   border: '1px solid var(--border-default)', borderRadius: 4,
                 }}
-              />
+              >
+                {symbols.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
               <button
                 onClick={() => void invoke()}
                 disabled={busy}

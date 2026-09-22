@@ -283,6 +283,15 @@ async def close_position(req: CloseRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/engine/direction/symbols")
+async def direction_symbols():
+    """Symbols with live direction sample buffers (lab dropdown source)."""
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    bufs = getattr(_ctx, "_direction_samples", None) or {}
+    return {"symbols": sorted(bufs)}
+
+
 class DirectionComputeRequest(BaseModel):
     """Request body for a button-invoked direction computation (#100)."""
 

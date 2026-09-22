@@ -16,6 +16,14 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   in prod `.env`; base URL and model (`jev-latest`) ship in
   settings.yaml.
 
+- **Direction Lab symbol dropdown + expanded sampling set.** The
+  lab's symbol box is now a dropdown fed by
+  `GET /api/direction/symbols` (proxied from the engine's live
+  sample buffers), so it can never offer a symbol the compute
+  endpoint would refuse. `direction_symbols` grows to
+  [NQZ6, YMZ6, MGCV6, CLV6] — all chart-anchored futures, sampling
+  is cache-reads only, LLM spend stays button-only. Picking a symbol
+  switches the lab chart immediately.
 - **Direction Lab chart + on-demand verdict overlay.** The lab tab
   now embeds a live SymbolChart (SR/RSI off) for the entered symbol
   with a top-left overlay: LOC (slope ticks/min + accel) and JEV

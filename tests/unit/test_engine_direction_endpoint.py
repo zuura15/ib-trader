@@ -38,6 +38,20 @@ def _reset_context(monkeypatch):
     set_context(None)
 
 
+class TestDirectionSymbols:
+    def test_lists_live_buffers_sorted(self):
+        set_context(_ctx(_direction_samples={
+            "YMZ6": _samples(), "NQZ6": _samples()}))
+        r = TestClient(app).get("/engine/direction/symbols")
+        assert r.status_code == 200
+        assert r.json() == {"symbols": ["NQZ6", "YMZ6"]}
+
+    def test_503_before_init(self):
+        set_context(None)
+        r = TestClient(app).get("/engine/direction/symbols")
+        assert r.status_code == 503
+
+
 class TestDirectionCompute:
     def test_local_only_when_no_keys(self):
         set_context(_ctx())
