@@ -16,12 +16,13 @@ config:
   # collide on the strategy's ref_id without this.
   ref_id: chart-bot-1-gc
   # GC = full Gold (100 oz). Switched from micro MGCQ6 → full GCQ6
-  # on 2026-06-07 as the operator scaled into full contracts. Rolled
-  # Q6 (Aug) → V6 (Oct) on 2026-07-21 ahead of the late-July Q6
-  # delivery window. Next roll: Z6 (Dec) before late-Sep. QBALGO twin
-  # is dropped by the qualifier (insync_client commit 46953eb) so the
-  # bare ``GCV6`` localSymbol resolves to COMEX unambiguously.
-  symbol: GCV6
+  # on 2026-06-07 as the operator scaled into full contracts. Roll
+  # history: Q6 → V6 2026-07-21, V6 → Z6 2026-09-27 (Oct delivery
+  # window; operator rolls the live position separately). Next roll:
+  # G7 (Feb) before late-Nov. QBALGO twin is dropped by the qualifier
+  # (insync_client commit 46953eb) so the bare ``GCZ6`` localSymbol
+  # resolves to COMEX unambiguously.
+  symbol: GCZ6
   sec_type: FUT
   # Full Gold: 100 oz/contract (10x micro). Used by P/L math + trail
   # target.
@@ -37,4 +38,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- GCV6
+- GCZ6

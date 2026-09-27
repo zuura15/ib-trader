@@ -106,6 +106,15 @@ const MIGRATED_TABS: Array<{
   // Direction Lab (#100) — isolated playground tab; anchor on Bots
   // (present in the variant-T stash tabset and most others).
   { component: 'direction-lab', name: 'Direction Lab', anchor: 'bots' },
+  // Gold (slot 1) — present in every persisted layout since the
+  // beginning, so this entry exists for the RENAME pass (which keys
+  // off MIGRATED_TABS by slot), not for injection. GCZ6 since the
+  // 2026-09-27 roll (Oct delivery window). Listed before the entries
+  // that anchor on slot 1.
+  {
+    component: 'chart-bot', name: 'GCZ6', anchor: 'chart-bot',
+    config: { slot: 1 }, slot: 1, anchorSlot: 7,
+  },
   // Slot 5 chart (CLX6 since the 2026-09-22 roll; CLV6 before that,
   // ESU6 originally) — anchored on Gold (slot 1) since 2026-09-20: its
   // old anchor (Sep MNQ, slot 3) is pruned as expired, and prune runs

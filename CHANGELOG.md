@@ -10,8 +10,14 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   orders on October gold inside the delivery close-out window (first
   notice 9/30), so the micro rolled immediately: chart-bot-7,
   `direction_symbols`, and the slot-7 tab name (rename pass carries
-  it into persisted layouts). GCV6 (slot 1) intentionally stays until
-  the operator's short is closed — it rolls to GCZ6 after.
+  it into persisted layouts).
+- **Full Gold rolled GCV6 → GCZ6 (Dec 2026).** chart-bot-1 + slot-1
+  tab name; slot 1 predates MIGRATED_TABS, so it gains an entry
+  (rename-pass coverage). Operator rolls the live GCV6 position
+  separately — the buy side of October gold is blocked pending a
+  delivery-intent declaration (IB order-handling rule seen live on
+  order 6761), while risk-reducing buys on the held contract remain
+  allowed.
 
 ## 2026-09-22
 
