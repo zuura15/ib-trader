@@ -3,6 +3,16 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-09-27
+
+### Changed
+- **Micro Gold rolled MGCV6 → MGCZ6 (Dec 2026).** IB blocks new
+  orders on October gold inside the delivery close-out window (first
+  notice 9/30), so the micro rolled immediately: chart-bot-7,
+  `direction_symbols`, and the slot-7 tab name (rename pass carries
+  it into persisted layouts). GCV6 (slot 1) intentionally stays until
+  the operator's short is closed — it rolls to GCZ6 after.
+
 ## 2026-09-22
 
 ### Added

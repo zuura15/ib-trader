@@ -117,8 +117,9 @@ const MIGRATED_TABS: Array<{
     config: { slot: 5 }, slot: 5, anchorSlot: 1,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
+  // MGCZ6 since the 2026-09-27 roll (Oct delivery close-out).
   {
-    component: 'chart-bot', name: 'MGCV6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'MGCZ6', anchor: 'chart-bot',
     config: { slot: 7 }, slot: 7, anchorSlot: 1,
   },
   // Dec Nasdaq (slot 8) — re-anchored on CLV6 (slot 5, present or
