@@ -377,17 +377,11 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             asyncio.create_task(prophylactic_resubscribe_loop(ctx)),
         ]
 
-        # Reconciler: startup recovery + sanity checks
-        from ib_trader.engine.reconciler import Reconciler
-        reconciler = Reconciler(
-            ctx.ib, redis,
-            sanity_interval=ctx.settings.get("reconciler_sanity_interval", 60),
-        )
-        await reconciler.startup_reconcile()
-        bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
-        print("[ENGINE] Reconciler started.")
-
-        # Internal HTTP API — wait for the socket to bind before proceeding
+        # Internal HTTP API — bind BEFORE the startup reconcile so a
+        # slow or wedged IB snapshot can't keep the API/UI/bots locked
+        # out (2026-10-01: reconcile hung on a snapshot collision and
+        # 8081 never bound; everything downstream showed
+        # connect_refused until the engine was killed).
         from ib_trader.engine.internal_api import start_internal_api
         internal_port = ctx.settings.get("engine_internal_port", 8081)
         api_task = await start_internal_api(ctx, port=internal_port)
@@ -395,6 +389,17 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # Give uvicorn time to bind the socket before bots try to connect
         await asyncio.sleep(1)
         print(f"[ENGINE] Internal API on 127.0.0.1:{internal_port}")
+
+        # Reconciler: startup recovery + sanity checks
+        from ib_trader.engine.reconciler import Reconciler
+        reconciler = Reconciler(
+            ctx.ib, redis,
+            sanity_interval=ctx.settings.get("reconciler_sanity_interval", 60),
+            snapshot_timeout=ctx.settings.get("reconciler_snapshot_timeout", 30),
+        )
+        await reconciler.startup_reconcile()
+        bg_tasks.append(asyncio.create_task(reconciler.run_sanity_loop()))
+        print("[ENGINE] Reconciler started.")
 
         # All command producers (bots, API, REPL) use the HTTP API.
         # No more polling loop. Keep the engine alive.

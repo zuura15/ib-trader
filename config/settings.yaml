@@ -114,6 +114,11 @@ prophylactic_resub_startup_delay_seconds: 600
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081
+# Startup reconcile: max seconds to wait for the IB open-orders
+# snapshot before reconciling degraded (empty snapshot + WARNING; the
+# sanity loop catches up once IB answers). Guards against the
+# 2026-10-01 wedge where this call hung forever.
+reconciler_snapshot_timeout: 30
 
 # Chart-pane realized-P&L rollup (per-contract 24h + today figures, swept
 # from IB executions so manual TWS trades are included).

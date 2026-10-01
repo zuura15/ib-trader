@@ -3,6 +3,24 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-10-01
+
+### Fixed
+- **Engine startup wedge: concurrent order snapshots orphaned each
+  other's ib-async futures.** ib-async keys snapshot requests
+  (openOrders / completedOrders) globally, so when the startup
+  reconciler and the 20s orders sweep (#98) called
+  `get_open_orders()` at the same moment, the reconciler's await hung
+  forever — the internal API on :8081 never bound and the UI/bots
+  showed connect_refused until the engine was killed (seen on three
+  consecutive prod restarts 2026-10-01). Three-part fix: snapshot
+  requests are serialized behind a client-level lock, the startup
+  reconcile's snapshot is time-bounded (`reconciler_snapshot_timeout`,
+  default 30s — on timeout it reconciles degraded with a WARNING and
+  the sanity loop catches up), and the internal API now binds BEFORE
+  the startup reconcile so no reconcile failure mode can keep the
+  engine unreachable.
+
 ## 2026-09-27
 
 ### Changed

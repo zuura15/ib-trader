@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from ib_trader.engine.order_ref import decode as decode_order_ref
+from ib_trader.logging_.alerts import log_and_alert
 from ib_trader.redis.streams import StreamWriter, StreamNames
 from ib_trader.redis.state import StateStore, StateKeys
 
@@ -49,13 +50,19 @@ class Reconciler:
         ib: IBClientBase instance (the engine's sole IB connection).
         redis: Async Redis client.
         sanity_interval: Seconds between sanity checks (default 60).
+        snapshot_timeout: Seconds to wait for the startup order
+            snapshot before reconciling degraded (default 30).
     """
 
-    def __init__(self, ib, redis, sanity_interval: int = 60) -> None:
+    def __init__(
+        self, ib, redis, sanity_interval: int = 60,
+        snapshot_timeout: float = 30.0,
+    ) -> None:
         self._ib = ib
         self._redis = redis
         self._state = StateStore(redis)
         self._sanity_interval = sanity_interval
+        self._snapshot_timeout = snapshot_timeout
 
     async def startup_reconcile(self) -> None:
         """Rebuild Redis state from IB on engine startup.
@@ -66,8 +73,28 @@ class Reconciler:
         """
         logger.info('{"event": "RECONCILER_STARTUP_BEGIN"}')
 
-        # Query IB for current state
-        open_orders = await self._ib.get_open_orders()
+        # Query IB for current state. Time-bound: this runs at startup
+        # and an unbounded hang here used to block the internal API from
+        # ever binding (2026-10-01). On timeout, reconcile degraded with
+        # an empty order snapshot — the sanity loop corrects any drift
+        # once IB answers again.
+        try:
+            open_orders = await asyncio.wait_for(
+                self._ib.get_open_orders(), timeout=self._snapshot_timeout,
+            )
+        except asyncio.TimeoutError:
+            await log_and_alert(
+                redis=self._redis,
+                trigger="RECONCILER_STARTUP_ORDERS_TIMEOUT",
+                message=(
+                    "Startup reconcile: IB open-orders snapshot timed out "
+                    f"after {self._snapshot_timeout:g}s; reconciling with "
+                    "an empty order snapshot (sanity loop will catch up)"
+                ),
+                severity="WARNING",
+                exc_info=False,
+            )
+            open_orders = []
         ib_positions = await self._get_ib_positions()
 
         # Build maps from orderRef. Ignore foreign-host orders — when

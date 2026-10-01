@@ -251,6 +251,14 @@ class InsyncClient(IBClientBase):
         # callback runs between placeOrder() and our callback dispatch
         # below, so the snapshot is genuinely pre-fill.
         self._order_placed_callbacks: list = []
+        # Serializes order-snapshot requests (reqOpenOrders /
+        # reqAllOpenOrders / reqCompletedOrders). ib_async keys these
+        # pending requests globally, not per-call: a second concurrent
+        # call replaces the first call's future, which then waits on an
+        # end-marker that will never resolve it. Observed live
+        # 2026-10-01: the startup reconciler and the #98 orders sweep
+        # collided and wedged engine startup indefinitely.
+        self._order_snapshot_lock = asyncio.Lock()
         # Per-order asyncio locks. Every dispatched callback (fill,
         # status, commission) for a given ib_order_id acquires this
         # lock before running, so IB events for the same order are
@@ -1698,7 +1706,15 @@ class InsyncClient(IBClientBase):
 
         Filters out terminal statuses (Cancelled, Filled, Inactive) since
         IB keeps them in the open orders list until session reset.
+
+        Serialized via ``_order_snapshot_lock`` — concurrent snapshot
+        requests orphan each other's ib_async futures (see the lock's
+        comment in ``__init__``).
         """
+        async with self._order_snapshot_lock:
+            return await self._get_open_orders_unlocked()
+
+    async def _get_open_orders_unlocked(self) -> list[dict]:
         # Bind THIS client's orders from prior sessions first: after a
         # reconnect reqOpenOrders re-delivers them with their real
         # orderIds. Orders owned by another client — TWS-placed, or
