@@ -6,6 +6,16 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-10-01
 
 ### Fixed
+- **Stale "Gateway disconnected — trading paused" banner surviving
+  engine restarts.** The `IB_GATEWAY_RECONNECTING` /
+  `IB_GATEWAY_DISCONNECTED` alerts were only auto-resolved on a
+  reconnect within one engine process's lifetime; an alert raised by
+  an engine that was killed mid-reconnect (Gateway restarted, then
+  `make prod`) persisted in `alerts:active` indefinitely and kept the
+  amber banner up while the stack was healthy. Engine startup now
+  clears these alerts once Redis is connected — at that point the
+  engine is already IB-connected, so any lingering reconnect alert is
+  stale by definition.
 - **Engine-wide DB poisoning after one "database is locked" error.**
   The command-audit write in `execute_single_command` used a raw
   `session.commit()`; when it hit transient SQLite lock contention,

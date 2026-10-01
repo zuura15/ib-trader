@@ -141,3 +141,42 @@ async def test_reconnect_loop_cancellation_propagates():
     ):
         with pytest.raises(asyncio.CancelledError):
             await engine_main._reconnect_with_backoff(ctx)
+
+
+async def test_resolve_clears_stale_reconnect_alerts():
+    """Startup regression (2026-10-01): alerts raised by a PREVIOUS
+    engine process must be cleared by ``_resolve_ib_disconnect_alert``
+    — engine startup now calls it once Redis is up, since being
+    IB-connected makes any lingering reconnect alert stale. A banner
+    left by the morning's Gateway restarts otherwise sat in
+    alerts:active all day with the stack fully healthy."""
+    import json
+
+    stale = {
+        "a1": json.dumps({"trigger": "IB_GATEWAY_RECONNECTING"}),
+        "a2": json.dumps({"trigger": "IB_GATEWAY_DISCONNECTED"}),
+        "a3": json.dumps({"trigger": "SOMETHING_ELSE"}),
+    }
+    redis = SimpleNamespace(
+        hgetall=AsyncMock(return_value=stale),
+        hdel=AsyncMock(return_value=2),
+    )
+    ctx = SimpleNamespace(ib=SimpleNamespace(), redis=redis)
+
+    captured: list = []
+    with patch.object(
+        engine_main, "_spawn_background",
+        side_effect=lambda coro: captured.append(coro),
+    ):
+        engine_main._resolve_ib_disconnect_alert(ctx)
+
+    assert len(captured) == 1
+    with patch(
+        "ib_trader.redis.streams.publish_activity", new=AsyncMock(),
+    ) as pub:
+        await captured[0]
+
+    redis.hdel.assert_awaited_once()
+    removed = set(redis.hdel.await_args.args[1:])
+    assert removed == {"a1", "a2"}  # unrelated alert untouched
+    pub.assert_awaited_once()

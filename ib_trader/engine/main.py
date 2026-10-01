@@ -279,6 +279,18 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         ctx.redis = redis
         print("[ENGINE] Connected to Redis.")
 
+        # Clear stale IB-reconnect alerts from a PREVIOUS engine
+        # process. The connect callback only resolves these on a
+        # reconnect within one process lifetime, so an alert raised by
+        # an engine that was killed mid-reconnect (e.g. the Gateway was
+        # restarted, then ``make prod`` restarted the stack) survived
+        # in alerts:active forever and kept the frontend's "Gateway
+        # disconnected — trading paused" banner up while everything was
+        # actually healthy (live 2026-10-01, banner stale since the
+        # morning Gateway restarts). We are IB-connected by this point
+        # in startup, so any reconnect alert is stale by definition.
+        _resolve_ib_disconnect_alert(ctx)
+
         # --- Publish engine session metadata ---
         # /api/status reads this so the UI header reports what the engine
         # is actually connected to (paper vs live) rather than parsing
