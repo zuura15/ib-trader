@@ -142,6 +142,18 @@ def create_db_engine(db_url: str):
             dbapi_conn.execute("PRAGMA journal_mode=WAL")
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
             dbapi_conn.execute("PRAGMA busy_timeout=5000")
+            # synchronous=NORMAL (2026-10-01): in WAL mode this skips
+            # the per-commit fsync (WAL is still synced at checkpoint),
+            # which matters because commits here run on the asyncio
+            # event-loop thread — on prod's stalling disk a single
+            # fsync hung the engine for seconds at a time (jbd2 +
+            # ib-api observed in D-state, 70% iowait). NORMAL in WAL
+            # cannot corrupt the DB; worst case a power cut loses the
+            # last few commits — acceptable for an OBSERVATIONAL
+            # store (IB is the source of truth for broker state, and
+            # every live operation completes in IB before the SQLite
+            # write).
+            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
     # Audit hook — every SQL statement gets logged with its caller so we can
     # hunt down code paths that still reach into SQLite when they shouldn't.
