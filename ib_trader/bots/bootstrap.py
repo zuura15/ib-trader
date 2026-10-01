@@ -278,7 +278,10 @@ def _update_row(
     fresh.tick_interval_seconds = d.tick_interval_seconds
     fresh.config_json = json.dumps(d.config, sort_keys=True, default=str)
     fresh.updated_at = datetime.now(timezone.utc)
-    session.commit()
+    # safe_commit keeps the scoped session usable if the commit hits
+    # transient SQLite lock contention (see data/repository.py).
+    from ib_trader.data.repository import safe_commit
+    safe_commit(session)
 
 
 def config_version_for(bot_id: str) -> str | None:

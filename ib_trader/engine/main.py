@@ -2198,6 +2198,15 @@ async def _heartbeat_loop(ctx: AppContext, pid: int) -> None:
             ctx.heartbeats.upsert("ENGINE", pid)
         except Exception:
             logger.exception('{"event": "HEARTBEAT_WRITE_FAILED"}')
+            # Backstop: if the shared scoped session is poisoned
+            # (PendingRollbackError after a failed commit elsewhere),
+            # roll it back so the whole engine's DB layer self-heals
+            # within one heartbeat interval instead of staying dead
+            # until restart (live 2026-10-01).
+            try:
+                ctx.heartbeats._session().rollback()
+            except Exception:
+                logger.debug("heartbeat session rollback failed", exc_info=True)
         await asyncio.sleep(interval)
 
 

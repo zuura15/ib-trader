@@ -6,6 +6,19 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-10-01
 
 ### Fixed
+- **Engine-wide DB poisoning after one "database is locked" error.**
+  The command-audit write in `execute_single_command` used a raw
+  `session.commit()`; when it hit transient SQLite lock contention,
+  the shared scoped session entered pending-rollback state and every
+  later DB write in the engine failed with `PendingRollbackError` —
+  heartbeats, fill handling, and commission persistence stayed dead
+  until restart (live 11:10, order 15444 / `buy GCZ6 1`). The audit
+  write (and the bot-bootstrap update) now go through `safe_commit`
+  (rollback + lock retry), a lint-style test forbids raw
+  `.commit()` outside the data layer, and the engine heartbeat loop
+  rolls the session back on write failure as a backstop so any
+  future poisoning self-heals within one 30 s heartbeat instead of
+  lasting until restart.
 - **Chart history/SR 504 bursts during HMDS slow spells.** IB's
   historical-data farm intermittently takes 45+ s to answer the
   1-min futures pulls; because every chart pane's 5-min cache TTL

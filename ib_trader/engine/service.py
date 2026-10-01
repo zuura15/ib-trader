@@ -348,8 +348,15 @@ async def execute_single_command(
             status=PendingCommandStatus.RUNNING,
             submitted_at=_dt.now(_tz.utc),
         )
+        # safe_commit, not a raw commit: a raw commit() that hits
+        # "database is locked" leaves the scoped session in
+        # pending-rollback state and poisons EVERY later DB write in
+        # the engine process (live 2026-10-01: one locked insert here
+        # killed heartbeats, fill handling, and commission writes
+        # until restart).
+        from ib_trader.data.repository import safe_commit
         ctx.pending_commands._session().add(cmd)
-        ctx.pending_commands._session().commit()
+        safe_commit(ctx.pending_commands._session())
         await _notify_commands_changed()
 
     try:

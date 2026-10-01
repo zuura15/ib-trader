@@ -94,3 +94,32 @@ class TestSessionPoisoningGuard:
 
         with pytest.raises(ValueError, match="original"):
             safe_commit(session)
+
+
+class TestNoRawCommitsOutsideDataLayer:
+    """Lint-style invariant: every ``session.commit()`` in application
+    code must go through ``safe_commit``. A raw commit that hits
+    "database is locked" poisons the shared scoped session and kills
+    every later DB write in that process (live 2026-10-01: one raw
+    commit in ``execute_single_command`` took down heartbeats, fill
+    handling, and commission writes until restart)."""
+
+    def test_no_raw_session_commit_calls(self):
+        import re
+        from pathlib import Path
+
+        pkg = Path(__file__).resolve().parents[2] / "ib_trader"
+        # The data layer owns safe_commit and may call commit() inside it.
+        allowed = {pkg / "data" / "repository.py"}
+        offenders: list[str] = []
+        for py in pkg.rglob("*.py"):
+            if py in allowed:
+                continue
+            for i, line in enumerate(py.read_text().splitlines(), 1):
+                stripped = line.split("#", 1)[0]
+                if re.search(r"\.commit\(\)", stripped):
+                    offenders.append(f"{py.relative_to(pkg)}:{i}: {line.strip()}")
+        assert not offenders, (
+            "raw session.commit() found — use safe_commit() instead:\n"
+            + "\n".join(offenders)
+        )
