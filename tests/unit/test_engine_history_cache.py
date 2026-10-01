@@ -38,8 +38,21 @@ def stub_ctx(monkeypatch):
     fake_ctx.ib = fake_ib
     monkeypatch.setattr(internal_api, "_ctx", fake_ctx)
     yield fake_ib
-    # Clean the shared module-level cache so tests don't bleed.
+    # Clean the shared module-level cache + inflight registry so tests
+    # don't bleed into each other.
     _HISTORY_CACHE.clear()
+    for t in list(internal_api._HISTORY_INFLIGHT.values()):
+        t.cancel()
+    internal_api._HISTORY_INFLIGHT.clear()
+
+
+async def _settle_inflight():
+    """Await any background refresh tasks (swallowing their errors)."""
+    for t in list(internal_api._HISTORY_INFLIGHT.values()):
+        try:
+            await t
+        except Exception:
+            pass
 
 
 def _fake_bar(close: float = 100.0):
@@ -85,6 +98,10 @@ class TestStaleFallback:
         )
 
         assert result == stale_bars
+        # The failed background refresh must not clobber the stale
+        # entry — the next poll serves it again and retries.
+        await _settle_inflight()
+        assert _HISTORY_CACHE[cache_key][1] == stale_bars
 
     @pytest.mark.asyncio
     async def test_502_when_ib_raises_and_no_cache(self, stub_ctx):
@@ -127,3 +144,64 @@ class TestStaleFallback:
 
         assert result == fresh_bars
         stub_ctx.req_historical_data_async.assert_not_called()
+
+
+class TestStaleWhileRevalidate:
+    """A stale-but-servable cache entry answers immediately; the IB
+    refetch happens in the background. Added 2026-10-01 after HMDS
+    slow spells (45+ s answers) turned every synchronized chart-pane
+    TTL expiry into a visible 504 burst across all charts."""
+
+    @pytest.mark.asyncio
+    async def test_stale_served_immediately_while_ib_is_slow(self, stub_ctx):
+        stale_bars = [{"ts": "2026-10-01T06:55:00+00:00", "close": 100.0}]
+        cache_key = (12345, 8, "3 mins", True)
+        _HISTORY_CACHE[cache_key] = (
+            time.monotonic() - (_HISTORY_TTL_SECONDS + 60), stale_bars,
+        )
+
+        async def slow_fetch(*a, **kw):
+            await asyncio.sleep(0.3)
+            return [_fake_bar(close=101.0)]
+
+        stub_ctx.req_historical_data_async.side_effect = slow_fetch
+
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        result = await get_history(
+            con_id=12345, hours=8, bar_size="3 mins", include_partial=True,
+        )
+        elapsed = loop.time() - t0
+
+        assert result == stale_bars
+        assert elapsed < 0.15, "stale-cache response blocked on the IB fetch"
+
+        # The background refresh lands in the cache for the next poll.
+        await _settle_inflight()
+        refreshed = _HISTORY_CACHE[cache_key][1]
+        assert refreshed and refreshed[0]["close"] == 101.0
+
+    @pytest.mark.asyncio
+    async def test_single_flight_dedups_concurrent_cold_calls(self, stub_ctx):
+        calls = 0
+
+        async def counted_fetch(*a, **kw):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return [_fake_bar(close=102.0)]
+
+        stub_ctx.req_historical_data_async.side_effect = counted_fetch
+
+        results = await asyncio.gather(
+            get_history(con_id=12345, hours=8, bar_size="3 mins",
+                        include_partial=True),
+            get_history(con_id=12345, hours=8, bar_size="3 mins",
+                        include_partial=True),
+            get_history(con_id=12345, hours=8, bar_size="3 mins",
+                        include_partial=True),
+        )
+
+        assert calls == 1, "concurrent identical requests must share one fetch"
+        assert all(r == results[0] for r in results)
+        assert results[0][0]["close"] == 102.0

@@ -6,6 +6,19 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-10-01
 
 ### Fixed
+- **Chart history/SR 504 bursts during HMDS slow spells.** IB's
+  historical-data farm intermittently takes 45+ s to answer the
+  1-min futures pulls; because every chart pane's 5-min cache TTL
+  expires in sync, each slow spell surfaced as a burst of
+  `ENGINE_HISTORY_TIMEOUT` / `ENGINE_SR_TIMEOUT` 504s across all
+  charts at once, then "resumed" when the late fetch landed in the
+  cache. `/engine/history` now serves stale-while-revalidate: a
+  stale-but-servable cache entry (≤ 30 min) answers immediately and
+  the IB refetch runs in the background (single-flight — concurrent
+  identical requests share one fetch). Safe by design: the frontend
+  merges live quote-tick bars on top of this base layer, so
+  staleness only delays volume/close backfill, never chart recency.
+  SR shares the same cache and inherits the fix.
 - **Engine startup wedge: concurrent order snapshots orphaned each
   other's ib-async futures.** ib-async keys snapshot requests
   (openOrders / completedOrders) globally, so when the startup

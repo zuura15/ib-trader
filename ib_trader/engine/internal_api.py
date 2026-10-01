@@ -806,6 +806,143 @@ _HISTORY_TTL_SECONDS = 300.0
 # refreshed AFTER pacing cleared, which is exactly the experience the
 # user reported 2026-05-19 / 2026-05-20.
 _HISTORY_STALE_FALLBACK_SECONDS = 1800.0  # 30 min
+# Single-flight registry: at most one in-flight IB fetch per cache key.
+# Chart panes poll in sync, so a cache expiry used to fan out N
+# identical HMDS requests at once.
+_HISTORY_INFLIGHT: dict[tuple, asyncio.Task] = {}
+
+
+async def _fetch_history_bars(
+    contract, con_id: int, hours: int, bar_size: str,
+    include_partial: bool, cache_key: tuple,
+) -> list[dict]:
+    """IB historical fetch + closed-bar postprocess + cache write.
+
+    Shared by the blocking cold-cache path and the background
+    stale-while-revalidate refresh in ``get_history``.
+    """
+    import time
+
+    # IB's durationStr only accepts S/D/W/M/Y — no H. The "S" format
+    # is capped at 86400 (24h); anything longer must use "N D".
+    #
+    # CME futures gotcha (2026-06-02 MGCQ6 incident): "N D" with
+    # useRTH=False returns "the current trading session + (N-1) prior
+    # sessions", NOT "N×24h calendar". CME sessions run ~23h with a
+    # 1h daily break, so e.g. a hours=48 request rounded to "2 D"
+    # returns only ~23-25h of bars — just the current session.
+    # Operator saw the MGCQ6 chart start at 3pm PT yesterday instead
+    # of midday two days ago.
+    #
+    # Fix: round up to the next whole day AND add one extra session
+    # buffer so the returned data covers the full requested calendar
+    # window. Cheap — backend over-fetches modestly; frontend's
+    # setVisibleRange clamps to the actual display window anyway.
+    hours_int = max(1, int(hours))
+    if hours_int <= 24:
+        duration_str = f"{hours_int * 3600} S"
+    else:
+        days = (hours_int + 23) // 24 + 1
+        duration_str = f"{days} D"
+    # TRADES is what the bot reasons about and what the operator sees
+    # on the chart. The prior BID_ASK feed put bot decisions on
+    # avg_ask / mid while the operator's eye reads last-trade prints,
+    # which produced "bot fired but the chart shows a different close"
+    # discrepancies (2026-05-12 MESM6 08:36). TRADES can be sparse
+    # overnight on illiquid contracts; we accept that gap because the
+    # bot is gated by RTH / futures dead-zone and won't act on stale
+    # ETH bars anyway.
+    bars = await _ctx.ib.req_historical_data_async(
+        contract,
+        duration_str=duration_str,
+        bar_size=bar_size,
+        what_to_show="TRADES",
+        use_rth=False,
+        format_date=2,
+    )
+
+    # Drop the in-progress bar (the bar whose slot end is still in
+    # the future). IB returns the currently-forming bar at the tail
+    # of historical data with whatever the latest tick is as its
+    # close — bots that consume this feed for pivot detection then
+    # see "bar - 1" as a strict pivot every few ticks even when it
+    # isn't, because the in-progress close moves above/below it as
+    # the tape ticks. Trimming the in-progress bar makes the feed a
+    # pure record of *closed* bars.
+    bar_seconds_map = {"1 min": 60, "3 mins": 180, "5 mins": 300,
+                        "15 mins": 900, "30 mins": 1800, "1 hour": 3600}
+    bar_seconds = bar_seconds_map.get(bar_size, 0)
+    from datetime import datetime as _dt, timezone as _tz
+    now_utc = _dt.now(_tz.utc).timestamp()
+    out: list[dict] = []
+    for bar in bars or []:
+        ts = getattr(bar, "date", None)
+        if (not include_partial) and bar_seconds > 0 \
+                and hasattr(ts, "timestamp"):
+            slot_end = ts.timestamp() + bar_seconds
+            if slot_end > now_utc + 0.5:
+                continue
+        ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        out.append({
+            "ts": ts_str,
+            "open": float(bar.open),
+            "high": float(bar.high),
+            "low": float(bar.low),
+            "close": float(bar.close),
+            "volume": int(getattr(bar, "volume", 0) or 0),
+        })
+
+    fetched_at = time.monotonic()
+    _HISTORY_CACHE[cache_key] = (fetched_at, out)
+    # Drop entries older than the stale-fallback horizon (NOT the fresh
+    # TTL) so the stale-serving path above still has data to serve.
+    # Past the fallback horizon the entry would be too old to be
+    # useful anyway.
+    if len(_HISTORY_CACHE) > 512:
+        for k in [k for k, (t, _) in _HISTORY_CACHE.items()
+                  if (fetched_at - t) > _HISTORY_STALE_FALLBACK_SECONDS]:
+            _HISTORY_CACHE.pop(k, None)
+    return out
+
+
+def _spawn_history_refresh(
+    cache_key: tuple, contract, con_id: int, hours: int,
+    bar_size: str, include_partial: bool,
+) -> asyncio.Task:
+    """Start (or join) the single-flight history fetch for a cache key.
+
+    Background callers never await the returned task, so its failure
+    is surfaced from a done-callback instead of being swallowed by
+    asyncio. A failed refresh is WARNING-grade: the stale cache keeps
+    the chart alive and the next poll retries (the common cause is IB
+    error 162 pacing, which clears within a minute or two).
+    """
+    task = _HISTORY_INFLIGHT.get(cache_key)
+    if task is not None and not task.done():
+        return task
+
+    async def _refresh() -> list[dict]:
+        try:
+            return await _fetch_history_bars(
+                contract, con_id, hours, bar_size, include_partial,
+                cache_key,
+            )
+        finally:
+            _HISTORY_INFLIGHT.pop(cache_key, None)
+
+    task = asyncio.create_task(_refresh())
+    _HISTORY_INFLIGHT[cache_key] = task
+
+    def _log_failure(t: asyncio.Task) -> None:
+        if t.cancelled() or t.exception() is None:
+            return
+        logger.warning(
+            '{"event": "HISTORY_FETCH_FAILED", "con_id": %d}',
+            con_id, exc_info=t.exception(),
+        )
+
+    task.add_done_callback(_log_failure)
+    return task
 
 
 @app.get("/engine/history")
@@ -871,6 +1008,7 @@ async def get_history(
         return cached[1]
     if cached and not isinstance(cached[0], (int, float)):
         _HISTORY_CACHE.pop(cache_key, None)
+        cached = None
 
     contract = _ctx.ib._contract_cache.get(int(con_id))
     if contract is None:
@@ -879,111 +1017,41 @@ async def get_history(
             detail=f"contract {con_id} not in cache; qualify it first",
         )
 
-    # IB's durationStr only accepts S/D/W/M/Y — no H. The "S" format
-    # is capped at 86400 (24h); anything longer must use "N D".
-    #
-    # CME futures gotcha (2026-06-02 MGCQ6 incident): "N D" with
-    # useRTH=False returns "the current trading session + (N-1) prior
-    # sessions", NOT "N×24h calendar". CME sessions run ~23h with a
-    # 1h daily break, so e.g. a hours=48 request rounded to "2 D"
-    # returns only ~23-25h of bars — just the current session.
-    # Operator saw the MGCQ6 chart start at 3pm PT yesterday instead
-    # of midday two days ago.
-    #
-    # Fix: round up to the next whole day AND add one extra session
-    # buffer so the returned data covers the full requested calendar
-    # window. Cheap — backend over-fetches modestly; frontend's
-    # setVisibleRange clamps to the actual display window anyway.
-    hours_int = max(1, int(hours))
-    if hours_int <= 24:
-        duration_str = f"{hours_int * 3600} S"
-    else:
-        days = (hours_int + 23) // 24 + 1
-        duration_str = f"{days} D"
-    # TRADES is what the bot reasons about and what the operator sees
-    # on the chart. The prior BID_ASK feed put bot decisions on
-    # avg_ask / mid while the operator's eye reads last-trade prints,
-    # which produced "bot fired but the chart shows a different close"
-    # discrepancies (2026-05-12 MESM6 08:36). TRADES can be sparse
-    # overnight on illiquid contracts; we accept that gap because the
-    # bot is gated by RTH / futures dead-zone and won't act on stale
-    # ETH bars anyway.
-    try:
-        bars = await _ctx.ib.req_historical_data_async(
-            contract,
-            duration_str=duration_str,
-            bar_size=bar_size,
-            what_to_show="TRADES",
-            use_rth=False,
-            format_date=2,
+    # Stale-while-revalidate (2026-10-01): HMDS intermittently takes
+    # 45+ s to answer these 1-min futures pulls; blocking the request
+    # on the refetch turned every slow spell into a 504 burst across
+    # all chart panes at once (their 5-min TTLs expire in sync). The
+    # frontend merges live quote-tick bars on top of this base layer
+    # (see the _HISTORY_TTL_SECONDS comment), so serving the stale
+    # slice immediately and refreshing in the background costs only
+    # delayed volume/close backfill — never chart recency. This also
+    # subsumes the old stale-on-IB-error fallback: the refresh task
+    # logs HISTORY_FETCH_FAILED and the next poll retries.
+    if cached and (now - cached[0]) < _HISTORY_STALE_FALLBACK_SECONDS:
+        _spawn_history_refresh(
+            cache_key, contract, int(con_id), int(hours), bar_size,
+            bool(include_partial),
         )
+        return cached[1]
+
+    # Cold cache (or beyond the stale horizon): await the single-flight
+    # fetch. ``shield`` so one disconnecting pane can't cancel the
+    # shared task out from under the other waiters, and so the fetch
+    # still lands in the cache for the next poll.
+    task = _spawn_history_refresh(
+        cache_key, contract, int(con_id), int(hours), bar_size,
+        bool(include_partial),
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        # Stale-cache fallback. The most common failure mode is IB
-        # error 162 (historical-data pacing limit) — usually clears in
-        # 1-2 minutes. Serving the last good bars (up to
-        # ``_HISTORY_STALE_FALLBACK_SECONDS`` old) keeps the chart
-        # alive instead of returning 502 on every poll until pacing
-        # clears. Stale data is preferable to a broken chart for a
-        # 3-min-bar timeframe. ``cached`` was looked up at the top of
-        # this function but rejected for being past the fresh TTL;
-        # we now revisit it as a degraded-quality fallback.
-        if cached is not None:
-            stale_age = now - cached[0]
-            if stale_age < _HISTORY_STALE_FALLBACK_SECONDS:
-                logger.warning(
-                    '{"event": "HISTORY_FETCH_STALE_FALLBACK", '
-                    '"con_id": %d, "stale_age_s": %.1f, '
-                    '"reason": "%s"}',
-                    con_id, stale_age, type(e).__name__,
-                )
-                return cached[1]
-        logger.exception('{"event": "HISTORY_FETCH_FAILED", "con_id": %d}', con_id)
-        raise HTTPException(status_code=502, detail=f"historical data failed: {e}") from e
-
-    # Drop the in-progress bar (the bar whose slot end is still in
-    # the future). IB returns the currently-forming bar at the tail
-    # of historical data with whatever the latest tick is as its
-    # close — bots that consume this feed for pivot detection then
-    # see "bar - 1" as a strict pivot every few ticks even when it
-    # isn't, because the in-progress close moves above/below it as
-    # the tape ticks. Trimming the in-progress bar makes the feed a
-    # pure record of *closed* bars.
-    bar_seconds_map = {"1 min": 60, "3 mins": 180, "5 mins": 300,
-                        "15 mins": 900, "30 mins": 1800, "1 hour": 3600}
-    bar_seconds = bar_seconds_map.get(bar_size, 0)
-    from datetime import datetime as _dt, timezone as _tz
-    # ``now`` above is ``time.monotonic()`` used by the TTL cache.
-    # Use a separate name here so the in-progress filter doesn't
-    # shadow it and break the cache check on the next call.
-    now_utc = _dt.now(_tz.utc).timestamp()
-    out: list[dict] = []
-    for bar in bars or []:
-        ts = getattr(bar, "date", None)
-        if (not include_partial) and bar_seconds > 0 \
-                and hasattr(ts, "timestamp"):
-            slot_end = ts.timestamp() + bar_seconds
-            if slot_end > now_utc + 0.5:
-                continue
-        ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-        out.append({
-            "ts": ts_str,
-            "open": float(bar.open),
-            "high": float(bar.high),
-            "low": float(bar.low),
-            "close": float(bar.close),
-            "volume": int(getattr(bar, "volume", 0) or 0),
-        })
-
-    _HISTORY_CACHE[cache_key] = (now, out)
-    # Drop entries older than the stale-fallback horizon (NOT the fresh
-    # TTL) so the stale-on-IB-error fallback above still has data to
-    # serve. Past the fallback horizon the entry would be too old to
-    # be useful anyway.
-    if len(_HISTORY_CACHE) > 512:
-        for k in [k for k, (t, _) in _HISTORY_CACHE.items()
-                  if (now - t) > _HISTORY_STALE_FALLBACK_SECONDS]:
-            _HISTORY_CACHE.pop(k, None)
-    return out
+        # Already logged with stack by the task's done-callback
+        # (HISTORY_FETCH_FAILED).
+        raise HTTPException(
+            status_code=502, detail=f"historical data failed: {e}",
+        ) from e
 
 
 @app.get("/engine/sr")
