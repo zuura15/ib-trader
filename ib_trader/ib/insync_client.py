@@ -388,6 +388,12 @@ class InsyncClient(IBClientBase):
         import logging as _logging
         _logging.getLogger("ib_async").setLevel(_logging.CRITICAL)
 
+        # Any intentional disconnect is over once we reconnect. A flag
+        # left True here makes every later Gateway drop look "expected",
+        # so the engine never starts its reconnect loop (2026-10-05/06:
+        # the 02:30 PT scheduled reconnect left it set, and the 14:45 PT
+        # Gateway drop wedged the engine until a manual restart).
+        self._expected_disconnect = False
         await self._throttle()
         await self.__ib.connectAsync(
             self._host,
@@ -2849,6 +2855,8 @@ class InsyncClient(IBClientBase):
             )
 
         if self._expected_disconnect:
+            # One intentional disconnect() covers exactly one drop.
+            self._expected_disconnect = False
             logger.info('{"event": "IB_DISCONNECTED", "expected": true}')
             return
         # Print to stdout so it shows up in `make dev` output even when

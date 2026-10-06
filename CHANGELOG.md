@@ -3,6 +3,19 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-10-06
+
+### Fixed
+- **Engine never reconnected after the 14:45 PT Gateway drop.** The
+  02:30 PT scheduled reconnect set `_expected_disconnect` and nothing
+  reset it, so the afternoon Gateway disconnect was logged as
+  "expected" and the reconnect-with-backoff loop never started — the
+  engine sat on "Not connected" until a manual restart (Oct 5 and 6).
+  The flag is now consumed by the one drop it covers and reset on every
+  `connect()`. `reconnect_ib` also hands off to the backoff loop when
+  its own reconnect attempt fails, instead of leaving the engine
+  disconnected.
+
 ## 2026-10-01
 
 ### Fixed

@@ -131,6 +131,11 @@ async def reconnect_ib(ctx: "AppContext", *, source: str) -> ReconnectResult:
     except Exception as e:
         reconnect_err = repr(e)
         logger.exception('{"event": "IB_RECONNECT_CONNECT_FAILED", "source": "%s"}', source)
+        # We dropped the socket ourselves, so no unexpected-disconnect
+        # event will start the backoff loop. Start it here, or the engine
+        # stays disconnected until someone restarts it.
+        from ib_trader.engine.main import _raise_ib_disconnect_alert
+        _raise_ib_disconnect_alert(ctx)
 
     watchlist_ok = 0
     watchlist_fail = 0
