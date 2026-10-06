@@ -16,6 +16,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   its own reconnect attempt fails, instead of leaving the engine
   disconnected.
 
+### Removed
+- **Daily 02:30 PT scheduled IB reconnect.** Added 2026-05-27 as a
+  pre-emptive cure for silent tick stalls; the tick-silence watchdog,
+  hourly prophylactic resubscribe and reconnect-with-backoff loop now
+  cover that, and the nightly forced disconnect is what masked the
+  14:45 PT Gateway drop above. `ib_daily_reconnect_pt` /
+  `ib_daily_reconnect_max_gap_hours` settings are no longer read. The
+  manual `POST /engine/ib/reconnect` endpoint is unchanged.
+
 ## 2026-10-01
 
 ### Fixed

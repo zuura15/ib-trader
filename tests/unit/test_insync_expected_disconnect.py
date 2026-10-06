@@ -69,7 +69,7 @@ async def test_failed_reconnect_hands_off_to_backoff_loop():
          patch.object(resilience, "_heartbeat_silence_seconds",
                       new=AsyncMock(return_value=None)), \
          patch("ib_trader.engine.main._raise_ib_disconnect_alert") as handoff:
-        result = await resilience.reconnect_ib(ctx, source="scheduled")
+        result = await resilience.reconnect_ib(ctx, source="manual")
 
     assert result.reconnect_ok is False
     handoff.assert_called_once_with(ctx)

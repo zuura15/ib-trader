@@ -24,16 +24,13 @@ What this module adds:
 
   * :func:`reconnect_ib` is a reusable helper that drops the IB socket,
     reconnects via the same code path as engine startup, then re-runs
-    every watchlist + position market-data subscription. Used by both
-    the manual ``POST /engine/ib/reconnect`` endpoint and the daily
-    scheduler below.
+    every watchlist + position market-data subscription. Used by the
+    manual ``POST /engine/ib/reconnect`` endpoint.
 
-  * :func:`scheduled_reconnect_loop` reconnects once per day at 02:30
-    PT — fifteen minutes after the IB Gateway's own 02:15 restart
-    window. Cadence is set in ``settings.yaml`` (``ib_daily_reconnect_pt``).
-    A pre-flight check skips the cycle when ticks are flowing normally
-    on the assumption "if it ain't broke", but the cycle still runs at
-    least once every 30 h to bound any drift the watchdog might miss.
+  A daily 02:30 PT scheduled reconnect used to live here; it was removed
+  2026-10-06. The watchdog, the hourly prophylactic resubscribe and the
+  engine's reconnect-with-backoff loop cover what it was for, and its
+  intentional disconnect masked the 14:45 PT Gateway drop.
 """
 from __future__ import annotations
 
@@ -41,7 +38,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -58,8 +55,6 @@ DEFAULT_SILENCE_THRESHOLD_S = 60
 DEFAULT_WATCHDOG_INTERVAL_S = 15
 DEFAULT_STARTUP_GRACE_S = 120        # no alerts in the first 2 min after loop start
 DEFAULT_MIN_CONFIRMATIONS = 3        # require 3 consecutive silent polls before alerting
-DEFAULT_RECONNECT_PT = "02:30"       # daily reconnect time
-DEFAULT_RECONNECT_MAX_GAP_HOURS = 30 # force a cycle if none happened in this window
 DEFAULT_PROPHYLACTIC_INTERVAL_H = 1.0
 DEFAULT_PROPHYLACTIC_STAGGER_S = 2.0
 DEFAULT_PROPHYLACTIC_STARTUP_DELAY_S = 600  # 10 min — let the first session settle
@@ -344,91 +339,6 @@ async def tick_silence_watchdog_loop(ctx: "AppContext") -> None:
             logger.exception('{"event": "TICK_WATCHDOG_LOOP_ERROR"}')
             # Don't tight-loop on persistent failure.
             await asyncio.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# Scheduled daily reconnect
-# ---------------------------------------------------------------------------
-
-async def scheduled_reconnect_loop(ctx: "AppContext") -> None:
-    """Reconnect once per day at the configured PT wall-clock time.
-
-    Default is 02:30 PT — 15 min after the IB Gateway's own 02:15
-    restart window — so we land on a fresh upstream session. The HH:MM
-    string in ``settings.yaml`` (``ib_daily_reconnect_pt``) overrides.
-
-    A safety floor (``ib_daily_reconnect_max_gap_hours``, default 30 h)
-    triggers a reconnect even if the wall-clock hit was missed (laptop
-    sleep, settings-yaml reload during the firing window, etc.) — the
-    cycle should never go > 30 h without running.
-    """
-    schedule_str: str = str(ctx.settings.get(
-        "ib_daily_reconnect_pt", DEFAULT_RECONNECT_PT,
-    ))
-    max_gap_h = float(ctx.settings.get(
-        "ib_daily_reconnect_max_gap_hours", DEFAULT_RECONNECT_MAX_GAP_HOURS,
-    ))
-    try:
-        sched_h, sched_m = (int(p) for p in schedule_str.split(":", 1))
-    except Exception:
-        logger.error(
-            '{"event": "IB_DAILY_RECONNECT_BAD_CONFIG", '
-            '"value": "%s", "fallback": "%s"}',
-            schedule_str, DEFAULT_RECONNECT_PT,
-        )
-        sched_h, sched_m = (int(p) for p in DEFAULT_RECONNECT_PT.split(":"))
-
-    last_run: datetime | None = None
-    logger.info(
-        '{"event": "IB_DAILY_RECONNECT_SCHEDULED", '
-        '"time_pt": "%02d:%02d", "max_gap_hours": %.1f}',
-        sched_h, sched_m, max_gap_h,
-    )
-
-    while True:
-        try:
-            now = datetime.now(PT)
-            next_fire = now.replace(hour=sched_h, minute=sched_m,
-                                    second=0, microsecond=0)
-            if next_fire <= now:
-                next_fire = next_fire + timedelta(days=1)
-
-            # Force-fire if the inter-cycle floor was breached. Useful
-            # when the wall-clock target was missed (process started after
-            # 02:30, laptop slept through the window, etc.).
-            if last_run is not None:
-                forced_at = last_run + timedelta(hours=max_gap_h)
-                if forced_at < next_fire:
-                    next_fire = max(forced_at, now + timedelta(seconds=10))
-
-            sleep_s = max(1.0, (next_fire - now).total_seconds())
-            logger.info(
-                '{"event": "IB_DAILY_RECONNECT_SLEEPING_UNTIL", '
-                '"target_pt": "%s", "sleep_s": %.0f}',
-                next_fire.isoformat(), sleep_s,
-            )
-            await asyncio.sleep(sleep_s)
-
-            result = await reconnect_ib(ctx, source="scheduled")
-            last_run = datetime.now(PT)
-            if not result.reconnect_ok:
-                # The standard engine reconnect-with-backoff loop should
-                # already be running by now (ib_async fires
-                # disconnectedEvent on the disconnect we just did, which
-                # triggers _reconnect_with_backoff). Log and continue —
-                # the next scheduled cycle will retry from scratch.
-                logger.warning(
-                    '{"event": "IB_DAILY_RECONNECT_INCOMPLETE", '
-                    '"error": %s}',
-                    json.dumps(result.reconnect_error),
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception('{"event": "IB_DAILY_RECONNECT_LOOP_ERROR"}')
-            # Don't tight-loop on a persistent failure; wait an hour
-            # before re-arming the wall-clock calculation.
-            await asyncio.sleep(3600)
 
 
 async def prophylactic_resubscribe_loop(ctx: "AppContext") -> None:
