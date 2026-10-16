@@ -61,6 +61,10 @@ class _OrderContext:
     # closed — too late to reach the console pane.
     pre_position_qty: Decimal | None = None
     pre_position_avg_cost: Decimal | None = None
+    # FUT only: LIFO lots of the pre-order position (GH #101), copied from
+    # ctx.lifo_basis when they add up to ``pre_position_qty``. When set,
+    # the console readout matches the close against the newest lots.
+    pre_position_lifo_lots: list | None = None
 
 
 def _session_tif() -> str:
@@ -439,6 +443,7 @@ async def execute_order(
     # stays None and the P&L emit is silently skipped.
     pre_qty: Decimal | None = None
     pre_avg: Decimal | None = None
+    pre_lots: list | None = None
     try:
         for _p in (getattr(ctx, "positions_cache", None) or []):
             if _p.get("con_id") == con_id:
@@ -447,6 +452,13 @@ async def execute_order(
                 if _q is not None and _a is not None:
                     pre_qty = Decimal(str(_q))
                     pre_avg = Decimal(str(_a))
+                if (_p.get("sec_type") or "").upper() == "FUT" and pre_qty:
+                    _res = (getattr(ctx, "lifo_basis", None) or {}).get(
+                        _p.get("local_symbol") or "")
+                    if (_res is not None and _res.method == "lifo"
+                            and _res.open_qty == pre_qty):
+                        from ib_trader.engine.lifo_pnl import Lot
+                        pre_lots = [Lot(qty=lot.qty, cost=lot.cost) for lot in _res.lots]
                 break
     except Exception as e:
         logger.debug("pre-order position snapshot failed", exc_info=e)
@@ -470,6 +482,7 @@ async def execute_order(
         order_ref=order_ref,
         pre_position_qty=pre_qty,
         pre_position_avg_cost=pre_avg,
+        pre_position_lifo_lots=pre_lots,
     )
 
     logger.info(
@@ -2319,10 +2332,23 @@ async def _emit_console_close_pnl(
     direction = Decimal("1") if pre_is_long else Decimal("-1")
     closed_qty = min(qty_filled, abs(pre_qty))
     multiplier = order_ctx.multiplier or Decimal("1")
-    pnl = (
+    avg_pnl = (
         (avg_price - pre_avg) * closed_qty * multiplier * direction
         - commission
     )
+    pnl = avg_pnl
+    method = "avg"
+    if order_ctx.pre_position_lifo_lots:
+        # Futures LIFO (GH #101): match against the newest lots. Work on a
+        # copy — the snapshot stays as taken at order creation.
+        from ib_trader.engine.lifo_pnl import Lot, realize_lifo
+        lots = [Lot(qty=lot.qty, cost=lot.cost)
+                for lot in order_ctx.pre_position_lifo_lots]
+        signed = qty_filled if order_is_buy else -qty_filled
+        lifo_pnl = realize_lifo(lots, signed, avg_price, commission, multiplier)
+        if lifo_pnl is not None:
+            pnl = lifo_pnl
+            method = "lifo"
     sign = "+" if pnl >= 0 else "-"
     sev = OutputSeverity.SUCCESS if pnl >= 0 else OutputSeverity.WARNING
     ctx.router.emit(
@@ -2335,9 +2361,9 @@ async def _emit_console_close_pnl(
         '{"event": "CONSOLE_CLOSE_PNL_COMPUTED", "serial": %d, '
         '"pre_qty": "%s", "pre_avg": "%s", "exit_price": "%s", '
         '"closed_qty": "%s", "multiplier": "%s", "commission": "%s", '
-        '"realized_pnl": "%s"}',
+        '"realized_pnl": "%s", "method": "%s", "avg_cost_pnl": "%s"}',
         order_ctx.trade_serial, pre_qty, pre_avg, avg_price,
-        closed_qty, multiplier, commission, pnl,
+        closed_qty, multiplier, commission, pnl, method, avg_pnl,
     )
     await _record_console_close_pnl(
         ctx, pnl, order_ctx.symbol, closed_qty,

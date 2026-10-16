@@ -62,6 +62,7 @@ def _to_record(ex: dict[str, Any]) -> dict[str, Any] | None:
         "local_symbol": sym,
         "symbol": ex.get("symbol") or "",
         "sec_type": ex.get("sec_type") or "",
+        "multiplier": None if ex.get("multiplier") in (None, "") else str(ex.get("multiplier")),
         "side": ex.get("side") or "",
         "exec_id": exec_id,
         "perm_id": int(ex.get("perm_id") or 0),
@@ -90,6 +91,13 @@ def _deshift_time(iso: str | None, future_cutoff: datetime,
     if d > future_cutoff:
         return (d + host_offset).isoformat()
     return iso
+
+
+def _is_zero(v: Any) -> bool:
+    try:
+        return v is None or Decimal(str(v)) == 0
+    except (ValueError, TypeError, ArithmeticError):
+        return True
 
 
 def merge_executions(
@@ -132,7 +140,14 @@ def merge_executions(
             prev["realized_pnl"] = rec["realized_pnl"]
             if rec.get("commission") is not None:
                 prev["commission"] = rec["commission"]
-        # else: keep prev unchanged.
+        else:
+            # Opening fills never carry realized P&L, so the branch above
+            # never refreshes their commission. Take it once it pairs —
+            # LIFO folds it into the lot cost.
+            if _is_zero(prev.get("commission")) and not _is_zero(rec.get("commission")):
+                prev["commission"] = rec["commission"]
+            if not prev.get("multiplier") and rec.get("multiplier"):
+                prev["multiplier"] = rec["multiplier"]
 
     cutoff = (now.astimezone(timezone.utc) - timedelta(hours=window_hours)).isoformat()
     return {
@@ -162,6 +177,7 @@ def records_to_execs(stored: dict[str, dict]) -> list[dict]:
             "local_symbol": r.get("local_symbol") or "",
             "symbol": r.get("symbol") or "",
             "sec_type": r.get("sec_type") or "",
+            "multiplier": r.get("multiplier"),
             "side": r.get("side") or "",
             "exec_id": r.get("exec_id") or "",
             "perm_id": int(r.get("perm_id") or 0),

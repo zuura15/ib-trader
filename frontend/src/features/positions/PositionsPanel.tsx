@@ -31,6 +31,9 @@ interface BrokerPosition {
   // is wrong (Aug crude trades in July).
   local_symbol?: string | null;
   con_id?: number | null;
+  // FUT only: per-unit LIFO cost of the open lots (GH #101). ``avg_cost``
+  // stays IB's average cost; the panel displays LIFO when this is set.
+  lifo_avg_cost?: string | null;
 }
 
 type SortKey = 'symbol' | 'quantity' | 'price' | 'avg_cost' | 'pnl';
@@ -42,7 +45,19 @@ function parseNum(v: string | null | undefined): number {
   return isNaN(n) ? 0 : n;
 }
 
-function computePnl(pos: BrokerPosition): number | null {
+/** Cost basis shown in the panel: LIFO for futures when the engine
+ *  supplied it, otherwise IB's average cost. */
+function displayCost(pos: BrokerPosition): string {
+  return pos.lifo_avg_cost ?? pos.avg_cost;
+}
+
+/** IB's average-cost P&L, only for rows displayed on a LIFO basis —
+ *  that's when the tooltip needs it. */
+function ibPnlIfLifo(pos: BrokerPosition): number | null {
+  return pos.lifo_avg_cost != null ? computePnl(pos, pos.avg_cost) : null;
+}
+
+function computePnl(pos: BrokerPosition, cost: string = displayCost(pos)): number | null {
   if (!pos.market_price) return null;
   // Per-unit price diff × qty × multiplier = dollar P&L. Backend now
   // sends per-unit avg_cost for futures (after dividing IB's total-cost
@@ -52,7 +67,7 @@ function computePnl(pos: BrokerPosition): number | null {
   const multStr = pos.multiplier;
   const mult = multStr ? parseFloat(multStr) : 1;
   const validMult = Number.isFinite(mult) && mult > 0 ? mult : 1;
-  return (parseNum(pos.market_price) - parseNum(pos.avg_cost))
+  return (parseNum(pos.market_price) - parseNum(cost))
        * parseNum(pos.quantity) * validMult;
 }
 
@@ -90,11 +105,11 @@ function chartPnlKey(pos: BrokerPosition): string {
  *  calculation (computePnl above), one publisher (this panel), dumb
  *  lookups everywhere else. */
 function publishChartPnl(rows: BrokerPosition[]): void {
-  const map: Record<string, { qty: number; pnl: number | null }> = {};
+  const map: Record<string, { qty: number; pnl: number | null; ibPnl?: number | null }> = {};
   for (const p of rows) {
     const qty = parseNum(p.quantity);
     if (!qty) continue;
-    map[chartPnlKey(p)] = { qty, pnl: computePnl(p) };
+    map[chartPnlKey(p)] = { qty, pnl: computePnl(p), ibPnl: ibPnlIfLifo(p) };
   }
   useStore.getState().setChartPnl(map);
 }
@@ -116,7 +131,7 @@ function sortPositions(positions: BrokerPosition[], key: SortKey, dir: SortDir):
         cmp = parseNum(a.market_price) - parseNum(b.market_price);
         break;
       case 'avg_cost':
-        cmp = parseNum(a.avg_cost) - parseNum(b.avg_cost);
+        cmp = parseNum(displayCost(a)) - parseNum(displayCost(b));
         break;
       case 'pnl':
         cmp = (computePnl(a) ?? -Infinity) - (computePnl(b) ?? -Infinity);
@@ -372,7 +387,8 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
               </tr>
             ) : sorted.map((pos) => {
               const qty = parseNum(pos.quantity);
-              const avg = parseNum(pos.avg_cost);
+              const avg = parseNum(displayCost(pos));
+              const ibPnl = ibPnlIfLifo(pos);
               const mkt = pos.market_price ? parseNum(pos.market_price) : null;
               const pnl = computePnl(pos);
               const isSelected =
@@ -429,13 +445,23 @@ export function PositionsPanel({ compact = false }: { compact?: boolean }) {
                   >
                     {qty > 0 ? '+' : ''}{qty}
                   </td>
-                  <td className={`text-right font-mono ${pnl !== null ? pnlClass(pnl) : ''}`}>
+                  <td
+                    className={`text-right font-mono ${pnl !== null ? pnlClass(pnl) : ''}`}
+                    title={ibPnl !== null
+                      ? `LIFO basis. IB average cost: ${formatCurrency(ibPnl)}` : undefined}
+                  >
                     {pnl !== null ? formatCurrency(pnl) : <span className="value-na">—</span>}
                   </td>
                   <td className="text-right font-mono" style={{ color: 'var(--text-primary)' }}>
                     {mkt !== null ? `$${mkt.toFixed(2)}` : <span className="value-na">—</span>}
                   </td>
-                  <td className="text-right font-mono" style={{ color: 'var(--text-secondary)' }}>
+                  <td
+                    className="text-right font-mono"
+                    style={{ color: 'var(--text-secondary)' }}
+                    title={pos.lifo_avg_cost != null
+                      ? `LIFO cost of the remaining contracts. IB average cost: $${parseNum(pos.avg_cost).toFixed(2)}`
+                      : undefined}
+                  >
                     ${avg.toFixed(2)}
                   </td>
                 </tr>

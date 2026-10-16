@@ -101,8 +101,10 @@ interface AppStore {
   // disabled". Deliberately a tiny DERIVED map (qty + pnl only), not
   // raw position rows: single calculation lives in PositionsPanel,
   // consumers do a dumb key lookup. See 2026-06-11 chart-P&L design.
-  chartPnl: Record<string, { qty: number; pnl: number | null }>;
-  setChartPnl: (map: Record<string, { qty: number; pnl: number | null }>) => void;
+  // ``ibPnl`` is set only when ``pnl`` uses a LIFO basis (FUT, GH #101):
+  // IB's average-cost figure for the hover tooltip.
+  chartPnl: Record<string, { qty: number; pnl: number | null; ibPnl?: number | null }>;
+  setChartPnl: (map: Record<string, { qty: number; pnl: number | null; ibPnl?: number | null }>) => void;
 
 
   // Bots

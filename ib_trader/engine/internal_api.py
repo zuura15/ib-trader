@@ -743,7 +743,32 @@ async def get_positions():
     """
     if _ctx is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
-    return _ctx.positions_cache
+    return with_lifo_cost(_ctx.positions_cache, _ctx.lifo_basis)
+
+
+def with_lifo_cost(positions: list[dict], lifo_basis: dict) -> list[dict]:
+    """Attach ``lifo_avg_cost`` to FUT positions (GH #101).
+
+    ``avg_cost`` stays IB's average cost (bots and anything else read it);
+    the UI prefers ``lifo_avg_cost`` when present. Attached only while the
+    LIFO lots add up to the position IB reports — right after a fill the
+    basis may lag by a sweep, and IB's number is the honest fallback.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    out = []
+    for p in positions:
+        res = lifo_basis.get(p.get("local_symbol") or "") if (
+            (p.get("sec_type") or "").upper() == "FUT") else None
+        if res is not None and res.method == "lifo" and res.avg_cost is not None:
+            try:
+                qty_matches = Decimal(str(p.get("quantity"))) == res.open_qty
+            except (InvalidOperation, ValueError, TypeError):
+                qty_matches = False
+            if qty_matches:
+                p = {**p, "lifo_avg_cost": str(res.avg_cost)}
+        out.append(p)
+    return out
 
 
 @app.get("/engine/positions/refresh")

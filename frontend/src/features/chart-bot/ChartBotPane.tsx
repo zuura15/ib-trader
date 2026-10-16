@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
+import { pnlBasisTooltip, type ChartPnlRollupEntry } from '../../api/client';
 
 interface Props {
   /** Trader-layout slot 1..4. Bound to bot id ``chart-bot-<slot>``. */
@@ -290,9 +291,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   // no WS, nothing the chart canvas depends on. The whole small map is
   // returned; we read our own symbol's entry. Replaces the old
   // tradeGroups-based 24h sum, which couldn't see manual TWS fills.
-  const [pnlRollup, setPnlRollup] = useState<
-    Record<string, { pnl_24h: number; pnl_session: number | null; sec_type: string }>
-  >({});
+  const [pnlRollup, setPnlRollup] = useState<Record<string, ChartPnlRollupEntry>>({});
   useEffect(() => {
     // Compact (mobile) panes show no per-pane P&L — the single 24h
     // figure lives in the header — so skip the poll entirely.
@@ -316,6 +315,11 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   const rollupEntry = symbol ? pnlRollup[symbol] : undefined;
   const pnl24h = rollupEntry ? rollupEntry.pnl_24h : null;
   const pnlSession = rollupEntry ? rollupEntry.pnl_session : null;
+  const sessionTooltip = pnlBasisTooltip(rollupEntry?.method, rollupEntry?.ib_pnl_session);
+  const tooltip24h = pnlBasisTooltip(rollupEntry?.method, rollupEntry?.ib_pnl_24h);
+  const liveTooltip = pnlBasisTooltip(
+    pnlEntry?.ibPnl != null ? 'lifo' : undefined, pnlEntry?.ibPnl,
+  );
 
   return (
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
@@ -353,16 +357,19 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             area — inset from the right so it clears the price axis,
             and from the bottom so it clears the time axis.
             ``pointer-events: none`` so chart pan/zoom/crosshair pass
-            straight through. Hidden when flat or when the publisher
-            (PositionsPanel) isn't mounted. */}
+            straight through — except when there's a LIFO tooltip to
+            show (FUT), where the number itself takes the hover.
+            Hidden when flat or when the publisher (PositionsPanel)
+            isn't mounted. */}
         {livePnl != null && positionQty !== 0 && (
           <span
+            title={liveTooltip}
             style={{
               position: 'absolute',
               bottom: 28,
               right: 72,
               zIndex: 15,
-              pointerEvents: 'none',
+              pointerEvents: liveTooltip ? 'auto' : 'none',
               fontFamily: 'ui-monospace, monospace',
               fontSize: 11,
               fontWeight: 700,
@@ -448,7 +455,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
               }}>
                 Today
               </span>
-              <span style={{
+              <span title={sessionTooltip} style={{
                 fontSize: 12, fontWeight: 700,
                 color: pnlSession >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
               }}>
@@ -464,7 +471,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
               24h
             </span>
             {pnl24h != null ? (
-              <span style={{
+              <span title={tooltip24h} style={{
                 fontSize: 12, fontWeight: 700,
                 color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
               }}>

@@ -64,6 +64,14 @@ class AppContext:
     # + 30s poll. Served via GET /engine/positions. No Redis.
     positions_cache: list = field(default_factory=list)
 
+    # Futures LIFO cost basis per localSymbol (GH #101), rebuilt by the
+    # engine's P&L rollup sweep: ``{local_symbol: LifoResult}``. Display
+    # only — IB's average cost stays the broker-side truth.
+    lifo_basis: dict = field(default_factory=dict)
+    # Set on a FUT position change so the rollup sweep re-runs right away
+    # instead of waiting out its interval. Created by the engine loop.
+    pnl_rollup_wake: object | None = None
+
     # Multi-broker support: dict of broker name → BrokerClientBase
     # When set, get_broker() uses this instead of self.ib
     _brokers: dict | None = field(default=None, repr=False)

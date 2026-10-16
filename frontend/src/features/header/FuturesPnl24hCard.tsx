@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getChartPnlRollup } from '../../api/client';
+import { getChartPnlRollup, pnlBasisTooltip } from '../../api/client';
 import { formatCurrency } from '../../utils/format';
 
 const REFRESH_MS = 30_000;
@@ -15,6 +15,8 @@ const REFRESH_MS = 30_000;
  */
 export function FuturesPnl24hCard({ compact = false }: { compact?: boolean } = {}) {
   const [pnl, setPnl] = useState<number | null>(null);
+  // IB average-cost total, set when any contract is on a LIFO basis.
+  const [ibPnl, setIbPnl] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -23,12 +25,17 @@ export function FuturesPnl24hCard({ compact = false }: { compact?: boolean } = {
         const rollup = await getChartPnlRollup();
         if (cancelled) return;
         let sum = 0;
+        let ibSum = 0;
+        let anyLifo = false;
         for (const entry of Object.values(rollup)) {
           if (entry.sec_type === 'FUT' && Number.isFinite(entry.pnl_24h)) {
             sum += entry.pnl_24h;
+            ibSum += Number.isFinite(entry.ib_pnl_24h) ? entry.ib_pnl_24h! : entry.pnl_24h;
+            anyLifo ||= entry.method === 'lifo';
           }
         }
         setPnl(sum);
+        setIbPnl(anyLifo ? ibSum : null);
       } catch {
         // Leave the last good value visible; muted until the next success.
       }
@@ -51,7 +58,8 @@ export function FuturesPnl24hCard({ compact = false }: { compact?: boolean } = {
   const title =
     'Realized P&L across ALL futures trades in the last 24h, summed from '
     + 'IB executions — includes trades placed directly in TWS, not just '
-    + 'this app. Options and stock trades are excluded.';
+    + 'this app. Options and stock trades are excluded.'
+    + (ibPnl !== null ? `\n${pnlBasisTooltip('lifo', ibPnl)}` : '');
 
   if (compact) {
     // Borderless inline form for the tight mobile header.

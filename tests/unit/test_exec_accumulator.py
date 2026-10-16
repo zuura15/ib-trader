@@ -50,6 +50,20 @@ class TestMerge:
         s = merge_executions(s, [_ex("e1", "NQU6", "SLD", 1, 30765, old, realized=100)], NOW)
         assert s["e1"]["realized_pnl"] == "100"
 
+    def test_opening_fill_commission_and_multiplier_refresh(self):
+        """Opening fills never get realized P&L, so their commission (and
+        multiplier) must still refresh once paired — LIFO folds the
+        commission into the lot cost (GH #101)."""
+        old = NOW - timedelta(minutes=5)
+        first = _ex("e1", "NQU6", "BOT", 1, 30765, old, comm="0")
+        s = merge_executions({}, [first], NOW)
+        paired = {**_ex("e1", "NQU6", "BOT", 1, 30765, old, comm="2.25"),
+                  "multiplier": "20"}
+        s = merge_executions(s, [paired], NOW)
+        assert s["e1"]["commission"] == "2.25"
+        assert s["e1"]["multiplier"] == "20"
+        assert records_to_execs(s)[0]["multiplier"] == "20"
+
     def test_known_realized_not_overwritten(self):
         old = NOW - timedelta(minutes=5)
         s = merge_executions({}, [_ex("e1", "NQU6", "SLD", 1, 30765, old, realized=100)], NOW)

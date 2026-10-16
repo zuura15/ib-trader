@@ -1235,8 +1235,13 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
     )
     from ib_trader.redis.state import StateKeys
 
+    from ib_trader.engine.lifo_pnl import compute_lifo
+
     interval = float(ctx.settings.get("pnl_rollup_interval_seconds", 60))
     session_hour = int(ctx.settings.get("futures_session_start_hour", 15))
+    wake = asyncio.Event()
+    ctx.pnl_rollup_wake = wake
+    fallback_reasons: dict[str, str | None] = {}
     while True:
         try:
             # Current-session executions (IB drops pre-Gateway-restart
@@ -1260,7 +1265,26 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
             stored = merge_executions(stored, fresh, now, window_hours=24.0)
             execs = records_to_execs(stored)
 
-            rollup = compute_pnl_rollup(execs, now, session_hour)
+            # Futures LIFO (GH #101). Positions are read AFTER the
+            # executions sweep so a fill in the sweep has normally already
+            # landed in the cache via positionEvent; a position change also
+            # wakes this loop, so any residual race self-corrects in seconds.
+            fut_positions = {
+                p.get("local_symbol"): p for p in ctx.positions_cache
+                if (p.get("sec_type") or "").upper() == "FUT" and p.get("local_symbol")
+            }
+            lifo = compute_lifo(execs, fut_positions)
+            ctx.lifo_basis = lifo
+            for sym, res in lifo.items():
+                if fallback_reasons.get(sym, "unset") != res.reason:
+                    fallback_reasons[sym] = res.reason
+                    if res.method != "lifo":
+                        logger.warning(
+                            '{"event": "LIFO_PNL_FALLBACK", "symbol": "%s", '
+                            '"reason": "%s"}', sym, res.reason,
+                        )
+
+            rollup = compute_pnl_rollup(execs, now, session_hour, lifo=lifo)
             # Per-contract execution markers (B/S + lot size), account-wide
             # so manual TWS fills show on the chart. ``now`` lets it correct
             # ib_async's future-shifted backfill times.
@@ -1282,7 +1306,11 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
             )
         except Exception:
             logger.exception('{"event": "PNL_ROLLUP_ERROR"}')
-        await asyncio.sleep(interval)
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        wake.clear()
 
 
 def _alert_stuck_order(ctx: AppContext, entry, timeout_seconds: float) -> None:
@@ -1883,6 +1911,11 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
             "display_symbol": display_symbol,
             "local_symbol": local_symbol,
         }
+        prev_qty = next(
+            (p.get("quantity") for p in ctx.positions_cache
+             if p.get("con_id") == con_id and p.get("sec_type") == sec_type),
+            "0",
+        )
         new_cache = [p for p in ctx.positions_cache
                      if not (p.get("symbol") == symbol
                              and p.get("sec_type") == sec_type
@@ -1890,6 +1923,11 @@ async def _handle_position_event(ctx, position, sem=None) -> None:
         if qty != 0:
             new_cache.append(entry)
         ctx.positions_cache = new_cache
+        wake = getattr(ctx, "pnl_rollup_wake", None)
+        if sec_type == "FUT" and wake is not None and Decimal(str(prev_qty)) != qty:
+            # A fill changed the position: rebuild the LIFO basis now
+            # rather than up to a rollup interval later.
+            wake.set()
 
         # Publish position change to stream (for WS diffs)
         if redis is not None:

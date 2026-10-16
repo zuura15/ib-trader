@@ -392,9 +392,23 @@ export function getConsolePnl24h() {
 }
 
 export interface ChartPnlRollupEntry {
+  /** Realized P&L on ``method``'s basis (LIFO for futures, GH #101). */
   pnl_24h: number;
   pnl_session: number | null;
+  /** IB's own average-cost figures — shown in the hover tooltip. */
+  ib_pnl_24h?: number;
+  ib_pnl_session?: number | null;
+  method?: 'lifo' | 'avg';
   sec_type: string;
+}
+
+/** Hover text for a realized-P&L figure: which basis it uses plus IB's
+ *  average-cost number, so a mismatch with TWS reads as a method
+ *  difference rather than a bug. */
+export function pnlBasisTooltip(method: string | undefined, ibPnl: number | null | undefined): string | undefined {
+  if (method !== 'lifo' || ibPnl == null || !Number.isFinite(ibPnl)) return undefined;
+  const ib = `${ibPnl >= 0 ? '+$' : '-$'}${Math.abs(ibPnl).toFixed(2)}`;
+  return `LIFO (sells match the newest lot first). IB average cost: ${ib}`;
 }
 
 /** Per-contract IB-authoritative realized-P&L rollup, keyed by localSymbol. */

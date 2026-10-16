@@ -1972,6 +1972,9 @@ class InsyncClient(IBClientBase):
                 "local_symbol": getattr(con, "localSymbol", "") or getattr(con, "symbol", ""),
                 "symbol": getattr(con, "symbol", "") or "",
                 "sec_type": getattr(con, "secType", "") or "",
+                # Contract multiplier (e.g. "20" for NQ) — needed to turn
+                # price diffs into dollars for LIFO P&L (GH #101).
+                "multiplier": getattr(con, "multiplier", "") or None,
                 "realized_pnl": realized,
                 "commission": commission,
                 "exec_time": exec_time,

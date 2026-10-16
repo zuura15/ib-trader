@@ -30,7 +30,10 @@ _WINDOW_MS = 24 * 60 * 60 * 1000
 async def get_chart_pnl_rollup(redis=Depends(get_redis)):
     """IB-authoritative per-contract realized-P&L rollup for chart panes.
 
-    Returns ``{ localSymbol: {pnl_24h, pnl_session, sec_type} }`` — produced
+    Returns ``{ localSymbol: {pnl_24h, pnl_session, ib_pnl_24h,
+    ib_pnl_session, method, sec_type} }`` — futures on a LIFO basis when
+    ``method == "lifo"`` (GH #101), IB's average-cost figures alongside —
+    produced
     by the engine's ``_pnl_rollup_loop`` from a periodic ``reqExecutions``
     sweep, so it includes trades the operator placed directly in TWS, not
     just orders our system originated. ``pnl_session`` is realized P&L since

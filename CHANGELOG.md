@@ -3,6 +3,23 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-10-16
+
+### Changed
+- **Futures P&L is now LIFO (#101).** A partial sale is matched against
+  the most recent add instead of IB's average cost, and the remaining
+  contracts keep the cost of the older lots. Applies to the chart pane
+  Today / 24h figures, the header 24h FUT card, the positions panel
+  (Avg Cost + P&L for FUT) and the chart's live open-P&L number, and
+  the console close readout. Realized + open P&L still sums to the same
+  total as IB; only the split differs. Hovering any of these shows IB's
+  average-cost figure. Positions held from before the ~24 h execution
+  window are treated as one lot at IB's average cost (back-solved from
+  IB's numbers); a contract that can't be solved cleanly falls back to
+  IB's figures and logs `LIFO_PNL_FALLBACK`. Stocks and options are
+  unchanged. `/engine/positions` keeps `avg_cost` as IB's value and adds
+  `lifo_avg_cost` for FUT.
+
 ## 2026-10-06
 
 ### Fixed
