@@ -220,7 +220,9 @@ def compute_lifo(
 
 def _compute_one(rows: list[dict], position: dict | None) -> LifoResult:
     pos = position or {}
-    mult = _dec(rows[0].get("multiplier")) or _dec(pos.get("multiplier"))
+    mult = next(
+        (m for m in (_dec(r.get("multiplier")) for r in rows) if m), None,
+    ) or _dec(pos.get("multiplier"))
     if not mult or mult <= 0:
         return LifoResult(method="avg", reason="unknown_multiplier")
 
