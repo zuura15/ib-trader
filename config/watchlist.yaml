@@ -7,12 +7,17 @@
 # its chart-bot-* symbols (config/bots/*.yaml) so their quote subs never
 # lapse, independent of the operator watchlist. See
 # ib_trader/config/watchlist_runtime.py.
-- QQQ
 - GLD
+- QQQ
+- DIA
+- GOOG
+- NVDA
 - META
+- MSFT
+- AMZN
 - CRM
 - USO
-- NVDA
-- SPY
-- GOOGL
-- AMZN
+- TSLA
+- INTC
+- AAPL
+- GME
