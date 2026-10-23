@@ -3,6 +3,13 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-10-22
+
+### Changed
+- **CL chart rolled CLX6 → CLZ6 (Dec 2026).** chart-bot-5 symbol/symbols,
+  `direction_symbols`, and the slot-5 layout tab name (the rename pass
+  syncs persisted layouts). Bot id/ref_id unchanged.
+
 ## 2026-10-16
 
 ### Changed

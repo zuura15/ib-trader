@@ -115,14 +115,14 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'GCZ6', anchor: 'chart-bot',
     config: { slot: 1 }, slot: 1, anchorSlot: 7,
   },
-  // Slot 5 chart (CLX6 since the 2026-09-22 roll; CLV6 before that,
+  // Slot 5 chart (CLZ6 since the 2026-10-22 roll; CLX6/CLV6 before that,
   // ESU6 originally) — anchored on Gold (slot 1) since 2026-09-20: its
   // old anchor (Sep MNQ, slot 3) is pruned as expired, and prune runs
   // before injection. Matched by slot so existing chart-bot tabs don't
   // mask it. On contract rolls just update ``name`` here — the rename
   // pass in migrateLayoutJson pushes it into persisted layouts.
   {
-    component: 'chart-bot', name: 'CLX6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'CLZ6', anchor: 'chart-bot',
     config: { slot: 5 }, slot: 5, anchorSlot: 1,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
