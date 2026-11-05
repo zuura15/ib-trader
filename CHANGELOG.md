@@ -3,6 +3,13 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-05
+
+### Changed
+- **Chart fill markers:** buy/sell dots are 25% smaller and no longer
+  print the lot size inline — hovering a dot shows its signed size
+  (+n / −n).
+
 ## 2026-10-22
 
 ### Changed

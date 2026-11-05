@@ -4,7 +4,7 @@ import {
 import {
   createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
   type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
-  type Time, type ISeriesMarkersPluginApi, type IPriceLine,
+  type Time, type ISeriesMarkersPluginApi, type IPriceLine, type MouseEventParams,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -587,6 +587,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // native series-markers primitive rather than the SR/fires SVG painter
   // above — fully isolated, so it can never perturb SR rendering.
   const execMarkersApiRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const execMarkerLabelsRef = useRef<Map<string, string>>(new Map());
+  const [execHover, setExecHover] = useState<{ x: number; y: number; text: string } | null>(null);
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
@@ -601,7 +603,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       barsRef.current.map((b) => b.time as number),
     );
     const markers: SeriesMarker<Time>[] = [];
-    for (const e of executionMarkers ?? []) {
+    execMarkerLabelsRef.current = new Map();
+    for (const [i, e] of (executionMarkers ?? []).entries()) {
+      const id = `exec-${i}`;
       const d = new Date(e.time);
       if (!Number.isFinite(d.getTime())) continue;
       // Snap the fill to its 1-min bar's slot-END label (how toBars
@@ -624,12 +628,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           ? { position: 'atPriceMiddle' as const, price: e.price }
           : { position: 'inBar' as const }),
         shape: 'circle',
-        // Color already encodes side (green buy / red sell), so the
-        // label is just the signed lot size — +n / −n — to keep the
-        // chart uncluttered.
+        // 25% under the library default — the color already encodes
+        // side (green buy / red sell).
+        size: 0.75,
         color: isBuy ? colors.bullish : colors.bearish,
-        text: `${isBuy ? '+' : '-'}${qtyTxt}`,
+        // No inline text: the signed lot size (+n / −n) shows only on
+        // hover (see the crosshair effect below) to keep the chart clean.
+        id,
       });
+      execMarkerLabelsRef.current.set(id, `${isBuy ? '+' : '-'}${qtyTxt}`);
     }
     markers.sort((a, b) => (a.time as number) - (b.time as number));
     try {
@@ -642,6 +649,25 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       execMarkersApiRef.current = null;
     };
   }, [executionMarkers, chartVersion, barsTick]);
+
+  // Hover readout for execution markers: the marker hit-test reports
+  // its id via the crosshair event; show that fill's signed lot size.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const onMove = (param: MouseEventParams<Time>) => {
+      const id = param.hoveredInfo?.objectId ?? param.hoveredObjectId;
+      const text = typeof id === 'string'
+        ? execMarkerLabelsRef.current.get(id) : undefined;
+      if (!text || !param.point) { setExecHover(null); return; }
+      setExecHover({ x: param.point.x, y: param.point.y, text });
+    };
+    chart.subscribeCrosshairMove(onMove);
+    return () => {
+      try { chart.unsubscribeCrosshairMove(onMove); } catch { /* torn down */ }
+      setExecHover(null);
+    };
+  }, [chartVersion]);
 
   // ── Working-order price lines (#98) ────────────────────────────────
   // One dashed horizontal line per open IB order on this contract with
@@ -3028,6 +3054,27 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      {execHover && (
+        <div
+          data-testid="exec-marker-hover"
+          style={{
+            position: 'absolute',
+            left: execHover.x + 8,
+            top: execHover.y - 22,
+            zIndex: 25,
+            pointerEvents: 'none',
+            padding: '1px 5px',
+            borderRadius: 3,
+            fontSize: 11,
+            fontWeight: 600,
+            background: 'var(--bg-primary)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border-default)',
+          }}
+        >
+          {execHover.text}
+        </div>
+      )}
       {hasPricePick && target && stripGeom && (
         <div
           data-testid="price-pick-strip"
