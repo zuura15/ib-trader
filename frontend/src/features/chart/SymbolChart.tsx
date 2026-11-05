@@ -2,9 +2,9 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
-  type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
-  type Time, type ISeriesMarkersPluginApi, type IPriceLine, type MouseEventParams,
+  createChart, ColorType, LineSeries, HistogramSeries,
+  type IChartApi, type ISeriesApi, type UTCTimestamp,
+  type Time, type IPriceLine, type MouseEventParams,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -20,7 +20,8 @@ import {
   type BackendSrPayload,
 } from './srBackend';
 import { useStore, type ChartTarget } from '../../data/store';
-import { useUserSetting } from '../../data/userSettings';
+import { getUserSetting, useUserSetting } from '../../data/userSettings';
+import { ExecDotsPrimitive, type ExecDot } from './execMarkersPrimitive';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 export interface SymbolChartHandle {
@@ -581,73 +582,74 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     }
   }, [historicalFires, chartVersion]);
 
-  // ── Execution markers (native lightweight-charts) ──────────────────
-  // A colored circle ON the price line per order (B/S + lot size),
-  // account-wide so fills placed directly in TWS show too. Uses the
-  // native series-markers primitive rather than the SR/fires SVG painter
-  // above — fully isolated, so it can never perturb SR rendering.
-  const execMarkersApiRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  // ── Execution markers (fill dots) ──────────────────────────────────
+  // A colored dot ON the price line per order (green buy / red sell),
+  // account-wide so fills placed directly in TWS show too. Drawn by a
+  // series primitive (not the native markers plugin, whose circles
+  // can't go below ~8px) sized as a multiple of the line width — the
+  // operator's ``fillMarkerScale`` setting. The signed lot size shows
+  // only on hover. Isolated from the SR/fires SVG painter above.
+  const fillMarkerScale = useUserSetting('fillMarkerScale');
+  const execDotsRef = useRef<ExecDotsPrimitive | null>(null);
   const execMarkerLabelsRef = useRef<Map<string, string>>(new Map());
   const [execHover, setExecHover] = useState<{ x: number; y: number; text: string } | null>(null);
+  // Attach one primitive per series instance (replaced on a
+  // chartVersion bump); the cleanup detaches it so none stack.
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
+    const prim = new ExecDotsPrimitive(getUserSetting('fillMarkerScale'));
+    try {
+      series.attachPrimitive(prim);
+      execDotsRef.current = prim;
+    } catch { /* chart mid-teardown — next run re-attaches */ }
+    return () => {
+      try { series.detachPrimitive(prim); } catch { /* already gone */ }
+      if (execDotsRef.current === prim) execDotsRef.current = null;
+    };
+  }, [chartVersion]);
+  useEffect(() => {
+    execDotsRef.current?.setScale(fillMarkerScale);
+  }, [fillMarkerScale, chartVersion]);
+  useEffect(() => {
+    const prim = execDotsRef.current;
+    if (!prim) return;
     const colors = themeColors();
-    // Only place a marker where an actual bar exists. lightweight-charts
-    // snaps a marker whose time has no matching data point to the NEAREST
-    // bar — which, after a session reset, drops 24 h of accumulated
-    // markers onto the new session's bars at bogus times. Requiring an
-    // exact bar-time match scopes markers to the loaded window and pins
-    // each to its real bar.
-    const barTimes = new Set<number>(
-      barsRef.current.map((b) => b.time as number),
+    // Only place a dot where an actual bar exists, pinned to its real
+    // bar. After a session reset, 24 h of accumulated fills would
+    // otherwise pile onto the new session's bars at bogus times;
+    // requiring an exact bar-time match scopes dots to the loaded window.
+    const barClose = new Map<number, number>(
+      barsRef.current.map((b) => [b.time as number, b.close]),
     );
-    const markers: SeriesMarker<Time>[] = [];
-    execMarkerLabelsRef.current = new Map();
+    const dots: ExecDot[] = [];
+    const labels = new Map<string, string>();
     for (const [i, e] of (executionMarkers ?? []).entries()) {
-      const id = `exec-${i}`;
       const d = new Date(e.time);
       if (!Number.isFinite(d.getTime())) continue;
       // Snap the fill to its 1-min bar's slot-END label (how toBars
-      // keys bars) so the marker lands on an existing data point.
+      // keys bars) so the dot lands on an existing data point.
       const sec = localUtcSeconds(d) as number;
-      const slotEnd = (Math.floor(sec / BAR_SECONDS) * BAR_SECONDS
-        + BAR_SECONDS) as UTCTimestamp;
-      if (!barTimes.has(slotEnd as number)) continue;  // no bar → skip
+      const slotEnd = Math.floor(sec / BAR_SECONDS) * BAR_SECONDS + BAR_SECONDS;
+      const close = barClose.get(slotEnd);
+      if (close == null) continue;  // no bar → skip
       const isBuy = e.side === 'B';
       const qtyTxt = Number.isInteger(e.qty)
         ? String(e.qty) : String(Number(e.qty.toFixed(2)));
-      // ``atPriceMiddle`` + ``price`` pins the marker at the actual FILL
-      // price (v5 price-anchored marker) rather than on the bar's close —
-      // so a sell @ 7571 sits at 7571, not wherever the bar happened to
-      // close. ``slotEnd`` still fixes the x (bar) position.
+      // Pin the dot at the actual FILL price, not the bar's close — a
+      // sell @ 7571 sits at 7571. Fall back to the close when unknown.
       const priceOk = Number.isFinite(e.price) && e.price > 0;
-      markers.push({
-        time: slotEnd,
-        ...(priceOk
-          ? { position: 'atPriceMiddle' as const, price: e.price }
-          : { position: 'inBar' as const }),
-        shape: 'circle',
-        // 25% under the library default — the color already encodes
-        // side (green buy / red sell).
-        size: 0.75,
-        color: isBuy ? colors.bullish : colors.bearish,
-        // No inline text: the signed lot size (+n / −n) shows only on
-        // hover (see the crosshair effect below) to keep the chart clean.
+      const id = `exec-${i}`;
+      dots.push({
         id,
+        time: slotEnd as UTCTimestamp,
+        price: priceOk ? e.price : close,
+        color: isBuy ? colors.bullish : colors.bearish,
       });
-      execMarkerLabelsRef.current.set(id, `${isBuy ? '+' : '-'}${qtyTxt}`);
+      labels.set(id, `${isBuy ? '+' : '-'}${qtyTxt}`);
     }
-    markers.sort((a, b) => (a.time as number) - (b.time as number));
-    try {
-      // Recreate against the current series instance (replaced on a
-      // chartVersion bump); the cleanup detaches it so none stack.
-      execMarkersApiRef.current = createSeriesMarkers(series, markers);
-    } catch { /* chart mid-teardown — next run re-attaches */ }
-    return () => {
-      try { execMarkersApiRef.current?.detach(); } catch { /* already gone */ }
-      execMarkersApiRef.current = null;
-    };
+    execMarkerLabelsRef.current = labels;
+    prim.setDots(dots);
   }, [executionMarkers, chartVersion, barsTick]);
 
   // Hover readout for execution markers: the marker hit-test reports

@@ -38,6 +38,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
   const signalActiveBars = useUserSetting('signalActiveBars');
   const brokenLookbackMinutes = useUserSetting('brokenLookbackMinutes');
+  const fillMarkerScale = useUserSetting('fillMarkerScale');
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
   const activeVariant = useStore((s) => s.activeVariant);
@@ -155,6 +156,20 @@ export function SettingsModal({ open, onClose }: Props) {
             />
           </SettingRow>
 
+          <SettingRow
+            label="Fill dot size"
+            help="Buy/sell fill dots on the chart, as a multiple of the price line's thickness. Hover a dot to see its lot size."
+          >
+            <NumberInput
+              min={1}
+              max={10}
+              step={1}
+              value={fillMarkerScale}
+              onChange={(n) => setUserSetting('fillMarkerScale', n)}
+              suffix="× line"
+            />
+          </SettingRow>
+
           <SectionTitle>Support/Resistance</SectionTitle>
           <SettingRow
             label="Broken-line lookback"
@@ -183,6 +198,7 @@ export function SettingsModal({ open, onClose }: Props) {
             onClick={() => {
               setUserSetting('signalActiveBars', DEFAULT_SETTINGS.signalActiveBars);
               setUserSetting('brokenLookbackMinutes', DEFAULT_SETTINGS.brokenLookbackMinutes);
+              setUserSetting('fillMarkerScale', DEFAULT_SETTINGS.fillMarkerScale);
             }}
             style={{
               background: 'transparent', border: '1px solid var(--border-default)',

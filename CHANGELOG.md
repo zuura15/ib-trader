@@ -6,9 +6,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-05
 
 ### Changed
-- **Chart fill markers:** buy/sell dots are 25% smaller and no longer
-  print the lot size inline — hovering a dot shows its signed size
-  (+n / −n).
+- **Chart fill markers:** buy/sell dots no longer print the lot size
+  inline — hovering a dot shows its signed size (+n / −n). Dots are now
+  drawn by a series primitive sized as a multiple of the price line's
+  thickness (default 2×), adjustable 1–10× under Settings → Chart
+  signals → "Fill dot size" (the native markers couldn't go below ~8px).
 
 ## 2026-10-22
 

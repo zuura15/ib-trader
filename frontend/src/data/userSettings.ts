@@ -16,11 +16,15 @@ export interface UserSettings {
   /** Minutes back to keep broken S/R lines visible (when the
    *  Broken filter is on). Default 30. */
   brokenLookbackMinutes: number;
+  /** Chart fill-dot diameter as a multiple of the price line's
+   *  thickness (1–10). Default 2. */
+  fillMarkerScale: number;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
   signalActiveBars: 2,
   brokenLookbackMinutes: 30,
+  fillMarkerScale: 2,
 };
 
 const KEY_PREFIX = 'ib-trader:settings:';
