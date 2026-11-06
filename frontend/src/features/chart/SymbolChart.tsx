@@ -22,6 +22,7 @@ import {
 import { useStore, type ChartTarget } from '../../data/store';
 import { getUserSetting, useUserSetting } from '../../data/userSettings';
 import { ExecDotsPrimitive, type ExecDot } from './execMarkersPrimitive';
+import { RsiBandsPrimitive } from './rsiBandsPrimitive';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 export interface SymbolChartHandle {
@@ -200,6 +201,16 @@ interface Props {
    *  on a successful backend amend; false reverts the line. */
   onOrderAmend?: (id: string, price: number) => Promise<boolean>;
 }
+
+/** RSI pane is pinned to a fixed 20–80 window with shaded
+ *  overbought (70–80) and oversold (20–30) zones. */
+const RSI_SCALE_MIN = 20;
+const RSI_SCALE_MAX = 80;
+const RSI_OVERSOLD = 30;
+const RSI_OVERBOUGHT = 70;
+const rsiFixedRange = () => ({
+  priceRange: { minValue: RSI_SCALE_MIN, maxValue: RSI_SCALE_MAX },
+});
 
 /** Price-pane margins: the bottom 15% is reserved for the volume
  *  histogram only while it's shown. */
@@ -1149,15 +1160,24 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         priceLineVisible: false,
         lastValueVisible: true,
         priceScaleId: 'right',
+        // Fixed 20–80 window (operator preference) — readings beyond
+        // it clip at the pane edge rather than rescaling the pane.
+        autoscaleInfoProvider: rsiFixedRange,
       }, 1);
+      rsi.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
       rsi.createPriceLine({
         price: 50,
         color: colors.grid,
         lineWidth: 1,
-        lineStyle: 1,        // dotted
+        lineStyle: 2,        // dashed
         axisLabelVisible: false,
         title: '',
       });
+      // Shaded overbought (70–80) / oversold (20–30) zones.
+      rsi.attachPrimitive(new RsiBandsPrimitive([
+        { from: RSI_OVERBOUGHT, to: RSI_SCALE_MAX, color: colors.bearish },
+        { from: RSI_SCALE_MIN, to: RSI_OVERSOLD, color: colors.bullish },
+      ]));
       try {
         const panes = chart.panes();
         panes[0]?.setStretchFactor(4);
@@ -2526,6 +2546,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
               priceLineVisible: false,
               lastValueVisible: false,
               crosshairMarkerVisible: false,
+              // Same fixed window as the RSI line so a divergence
+              // pivot outside 20–80 can't rescale the pane.
+              autoscaleInfoProvider: rsiFixedRange,
             }, 1);
             ds.setData([
               { time: points[d.fromIdx].time, value: rsiVals[d.fromIdx]! },

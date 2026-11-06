@@ -12,6 +12,9 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   on. The bot chart panes had RSI hard-disabled since 870d931 — they now
   follow the setting. Hiding volume hands its bottom strip back to the
   price line. Direction Lab keeps RSI off.
+- **RSI pane:** fixed 20–80 scale (readings beyond clip at the edge),
+  shaded overbought 70–80 (red) and oversold 20–30 (green) zones, and a
+  dashed 50 midline.
 
 ## 2026-11-05
 
