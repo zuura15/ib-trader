@@ -512,6 +512,76 @@ async def amend_order_endpoint(req: AmendOrderRequest):
     return {"status": "ok", "ib_order_id": req.ib_order_id, "price": str(price)}
 
 
+class CancelOrderRequest(BaseModel):
+    """Request body for cancelling one working order (chart cancel button)."""
+
+    ib_order_id: str = Field(description="Client orderId, or permId for sweep-keyed rows")
+
+
+@app.post("/engine/cancel-order")
+async def cancel_order_endpoint(req: CancelOrderRequest):
+    """Cancel one working order — chart order-line / header-dot cancel.
+
+    The cancel is a request: IB's orderStatus (Cancelled) is the only
+    terminal signal, and the status dispatcher records it. TWS-bound
+    orders can't be cancelled from this session and surface as 409.
+    """
+    if _ctx is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    oid = (req.ib_order_id or "").strip()
+    if not oid or oid == "0":
+        raise HTTPException(status_code=422, detail="ib_order_id required")
+
+    row = None
+    try:
+        for o in await _ctx.ib.get_open_orders():
+            if oid in (str(o.get("ib_order_id") or ""), str(o.get("perm_id") or "")):
+                row = o
+                break
+    except Exception as e:
+        logger.exception('{"event": "CANCEL_LOOKUP_FAILED", "ib_order_id": "%s"}', oid)
+        raise HTTPException(status_code=502, detail=f"open-orders lookup failed: {e}") from e
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no working order {oid!r} at IB")
+
+    try:
+        await _ctx.ib.cancel_order(oid)
+    except RuntimeError as e:
+        # Foreign (TWS-bound) order — expected, user-actionable.
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        logger.exception('{"event": "CANCEL_ORDER_FAILED", "ib_order_id": "%s"}', oid)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    # Observational audit row — never gates the cancel (tenet).
+    try:
+        from datetime import datetime, timezone
+        from decimal import Decimal as _D
+        from ib_trader.data.models import TransactionAction
+        from ib_trader.engine.order import _write_txn
+        _write_txn(
+            _ctx, TransactionAction.CANCEL_ATTEMPT,
+            (row.get("local_symbol") or row.get("symbol") or "?"),
+            row.get("side") or "?",
+            row.get("order_type") or "?",
+            _D(str(row.get("qty") or "0")),
+            ib_order_id=int(oid) if oid.isdigit() else None,
+            ib_responded_at=datetime.now(timezone.utc),
+        )
+    except Exception:
+        logger.exception('{"event": "CANCEL_TXN_WRITE_FAILED", "ib_order_id": "%s"}', oid)
+
+    if getattr(_ctx, "redis", None) is not None:
+        try:
+            from ib_trader.redis.streams import publish_activity
+            await publish_activity(_ctx.redis, "orders")
+        except Exception:
+            logger.exception('{"event": "CANCEL_ACTIVITY_PUBLISH_FAILED"}')
+
+    logger.info('{"event": "ORDER_CANCEL_API", "ib_order_id": "%s"}', oid)
+    return {"status": "cancel_requested", "ib_order_id": oid}
+
+
 @app.post("/engine/cancel-by-symbol")
 async def cancel_by_symbol(req: dict):
     """Cancel every open IB order for a given symbol.

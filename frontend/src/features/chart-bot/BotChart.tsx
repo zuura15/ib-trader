@@ -7,7 +7,8 @@ import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import { useStore, type ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
 // PositionStrip import removed with the 2-row shelf — see chartBody.
-import { getBotTrades, getChartExecutions, type ChartExecutionMarker } from '../../api/client';
+import { getBotTrades, getChartExecutions, requestOrderCancel, type ChartExecutionMarker } from '../../api/client';
+import { CancelOrderButton } from '../chart/CancelOrderButton';
 
 interface Props {
   /** Bot identity. Frontend convention: ``chart-bot-<slot>``. */
@@ -87,6 +88,26 @@ export function BotChart({
     trailingPercent: number | null; permId: string | null;
   }>>([]);
   const [ordersHover, setOrdersHover] = useState(false);
+  // Short grace period on leave so a diagonal move from the dot to a
+  // popover row's cancel button doesn't close the popover mid-way.
+  const ordersHoverTimerRef = useRef<number | null>(null);
+  const openOrdersHover = () => {
+    if (ordersHoverTimerRef.current != null) {
+      window.clearTimeout(ordersHoverTimerRef.current);
+      ordersHoverTimerRef.current = null;
+    }
+    setOrdersHover(true);
+  };
+  const closeOrdersHoverSoon = () => {
+    if (ordersHoverTimerRef.current != null) window.clearTimeout(ordersHoverTimerRef.current);
+    ordersHoverTimerRef.current = window.setTimeout(() => {
+      ordersHoverTimerRef.current = null;
+      setOrdersHover(false);
+    }, 350);
+  };
+  useEffect(() => () => {
+    if (ordersHoverTimerRef.current != null) window.clearTimeout(ordersHoverTimerRef.current);
+  }, []);
   const [ordersPollNonce, setOrdersPollNonce] = useState(0);
   const lastOrdersSigRef = useRef<string>('[]');
   const refreshTick = useStore((st) => st.positionRefreshTick);
@@ -144,7 +165,7 @@ export function BotChart({
   const orderLines = useMemo(() => {
     const out: Array<{
       id: string; price: number; label: string;
-      side: 'BUY' | 'SELL'; draggable: boolean;
+      side: 'BUY' | 'SELL'; draggable: boolean; cancellable: boolean;
     }> = [];
     for (const o of openOrders) {
       const type = o.orderType.toUpperCase();
@@ -165,6 +186,7 @@ export function BotChart({
           : type.toLowerCase() || '?',
         side: o.side === 'BUY' ? 'BUY' : 'SELL',
         draggable: !isTrail && !foreign,
+        cancellable: !foreign,
       });
     }
     return out;
@@ -185,6 +207,14 @@ export function BotChart({
     } catch {
       return false;
     }
+  };
+
+  // Cancel (chart handle ✕ / header popover ✕). null = sent; the next
+  // poll drops the row once IB confirms Cancelled.
+  const handleOrderCancel = async (id: string): Promise<string | null> => {
+    const err = await requestOrderCancel(id);
+    if (!err) setOrdersPollNonce((n) => n + 1);
+    return err;
   };
 
   // Price rendered at the contract's tick precision (0.25 → 2dp etc.).
@@ -730,8 +760,8 @@ export function BotChart({
         {openOrders.length > 0 && (
           <span
             style={{ position: 'relative', display: 'inline-flex' }}
-            onMouseEnter={() => setOrdersHover(true)}
-            onMouseLeave={() => setOrdersHover(false)}
+            onMouseEnter={openOrdersHover}
+            onMouseLeave={closeOrdersHoverSoon}
           >
             <span
               title={ordersHover ? undefined : `${openOrders.length} working order(s)`}
@@ -744,9 +774,16 @@ export function BotChart({
             />
             {ordersHover && (
               <div
+                // paddingTop bridges the dot → popover gap so the
+                // pointer can reach the cancel buttons without the
+                // hover dropping.
                 style={{
-                  position: 'absolute', top: 'calc(100% + 6px)', left: -4,
-                  zIndex: 60,
+                  position: 'absolute', top: '100%', left: -4,
+                  zIndex: 60, paddingTop: 6,
+                }}
+              >
+              <div
+                style={{
                   background: 'var(--bg-primary)',
                   border: '1px solid var(--border-default)',
                   borderRadius: 4, padding: '6px 8px',
@@ -772,8 +809,19 @@ export function BotChart({
                     <span style={{ color: 'var(--text-secondary)' }}>
                       {fmtOrderPrice(o)}
                     </span>
+                    <span style={{ marginLeft: 'auto', paddingLeft: 6 }}>
+                      <CancelOrderButton
+                        size="xs"
+                        testId={`chart-orders-cancel-${o.id}`}
+                        onCancel={() => handleOrderCancel(o.id)}
+                        disabledReason={o.permId != null && o.permId === o.id
+                          ? 'Placed or modified in TWS — cancel it there'
+                          : undefined}
+                      />
+                    </span>
                   </div>
                 ))}
+              </div>
               </div>
             )}
           </span>
@@ -816,6 +864,7 @@ export function BotChart({
           onLastPrice={setLastPrice}
           orderLines={orderLines}
           onOrderAmend={handleOrderAmend}
+          onOrderCancel={handleOrderCancel}
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>

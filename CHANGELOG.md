@@ -5,6 +5,17 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-06
 
+### Added
+- **Cancel a working order from the chart.** Hover an order line's
+  right-edge handle, or hover the amber open-orders dot in the chart
+  title, and click ✕ → "cancel?" → click again to send. New
+  `POST /api/orders/cancel` → engine `/engine/cancel-order` (404 for an
+  unknown order, 409 for TWS-bound orders this session can't cancel;
+  writes a CANCEL_ATTEMPT audit row — IB's Cancelled status stays the
+  terminal signal). TRAIL orders now get a cancel-only handle. The dot
+  popover stays open briefly after the pointer leaves so its buttons
+  are reachable.
+
 ### Changed
 - **Charts: RSI back on, with on/off settings for RSI and volume.** New
   Settings → Chart indicators section toggles the volume histogram and

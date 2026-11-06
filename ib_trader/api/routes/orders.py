@@ -75,6 +75,22 @@ async def amend_order(body: dict):
         return resp.json()
 
 
+@router.post("/cancel")
+async def cancel_order(body: dict):
+    """Cancel one working order — chart cancel button. Proxy to engine."""
+    ib_order_id = str(body.get("ib_order_id") or "")
+    if not ib_order_id:
+        raise HTTPException(status_code=422, detail="ib_order_id required")
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{_engine_url()}/engine/cancel-order",
+            json={"ib_order_id": ib_order_id},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return resp.json()
+
+
 @router.post("/cancel-by-symbol")
 async def cancel_by_symbol(body: dict):
     """Cancel every open IB order for a symbol — proxy to engine."""

@@ -23,6 +23,7 @@ import { useStore, type ChartTarget } from '../../data/store';
 import { getUserSetting, useUserSetting } from '../../data/userSettings';
 import { ExecDotsPrimitive, type ExecDot } from './execMarkersPrimitive';
 import { RsiBandsPrimitive } from './rsiBandsPrimitive';
+import { CancelOrderButton } from './CancelOrderButton';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 export interface SymbolChartHandle {
@@ -195,11 +196,16 @@ interface Props {
     /** Whether the order can be price-amended from this session
      *  (false for TRAIL and TWS-bound orders). */
     draggable?: boolean;
+    /** Whether this session can cancel it (false for TWS-bound). */
+    cancellable?: boolean;
   }>;
   /** Drag-to-amend callback (#99): fired when the user confirms a
    *  dragged order label at its new tick-rounded price. Resolve true
    *  on a successful backend amend; false reverts the line. */
   onOrderAmend?: (id: string, price: number) => Promise<boolean>;
+  /** Cancel callback for the ✕ on an order-line handle (hover the
+   *  handle to reveal it). Resolves null on success, else the reason. */
+  onOrderCancel?: (id: string) => Promise<string | null>;
 }
 
 /** RSI pane is pinned to a fixed 20–80 window with shaded
@@ -243,6 +249,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     onLastPrice,
     orderLines,
     onOrderAmend,
+    onOrderCancel,
   }: Props,
   ref,
 ) {
@@ -741,8 +748,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const hasPricePick = !!onPricePick;
   // Declared before the stripGeom effect below — its deps array is
   // evaluated at render, so this binding must already exist.
-  const hasDraggableOrders = !!onOrderAmend
-    && (orderLines ?? []).some((l) => l.id && l.draggable);
+  // A line gets a right-edge handle when it can be dragged (amend) or
+  // cancelled from the chart; non-draggable handles only offer cancel.
+  const lineHasHandle = (l: { id?: string; draggable?: boolean }) =>
+    !!l.id && ((!!onOrderAmend && !!l.draggable) || !!onOrderCancel);
+  const hasOrderHandles = (orderLines ?? []).some(lineHasHandle);
   const [stripGeom, setStripGeom] = useState<
     { right: number; height: number } | null
   >(null);
@@ -750,7 +760,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     { y: number; price: number } | null
   >(null);
   useEffect(() => {
-    if (!hasPricePick && !hasDraggableOrders) { setStripGeom(null); return; }
+    if (!hasPricePick && !hasOrderHandles) { setStripGeom(null); return; }
     const measure = () => {
       const chart = chartRef.current;
       const el = containerRef.current;
@@ -776,7 +786,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     measure();
     const id = window.setInterval(measure, 1000);
     return () => window.clearInterval(id);
-  }, [hasPricePick, hasDraggableOrders, chartVersion]);
+  }, [hasPricePick, hasOrderHandles, chartVersion]);
 
   // Decimals implied by the tick (0.25 → 2, 0.1 → 1) so the hover tag
   // and the drafted command show the exchange's own price format.
@@ -811,25 +821,29 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const amendFlowRef = useRef<AmendFlow | null>(null);
   useEffect(() => { amendFlowRef.current = amendFlow; }, [amendFlow]);
 
-  const [orderHandles, setOrderHandles] = useState<Array<{
+  type OrderHandle = {
     id: string; y: number; side: 'BUY' | 'SELL'; price: number; label: string;
-  }>>([]);
+    draggable: boolean; cancellable: boolean;
+  };
+  const [orderHandles, setOrderHandles] = useState<OrderHandle[]>([]);
+  const [hoverHandleId, setHoverHandleId] = useState<string | null>(null);
   useEffect(() => {
-    if (!hasDraggableOrders) { setOrderHandles([]); return; }
+    if (!hasOrderHandles) { setOrderHandles([]); return; }
     const measure = () => {
       const ser = seriesRef.current;
       if (!ser) return;
       const flow = amendFlowRef.current;
-      const hs: Array<{ id: string; y: number; side: 'BUY' | 'SELL';
-                        price: number; label: string }> = [];
+      const hs: OrderHandle[] = [];
       for (const ln of orderLines ?? []) {
-        if (!ln.id || !ln.draggable) continue;
+        if (!ln.id || !lineHasHandle(ln)) continue;
         if (flow && flow.id === ln.id) continue;  // dragged handle renders from flow
         const y = ser.priceToCoordinate(ln.price);
         if (y == null || (y as number) < 0) continue;
         if (stripGeom && (y as number) > stripGeom.height) continue;
         hs.push({ id: ln.id, y: y as number, side: ln.side,
-                  price: ln.price, label: ln.label });
+                  price: ln.price, label: ln.label,
+                  draggable: !!onOrderAmend && !!ln.draggable,
+                  cancellable: ln.cancellable !== false });
       }
       setOrderHandles((prev) =>
         JSON.stringify(prev) === JSON.stringify(hs) ? prev : hs);
@@ -837,7 +851,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     measure();
     const t = window.setInterval(measure, 300);
     return () => window.clearInterval(t);
-  }, [orderLines, hasDraggableOrders, chartVersion, stripGeom, amendFlow?.id]);
+  }, [orderLines, hasOrderHandles, chartVersion, stripGeom, amendFlow?.id]);
 
   const revertAmendFlow = () => {
     const f = amendFlowRef.current;
@@ -3189,28 +3203,50 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           )}
         </div>
       )}
-      {stripGeom && onOrderAmend && orderHandles.map((h) => (
+      {stripGeom && orderHandles.map((h) => (
+        // Handle + hover-revealed cancel share one hover box so the
+        // pointer can travel from the handle onto the ✕.
         <div
           key={h.id}
-          data-testid={`order-drag-handle-${h.id}`}
-          title={`drag to move ${h.label} @ ${h.price.toFixed(pickDecimals)}`}
-          onMouseDown={(e) => startOrderDrag(h, e)}
+          onMouseEnter={() => setHoverHandleId(h.id)}
+          onMouseLeave={() => setHoverHandleId((cur) => (cur === h.id ? null : cur))}
           style={{
             position: 'absolute',
             right: stripGeom.right + 1,
-            top: h.y - 5,
-            width: 22,
-            height: 11,
+            top: h.y - 10,
+            height: 21,
             zIndex: 22,
-            cursor: 'ns-resize',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            background: h.side === 'BUY'
-              ? 'rgba(22,163,74,0.85)' : 'rgba(220,38,38,0.85)',
-            color: '#fff', fontSize: 8, lineHeight: 1, letterSpacing: 0.5,
-            borderRadius: 3, userSelect: 'none',
+            display: 'flex', flexDirection: 'row-reverse', alignItems: 'center', gap: 3,
           }}
         >
-          ≡
+          <div
+            data-testid={`order-drag-handle-${h.id}`}
+            title={h.draggable
+              ? `drag to move ${h.label} @ ${h.price.toFixed(pickDecimals)}`
+              : `${h.label} @ ${h.price.toFixed(pickDecimals)}`}
+            onMouseDown={h.draggable ? (e) => startOrderDrag(h, e) : undefined}
+            style={{
+              width: 22,
+              height: 11,
+              cursor: h.draggable ? 'ns-resize' : 'default',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: h.side === 'BUY'
+                ? 'rgba(22,163,74,0.85)' : 'rgba(220,38,38,0.85)',
+              color: '#fff', fontSize: 8, lineHeight: 1, letterSpacing: 0.5,
+              borderRadius: 3, userSelect: 'none',
+            }}
+          >
+            ≡
+          </div>
+          {onOrderCancel && hoverHandleId === h.id && !amendFlow && (
+            <CancelOrderButton
+              size="xs"
+              testId={`order-cancel-${h.id}`}
+              onCancel={() => onOrderCancel(h.id)}
+              disabledReason={h.cancellable ? undefined
+                : 'Placed or modified in TWS — cancel it there'}
+            />
+          )}
         </div>
       ))}
       {stripGeom && amendFlow && (

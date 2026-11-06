@@ -434,3 +434,25 @@ export type ChartExecutions = Record<string, ChartExecutionMarker[]>;
 export function getChartExecutions() {
   return request<ChartExecutions>('/chart/executions');
 }
+
+/** POST /api/orders/cancel → null on success, else IB's reason. */
+export async function requestOrderCancel(ibOrderId: string): Promise<string | null> {
+  try {
+    const r = await fetch('/api/orders/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ib_order_id: ibOrderId }),
+    });
+    if (r.ok) return null;
+    const text = await r.text();
+    try {
+      const detail = JSON.parse(text)?.detail;
+      // The API proxies the engine's error body, which is itself JSON.
+      try { return JSON.parse(detail)?.detail ?? String(detail); } catch { return String(detail); }
+    } catch {
+      return text || `HTTP ${r.status}`;
+    }
+  } catch (e) {
+    return String(e);
+  }
+}
