@@ -39,6 +39,8 @@ export function SettingsModal({ open, onClose }: Props) {
   const signalActiveBars = useUserSetting('signalActiveBars');
   const brokenLookbackMinutes = useUserSetting('brokenLookbackMinutes');
   const fillMarkerScale = useUserSetting('fillMarkerScale');
+  const chartShowVolume = useUserSetting('chartShowVolume');
+  const chartShowRsi = useUserSetting('chartShowRsi');
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
   const activeVariant = useStore((s) => s.activeVariant);
@@ -170,6 +172,26 @@ export function SettingsModal({ open, onClose }: Props) {
             />
           </SettingRow>
 
+          <SectionTitle>Chart indicators</SectionTitle>
+          <SettingRow
+            label="Volume"
+            help="Volume histogram along the bottom of each chart."
+          >
+            <Toggle
+              checked={chartShowVolume}
+              onChange={(v) => setUserSetting('chartShowVolume', v)}
+            />
+          </SettingRow>
+          <SettingRow
+            label="RSI"
+            help="RSI(14) pane under each chart, with dashed bullish/bearish divergence lines."
+          >
+            <Toggle
+              checked={chartShowRsi}
+              onChange={(v) => setUserSetting('chartShowRsi', v)}
+            />
+          </SettingRow>
+
           <SectionTitle>Support/Resistance</SectionTitle>
           <SettingRow
             label="Broken-line lookback"
@@ -199,6 +221,8 @@ export function SettingsModal({ open, onClose }: Props) {
               setUserSetting('signalActiveBars', DEFAULT_SETTINGS.signalActiveBars);
               setUserSetting('brokenLookbackMinutes', DEFAULT_SETTINGS.brokenLookbackMinutes);
               setUserSetting('fillMarkerScale', DEFAULT_SETTINGS.fillMarkerScale);
+              setUserSetting('chartShowVolume', DEFAULT_SETTINGS.chartShowVolume);
+              setUserSetting('chartShowRsi', DEFAULT_SETTINGS.chartShowRsi);
             }}
             style={{
               background: 'transparent', border: '1px solid var(--border-default)',
@@ -276,5 +300,18 @@ function NumberInput({
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{suffix}</span>
       )}
     </span>
+  );
+}
+
+function Toggle({
+  checked, onChange,
+}: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <input
+      type="checkbox"
+      checked={checked}
+      onChange={(e) => onChange(e.target.checked)}
+      style={{ width: 16, height: 16, cursor: 'pointer', accentColor: 'var(--accent-blue)' }}
+    />
   );
 }

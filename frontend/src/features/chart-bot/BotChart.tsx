@@ -800,7 +800,6 @@ export function BotChart({
           ref={chartRef}
           target={target}
           enableSr
-          showRsi={false}
           showBrokenSr={showBrokenSr}
           brokenMinutes={brokenMinutes}
           showCounterSupport={showCounterSupport}

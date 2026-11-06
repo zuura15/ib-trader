@@ -201,6 +201,12 @@ interface Props {
   onOrderAmend?: (id: string, price: number) => Promise<boolean>;
 }
 
+/** Price-pane margins: the bottom 15% is reserved for the volume
+ *  histogram only while it's shown. */
+function priceScaleMargins(volumeShown: boolean) {
+  return { top: 0.05, bottom: volumeShown ? 0.15 : 0.05 };
+}
+
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
   {
     target,
@@ -293,6 +299,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const rsiSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  // Operator toggles (Settings → Chart indicators). ``showRsi`` is the
+  // caller's capability gate (e.g. Direction Lab forces it off); the
+  // setting switches it per user. Volume toggles in place, no rebuild.
+  const rsiSetting = useUserSetting('chartShowRsi');
+  const rsiOn = showRsi && rsiSetting;
+  const volumeOn = useUserSetting('chartShowVolume');
+  const volumeOnRef = useRef(volumeOn);
+  volumeOnRef.current = volumeOn;
   const divergenceSeriesRef = useRef<ISeriesApi<'Line'>[]>([]);
   // Auto-detected support/resistance lines on the price pane. Recreated
   // every refresh; `srHiddenRef` lets the user dismiss them for the
@@ -1053,7 +1067,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     return () => obs.disconnect();
   }, []);
 
-  // Create / recreate chart on theme change. showRsi changes also trigger
+  // Create / recreate chart on theme change. RSI on/off also triggers
   // a rebuild since the pane structure differs.
   useEffect(() => {
     const el = containerRef.current;
@@ -1109,7 +1123,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // proportions where price dominates and volume sits as a
         // thin band underneath. Earlier 0.25/0.25 squashed price
         // into the middle 50% with empty space top and bottom.
-        scaleMargins: { top: 0.05, bottom: 0.15 },
+        scaleMargins: priceScaleMargins(volumeOnRef.current),
       },
       crosshair: { mode: 1 },
     });
@@ -1128,7 +1142,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     });
 
     let rsi: ISeriesApi<'Line'> | null = null;
-    if (showRsi) {
+    if (rsiOn) {
       rsi = chart.addSeries(LineSeries, {
         color: colors.rsi,
         lineWidth: 1,
@@ -1162,6 +1176,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       color: 'rgba(120, 144, 156, 0.45)',
       priceLineVisible: false,
       lastValueVisible: false,
+      visible: volumeOnRef.current,
     });
     chart.priceScale('volume').applyOptions({
       scaleMargins: { top: 0.85, bottom: 0 },
@@ -2297,7 +2312,19 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       volumeSeriesRef.current = null;
       barsRef.current = [];
     };
-  }, [theme, showRsi]);
+  }, [theme, rsiOn]);
+
+  // Volume on/off in place: hide the histogram and hand its bottom
+  // strip back to the price polyline.
+  useEffect(() => {
+    try { volumeSeriesRef.current?.applyOptions({ visible: volumeOn }); }
+    catch { /* chart mid-teardown */ }
+    try {
+      chartRef.current?.priceScale('right').applyOptions({
+        scaleMargins: priceScaleMargins(volumeOn),
+      });
+    } catch { /* chart mid-teardown */ }
+  }, [volumeOn, chartVersion]);
 
   // Data fetch + 30s refresh + retry-with-backoff.
   useEffect(() => {
@@ -2920,7 +2947,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const priceScale = chart.priceScale('right');
       try {
         priceScale.applyOptions({
-          scaleMargins: { top: 0.05, bottom: 0.15 },
+          scaleMargins: priceScaleMargins(volumeOnRef.current),
         });
       } catch { /* ignore */ }
       try { priceScale.setAutoScale(true); } catch { /* ignore */ }

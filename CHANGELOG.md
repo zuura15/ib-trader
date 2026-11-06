@@ -3,6 +3,16 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-06
+
+### Changed
+- **Charts: RSI back on, with on/off settings for RSI and volume.** New
+  Settings → Chart indicators section toggles the volume histogram and
+  the RSI(14) pane (with divergence lines) independently; both default
+  on. The bot chart panes had RSI hard-disabled since 870d931 — they now
+  follow the setting. Hiding volume hands its bottom strip back to the
+  price line. Direction Lab keeps RSI off.
+
 ## 2026-11-05
 
 ### Changed

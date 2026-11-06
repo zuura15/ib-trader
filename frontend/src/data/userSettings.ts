@@ -19,12 +19,18 @@ export interface UserSettings {
   /** Chart fill-dot diameter as a multiple of the price line's
    *  thickness (1–10). Default 2. */
   fillMarkerScale: number;
+  /** Show the RSI(14) sub-pane (with divergence lines) on charts. */
+  chartShowRsi: boolean;
+  /** Show the volume histogram along the bottom of charts. */
+  chartShowVolume: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
   signalActiveBars: 2,
   brokenLookbackMinutes: 30,
   fillMarkerScale: 2,
+  chartShowRsi: true,
+  chartShowVolume: true,
 };
 
 const KEY_PREFIX = 'ib-trader:settings:';
@@ -40,6 +46,9 @@ function read<K extends keyof UserSettings>(key: K): UserSettings[K] {
     if (typeof DEFAULT_SETTINGS[key] === 'number') {
       const n = Number(parsed);
       return (Number.isFinite(n) ? n : DEFAULT_SETTINGS[key]) as UserSettings[K];
+    }
+    if (typeof DEFAULT_SETTINGS[key] === 'boolean') {
+      return (typeof parsed === 'boolean' ? parsed : DEFAULT_SETTINGS[key]) as UserSettings[K];
     }
     return parsed as UserSettings[K];
   } catch {
