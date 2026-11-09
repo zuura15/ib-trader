@@ -3,6 +3,7 @@ import {
   getDiagRing, subscribeDiag, recordDiag, recordBoot,
   type DiagEvent,
 } from './diagnostics';
+import { MOBILE_QUERY } from './layoutBreakpoint';
 
 /**
  * Always-mounted diagnostic surface. Three modes:
@@ -31,7 +32,7 @@ export function DiagOverlay() {
       proto: window.location.protocol,
       host: window.location.host,
       viewport: vp,
-      isMobile: window.matchMedia('(max-width: 767px)').matches,
+      isMobile: window.matchMedia(MOBILE_QUERY).matches,
       readyState: document.readyState,
     });
 

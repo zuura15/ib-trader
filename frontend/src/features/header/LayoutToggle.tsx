@@ -11,7 +11,7 @@ const ORDER: Array<'auto' | 'mobile' | 'desktop'> = ['auto', 'mobile', 'desktop'
 /**
  * Manual override for layout mode (auto / mobile / desktop).
  *
- * The auto mode defers to ``window.matchMedia('(max-width: 767px)')`` —
+ * The auto mode defers to ``MOBILE_QUERY`` (app/layoutBreakpoint.ts) —
  * which works correctly on Firefox and Safari but is regularly defeated
  * on Chrome Android by the per-origin "Desktop site" preference and by
  * UA-Client-Hints caching that survives "Clear site data". This toggle

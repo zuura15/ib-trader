@@ -4,6 +4,7 @@ import { WorkstationLayout } from '../layout/WorkstationLayout';
 import { MobileLayout } from '../layout/MobileLayout';
 import { useStore } from '../data/store';
 import { useVisibilityRepaint } from '../hooks/useVisibilityRepaint';
+import { MOBILE_QUERY } from './layoutBreakpoint';
 
 // Full-screen blocking overlay for CATASTROPHIC alerts (IB Gateway down, etc.)
 // Renders on top of everything so the user can't miss it. The dismiss button
@@ -157,11 +158,6 @@ function ReconnectingBanner() {
     </div>
   );
 }
-
-// Phones, plus portrait foldables / small tablets (a Galaxy Fold's inner
-// screen is ~750–900 CSS px wide in portrait) — they get the vertical
-// three-tab layout rather than the multi-pane desktop.
-const MOBILE_QUERY = '(max-width: 767px), (orientation: portrait) and (max-width: 1000px)';
 
 // Create the MediaQueryList once at module scope. This is safe because
 // the query string is a compile-time constant. Avoids re-creating the

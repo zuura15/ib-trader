@@ -48,7 +48,7 @@ interface AppStore {
 
   // Layout override — manual escape from Chrome's "Desktop site" /
   // UA-Client-Hints viewport trickery. ``auto`` (default) defers to the
-  // matchMedia(max-width: 767px) check in App.useIsMobile; ``mobile``
+  // MOBILE_QUERY (app/layoutBreakpoint.ts) check in App.useIsMobile; ``mobile``
   // and ``desktop`` force the corresponding layout regardless of the
   // browser's reported viewport.
   layoutOverride: 'auto' | 'mobile' | 'desktop';

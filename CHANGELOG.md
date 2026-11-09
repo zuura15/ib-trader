@@ -17,6 +17,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   fills, recommendation badge). Portrait foldables up to 1000 px wide
   (Galaxy Fold inner screen) also get this layout. The old 5-tab swipe
   layout and `MobileTradeView` are removed.
+- **Narrow desktop windows use the mobile layout.** Any viewport under
+  1100 px (e.g. a browser snapped to half a 1920 screen) switches to the
+  Pos / Graphs / Watch layout and back live on resize; Settings →
+  Layout mode still forces either. Breakpoint lives in
+  `frontend/src/app/layoutBreakpoint.ts`.
 - **Recommendation markers (#102):** the text arrows are replaced by small
   triangles the same size as the fill dots — up/green for buy, down/red
   for sell, solid for Strong, outline for plain Buy/Sell; hover one for
