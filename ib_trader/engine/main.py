@@ -40,6 +40,7 @@ from ib_trader.data.repositories.pending_command_repository import PendingComman
 from ib_trader.data.repositories.bot_repository import BotRepository, BotEventRepository
 from ib_trader.data.repositories.bot_trade_repository import BotTradeRepository
 from ib_trader.data.repositories.template_repository import OrderTemplateRepository
+from ib_trader.data.repositories.execution_archive_repository import ExecutionArchiveRepository
 from ib_trader.engine.tracker import OrderTracker
 from ib_trader.logging_.logger import setup_logging
 
@@ -181,6 +182,7 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
         bot_events=BotEventRepository(session_factory),
         bot_trades=BotTradeRepository(session_factory),
         templates=OrderTemplateRepository(session_factory),
+        executions_archive=ExecutionArchiveRepository(session_factory),
     )
 
     asyncio.run(run_engine(ctx, symbols))
@@ -1236,12 +1238,41 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
     from ib_trader.redis.state import StateKeys
 
     from ib_trader.engine.lifo_pnl import compute_lifo
+    from ib_trader.logging_.alerts import log_and_alert
+
+    # Archived fills per contract, keyed by the executions window's start:
+    # history only changes when a fill ages out of the window, so most
+    # sweeps reuse it without touching SQLite.
+    history_cache: dict[str, tuple[object, list[dict]]] = {}
+    # exec_id → (commission, realized_pnl, multiplier) last archived, so a
+    # sweep only writes executions that are new or gained late fields.
+    archived: dict[str, tuple] = {}
+
+    def _archived_fills(sym: str, window_start) -> list[dict]:
+        hit = history_cache.get(sym)
+        if hit is not None and hit[0] == window_start:
+            return hit[1]
+        before = None
+        if window_start is not None:
+            from datetime import timezone as _tz
+            before = window_start.astimezone(_tz.utc).replace(tzinfo=None)
+        rows = [
+            {
+                "local_symbol": sym, "sec_type": e.sec_type or "FUT",
+                "side": e.side, "shares": e.shares, "price": e.price,
+                "commission": e.commission, "realized_pnl": e.realized_pnl,
+                "exec_id": e.exec_id, "exec_time": e.exec_time,
+            }
+            for e in ctx.executions_archive.get_for_symbol(sym, before=before)
+        ]
+        history_cache[sym] = (window_start, rows)
+        return rows
 
     interval = float(ctx.settings.get("pnl_rollup_interval_seconds", 60))
     session_hour = int(ctx.settings.get("futures_session_start_hour", 15))
     wake = asyncio.Event()
     ctx.pnl_rollup_wake = wake
-    fallback_reasons: dict[str, str | None] = {}
+    fallback_reasons: dict[str, object] = {}
     while True:
         try:
             # Current-session executions (IB drops pre-Gateway-restart
@@ -1265,6 +1296,33 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
             stored = merge_executions(stored, fresh, now, window_hours=24.0)
             execs = records_to_execs(stored)
 
+            # Archive every execution durably (GH #101): IB forgets fills
+            # after ~24 h; LIFO rebuilds older lots from this table.
+            if ctx.executions_archive is not None:
+                pending = [
+                    rec for eid, rec in stored.items()
+                    if archived.get(eid) != (
+                        rec.get("commission"), rec.get("realized_pnl"),
+                        rec.get("multiplier"),
+                    )
+                ]
+                if pending:
+                    try:
+                        ctx.executions_archive.upsert(pending)
+                        for rec in pending:
+                            archived[rec["exec_id"]] = (
+                                rec.get("commission"), rec.get("realized_pnl"),
+                                rec.get("multiplier"),
+                            )
+                        history_cache.clear()
+                    except Exception:
+                        await log_and_alert(
+                            redis=ctx.redis, trigger="EXEC_ARCHIVE_WRITE_FAILED",
+                            message="Couldn't archive IB executions; retrying "
+                                    "next sweep",
+                            dedup_key="EXEC_ARCHIVE_WRITE_FAILED",
+                        )
+
             # Futures LIFO (GH #101). Positions are read AFTER the
             # executions sweep so a fill in the sweep has normally already
             # landed in the cache via positionEvent; a position change also
@@ -1273,15 +1331,39 @@ async def _pnl_rollup_loop(ctx: AppContext) -> None:
                 p.get("local_symbol"): p for p in ctx.positions_cache
                 if (p.get("sec_type") or "").upper() == "FUT" and p.get("local_symbol")
             }
-            lifo = compute_lifo(execs, fut_positions)
+            # Pre-window lots come from the execution archive, which
+            # compute_lifo accepts only if it reproduces IB's numbers.
+            window_start = min((e["exec_time"] for e in execs), default=None)
+            history: dict[str, list[dict]] = {}
+            try:
+                if ctx.executions_archive is not None:
+                    for sym in fut_positions:
+                        history[sym] = _archived_fills(sym, window_start)
+            except Exception:
+                history = {}
+                await log_and_alert(
+                    redis=ctx.redis, trigger="LIFO_HISTORY_READ_FAILED",
+                    message="LIFO: couldn't read archived fills; pre-window "
+                            "positions use IB average cost",
+                    dedup_key="LIFO_HISTORY_READ_FAILED",
+                )
+            lifo = compute_lifo(execs, fut_positions, history)
             ctx.lifo_basis = lifo
             for sym, res in lifo.items():
-                if fallback_reasons.get(sym, "unset") != res.reason:
-                    fallback_reasons[sym] = res.reason
+                state = (res.reason, res.seed_source, res.history_note)
+                if fallback_reasons.get(sym, "unset") != state:
+                    fallback_reasons[sym] = state
                     if res.method != "lifo":
                         logger.warning(
                             '{"event": "LIFO_PNL_FALLBACK", "symbol": "%s", '
                             '"reason": "%s"}', sym, res.reason,
+                        )
+                    else:
+                        logger.info(
+                            '{"event": "LIFO_SEED", "symbol": "%s", '
+                            '"seed_source": "%s", "history_note": "%s", '
+                            '"open_lots": %d}',
+                            sym, res.seed_source, res.history_note, len(res.lots),
                         )
 
             rollup = compute_pnl_rollup(execs, now, session_hour, lifo=lifo)

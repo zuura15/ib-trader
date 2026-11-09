@@ -58,6 +58,8 @@ class AppContext:
     bot_events: BotEventRepository | None = None
     bot_trades: BotTradeRepository | None = None
     templates: OrderTemplateRepository | None = None
+    # Archive of every IB execution (GH #101 LIFO history). Engine-only.
+    executions_archive: object | None = None
     router: OutputRouter = field(default_factory=OutputRouter)
 
     # In-memory IB positions cache — refreshed by positionEvent callback

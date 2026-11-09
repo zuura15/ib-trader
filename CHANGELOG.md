@@ -3,6 +3,30 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-08
+
+### Added
+- **`scripts/deploy_prod.sh`** — one-command prod deploy from the dev
+  box: refuses on a dirty prod checkout or a bot holding a live
+  position, shows incoming commits, `git pull --ff-only`, `npm ci` /
+  `alembic upgrade` when needed, Ctrl+C + `make prod` inside the
+  `trading` screen session, then waits for a new engine heartbeat.
+  `--dry-run` previews, `--yes` skips the prompt.
+- **IB execution archive (`ib_executions`, migration e7b3c9a41d20).**
+  Every execution the engine sees — account-wide, including TWS and
+  mobile fills — is now stored permanently (IB's API forgets them after
+  ~24 h).
+
+### Fixed
+- **Futures LIFO for positions older than 24 h (#101).** A partial close
+  of a position opened before IB's 24 h execution window was priced at
+  IB's average cost (2026-11-08: 1 GCZ6 sold showed −$315.84). The
+  pre-window lots are now rebuilt from the execution archive — replayed
+  from the last point the position was flat and accepted only when that
+  reproduces IB's quantity and average cost; otherwise IB's average is
+  used as before (logged as `LIFO_SEED` with `seed_source`). Positions
+  opened before the archive existed stay on IB's average until closed.
+
 ## 2026-11-06
 
 ### Added

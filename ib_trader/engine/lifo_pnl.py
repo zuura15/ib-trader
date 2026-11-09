@@ -9,14 +9,19 @@ between realized and open P&L differs.
 This is a display-only view derived from IB executions (IB stays the
 source of truth). Pure / IB-free so it can be unit-tested directly.
 
-History limit: we only see executions from the trailing ~24 h store.
-Whatever position existed before the oldest execution is treated as ONE
-seed lot at IB's average cost, back-solved from IB's own numbers:
+History limit: IB only hands us executions from the trailing ~24 h
+store. Whatever position existed before the oldest execution (the
+"seed") gets its average cost back-solved from IB's own numbers:
   * position never went flat/flipped since → solve from IB's current
     average cost (IB's avg is affine in the seed cost);
   * the seed was fully closed out → solve from IB's realized P&L on the
     fills that closed it.
-Any contract that can't be solved cleanly is reported with
+The seed's individual lots are then rebuilt from the archive of every IB
+execution on the account (``history``): replay from the latest point the
+position was flat, accepted only when it reproduces IB exactly — same
+quantity, and an average-cost replay landing on the back-solved seed
+cost. When no such point exists (e.g. the position predates the
+archive), the seed stays ONE lot at IB's average cost. Any contract that can't be solved cleanly is reported with
 ``method="avg"`` and callers fall back to IB's numbers for it.
 
 Conventions (match IB): opening commission is folded into the lot cost,
@@ -34,6 +39,17 @@ _ONE = Decimal("1")
 # Seed cost further than this from the first fill price means our inputs
 # disagree (stale position snapshot, missing fills) — fall back to IB.
 _SEED_SANITY_RATIO = Decimal("0.5")
+# History replay must land on IB's average cost within this fraction of
+# price (~0.04 on gold at 4100) — tight enough that a wrong flat point
+# can't match by coincidence; IB's average includes commissions exactly
+# as the replay folds them.
+_HISTORY_MATCH_RATIO = Decimal("0.00001")
+# Only search this many most-recent archived fills for the flat point.
+_HISTORY_MAX_FILLS = 3000
+# Memo of history rebuilds — compute_lifo runs every sweep, the archive
+# only changes when a fill lands.
+_history_memo: dict[tuple, tuple[list[Lot] | None, str | None]] = {}
+_HISTORY_MEMO_MAX = 64
 
 
 @dataclass
@@ -48,6 +64,12 @@ class LifoResult:
     """Per-contract LIFO outcome."""
     method: str                      # "lifo" or "avg" (fallback)
     reason: str | None = None        # why we fell back, when method == "avg"
+    # Where the pre-window lots came from: "history" (archived fills
+    # replayed and verified against IB), "ib_avg" (one lot at IB's
+    # average cost), or None when there was no pre-window position.
+    seed_source: str | None = None
+    # Why archived history wasn't used, when it was offered but failed.
+    history_note: str | None = None
     realized_by_exec: dict[str, Decimal] = field(default_factory=dict)
     lots: list[Lot] = field(default_factory=list)
 
@@ -193,6 +215,7 @@ def _solve_seed_cost(
 def compute_lifo(
     executions: list[dict],
     positions: dict[str, dict],
+    history: dict[str, list[dict]] | None = None,
 ) -> dict[str, LifoResult]:
     """LIFO-match every FUT contract in ``executions``.
 
@@ -201,8 +224,11 @@ def compute_lifo(
     ``commission``, ``realized_pnl``, ``exec_id``, ``exec_time``,
     ``multiplier``). ``positions`` maps local_symbol → ``{quantity,
     avg_cost (per unit), multiplier}`` for currently-held FUT contracts.
-    Contracts held with no executions in the window are not returned —
-    there's nothing to re-match, IB's average cost is already their basis.
+    ``history`` maps local_symbol → the app's archived fills for that
+    contract from BEFORE the executions window (same dict shape), used
+    to rebuild the pre-window lots. Contracts held with no executions in
+    the window are returned only when history rebuilds their lots —
+    otherwise IB's average cost is already their basis.
     """
     by_sym: dict[str, list[dict]] = {}
     for ex in executions:
@@ -212,20 +238,23 @@ def compute_lifo(
         if sym:
             by_sym.setdefault(sym, []).append(ex)
 
+    history = history or {}
     out: dict[str, LifoResult] = {}
     for sym, rows in by_sym.items():
-        out[sym] = _compute_one(rows, positions.get(sym))
+        out[sym] = _compute_one(rows, positions.get(sym), history.get(sym))
+    # Held with no fills in the window: only history can say anything.
+    for sym, pos in positions.items():
+        if sym in out or not history.get(sym):
+            continue
+        res = _compute_one([], pos, history[sym])
+        if res.seed_source == "history":
+            out[sym] = res
     return out
 
 
-def _compute_one(rows: list[dict], position: dict | None) -> LifoResult:
-    pos = position or {}
-    mult = next(
-        (m for m in (_dec(r.get("multiplier")) for r in rows) if m), None,
-    ) or _dec(pos.get("multiplier"))
-    if not mult or mult <= 0:
-        return LifoResult(method="avg", reason="unknown_multiplier")
-
+def _fills_from_rows(rows: list[dict]) -> tuple[list[tuple], dict] | None:
+    """Sorted ``(exec_id, signed_qty, price, commission)`` tuples plus
+    IB realized by exec_id; None when any row is unusable."""
     rows = sorted(rows, key=lambda r: (r["exec_time"], r.get("exec_id") or ""))
     fills: list[tuple] = []
     ib_realized: dict[str, Decimal | None] = {}
@@ -233,27 +262,117 @@ def _compute_one(rows: list[dict], position: dict | None) -> LifoResult:
         sq = _signed_qty(r)
         price = r.get("price")
         if sq is None or price is None:
-            return LifoResult(method="avg", reason="incomplete_fill")
+            return None
         eid = r.get("exec_id") or ""
         fills.append((eid, sq, price, r.get("commission") or _ZERO))
         ib_realized[eid] = r.get("realized_pnl")
+    return fills, ib_realized
+
+
+def _lots_from_history(
+    hist_rows: list[dict], seed_qty: Decimal, seed_cost: Decimal,
+    multiplier: Decimal,
+) -> tuple[list[Lot] | None, str | None]:
+    """Rebuild the seed's LIFO lots from archived fills.
+
+    Scans back for the latest fill k such that replaying fills[k:] from
+    flat reproduces IB's seed: same net quantity AND an average-cost
+    replay matching the seed cost. That k is where the position was last
+    flat with every later fill on record. Returns (lots, None) or
+    (None, reason).
+    """
+    if not hist_rows:
+        return None, "history_empty"
+    key = (
+        hist_rows[-1].get("exec_id"), len(hist_rows), seed_qty,
+        seed_cost.quantize(Decimal("0.000001")), multiplier,
+    )
+    hit = _history_memo.get(key)
+    if hit is not None:
+        return ([Lot(lot.qty, lot.cost) for lot in hit[0]] if hit[0] else None), hit[1]
+    parsed = _fills_from_rows(hist_rows[-_HISTORY_MAX_FILLS:])
+    if parsed is None:
+        result: tuple[list[Lot] | None, str | None] = (None, "history_incomplete_fill")
+    else:
+        fills, _ = parsed
+        result = (None, "history_no_flat_point")
+        net = _ZERO
+        tol = abs(seed_cost) * _HISTORY_MATCH_RATIO
+        for k in range(len(fills) - 1, -1, -1):
+            net += fills[k][1]
+            if net != seed_qty:
+                continue
+            suffix = fills[k:]
+            avg, _, _ = _simulate_avg(_ZERO, _ZERO, suffix, multiplier)
+            if avg is None or abs(avg - seed_cost) > tol:
+                continue
+            lots: list[Lot] = []
+            for _eid, sq, price, comm in suffix:
+                realize_lifo(lots, sq, price, comm, multiplier)
+            result = (lots, None)
+            break
+    if len(_history_memo) >= _HISTORY_MEMO_MAX:
+        _history_memo.clear()
+    _history_memo[key] = result
+    lots_out = [Lot(lot.qty, lot.cost) for lot in result[0]] if result[0] else None
+    return lots_out, result[1]
+
+
+def _compute_one(
+    rows: list[dict], position: dict | None,
+    hist_rows: list[dict] | None = None,
+) -> LifoResult:
+    pos = position or {}
+    mult = next(
+        (m for m in (_dec(r.get("multiplier")) for r in rows) if m), None,
+    ) or _dec(pos.get("multiplier"))
+    if not mult or mult <= 0:
+        return LifoResult(method="avg", reason="unknown_multiplier")
+
+    parsed = _fills_from_rows(rows)
+    if parsed is None:
+        return LifoResult(method="avg", reason="incomplete_fill")
+    fills, ib_realized = parsed
 
     current_qty = _dec(pos.get("quantity")) or _ZERO
     seed_qty = current_qty - sum((f[1] for f in fills), _ZERO)
 
     lots: list[Lot] = []
+    seed_source: str | None = None
+    history_note: str | None = None
     if seed_qty != 0:
-        seed_cost, reason = _solve_seed_cost(
-            seed_qty, fills, mult, _dec(pos.get("avg_cost")), ib_realized,
-        )
-        if seed_cost is None:
-            return LifoResult(method="avg", reason=reason)
-        first_price = fills[0][2]
-        if first_price and abs(seed_cost - first_price) / first_price > _SEED_SANITY_RATIO:
-            return LifoResult(method="avg", reason="seed_cost_implausible")
-        lots.append(Lot(qty=seed_qty, cost=seed_cost))
+        if fills:
+            seed_cost, reason = _solve_seed_cost(
+                seed_qty, fills, mult, _dec(pos.get("avg_cost")), ib_realized,
+            )
+            if seed_cost is None:
+                return LifoResult(method="avg", reason=reason)
+            first_price = fills[0][2]
+            if first_price and abs(seed_cost - first_price) / first_price > _SEED_SANITY_RATIO:
+                return LifoResult(method="avg", reason="seed_cost_implausible")
+        else:
+            # No fills in the window: the whole position is the seed and
+            # IB's current average cost is its basis.
+            seed_cost = _dec(pos.get("avg_cost"))
+            if seed_cost is None:
+                return LifoResult(method="avg", reason="no_ib_avg_cost")
+        if hist_rows:
+            hist_lots, history_note = _lots_from_history(
+                hist_rows, seed_qty, seed_cost, mult,
+            )
+        else:
+            hist_lots = None
+        if hist_lots is not None:
+            lots.extend(hist_lots)
+            seed_source = "history"
+        else:
+            lots.append(Lot(qty=seed_qty, cost=seed_cost))
+            seed_source = "ib_avg"
 
-    result = LifoResult(method="lifo", lots=lots)
+    result = LifoResult(
+        method="lifo", lots=lots, seed_source=seed_source,
+        history_note=history_note,
+    )
     for eid, sq, price, comm in fills:
         pnl = realize_lifo(lots, sq, price, comm, mult)
         if pnl is not None:

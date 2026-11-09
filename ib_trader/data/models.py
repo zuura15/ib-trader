@@ -467,3 +467,35 @@ class OrderTemplate(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
+
+
+class IbExecution(Base):
+    """Archive of every IB execution seen on the account (incl. fills
+    placed in TWS / mobile), keyed by IB's ``execId``.
+
+    Raw IB data persisted for audit — archival, never live state. IB's
+    ``reqExecutions`` only reaches back ~24 h; this table is the durable
+    history the futures LIFO view (GH #101) rebuilds older lots from.
+    Insert-once per exec; a later sweep may fill in ``commission`` /
+    ``realized_pnl`` / ``multiplier`` once IB's commission report pairs.
+    """
+
+    __tablename__ = "ib_executions"
+
+    exec_id      = Column(String(64), primary_key=True)
+    perm_id      = Column(Integer, nullable=True)
+    local_symbol = Column(String(32), nullable=False)
+    symbol       = Column(String(20), nullable=True)
+    sec_type     = Column(String(8), nullable=True)
+    side         = Column(String(4), nullable=False)       # BOT / SLD
+    shares       = Column(Numeric(18, 4), nullable=False)
+    price        = Column(Numeric(18, 8), nullable=False)
+    commission   = Column(Numeric(18, 8), nullable=True)
+    realized_pnl = Column(Numeric(18, 8), nullable=True)
+    multiplier   = Column(String(16), nullable=True)
+    exec_time    = Column(DateTime, nullable=False)        # naive UTC
+    recorded_at  = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        Index("ix_ib_exec_symbol_time", "local_symbol", "exec_time"),
+    )

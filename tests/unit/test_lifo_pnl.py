@@ -186,3 +186,92 @@ async def test_console_readout_uses_lifo_lots():
     assert captured == ["  P&L (closed 1 NQZ6): +$40.00"]
     # Snapshot untouched — the lots belong to the order context.
     assert order_ctx.pre_position_lifo_lots[-1] == Lot(D("1"), D("110"))
+
+
+# ---------------------------------------------------------------------------
+# Pre-window lots rebuilt from the IB execution archive
+# ---------------------------------------------------------------------------
+
+def _hist(i, side, qty, price, *, comm="0", sym="GCZ6"):
+    row = _ex(i, side, qty, price, comm=comm, sym=sym, mult="100")
+    row["exec_time"] = T0 - timedelta(days=3) + timedelta(minutes=i)
+    row["exec_id"] = f"txn:{i}"
+    return row
+
+
+# The 2026-11-08 GCZ6 case: three buys / two sells on Nov 5 leave 3 lots;
+# nothing in the 24 h window. LIFO lots come purely from history.
+_GC_HISTORY = [
+    _hist(1, "BOT", 1, "4122.5"), _hist(2, "BOT", 1, "4123.9"),
+    _hist(3, "SLD", 1, "4124.4"),                       # closes 4123.9
+    _hist(4, "BOT", 1, "4101.7"), _hist(5, "SLD", 1, "4098.2"),  # closes 4101.7
+    _hist(6, "BOT", 1, "4104.5"), _hist(7, "BOT", 1, "4110.0"),
+]
+
+
+def _ib_avg(fills):
+    from ib_trader.engine.lifo_pnl import _fills_from_rows, _simulate_avg
+    avg, _, _ = _simulate_avg(D("0"), D("0"), _fills_from_rows(fills)[0], D("100"))
+    return avg
+
+
+def test_history_rebuilds_lots_with_no_window_fills():
+    pos = _pos(3, _ib_avg(_GC_HISTORY), sym="GCZ6", mult="100")
+    res = compute_lifo([], pos, {"GCZ6": _GC_HISTORY})["GCZ6"]
+    assert res.method == "lifo" and res.seed_source == "history"
+    assert [lot.cost for lot in res.lots] == [D("4122.5"), D("4104.5"), D("4110.0")]
+    # Selling one now matches the newest lot (4110.0), not IB's average.
+    lots = [Lot(lot.qty, lot.cost) for lot in res.lots]
+    assert realize_lifo(lots, D("-1"), D("4106.9"), D("0"), D("100")) == D("-310")
+
+
+def test_history_with_unrecorded_fill_falls_back_to_one_lot():
+    """A TWS fill the app never saw → quantities disagree → IB average."""
+    pos = _pos(4, _ib_avg(_GC_HISTORY), sym="GCZ6", mult="100")
+    res = compute_lifo([], pos, {"GCZ6": _GC_HISTORY})
+    assert "GCZ6" not in res          # no window fills + no history → IB avg
+
+
+def test_history_avg_mismatch_is_rejected():
+    pos = _pos(3, "4000", sym="GCZ6", mult="100")    # IB disagrees on cost
+    ex = _ex(10, "BOT", 1, "4100", sym="GCZ6", mult="100")
+    res = compute_lifo([ex], {"GCZ6": {**pos["GCZ6"], "quantity": "4"}},
+                       {"GCZ6": _GC_HISTORY})["GCZ6"]
+    assert res.seed_source == "ib_avg"
+    assert res.history_note == "history_no_flat_point"
+    assert len(res.lots) == 2          # one seed lot + the window buy
+
+
+def test_history_seed_under_window_fills():
+    """History lots sit underneath fills from the 24 h window."""
+    seed_avg = _ib_avg(_GC_HISTORY)
+    window = [_ex(10, "BOT", 1, "4120", sym="GCZ6", mult="100")]
+    ib_avg_now = (3 * seed_avg + D("4120")) / 4
+    res = compute_lifo(
+        window, _pos(4, ib_avg_now, sym="GCZ6", mult="100"),
+        {"GCZ6": _GC_HISTORY},
+    )["GCZ6"]
+    assert res.seed_source == "history"
+    assert [lot.cost for lot in res.lots] == [
+        D("4122.5"), D("4104.5"), D("4110.0"), D("4120"),
+    ]
+
+
+def test_history_finds_latest_flat_point_when_archive_starts_mid_position():
+    """The archive began while a different position was open (its
+    earlier fills are missing), so a replay from the start is wrong —
+    but the replay from the last flat point reproduces IB exactly."""
+    prefix = [_hist(0, "SLD", 2, "4000")]          # half-recorded old short
+    pos = _pos(3, _ib_avg(_GC_HISTORY), sym="GCZ6", mult="100")
+    res = compute_lifo([], pos, {"GCZ6": prefix + _GC_HISTORY})["GCZ6"]
+    assert res.seed_source == "history"
+    assert [lot.cost for lot in res.lots] == [D("4122.5"), D("4104.5"), D("4110.0")]
+
+
+def test_history_commission_folded_like_ib():
+    """IB's average cost includes commission; the replay must match it."""
+    hist = [_hist(1, "BOT", 1, "4100", comm="2.51"), _hist(2, "BOT", 1, "4110", comm="2.51")]
+    ib_avg = (D("4100") + D("4110")) / 2 + D("2.51") / 100
+    res = compute_lifo([], _pos(2, ib_avg, sym="GCZ6", mult="100"), {"GCZ6": hist})["GCZ6"]
+    assert res.seed_source == "history"
+    assert [lot.cost for lot in res.lots] == [D("4100.0251"), D("4110.0251")]
