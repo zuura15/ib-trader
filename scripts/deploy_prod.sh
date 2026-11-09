@@ -41,7 +41,12 @@ done
 
 say() { printf '[deploy] %s\n' "$*"; }
 die() { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
-remote() { ssh -o ConnectTimeout=8 "$PROD_HOST" "cd '$PROD_DIR' && $1"; }
+# Non-interactive ssh doesn't source the profile, so put the user-local
+# tool dirs (uv lives in ~/.local/bin) on PATH explicitly.
+remote() {
+    ssh -o ConnectTimeout=8 "$PROD_HOST" \
+        "export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\"; cd '$PROD_DIR' && $1"
+}
 
 # --- 1. Preflight -----------------------------------------------------
 local_ahead=$(git rev-list --count origin/main..main 2>/dev/null || echo 0)
