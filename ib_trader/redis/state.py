@@ -203,6 +203,13 @@ class StateKeys:
         return "console:pnl:24h"
 
     @staticmethod
+    def signal_rules_config() -> str:
+        """Global trade-recommendation rules config (JSON document, GH
+        #102). Edited from the UI's rules editor; absent → the frontend
+        rule registry's defaults apply."""
+        return "signal_rules:config"
+
+    @staticmethod
     def watchlist_symbols() -> str:
         """Durable operator watchlist (JSON list of symbol roots).
 

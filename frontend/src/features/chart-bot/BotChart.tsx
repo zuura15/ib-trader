@@ -848,6 +848,7 @@ export function BotChart({
           ref={chartRef}
           target={target}
           enableSr
+          showRecommendation
           showBrokenSr={showBrokenSr}
           brokenMinutes={brokenMinutes}
           showCounterSupport={showCounterSupport}

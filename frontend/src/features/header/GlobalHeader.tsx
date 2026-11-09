@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useStore } from '../../data/store';
 import { SettingsModal } from '../settings/SettingsModal';
+import { SignalRulesPanel } from '../signals/SignalRulesPanel';
 import { FuturesPnl24hCard } from './FuturesPnl24hCard';
 import { ResyncButton } from './ResyncButton';
 
@@ -21,6 +22,7 @@ export function GlobalHeader() {
     return `${date}, ${time}`;
   })();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
 
   const healthyCount = Object.values(serviceHealth).filter(Boolean).length;
   const totalServices = Object.keys(serviceHealth).length;
@@ -116,6 +118,24 @@ export function GlobalHeader() {
             ResyncButton for the click vs shift+click semantics. */}
         <ResyncButton />
 
+        {/* Trade-recommendation rules editor (GH #102) — its own entry,
+            separate from Settings, since it's edited during trading. */}
+        <button
+          onClick={() => setRulesOpen(true)}
+          title="Trade recommendation rules"
+          aria-label="Open trade recommendation rules"
+          data-testid="open-signal-rules"
+          className="rounded border cursor-pointer"
+          style={{
+            borderColor: 'var(--border-default)', background: 'var(--bg-primary)',
+            color: 'var(--text-secondary)',
+            height: 32, padding: '0 8px', fontSize: 11, fontWeight: 600,
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+          }}
+        >
+          ⇅ Signals
+        </button>
+
         {/* Settings (theme + layout selectors moved here so the header
             has room for the resync button). */}
         <button
@@ -134,6 +154,7 @@ export function GlobalHeader() {
         </button>
       </div>
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SignalRulesPanel open={rulesOpen} onClose={() => setRulesOpen(false)} />
     </header>
   );
 }

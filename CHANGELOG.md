@@ -6,6 +6,19 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-08
 
 ### Added
+- **Trade recommendation gauge (#102) — label only, never trades.** Chart
+  panes show a Strong Sell / Sell / Neutral / Buy / Strong Buy badge (or
+  "No trade" during a blocked time; hover lists the reasons) and labels
+  on bars where the call changed. Three rule groups: primary signals
+  (S/R bounce, double/triple bottom & top, head & shoulders — tolerances
+  in ATR), RSI reinforce/veto, and Pacific-time rules (No trade 5 min
+  before 4:00, 5:30, 11:00, 12:45, 13:00, 14:00, 16:00, 17:00, 21:00;
+  weak before any other hour and 6:00–7:30). Everything is configurable
+  in a new **⇅ Signals** editor in the header, stored globally
+  (`GET/PUT /api/signal-rules`, Redis) and shared by all devices. Rules
+  come from a registry with param schemas, so new rules appear in the
+  editor without UI changes. Defaults tuned on 8 h of real GC/NQ/MNQ
+  1-min bars (~40–55 labels per 8 h).
 - **`scripts/deploy_prod.sh`** — one-command prod deploy from the dev
   box: refuses on a dirty prod checkout or a bot holding a live
   position, shows incoming commits, `git pull --ff-only`, `npm ci` /

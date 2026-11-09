@@ -2,9 +2,9 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, HistogramSeries,
-  type IChartApi, type ISeriesApi, type UTCTimestamp,
-  type Time, type IPriceLine, type MouseEventParams,
+  createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
+  type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
+  type Time, type IPriceLine, type MouseEventParams, type ISeriesMarkersPluginApi,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -24,6 +24,12 @@ import { getUserSetting, useUserSetting } from '../../data/userSettings';
 import { ExecDotsPrimitive, type ExecDot } from './execMarkersPrimitive';
 import { RsiBandsPrimitive } from './rsiBandsPrimitive';
 import { CancelOrderButton } from './CancelOrderButton';
+import { useSignalConfig } from '../signals/configStore';
+import {
+  buildContext, evaluateAt, evaluateHistory, GRADE_LABEL,
+} from '../signals/evaluate';
+import type { Grade, Recommendation } from '../signals/types';
+import { RecommendationBadge } from '../signals/RecommendationBadge';
 import { useVisibilityWake } from '../../hooks/useVisibilityWake';
 
 export interface SymbolChartHandle {
@@ -71,6 +77,9 @@ interface Props {
   target: ChartTarget | null;
   /** Visible minutes default. Defaults to chartUtils VISIBLE_MINUTES (90). */
   visibleMinutes?: number;
+  /** Show the trade-recommendation gauge (GH #102): a badge plus labels
+   *  on bars where the call changed, driven by the global rules config. */
+  showRecommendation?: boolean;
   /** Show the RSI sub-pane. Default true. */
   showRsi?: boolean;
   /** Render the placeholder "Click a row…" message when target is null. */
@@ -229,6 +238,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     target,
     visibleMinutes = VISIBLE_MINUTES,
     showRsi = true,
+    showRecommendation = false,
     placeholder = 'Click a row in Positions or Watchlist to chart it.',
     enableSr = true,
     showBrokenSr = false,
@@ -701,6 +711,70 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       try { chart.unsubscribeCrosshairMove(onMove); } catch { /* torn down */ }
       setExecHover(null);
     };
+  }, [chartVersion]);
+
+  // ── Trade recommendation (GH #102) ─────────────────────────────────
+  // Label only. History labels mark bars where the call changed (time
+  // rules checked at each bar's close); the badge is the call on the
+  // latest bar with time rules checked against the clock, re-checked
+  // every 15 s so a block window opens/closes on time.
+  const sigCfg = useSignalConfig();
+  const [rec, setRec] = useState<Recommendation | null>(null);
+  const [recClock, setRecClock] = useState(0);
+  const [recHover, setRecHover] = useState(false);
+  const recMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  useEffect(() => {
+    if (!showRecommendation) return;
+    const t = window.setInterval(() => setRecClock((c) => c + 1), 15_000);
+    return () => window.clearInterval(t);
+  }, [showRecommendation]);
+  useEffect(() => {
+    const series = seriesRef.current;
+    const on = showRecommendation && sigCfg.enabled;
+    const bars = barsRef.current;
+    if (!series || !on || bars.length < 20) {
+      setRec(null);
+      return;
+    }
+    let ctx;
+    try {
+      ctx = buildContext(bars, sigCfg);
+    } catch (err) {
+      try { console.warn('recommendation context failed', err); } catch { /* no console */ }
+      setRec(null);
+      return;
+    }
+    setRec(sigCfg.display.badge
+      ? evaluateAt(ctx, bars.length - 1, sigCfg, Date.now()) : null);
+    const markers: SeriesMarker<Time>[] = [];
+    if (sigCfg.display.history) {
+      const colors = themeColors();
+      let prev: Grade = 0;
+      for (const r of evaluateHistory(ctx, sigCfg, sigCfg.display.historyBars)) {
+        const g: Grade = r.blocked ? 0 : r.grade;
+        if (g !== 0 && g !== prev) {
+          const buy = g > 0;
+          markers.push({
+            time: bars[r.idx].time,
+            position: buy ? 'belowBar' : 'aboveBar',
+            shape: buy ? 'arrowUp' : 'arrowDown',
+            color: buy ? colors.bullish : colors.bearish,
+            text: GRADE_LABEL[g],
+            size: Math.abs(g) === 2 ? 1 : 0.6,
+          });
+        }
+        prev = g;
+      }
+    }
+    try {
+      if (recMarkersRef.current) recMarkersRef.current.setMarkers(markers);
+      else recMarkersRef.current = createSeriesMarkers(series, markers);
+    } catch { /* chart mid-teardown — next run re-attaches */ }
+  }, [showRecommendation, sigCfg, barsTick, chartVersion, recClock]);
+  // Detach on series replacement / unmount so markers never stack.
+  useEffect(() => () => {
+    try { recMarkersRef.current?.detach(); } catch { /* already gone */ }
+    recMarkersRef.current = null;
   }, [chartVersion]);
 
   // ── Working-order price lines (#98) ────────────────────────────────
@@ -3120,6 +3194,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      {rec && (
+        <RecommendationBadge
+          rec={rec}
+          hover={recHover}
+          onHover={setRecHover}
+        />
+      )}
       {execHover && (
         <div
           data-testid="exec-marker-hover"
