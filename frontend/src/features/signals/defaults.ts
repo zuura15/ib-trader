@@ -42,7 +42,7 @@ export function defaultSignalConfig(): SignalConfig {
     timeZone: 'America/Los_Angeles',
     thresholds: { buy: 0.5, strong: 0.85, minStrength: 0.2 },
     analysis: { atrPeriod: 14, pivotLeft: 5, pivotRight: 5 },
-    display: { badge: true, history: true, historyBars: 240 },
+    display: { badge: true, history: true, historyMinutes: 30 },
     rules: Object.fromEntries(RULES.map((r) => [r.id, defaultRuleConfig(r.id)])),
     timeEvents: DEFAULT_TIME_EVENTS.map((e) => ({ ...e })),
     hourRollover: { enabled: true, before: 5, after: 0, effect: 'weak' },
@@ -75,7 +75,12 @@ export function mergeSignalConfig(stored: unknown): SignalConfig {
     timeZone: typeof s.timeZone === 'string' && s.timeZone ? s.timeZone : d.timeZone,
     thresholds: { ...d.thresholds, ...(s.thresholds ?? {}) },
     analysis: { ...d.analysis, ...(s.analysis ?? {}) },
-    display: { ...d.display, ...(s.display ?? {}) },
+    display: {
+      badge: s.display?.badge ?? d.display.badge,
+      history: s.display?.history ?? d.display.history,
+      historyMinutes: Number.isFinite(s.display?.historyMinutes)
+        ? s.display!.historyMinutes : d.display.historyMinutes,
+    },
     rules,
     timeEvents: Array.isArray(s.timeEvents) ? s.timeEvents : d.timeEvents,
     hourRollover: { ...d.hourRollover, ...(s.hourRollover ?? {}) },

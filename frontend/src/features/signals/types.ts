@@ -88,8 +88,9 @@ export interface SignalConfig {
     badge: boolean;
     /** Labels on the bars where the recommendation changed. */
     history: boolean;
-    /** How many recent bars get history labels. */
-    historyBars: number;
+    /** Markers are drawn only for the last this-many minutes (the full
+     *  history is still evaluated; this only limits what's shown). */
+    historyMinutes: number;
   };
   /** Primary + secondary rules, keyed by rule id (see registry). */
   rules: Record<string, RuleConfig>;

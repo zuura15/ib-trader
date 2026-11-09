@@ -2,9 +2,9 @@ import {
   forwardRef, useEffect, useImperativeHandle, useRef, useState,
 } from 'react';
 import {
-  createChart, ColorType, LineSeries, HistogramSeries, createSeriesMarkers,
-  type IChartApi, type ISeriesApi, type UTCTimestamp, type SeriesMarker,
-  type Time, type IPriceLine, type MouseEventParams, type ISeriesMarkersPluginApi,
+  createChart, ColorType, LineSeries, HistogramSeries,
+  type IChartApi, type ISeriesApi, type UTCTimestamp,
+  type Time, type IPriceLine, type MouseEventParams,
 } from 'lightweight-charts';
 import { getHistory } from '../../api/client';
 import {
@@ -702,7 +702,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     const onMove = (param: MouseEventParams<Time>) => {
       const id = param.hoveredInfo?.objectId ?? param.hoveredObjectId;
       const text = typeof id === 'string'
-        ? execMarkerLabelsRef.current.get(id) : undefined;
+        ? (execMarkerLabelsRef.current.get(id) ?? recLabelsRef.current.get(id))
+        : undefined;
       if (!text || !param.point) { setExecHover(null); return; }
       setExecHover({ x: param.point.x, y: param.point.y, text });
     };
@@ -714,15 +715,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   }, [chartVersion]);
 
   // ── Trade recommendation (GH #102) ─────────────────────────────────
-  // Label only. History labels mark bars where the call changed (time
-  // rules checked at each bar's close); the badge is the call on the
-  // latest bar with time rules checked against the clock, re-checked
-  // every 15 s so a block window opens/closes on time.
+  // Label only. Triangles (fill-dot size; solid = strong, outline =
+  // plain Buy/Sell) mark bars where the call changed, for the last
+  // ``display.historyMinutes`` — time rules checked at each bar's close.
+  // The badge is the call on the latest bar with time rules checked
+  // against the clock, re-checked every 15 s so a block window
+  // opens/closes on time. Hover a triangle for its reasons.
   const sigCfg = useSignalConfig();
   const [rec, setRec] = useState<Recommendation | null>(null);
   const [recClock, setRecClock] = useState(0);
   const [recHover, setRecHover] = useState(false);
-  const recMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const recDotsRef = useRef<ExecDotsPrimitive | null>(null);
+  const recLabelsRef = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     if (!showRecommendation) return;
     const t = window.setInterval(() => setRecClock((c) => c + 1), 15_000);
@@ -730,52 +734,71 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   }, [showRecommendation]);
   useEffect(() => {
     const series = seriesRef.current;
+    if (!series || !showRecommendation) return;
+    const prim = new ExecDotsPrimitive(getUserSetting('fillMarkerScale'));
+    try {
+      series.attachPrimitive(prim);
+      recDotsRef.current = prim;
+    } catch { /* chart mid-teardown — next run re-attaches */ }
+    return () => {
+      try { series.detachPrimitive(prim); } catch { /* already gone */ }
+      if (recDotsRef.current === prim) recDotsRef.current = null;
+    };
+  }, [chartVersion, showRecommendation]);
+  useEffect(() => {
+    recDotsRef.current?.setScale(fillMarkerScale);
+  }, [fillMarkerScale, chartVersion, showRecommendation]);
+  useEffect(() => {
+    const prim = recDotsRef.current;
     const on = showRecommendation && sigCfg.enabled;
     const bars = barsRef.current;
-    if (!series || !on || bars.length < 20) {
+    const clear = () => {
       setRec(null);
-      return;
-    }
+      recLabelsRef.current = new Map();
+      prim?.setDots([]);
+    };
+    if (!prim || !on || bars.length < 20) { clear(); return; }
     let ctx;
     try {
       ctx = buildContext(bars, sigCfg);
     } catch (err) {
       try { console.warn('recommendation context failed', err); } catch { /* no console */ }
-      setRec(null);
+      clear();
       return;
     }
     setRec(sigCfg.display.badge
       ? evaluateAt(ctx, bars.length - 1, sigCfg, Date.now()) : null);
-    const markers: SeriesMarker<Time>[] = [];
+    const dots: ExecDot[] = [];
+    const labels = new Map<string, string>();
     if (sigCfg.display.history) {
       const colors = themeColors();
-      let prev: Grade = 0;
-      for (const r of evaluateHistory(ctx, sigCfg, sigCfg.display.historyBars)) {
+      const cutoff = (bars[bars.length - 1].time as number)
+        - sigCfg.display.historyMinutes * 60;
+      // One bar before the window so its first bar knows the prior call.
+      const windowBars = bars.filter((b) => (b.time as number) >= cutoff).length + 1;
+      let prev: Grade | null = null;
+      for (const r of evaluateHistory(ctx, sigCfg, windowBars)) {
         const g: Grade = r.blocked ? 0 : r.grade;
-        if (g !== 0 && g !== prev) {
+        if (prev !== null && g !== 0 && g !== prev) {
           const buy = g > 0;
-          markers.push({
+          const id = `rec-${r.idx}`;
+          dots.push({
+            id,
             time: bars[r.idx].time,
-            position: buy ? 'belowBar' : 'aboveBar',
-            shape: buy ? 'arrowUp' : 'arrowDown',
+            price: bars[r.idx].close,
             color: buy ? colors.bullish : colors.bearish,
-            text: GRADE_LABEL[g],
-            size: Math.abs(g) === 2 ? 1 : 0.6,
+            shape: buy ? 'up' : 'down',
+            hollow: Math.abs(g) < 2,
           });
+          const why = r.contributions.map((c) => c.detail).join('; ');
+          labels.set(id, `${GRADE_LABEL[g]}${why ? ` — ${why}` : ''}`);
         }
         prev = g;
       }
     }
-    try {
-      if (recMarkersRef.current) recMarkersRef.current.setMarkers(markers);
-      else recMarkersRef.current = createSeriesMarkers(series, markers);
-    } catch { /* chart mid-teardown — next run re-attaches */ }
+    recLabelsRef.current = labels;
+    prim.setDots(dots);
   }, [showRecommendation, sigCfg, barsTick, chartVersion, recClock]);
-  // Detach on series replacement / unmount so markers never stack.
-  useEffect(() => () => {
-    try { recMarkersRef.current?.detach(); } catch { /* already gone */ }
-    recMarkersRef.current = null;
-  }, [chartVersion]);
 
   // ── Working-order price lines (#98) ────────────────────────────────
   // One dashed horizontal line per open IB order on this contract with
@@ -3210,6 +3233,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             top: execHover.y - 22,
             zIndex: 25,
             pointerEvents: 'none',
+            maxWidth: 340,
             padding: '1px 5px',
             borderRadius: 3,
             fontSize: 11,

@@ -3,6 +3,15 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-09
+
+### Changed
+- **Recommendation markers (#102):** the text arrows are replaced by small
+  triangles the same size as the fill dots — up/green for buy, down/red
+  for sell, solid for Strong, outline for plain Buy/Sell; hover one for
+  its grade and reasons. Only the last 30 minutes are drawn
+  (`display.historyMinutes`, editable in ⇅ Signals).
+
 ## 2026-11-08
 
 ### Added

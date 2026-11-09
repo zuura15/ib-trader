@@ -1,5 +1,6 @@
 /**
- * Execution-fill dots drawn as a lightweight-charts series primitive.
+ * Small chart markers drawn as a lightweight-charts series primitive:
+ * execution-fill dots, and the recommendation triangles (GH #102).
  *
  * The native series-markers plugin clamps circles to a ~8px minimum
  * diameter (it scales with bar spacing, floor 12px × 0.8), which is too
@@ -19,6 +20,11 @@ export interface ExecDot {
   time: Time;
   price: number;
   color: string;
+  /** Default 'circle'. Triangles sit one marker-height off the price
+   *  (below the line for 'up', above for 'down'). */
+  shape?: 'circle' | 'up' | 'down';
+  /** Outline only (weak signal) instead of filled. */
+  hollow?: boolean;
 }
 
 type DrawTarget = Parameters<IPrimitivePaneRenderer['draw']>[0];
@@ -34,7 +40,10 @@ export class ExecDotsPrimitive implements ISeriesPrimitive<Time> {
   private dots: ExecDot[] = [];
   private scale: number;
   /** Screen positions from the last paint, reused for hit-testing. */
-  private placed: Array<{ id: string; x: number; y: number; color: string }> = [];
+  private placed: Array<{
+    id: string; x: number; y: number; color: string;
+    shape: 'circle' | 'up' | 'down'; hollow: boolean;
+  }> = [];
 
   constructor(scale: number) {
     this.scale = scale;
@@ -76,11 +85,17 @@ export class ExecDotsPrimitive implements ISeriesPrimitive<Time> {
     this.placed = [];
     if (!chart || !series) return;
     const ts = chart.timeScale();
+    const size = this.diameter();
     for (const d of this.dots) {
       const x = ts.timeToCoordinate(d.time);
       const y = series.priceToCoordinate(d.price);
       if (x == null || y == null) continue;
-      this.placed.push({ id: d.id, x, y, color: d.color });
+      const shape = d.shape ?? 'circle';
+      // Triangles clear the price line by one marker height.
+      const dy = shape === 'up' ? size * 1.5 : shape === 'down' ? -size * 1.5 : 0;
+      this.placed.push({
+        id: d.id, x, y: y + dy, color: d.color, shape, hollow: !!d.hollow,
+      });
     }
   }
 
@@ -92,15 +107,30 @@ export class ExecDotsPrimitive implements ISeriesPrimitive<Time> {
       renderer: () => ({
         draw: (target: DrawTarget) => {
           target.useBitmapCoordinateSpace(({ context, horizontalPixelRatio, verticalPixelRatio }) => {
-            const r = radius * Math.max(horizontalPixelRatio, verticalPixelRatio);
+            const pr = Math.max(horizontalPixelRatio, verticalPixelRatio);
+            const r = radius * pr;
             for (const p of placed) {
+              const cx = p.x * horizontalPixelRatio;
+              const cy = p.y * verticalPixelRatio;
               context.beginPath();
-              context.fillStyle = p.color;
-              context.arc(
-                p.x * horizontalPixelRatio, p.y * verticalPixelRatio,
-                r, 0, 2 * Math.PI,
-              );
-              context.fill();
+              if (p.shape === 'circle') {
+                context.arc(cx, cy, r, 0, 2 * Math.PI);
+              } else {
+                // Equilateral-ish triangle inscribed in the marker box.
+                const tip = p.shape === 'up' ? -r : r;
+                context.moveTo(cx, cy + tip);
+                context.lineTo(cx + r, cy - tip);
+                context.lineTo(cx - r, cy - tip);
+                context.closePath();
+              }
+              if (p.hollow) {
+                context.strokeStyle = p.color;
+                context.lineWidth = Math.max(1, pr);
+                context.stroke();
+              } else {
+                context.fillStyle = p.color;
+                context.fill();
+              }
             }
           });
         },

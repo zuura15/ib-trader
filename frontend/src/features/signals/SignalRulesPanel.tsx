@@ -112,10 +112,11 @@ export function SignalRulesPanel({ open, onClose }: Props) {
                 onChange={(v) => update((x) => ({ ...x, analysis: { ...x.analysis, pivotRight: v } }))} />
               <BoolField label="Badge on chart" value={c.display.badge}
                 onChange={(v) => update((x) => ({ ...x, display: { ...x.display, badge: v } }))} />
-              <BoolField label="Labels where the call changed" value={c.display.history}
+              <BoolField label="Triangles where the call changed" value={c.display.history}
                 onChange={(v) => update((x) => ({ ...x, display: { ...x.display, history: v } }))} />
-              <NumField label="Label the last" unit="bars" value={c.display.historyBars} min={10} max={2000} step={10}
-                onChange={(v) => update((x) => ({ ...x, display: { ...x.display, historyBars: v } }))} />
+              <NumField label="Show triangles for the last" unit="min" value={c.display.historyMinutes} min={5} max={1440} step={5}
+                help="Solid = strong, outline = plain Buy/Sell. Hover a triangle for the reasons."
+                onChange={(v) => update((x) => ({ ...x, display: { ...x.display, historyMinutes: v } }))} />
               <TextField label="Time zone for time rules" value={c.timeZone}
                 onChange={(v) => update((x) => ({ ...x, timeZone: v }))} />
             </Grid>
