@@ -6,6 +6,17 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-09
 
 ### Changed
+- **Mobile layout redesigned for portrait.** Three tabs on a bottom bar:
+  **Pos** (positions, working orders, console — collapsible sections),
+  **Graphs** (every desktop chart as a collapsible panel stacked
+  vertically; any number open at once, open set remembered; collapsed
+  panels show the position + live P&L), **Watch** (watchlist). Header:
+  status, 24 h futures P&L, alerts bell with count, and a ⋯ menu for
+  Signal rules, Settings, Trades, Bot trades, Logs and Resync. Charts are
+  the same desktop pane (B/S/C, qty, price strip, order lines, cancel,
+  fills, recommendation badge). Portrait foldables up to 1000 px wide
+  (Galaxy Fold inner screen) also get this layout. The old 5-tab swipe
+  layout and `MobileTradeView` are removed.
 - **Recommendation markers (#102):** the text arrows are replaced by small
   triangles the same size as the fill dots — up/green for buy, down/red
   for sell, solid for Strong, outline for plain Buy/Sell; hover one for

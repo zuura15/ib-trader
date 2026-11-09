@@ -42,7 +42,7 @@ export function DiagOverlay() {
       // the previous version only looked for flexlayout and auto-fired
       // the overlay on every mobile page load.
       const desktopLayout = document.querySelector('.flexlayout__layout');
-      const mobileLayout = document.querySelector('.mobile-swipe-container');
+      const mobileLayout = document.querySelector('.mobile-layout-shell');
       const layout = desktopLayout || mobileLayout;
       const rootRect = root?.getBoundingClientRect();
       const layoutRect = (layout as HTMLElement | null)?.getBoundingClientRect();

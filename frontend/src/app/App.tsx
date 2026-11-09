@@ -158,7 +158,10 @@ function ReconnectingBanner() {
   );
 }
 
-const MOBILE_QUERY = '(max-width: 767px)';
+// Phones, plus portrait foldables / small tablets (a Galaxy Fold's inner
+// screen is ~750–900 CSS px wide in portrait) — they get the vertical
+// three-tab layout rather than the multi-pane desktop.
+const MOBILE_QUERY = '(max-width: 767px), (orientation: portrait) and (max-width: 1000px)';
 
 // Create the MediaQueryList once at module scope. This is safe because
 // the query string is a compile-time constant. Avoids re-creating the

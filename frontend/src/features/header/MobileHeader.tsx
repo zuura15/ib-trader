@@ -1,12 +1,15 @@
+import { useState } from 'react';
 import { useStore } from '../../data/store';
-import type { ThemeMode } from '../../types';
 import { FuturesPnl24hCard } from './FuturesPnl24hCard';
-import { LayoutToggle } from './LayoutToggle';
+import { ResyncButton } from './ResyncButton';
 
-const THEME_CYCLE: ThemeMode[] = ['dark', 'charcoal', 'navy', 'mocha', 'light'];
-const THEME_ICONS: Record<ThemeMode, string> = {
-  dark: '🌑', charcoal: '◼', navy: '🔵', mocha: '☕', light: '☀',
-};
+type SheetId = 'trades' | 'bot-trades' | 'alerts' | 'logs';
+
+interface Props {
+  onOpenSheet: (s: SheetId) => void;
+  onOpenSettings: () => void;
+  onOpenRules: () => void;
+}
 
 /**
  * Condensed header for the mobile layout.
@@ -14,9 +17,11 @@ const THEME_ICONS: Record<ThemeMode, string> = {
  * Shows the minimum critical information a trader needs at a glance:
  * connection status, account mode (paper vs live), and data freshness.
  */
-export function MobileHeader() {
-  const { global, dataMode, wsConnected, theme, setTheme } = useStore();
+export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules }: Props) {
+  const { global, dataMode, wsConnected, alerts } = useStore();
   const { connectionStatus, accountMode } = global;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const activeAlerts = alerts.filter((a) => !a.dismissed).length;
 
   const dataFresh = dataMode === 'mock' ? true : wsConnected;
 
@@ -45,9 +50,6 @@ export function MobileHeader() {
               display: 'inline-block',
             }}
           />
-          <span style={{ fontSize: 14, color: 'var(--text-secondary)', textTransform: 'capitalize' }}>
-            {connectionStatus}
-          </span>
         </div>
 
         {/* Account mode */}
@@ -77,21 +79,71 @@ export function MobileHeader() {
       {/* Center: single account-wide 24h futures realized P&L */}
       <FuturesPnl24hCard compact />
 
-      {/* Right: layout override + theme cycler */}
-      <div className="flex items-center gap-2">
-        <LayoutToggle size="xs" />
+      {/* Right: alerts + menu (signals, settings, resync, sheets) */}
+      <div className="flex items-center gap-1" style={{ position: 'relative' }}>
         <button
-          onClick={() => {
-            const idx = THEME_CYCLE.indexOf(theme);
-            setTheme(THEME_CYCLE[(idx + 1) % THEME_CYCLE.length]);
-          }}
-          className="border-none cursor-pointer rounded"
-          style={{ background: 'transparent', color: 'var(--text-muted)', fontSize: 16, minWidth: 44, minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
-          aria-label="Cycle theme"
+          onClick={() => onOpenSheet('alerts')}
+          aria-label="Alerts"
+          style={iconBtn}
         >
-          <span>{THEME_ICONS[theme]}</span>
+          <span>🔔</span>
+          {activeAlerts > 0 && (
+            <span style={{
+              position: 'absolute', top: 6, right: 4, minWidth: 16, height: 16,
+              borderRadius: 8, background: 'var(--accent-red)', color: '#fff',
+              fontSize: 10, fontWeight: 700, lineHeight: '16px', textAlign: 'center',
+              padding: '0 3px',
+            }}>{activeAlerts}</span>
+          )}
         </button>
+        <button
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-label="Menu"
+          aria-expanded={menuOpen}
+          data-testid="mobile-menu"
+          style={iconBtn}
+        >
+          ⋯
+        </button>
+        {menuOpen && (
+          <>
+            <div onClick={() => setMenuOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 70 }} />
+            <div style={{
+              position: 'absolute', top: '100%', right: 0, zIndex: 71, minWidth: 200,
+              background: 'var(--bg-primary)', border: '1px solid var(--border-default)',
+              borderRadius: 6, boxShadow: '0 8px 24px rgba(0,0,0,0.35)', padding: 4,
+            }}>
+              {([
+                ['⇅  Signal rules', onOpenRules],
+                ['⚙  Settings', onOpenSettings],
+                ['☰  Trades', () => onOpenSheet('trades')],
+                ['🤖  Bot trades', () => onOpenSheet('bot-trades')],
+                ['📜  Logs', () => onOpenSheet('logs')],
+              ] as const).map(([label, fn]) => (
+                <button
+                  key={label}
+                  onClick={() => { setMenuOpen(false); fn(); }}
+                  style={menuItem}
+                >
+                  {label}
+                </button>
+              ))}
+              <div style={{ padding: '6px 8px' }}><ResyncButton /></div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
 }
+
+const iconBtn: React.CSSProperties = {
+  position: 'relative', background: 'transparent', border: 'none', cursor: 'pointer',
+  color: 'var(--text-secondary)', fontSize: 18, minWidth: 44, minHeight: 44,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+};
+const menuItem: React.CSSProperties = {
+  display: 'block', width: '100%', textAlign: 'left', minHeight: 44,
+  padding: '0 12px', border: 'none', background: 'transparent', cursor: 'pointer',
+  fontSize: 14, color: 'var(--text-primary)', borderRadius: 4,
+};

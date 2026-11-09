@@ -1,332 +1,232 @@
-import { useRef, useState, useEffect, useCallback } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { MobileHeader } from '../features/header/MobileHeader';
+import { PositionsPanel } from '../features/positions/PositionsPanel';
 import { OrdersPanel } from '../features/orders/OrdersPanel';
 import { WatchlistPanel } from '../features/watchlist/WatchlistPanel';
+import { CommandConsole } from '../features/console/CommandConsole';
 import { TradesPanel } from '../features/trades/TradesPanel';
 import { AlertsPanel } from '../features/alerts/AlertsPanel';
 import { LogStream } from '../features/logs/LogStream';
 import { BotTradesPanel } from '../features/bots/BotTradesPanel';
-import { MobileTradeView } from '../features/chart-bot/MobileTradeView';
-const TABS = ['Trade', 'Watch', 'Orders', 'Trades', 'Logs'] as const;
-
-type Tab = (typeof TABS)[number];
+import { SettingsModal } from '../features/settings/SettingsModal';
+import { SignalRulesPanel } from '../features/signals/SignalRulesPanel';
+import { ChartAccordion } from '../features/mobile/ChartAccordion';
+import { useStore } from '../data/store';
 
 /**
- * Detect iOS Safari via user-agent.
+ * Portrait mobile layout: three tabs on a bottom bar — Pos, Graphs,
+ * Watch — with everything flowing vertically inside the phone's width
+ * (a wide phone like the Fold's inner screen just gets wider panels).
  *
- * Checks for iPhone/iPod explicitly. Avoids the `navigator.platform === 'MacIntel'`
- * + `maxTouchPoints` heuristic that false-positives on macOS with Magic Trackpad.
- * iPad detection uses the 'iPad' token in the UA string.
- *
- * TODO: iOS Safari support — scroll-snap + nested overflow-y conflicts need
- * directional gesture locking. See GitHub issue #39.
+ * Every tab stays MOUNTED and is hidden with ``visibility`` (not
+ * ``display:none``): PositionsPanel publishes the live per-contract P&L
+ * the charts read, and open charts keep their size and zoom across tab
+ * switches. Secondary surfaces (trades, logs, alerts, bot trades,
+ * settings, signal rules) open as full-screen sheets from the header menu.
  */
-function isIOSSafari(): boolean {
-  const ua = navigator.userAgent;
-  const isIOS = /iPad|iPhone|iPod/.test(ua);
-  const isSafari = /Safari/.test(ua) && !/CriOS|FxiOS|OPiOS|EdgiOS|Chrome/.test(ua);
-  return isIOS && isSafari;
-}
+
+const TABS = [
+  { id: 'pos', label: 'Pos', icon: '▤' },
+  { id: 'graphs', label: 'Graphs', icon: '📈' },
+  { id: 'watch', label: 'Watch', icon: '☰' },
+] as const;
+type Tab = (typeof TABS)[number]['id'];
+
+type Sheet = 'trades' | 'bot-trades' | 'alerts' | 'logs' | null;
 
 export function MobileLayout() {
-  // Data initialization (WS / mock) is handled by App.tsx — not duplicated here.
-
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [activeTab, setActiveTabRaw] = useState<Tab>(() => {
-    const saved = localStorage.getItem('ib-mobile-tab');
-    return saved && TABS.includes(saved as Tab) ? (saved as Tab) : 'Trade';
+  const [tab, setTabRaw] = useState<Tab>(() => {
+    const saved = localStorage.getItem('ib-mobile-tab3');
+    return TABS.some((t) => t.id === saved) ? (saved as Tab) : 'graphs';
   });
-  const setActiveTab = useCallback((tab: Tab) => {
-    localStorage.setItem('ib-mobile-tab', tab);
-    setActiveTabRaw(tab);
-  }, []);
-  const [unsupported] = useState(isIOSSafari);
-  const programmaticScrollRef = useRef(false);
+  const setTab = (t: Tab) => {
+    try { localStorage.setItem('ib-mobile-tab3', t); } catch { /* private mode */ }
+    setTabRaw(t);
+  };
+  const [sheet, setSheet] = useState<Sheet>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [rulesOpen, setRulesOpen] = useState(false);
 
-  // Directional gesture locking: when a touch starts inside a data table,
-  // detect whether the initial movement is horizontal or vertical.
-  // If horizontal → lock out the tab swipe container so the table scrolls.
-  // If vertical → let the tab/page scroll normally.
+  // A chart's price strip drafts a command into the console — show it.
+  const consoleDraft = useStore((s) => s.consoleDraft);
+  const seenDraftRef = useRef(consoleDraft?.nonce ?? 0);
   useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-
-    let startX = 0;
-    let startY = 0;
-    let locked: 'none' | 'horizontal' | 'vertical' = 'none';
-
-    const isInsideTable = (target: EventTarget | null): boolean => {
-      let el = target as HTMLElement | null;
-      while (el && el !== container) {
-        if (el.classList.contains('data-table') || el.closest('.data-table')) return true;
-        el = el.parentElement;
-      }
-      return false;
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      locked = 'none';
-      if (!isInsideTable(e.target)) return;
-      startX = e.touches[0].clientX;
-      startY = e.touches[0].clientY;
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (locked !== 'none') {
-        if (locked === 'horizontal') {
-          // Already locked horizontal — keep blocking tab swipe
-          container.style.overflowX = 'hidden';
-          container.style.scrollSnapType = 'none';
-        }
-        return;
-      }
-      if (!isInsideTable(e.target)) return;
-
-      const dx = Math.abs(e.touches[0].clientX - startX);
-      const dy = Math.abs(e.touches[0].clientY - startY);
-
-      // Need at least 8px of movement to decide direction
-      if (dx < 8 && dy < 8) return;
-
-      if (dx > dy) {
-        // Horizontal swipe inside table — lock out tab container
-        locked = 'horizontal';
-        container.style.overflowX = 'hidden';
-        container.style.scrollSnapType = 'none';
-      } else {
-        locked = 'vertical';
-      }
-    };
-
-    const onTouchEnd = () => {
-      if (locked === 'horizontal') {
-        container.style.overflowX = 'auto';
-        container.style.scrollSnapType = 'x mandatory';
-      }
-      locked = 'none';
-    };
-
-    container.addEventListener('touchstart', onTouchStart, { passive: true });
-    container.addEventListener('touchmove', onTouchMove, { passive: true });
-    container.addEventListener('touchend', onTouchEnd, { passive: true });
-    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
-    return () => {
-      container.removeEventListener('touchstart', onTouchStart);
-      container.removeEventListener('touchmove', onTouchMove);
-      container.removeEventListener('touchend', onTouchEnd);
-      container.removeEventListener('touchcancel', onTouchEnd);
-    };
-  }, []);
-
-  // Sync tab indicator with scroll position via scroll event.
-  // More reliable than IntersectionObserver during fast swipes —
-  // simply compute which page is closest to the scroll offset.
-  useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-
-    let ticking = false;
-    const onScroll = () => {
-      // Suppress scroll handler during programmatic scrollTo to prevent
-      // the tab indicator from flickering through intermediate positions.
-      if (ticking || programmaticScrollRef.current) return;
-      ticking = true;
-      requestAnimationFrame(() => {
-        ticking = false;
-        const pageWidth = container.offsetWidth;
-        if (pageWidth === 0) return;
-        const idx = Math.round(container.scrollLeft / pageWidth);
-        const clamped = Math.max(0, Math.min(idx, TABS.length - 1));
-        setActiveTab(TABS[clamped]);
-      });
-    };
-
-    container.addEventListener('scroll', onScroll, { passive: true });
-    return () => container.removeEventListener('scroll', onScroll);
-  }, []);
-
-  // Re-snap to the active tab on orientation change / container resize.
-  // Without this, rotating the device leaves scrollLeft at the old width's
-  // offset, which doesn't align with the new page width.
-  useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-
-    const observer = new ResizeObserver(() => {
-      const idx = TABS.indexOf(activeTab);
-      // Instant snap (no smooth scroll) — we just need alignment, not animation.
-      container.scrollTo({ left: idx * container.offsetWidth, behavior: 'instant' });
-    });
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, [activeTab]);
-
-  const scrollToTab = useCallback((tab: Tab) => {
-    const container = scrollRef.current;
-    if (!container) return;
-    const idx = TABS.indexOf(tab);
-
-    // Suppress the scroll event handler during programmatic scroll to prevent
-    // tab indicator jitter from intermediate scroll positions.
-    programmaticScrollRef.current = true;
-    setActiveTab(tab);
-    container.scrollTo({ left: idx * container.offsetWidth, behavior: 'smooth' });
-
-    // Use `scrollend` event (Chrome 109+) as the primary signal that the
-    // smooth scroll completed. Fall back to a timeout for older browsers.
-    const onScrollEnd = () => {
-      programmaticScrollRef.current = false;
-      container.removeEventListener('scrollend', onScrollEnd);
-    };
-
-    if ('onscrollend' in container) {
-      container.addEventListener('scrollend', onScrollEnd, { once: true });
-    } else {
-      setTimeout(() => { programmaticScrollRef.current = false; }, 500);
-    }
-  }, []);
-
-  if (unsupported) {
-    return (
-      <div
-        className="flex items-center justify-center h-dvh w-screen p-8"
-        style={{ background: 'var(--bg-root)', color: 'var(--text-primary)' }}
-      >
-        <div className="text-center" style={{ maxWidth: 400 }}>
-          <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 12 }}>
-            Browser Not Supported
-          </div>
-          <div style={{ fontSize: 14, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-            The mobile trading interface is not supported on iOS Safari.
-            Please use Chrome on Android, or access the desktop version
-            from a computer.
-          </div>
-          {/* TODO: iOS Safari support — scroll-snap + nested overflow-y
-              conflicts need directional gesture locking or a JS-driven
-              swipe implementation. See GitHub issue #39. */}
-        </div>
-      </div>
-    );
-  }
+    if (!consoleDraft || consoleDraft.nonce === seenDraftRef.current) return;
+    seenDraftRef.current = consoleDraft.nonce;
+    setTab('pos');
+  }, [consoleDraft]);
 
   return (
     <div
       className="flex flex-col h-dvh w-screen overflow-hidden"
       style={{ background: 'var(--bg-root)' }}
     >
-      <MobileHeader />
+      <MobileHeader
+        onOpenSheet={(s) => setSheet(s)}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenRules={() => setRulesOpen(true)}
+      />
 
-      {/* Tab bar */}
-      <div
-        className="flex shrink-0 border-b"
-        style={{ borderColor: 'var(--border-default)', background: 'var(--bg-primary)' }}
-        role="tablist"
-      >
-        {TABS.map((tab) => (
-          <button
-            key={tab}
-            id={`tab-${tab}`}
-            role="tab"
-            aria-selected={activeTab === tab}
-            aria-controls={`tabpanel-${tab}`}
-            onClick={() => scrollToTab(tab)}
-            className="flex-1 border-none cursor-pointer transition-colors"
-            style={{
-              fontSize: 17,
-              fontWeight: activeTab === tab ? 600 : 400,
-              color: activeTab === tab ? 'var(--accent-blue)' : 'var(--text-muted)',
-              background: 'transparent',
-              borderBottom: activeTab === tab
-                ? '2px solid var(--accent-blue)'
-                : '2px solid transparent',
-              padding: '12px 0',
-              minHeight: 44,
-            }}
-          >
-            {tab}
-          </button>
-        ))}
+      {/* .mobile-layout-shell: DiagOverlay's white-screen watchdog looks
+          for it to confirm the mobile layout rendered. */}
+      <div className="mobile-layout-shell" style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+        <TabPane visible={tab === 'pos'}><PosTab /></TabPane>
+        <TabPane visible={tab === 'graphs'}><ChartAccordion /></TabPane>
+        <TabPane visible={tab === 'watch'}><WatchlistPanel /></TabPane>
       </div>
 
-      {/* Swipeable pages — CSS scroll-snap for native-feeling swipe.
-          TODO: iOS Safari has conflicts with nested overflow-y children.
-          If iOS support is added, consider overscroll-behavior or a
-          JS-driven swipe with directional locking. */}
-      <div
-        ref={scrollRef}
-        className="flex flex-1 overflow-y-hidden mobile-swipe-container"
+      <nav
+        role="tablist"
         style={{
-          overflowX: 'auto',
-          scrollSnapType: 'x mandatory',
-          scrollbarWidth: 'none',       /* Firefox */
+          display: 'flex', flexShrink: 0, borderTop: '1px solid var(--border-default)',
+          background: 'var(--bg-primary)', paddingBottom: 'env(safe-area-inset-bottom)',
         }}
       >
-        {/* Tab 1: Trade — two stacked chart rows (Gold/Console/Positions
-            over Nasdaq/Micro NQ). See MobileTradeView. */}
-        <div
-          id="tabpanel-Trade"
-          role="tabpanel"
-          aria-labelledby="tab-Trade"
-          className="flex flex-col shrink-0 w-screen h-full"
-          style={{ scrollSnapAlign: 'start', overflow: 'hidden' }}
-        >
-          <MobileTradeView />
-        </div>
+        {TABS.map((t) => {
+          const on = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={on}
+              data-testid={`mobile-tab-${t.id}`}
+              onClick={() => setTab(t.id)}
+              style={{
+                flex: 1, minHeight: 54, border: 'none', cursor: 'pointer',
+                background: 'transparent', display: 'flex', flexDirection: 'column',
+                alignItems: 'center', justifyContent: 'center', gap: 2,
+                color: on ? 'var(--accent-blue)' : 'var(--text-muted)',
+                borderTop: on ? '2px solid var(--accent-blue)' : '2px solid transparent',
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1 }}>{t.icon}</span>
+              <span style={{ fontSize: 12, fontWeight: on ? 700 : 500 }}>{t.label}</span>
+            </button>
+          );
+        })}
+      </nav>
 
-        {/* Tab 2: Watch — watchlist */}
-        <div
-          id="tabpanel-Watch"
-          role="tabpanel"
-          aria-labelledby="tab-Watch"
-          className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
-          style={{ scrollSnapAlign: 'start' }}
+      {sheet && (
+        <MobileSheet
+          title={{
+            trades: 'Trades', 'bot-trades': 'Bot trades', alerts: 'Alerts', logs: 'Logs',
+          }[sheet]}
+          onClose={() => setSheet(null)}
         >
-          <WatchlistPanel />
-        </div>
+          {sheet === 'trades' && <TradesPanel compact />}
+          {sheet === 'bot-trades' && <BotTradesPanel compact />}
+          {sheet === 'alerts' && <AlertsPanel />}
+          {sheet === 'logs' && <LogStream maxLines={200} />}
+        </MobileSheet>
+      )}
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SignalRulesPanel open={rulesOpen} onClose={() => setRulesOpen(false)} />
+    </div>
+  );
+}
 
-        {/* Tab 3: Orders — trades + open orders */}
-        <div
-          id="tabpanel-Orders"
-          role="tabpanel"
-          aria-labelledby="tab-Orders"
-          className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
-          style={{ scrollSnapAlign: 'start' }}
-        >
-          <div className="flex-1">
-            <TradesPanel compact />
-          </div>
-          <div className="flex-1">
-            <OrdersPanel compact />
-          </div>
-        </div>
+/** Pos tab: positions, working orders and the console, stacked. */
+function PosTab() {
+  return (
+    <div style={{ height: '100%', overflowY: 'auto', WebkitOverflowScrolling: 'touch' }}>
+      <Section title="Positions" height="min(46dvh, 460px)" testId="mobile-pos-positions">
+        <PositionsPanel compact />
+      </Section>
+      <Section title="Working orders" height="min(28dvh, 300px)" testId="mobile-pos-orders">
+        <OrdersPanel compact />
+      </Section>
+      <Section title="Console" height="min(42dvh, 420px)" testId="mobile-pos-console">
+        <CommandConsole compact />
+      </Section>
+      <div style={{ height: 16 }} />
+    </div>
+  );
+}
 
-        {/* Tab 4: Trades — bot round-trip P&L records */}
-        <div
-          id="tabpanel-Trades"
-          role="tabpanel"
-          aria-labelledby="tab-Trades"
-          className="flex flex-col shrink-0 w-screen h-full overflow-hidden"
-          style={{ scrollSnapAlign: 'start' }}
-        >
-          <BotTradesPanel compact />
-        </div>
-
-        {/* Tab 5: Logs — alerts + log stream */}
-        <div
-          id="tabpanel-Logs"
-          role="tabpanel"
-          aria-labelledby="tab-Logs"
-          className="flex flex-col shrink-0 w-screen h-full overflow-y-auto"
-          style={{ scrollSnapAlign: 'start' }}
-        >
-          <div style={{ minHeight: 100 }}>
-            <AlertsPanel />
-          </div>
-          <div className="flex-1">
-            <LogStream maxLines={200} />
-          </div>
-        </div>
+/** Collapsible, fixed-height section. Kept mounted when collapsed
+ *  (hidden) so PositionsPanel keeps publishing live P&L. */
+function Section({
+  title, height, testId, children,
+}: { title: string; height: string; testId: string; children: ReactNode }) {
+  const key = `ib-mobile-sec-${testId}`;
+  const [open, setOpen] = useState(() => localStorage.getItem(key) !== '0');
+  return (
+    <section
+      data-testid={testId}
+      style={{
+        margin: '6px 8px', border: '1px solid var(--border-default)',
+        borderRadius: 6, overflow: 'hidden', background: 'var(--panel-bg)',
+      }}
+    >
+      <button
+        onClick={() => {
+          try { localStorage.setItem(key, open ? '0' : '1'); } catch { /* private mode */ }
+          setOpen(!open);
+        }}
+        aria-expanded={open}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+          padding: '0 12px', minHeight: 42, border: 'none', cursor: 'pointer',
+          background: 'var(--bg-primary)', color: 'var(--text-primary)',
+          fontSize: 14, fontWeight: 700,
+          borderBottom: open ? '1px solid var(--border-default)' : 'none',
+        }}
+      >
+        <span style={{
+          fontSize: 12, color: 'var(--text-muted)', width: 12,
+          transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 120ms',
+        }}>▶</span>
+        {title}
+      </button>
+      <div style={{ height: open ? height : 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        {children}
       </div>
+    </section>
+  );
+}
+
+function TabPane({ visible, children }: { visible: boolean; children: ReactNode }) {
+  return (
+    <div
+      aria-hidden={!visible}
+      style={{
+        position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+        minHeight: 0, visibility: visible ? 'visible' : 'hidden',
+        pointerEvents: visible ? 'auto' : 'none', zIndex: visible ? 1 : 0,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function MobileSheet({
+  title, onClose, children,
+}: { title: string; onClose: () => void; children: ReactNode }) {
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 8000, display: 'flex', flexDirection: 'column',
+        background: 'var(--bg-root)',
+      }}
+    >
+      <div style={{
+        display: 'flex', alignItems: 'center', minHeight: 48, padding: '0 6px 0 14px',
+        borderBottom: '1px solid var(--border-default)', background: 'var(--bg-primary)',
+      }}>
+        <span style={{ flex: 1, fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>{title}</span>
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            minWidth: 44, minHeight: 44, border: 'none', background: 'transparent',
+            fontSize: 22, color: 'var(--text-muted)', cursor: 'pointer',
+          }}
+        >
+          ×
+        </button>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>{children}</div>
     </div>
   );
 }
