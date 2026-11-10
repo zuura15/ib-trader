@@ -12,6 +12,8 @@ interface Props {
    *  figure lives once in the mobile header). Defaults to the full
    *  desktop chrome. */
   compact?: boolean;
+  /** Passed to BotChart's header row (mobile collapse chevron). */
+  headerLeading?: React.ReactNode;
 }
 
 interface BotApiShape {
@@ -24,6 +26,15 @@ interface BotApiShape {
 
 function botIdForSlot(slot: number): string {
   return `chart-bot-${slot}`;
+}
+
+/** Signed dollars; whole dollars in compact (mobile) panes. */
+function fmtUsd(v: number, compact?: boolean): string {
+  const abs = Math.abs(v);
+  const txt = compact
+    ? abs.toLocaleString(undefined, { maximumFractionDigits: 0 })
+    : abs.toFixed(2);
+  return `${v >= 0 ? '+$' : '-$'}${txt}`;
 }
 
 const QTY_STORAGE_KEY = (slot: number) => `ib-chart-qty-${slot}`;
@@ -94,7 +105,7 @@ function tickSizeFor(symbol: string | null): number {
  * ``sell N <sym> market`` for the inverse side at the held qty. Button
  * is disabled when no position is held.
  */
-export function ChartBotPane({ slot, compact = false }: Props) {
+export function ChartBotPane({ slot, compact = false, headerLeading }: Props) {
   const botId = botIdForSlot(slot);
   const [bot, setBot] = useState<BotApiShape | null>(null);
   const [botFetchError, setBotFetchError] = useState<string | null>(null);
@@ -281,6 +292,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
 
   const canClose = positionQty !== 0;
   const positionLabel = positionQty === 0 ? null
+    : compact ? (positionQty > 0 ? `+${positionQty}` : `${positionQty}`)
     : positionQty > 0 ? `LONG ${positionQty}`
     : `SHORT ${Math.abs(positionQty)}`;
 
@@ -293,9 +305,6 @@ export function ChartBotPane({ slot, compact = false }: Props) {
   // tradeGroups-based 24h sum, which couldn't see manual TWS fills.
   const [pnlRollup, setPnlRollup] = useState<Record<string, ChartPnlRollupEntry>>({});
   useEffect(() => {
-    // Compact (mobile) panes show no per-pane P&L — the single 24h
-    // figure lives in the header — so skip the poll entirely.
-    if (compact) return;
     let cancelled = false;
     const poll = async () => {
       const ctrl = new AbortController();
@@ -311,7 +320,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
     poll();
     const id = window.setInterval(poll, 30_000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [compact]);
+  }, []);
   const rollupEntry = symbol ? pnlRollup[symbol] : undefined;
   const pnl24h = rollupEntry ? rollupEntry.pnl_24h : null;
   const pnlSession = rollupEntry ? rollupEntry.pnl_session : null;
@@ -351,6 +360,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
           fullscreenFooter={renderTradeStrip()}
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
+          headerLeading={headerLeading}
         />
         {/* Live P&L for the open position on this exact contract.
             Free-floating colored number, bottom-right of the plot
@@ -378,7 +388,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             }}
             data-testid={`chart-live-pnl-${slot}`}
           >
-            {livePnl >= 0 ? '+$' : '-$'}{Math.abs(livePnl).toFixed(2)}
+            {fmtUsd(livePnl, compact)}
           </span>
         )}
         {/* Transient action status (BUY/SELL/CLOSE click feedback),
@@ -441,11 +451,10 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             FUT only) and 24H. Both IB-authoritative and account-wide,
             so trades placed directly in TWS are included. ``—`` when no
             realized activity so the slot doesn't read as a stale zero.
-            Hidden in compact (mobile) — the header carries one 24h. */}
-        {!compact && (
+            Compact (mobile): shorter labels, whole dollars. */}
         <span style={{
-          display: 'inline-flex', alignItems: 'center', gap: 10,
-          fontFamily: 'ui-monospace, monospace',
+          display: 'inline-flex', alignItems: 'center', gap: compact ? 8 : 10,
+          fontFamily: 'ui-monospace, monospace', whiteSpace: 'nowrap',
         }}>
           {pnlSession != null && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
@@ -453,13 +462,13 @@ export function ChartBotPane({ slot, compact = false }: Props) {
                 fontSize: 10, letterSpacing: '0.15em',
                 textTransform: 'uppercase', color: 'var(--text-muted)',
               }}>
-                Today
+                {compact ? 'Day' : 'Today'}
               </span>
               <span title={sessionTooltip} style={{
                 fontSize: 12, fontWeight: 700,
                 color: pnlSession >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
               }}>
-                {pnlSession >= 0 ? '+$' : '-$'}{Math.abs(pnlSession).toFixed(2)}
+                {fmtUsd(pnlSession, compact)}
               </span>
             </span>
           )}
@@ -475,14 +484,13 @@ export function ChartBotPane({ slot, compact = false }: Props) {
                 fontSize: 12, fontWeight: 700,
                 color: pnl24h >= 0 ? 'var(--accent-green)' : 'var(--accent-red)',
               }}>
-                {pnl24h >= 0 ? '+$' : '-$'}{Math.abs(pnl24h).toFixed(2)}
+                {fmtUsd(pnl24h, compact)}
               </span>
             ) : (
               <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>—</span>
             )}
           </span>
         </span>
-        )}
 
         {/* Right: position badge + qty + BUY/SELL/CLOSE. The
             ``marginLeft: auto`` pushes the whole cluster against the
@@ -517,7 +525,7 @@ export function ChartBotPane({ slot, compact = false }: Props) {
               setQty(Number.isFinite(n) && n > 0 ? Math.floor(n) : 1);
             }}
             style={{
-              width: 56,
+              width: compact ? 44 : 56,
               padding: '3px 6px',
               background: 'var(--bg-secondary)',
               border: '1px solid var(--border-default)',
@@ -534,8 +542,8 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             style={{
               background: 'var(--accent-green)', color: '#fff',
               border: 'none', borderRadius: 3,
-              padding: compact ? '9px 0' : '3px 14px',
-              minWidth: compact ? 42 : undefined,
+              padding: compact ? '7px 0' : '3px 14px',
+              minWidth: compact ? 38 : undefined,
               fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
               opacity: pendingAction && pendingAction !== 'buy' ? 0.5 : 1,
@@ -551,8 +559,8 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             style={{
               background: 'var(--accent-red)', color: '#fff',
               border: 'none', borderRadius: 3,
-              padding: compact ? '9px 0' : '3px 14px',
-              minWidth: compact ? 42 : undefined,
+              padding: compact ? '7px 0' : '3px 14px',
+              minWidth: compact ? 38 : undefined,
               fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: pendingAction || !symbol ? 'not-allowed' : 'pointer',
               opacity: pendingAction && pendingAction !== 'sell' ? 0.5 : 1,
@@ -568,8 +576,8 @@ export function ChartBotPane({ slot, compact = false }: Props) {
             style={{
               background: 'var(--accent-blue)', color: '#fff',
               border: 'none', borderRadius: 3,
-              padding: compact ? '9px 0' : '3px 14px',
-              minWidth: compact ? 42 : undefined,
+              padding: compact ? '7px 0' : '3px 14px',
+              minWidth: compact ? 38 : undefined,
               fontSize: compact ? 15 : 11, fontWeight: 700, letterSpacing: '0.05em',
               cursor: (pendingAction || !canClose) ? 'not-allowed' : 'pointer',
               opacity:

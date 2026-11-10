@@ -11,6 +11,8 @@ import { BotTradesPanel } from '../features/bots/BotTradesPanel';
 import { SettingsModal } from '../features/settings/SettingsModal';
 import { SignalRulesPanel } from '../features/signals/SignalRulesPanel';
 import { ChartAccordion } from '../features/mobile/ChartAccordion';
+import { chartSlots, useOpenCharts } from '../features/mobile/chartSlots';
+import { useChartBotSymbols } from '../data/useChartBotSymbols';
 import { useStore } from '../data/store';
 
 /**
@@ -44,6 +46,10 @@ export function MobileLayout() {
     setTabRaw(t);
   };
   const [sheet, setSheet] = useState<Sheet>(null);
+  const sym = useChartBotSymbols();
+  const slots = chartSlots(sym);
+  const [openCharts, setOpenCharts] = useOpenCharts();
+  const allOpen = slots.length > 0 && slots.every((s) => openCharts.includes(s));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
 
@@ -65,13 +71,20 @@ export function MobileLayout() {
         onOpenSheet={(s) => setSheet(s)}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenRules={() => setRulesOpen(true)}
+        action={tab === 'graphs' ? {
+          label: allOpen ? 'Collapse all charts' : 'Expand all charts',
+          icon: allOpen ? '⊟' : '⊞',
+          onClick: () => setOpenCharts(allOpen ? [] : slots),
+        } : null}
       />
 
       {/* .mobile-layout-shell: DiagOverlay's white-screen watchdog looks
           for it to confirm the mobile layout rendered. */}
       <div className="mobile-layout-shell" style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         <TabPane visible={tab === 'pos'}><PosTab /></TabPane>
-        <TabPane visible={tab === 'graphs'}><ChartAccordion /></TabPane>
+        <TabPane visible={tab === 'graphs'}>
+          <ChartAccordion sym={sym} slots={slots} open={openCharts} setOpen={setOpenCharts} />
+        </TabPane>
         <TabPane visible={tab === 'watch'}><WatchlistPanel /></TabPane>
       </div>
 
@@ -154,8 +167,8 @@ function Section({
     <section
       data-testid={testId}
       style={{
-        margin: '6px 8px', border: '1px solid var(--border-default)',
-        borderRadius: 6, overflow: 'hidden', background: 'var(--panel-bg)',
+        borderBottom: '1px solid var(--border-default)',
+        overflow: 'hidden', background: 'var(--panel-bg)',
       }}
     >
       <button
@@ -166,7 +179,7 @@ function Section({
         aria-expanded={open}
         style={{
           width: '100%', display: 'flex', alignItems: 'center', gap: 10,
-          padding: '0 12px', minHeight: 42, border: 'none', cursor: 'pointer',
+          padding: '0 10px', minHeight: 38, border: 'none', cursor: 'pointer',
           background: 'var(--bg-primary)', color: 'var(--text-primary)',
           fontSize: 14, fontWeight: 700,
           borderBottom: open ? '1px solid var(--border-default)' : 'none',

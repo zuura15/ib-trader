@@ -217,6 +217,10 @@ interface Props {
   onOrderCancel?: (id: string) => Promise<string | null>;
 }
 
+function trimPrice(p: number): string {
+  return p.toFixed(2).replace(/\.?0+$/, '');
+}
+
 /** RSI pane is pinned to a fixed 20–80 window with shaded
  *  overbought (70–80) and oversold (20–30) zones. */
 const RSI_SCALE_MIN = 20;
@@ -1248,6 +1252,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         scaleMargins: priceScaleMargins(volumeOnRef.current),
       },
       crosshair: { mode: 1 },
+      // Axis / last-price / crosshair labels without trailing zeros
+      // ("4135.00" → "4135", "4132.50" → "4132.5") — saves axis width,
+      // most noticeably on phones.
+      localization: { priceFormatter: trimPrice },
     });
     const series = chart.addSeries(LineSeries, {
       color: colors.line,
@@ -1275,7 +1283,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // it clip at the pane edge rather than rescaling the pane.
         autoscaleInfoProvider: rsiFixedRange,
       }, 1);
-      rsi.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 } });
+      // Small margins so the 80 / 20 axis labels aren't clipped at the edges.
+      rsi.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: 0.06 } });
       rsi.createPriceLine({
         price: 50,
         color: colors.grid,

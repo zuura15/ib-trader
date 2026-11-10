@@ -9,6 +9,8 @@ interface Props {
   onOpenSheet: (s: SheetId) => void;
   onOpenSettings: () => void;
   onOpenRules: () => void;
+  /** Tab-specific header action (Graphs: expand / collapse all). */
+  action?: { label: string; icon: string; onClick: () => void } | null;
 }
 
 /**
@@ -17,7 +19,7 @@ interface Props {
  * Shows the minimum critical information a trader needs at a glance:
  * connection status, account mode (paper vs live), and data freshness.
  */
-export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules }: Props) {
+export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules, action }: Props) {
   const { global, dataMode, wsConnected, alerts } = useStore();
   const { connectionStatus, accountMode } = global;
   const [menuOpen, setMenuOpen] = useState(false);
@@ -34,7 +36,7 @@ export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules }: Props
 
   return (
     <div
-      className="flex items-center justify-between px-3 py-1.5 shrink-0 border-b"
+      className="flex items-center justify-between px-2 py-0.5 shrink-0 border-b"
       style={{ background: 'var(--bg-root)', borderColor: 'var(--border-default)' }}
     >
       {/* Left: connection + account */}
@@ -81,6 +83,17 @@ export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules }: Props
 
       {/* Right: alerts + menu (signals, settings, resync, sheets) */}
       <div className="flex items-center gap-1" style={{ position: 'relative' }}>
+        {action && (
+          <button
+            onClick={action.onClick}
+            aria-label={action.label}
+            title={action.label}
+            data-testid="mobile-header-action"
+            style={iconBtn}
+          >
+            {action.icon}
+          </button>
+        )}
         <button
           onClick={() => onOpenSheet('alerts')}
           aria-label="Alerts"
@@ -139,7 +152,7 @@ export function MobileHeader({ onOpenSheet, onOpenSettings, onOpenRules }: Props
 
 const iconBtn: React.CSSProperties = {
   position: 'relative', background: 'transparent', border: 'none', cursor: 'pointer',
-  color: 'var(--text-secondary)', fontSize: 18, minWidth: 44, minHeight: 44,
+  color: 'var(--text-secondary)', fontSize: 18, minWidth: 40, minHeight: 40,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
 };
 const menuItem: React.CSSProperties = {

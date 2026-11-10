@@ -5,6 +5,17 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-10
 
+### Changed
+- **Mobile real-estate pass.** The "Expand all" row is gone (now a ⊞/⊟
+  icon in the header on the Graphs tab); an open chart has no separate
+  title bar (its collapse chevron sits in the chart's own header row);
+  chart panels and Pos sections run edge to edge; slimmer header and
+  section bars. The B/S/C band now shows Day and 24h realized P&L (whole
+  dollars on mobile) and the position as +n/−n.
+- **Price labels drop trailing zeros** on every chart ("4135.00" →
+  "4135", "4126.20" → "4126.2"); the RSI pane's 20/80 labels no longer
+  clip.
+
 ### Fixed
 - **Prices lag 4–5 s when returning to an idle tab.** On wake the charts
   and watchlist reconnect their quote stream, but the server only

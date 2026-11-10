@@ -11,6 +11,9 @@ import { getBotTrades, getChartExecutions, requestOrderCancel, type ChartExecuti
 import { CancelOrderButton } from '../chart/CancelOrderButton';
 
 interface Props {
+  /** Rendered at the very start of the header row (mobile: the
+   *  collapse chevron, so the panel needs no separate title bar). */
+  headerLeading?: React.ReactNode;
   /** Bot identity. Frontend convention: ``chart-bot-<slot>``. */
   botId: string;
   /** Bot's ``ref_id``, falls back to ``botId`` when absent. */
@@ -70,7 +73,7 @@ export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
   fullscreenFooter, onFullscreenChange,
-  onPricePick, pickTickSize,
+  onPricePick, pickTickSize, headerLeading,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -742,6 +745,7 @@ export function BotChart({
         display: 'flex', alignItems: 'center', gap: 8,
         fontSize: 12, fontWeight: 600, color: 'var(--text-primary)',
       }}>
+        {headerLeading}
         <span>{renderTitle ? renderTitle(state) : (symbol ?? '—')}</span>
         {/* Current price right after the ticker name (#98). */}
         {lastPrice != null && (
