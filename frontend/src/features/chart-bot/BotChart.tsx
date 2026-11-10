@@ -9,6 +9,8 @@ import { useBotState, type BotPositionState } from '../../data/useBotState';
 // PositionStrip import removed with the 2-row shelf — see chartBody.
 import { getBotTrades, getChartExecutions, requestOrderCancel, type ChartExecutionMarker } from '../../api/client';
 import { CancelOrderButton } from '../chart/CancelOrderButton';
+import { RecommendationBadge } from '../signals/RecommendationBadge';
+import type { Recommendation } from '../signals/types';
 
 interface Props {
   /** Rendered at the very start of the header row (mobile: the
@@ -85,6 +87,10 @@ export function BotChart({
   // SQLite). Polled on a slow 5s interval plus the same triggers the
   // Orders panel uses (command completion, resync).
   const [lastPrice, setLastPrice] = useState<number | null>(null);
+  // Trade recommendation (GH #102), shown in this header next to the
+  // price instead of floating over the chart.
+  const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
+  const [recHover, setRecHover] = useState(false);
   const [openOrders, setOpenOrders] = useState<Array<{
     id: string; side: string; qty: number; orderType: string;
     limitPrice: number | null; stopPrice: number | null;
@@ -759,6 +765,14 @@ export function BotChart({
             {lastPrice.toFixed(priceDecimals)}
           </span>
         )}
+        {recommendation && (
+          <RecommendationBadge
+            rec={recommendation}
+            hover={recHover}
+            onHover={setRecHover}
+            variant="inline"
+          />
+        )}
         {/* Binary open-orders indicator — amber dot when IB holds ≥1
             working order on this contract; hover lists the orders. */}
         {openOrders.length > 0 && (
@@ -867,6 +881,7 @@ export function BotChart({
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
           onLastPrice={setLastPrice}
+          onRecommendation={setRecommendation}
           orderLines={orderLines}
           onOrderAmend={handleOrderAmend}
           onOrderCancel={handleOrderCancel}

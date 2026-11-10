@@ -6,6 +6,10 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-10
 
 ### Changed
+- **Recommendation badge moved into the chart header**, right after the
+  symbol and price (hover still shows the reasons), instead of floating
+  over the top-centre of the plot. Charts without a header keep the
+  overlay.
 - **Mobile real-estate pass.** The "Expand all" row is gone (now a ⊞/⊟
   icon in the header on the Graphs tab); an open chart has no separate
   title bar (its collapse chevron sits in the chart's own header row);

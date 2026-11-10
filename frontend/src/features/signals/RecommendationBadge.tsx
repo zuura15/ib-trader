@@ -1,15 +1,19 @@
 import { GRADE_LABEL } from './evaluate';
 import type { Recommendation } from './types';
 
-/** Chart badge for the current recommendation (GH #102); hover lists
- *  every rule that voted or adjusted, and any time rule in force. */
+/** Badge for the current recommendation (GH #102); hover lists every
+ *  rule that voted or adjusted, and any time rule in force. ``inline``
+ *  sits in a chart pane's header row; ``overlay`` floats top-centre on
+ *  the chart (charts without a header). */
 export function RecommendationBadge({
-  rec, hover, onHover,
+  rec, hover, onHover, variant = 'overlay',
 }: {
   rec: Recommendation;
   hover: boolean;
   onHover: (h: boolean) => void;
+  variant?: 'overlay' | 'inline';
 }) {
+  const inline = variant === 'inline';
   const blocked = !!rec.blocked;
   const label = blocked ? 'No trade' : GRADE_LABEL[rec.grade];
   const bg = blocked ? 'var(--accent-yellow, #ca8a04)'
@@ -23,14 +27,18 @@ export function RecommendationBadge({
       data-testid="recommendation-badge"
       onMouseEnter={() => onHover(true)}
       onMouseLeave={() => onHover(false)}
-      style={{
+      style={inline ? {
+        position: 'relative', display: 'inline-flex', zIndex: 60,
+        fontFamily: 'ui-monospace, monospace',
+      } : {
         position: 'absolute', top: 6, left: '50%', transform: 'translateX(-50%)',
         zIndex: 24, fontFamily: 'ui-monospace, monospace',
       }}
     >
       <div
         style={{
-          padding: '2px 8px', borderRadius: 3, fontSize: 11,
+          padding: inline ? '1px 6px' : '2px 8px', borderRadius: 3,
+          fontSize: inline ? 10 : 11,
           fontWeight: strong ? 800 : 700, letterSpacing: 0.5,
           textTransform: 'uppercase', whiteSpace: 'nowrap', cursor: 'default',
           background: bg, color: fg,
@@ -43,8 +51,9 @@ export function RecommendationBadge({
       {hover && (
         <div
           style={{
-            position: 'absolute', top: 'calc(100% + 4px)', left: '50%',
-            transform: 'translateX(-50%)', minWidth: 260, maxWidth: 380,
+            position: 'absolute', top: 'calc(100% + 4px)',
+            ...(inline ? { left: 0 } : { left: '50%', transform: 'translateX(-50%)' }),
+            minWidth: 260, maxWidth: 'min(380px, 90vw)',
             padding: '6px 8px', borderRadius: 4, fontSize: 11, lineHeight: 1.5,
             background: 'var(--bg-primary)', color: 'var(--text-primary)',
             border: '1px solid var(--border-default)',

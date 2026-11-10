@@ -193,6 +193,9 @@ interface Props {
    *  historical load, so pane headers can show the current price
    *  without opening a second quote socket. */
   onLastPrice?: (price: number) => void;
+  /** Receives the current recommendation (GH #102). When set, the chart
+   *  draws no top-centre badge — the parent shows it (pane header). */
+  onRecommendation?: (rec: Recommendation | null) => void;
   /** Working-order price lines (#98): one dashed horizontal line per
    *  open IB order on this contract, with a short axis label
    *  (lim / sl / trl). lightweight-charts renders the line + label
@@ -261,6 +264,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     onPricePick,
     pickTickSize = 0.01,
     onLastPrice,
+    onRecommendation,
     orderLines,
     onOrderAmend,
     onOrderCancel,
@@ -729,6 +733,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const [rec, setRec] = useState<Recommendation | null>(null);
   const [recClock, setRecClock] = useState(0);
   const [recHover, setRecHover] = useState(false);
+  const onRecommendationRef = useRef(onRecommendation);
+  useEffect(() => { onRecommendationRef.current = onRecommendation; }, [onRecommendation]);
+  useEffect(() => { onRecommendationRef.current?.(rec); }, [rec]);
   const recDotsRef = useRef<ExecDotsPrimitive | null>(null);
   const recLabelsRef = useRef<Map<string, string>>(new Map());
   useEffect(() => {
@@ -3226,7 +3233,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   return (
     <div className="relative" style={{ width: '100%', height: '100%', minHeight: 0 }}>
       <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
-      {rec && (
+      {rec && !onRecommendation && (
         <RecommendationBadge
           rec={rec}
           hover={recHover}
