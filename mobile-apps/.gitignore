@@ -1,0 +1,14 @@
+# Android / Go build outputs for the launcher. Do not ignore sources.
+android-launcher/.gradle/
+android-launcher/**/build/
+android-launcher/local.properties
+android-launcher/app/libs/
+android-launcher/**/*.apk
+android-launcher/**/.cxx/
+android-launcher/**/*.so
+*.keystore
+*.jks
+
+# The repo root ignores every *.xml. Launcher manifests and resources are source.
+!*.xml
+!**/*.xml
