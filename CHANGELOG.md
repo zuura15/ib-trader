@@ -45,6 +45,9 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   opened on top of it, most visibly in Burrow on the phone. The login screen
   now counts as a rendered shell, and so does the "Connecting…" state shown
   while the session check is in flight (seconds over a Tailscale relay).
+  Because those screens are `position: fixed`, `#root` can collapse to 0
+  height (Galaxy Fold cover screen, 296 px wide), which the watchdog also
+  read as a white screen. For them it now goes by the screen's own size.
 - **Clients could keep running an old build.** ib-api served `index.html`
   with no `Cache-Control`, so a WebView's disk cache (it survives app
   restarts) could keep loading the previous bundle. It's now `no-cache`;

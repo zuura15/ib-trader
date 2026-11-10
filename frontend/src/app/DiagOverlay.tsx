@@ -64,7 +64,11 @@ export function DiagOverlay() {
       // White-screen signal: root is missing/zero-sized, OR no recognized
       // layout shell rendered. Either flavor counts — only the absence of
       // BOTH is the trigger.
-      const suspicious = !root || !rootOk || !layoutOk;
+      // The login / "Connecting…" shell is position:fixed, so #root has
+      // no in-flow content and collapses to 0 height on some WebViews
+      // (seen as rootRect 296x0 on a Galaxy Fold cover screen). For that
+      // shell, its own size is the signal; #root's is meaningless.
+      const suspicious = !root || !layoutOk || (!rootOk && !loginShell);
       if (suspicious) {
         recordDiag({
           kind: 'watchdog',
