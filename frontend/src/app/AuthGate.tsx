@@ -36,7 +36,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  if (state === 'checking') return <div style={screen} />;
+  // Over a slow link (Burrow via a DERP relay) the session check can take
+  // seconds; show that we're waiting, and mark it as a deliberate render
+  // so the white-screen watchdog doesn't open Diagnostics over it.
+  if (state === 'checking') {
+    return (
+      <div className={LOGIN_SHELL_CLASS} style={screen}>
+        <span style={hint}>Connecting…</span>
+      </div>
+    );
+  }
   if (state === 'login') return <LoginScreen onSuccess={() => setState('open')} />;
   return <>{children}</>;
 }

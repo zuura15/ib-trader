@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # bundle that ``make prod`` produces and ib-api serves directly.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
+_NO_CACHE = {"Cache-Control": "no-cache"}
 
 
 def _mount_frontend_dist(app: FastAPI) -> None:
@@ -84,10 +85,15 @@ def _mount_frontend_dist(app: FastAPI) -> None:
             resolved = candidate.resolve()
             resolved.relative_to(_FRONTEND_DIST.resolve())
             if resolved.is_file():
+                if resolved == index_html.resolve():
+                    return FileResponse(resolved, headers=_NO_CACHE)
                 return FileResponse(resolved)
         except (ValueError, OSError):
             pass
-        return FileResponse(index_html)
+        # index.html names the content-hashed bundle, so it must be
+        # revalidated on every load or a client (e.g. Burrow's WebView,
+        # whose disk cache survives restarts) keeps running an old build.
+        return FileResponse(index_html, headers=_NO_CACHE)
 
     logger.info(
         '{"event": "FRONTEND_DIST_MOUNTED", "path": "%s"}', _FRONTEND_DIST,
