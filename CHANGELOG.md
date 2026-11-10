@@ -3,6 +3,15 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-10
+
+### Fixed
+- **Prices lag 4–5 s when returning to an idle tab.** On wake the charts
+  and watchlist reconnect their quote stream, but the server only
+  forwarded ticks that arrived *after* the subscribe, so the price stayed
+  stale until the next tick (seconds in a quiet market). `subscribe_quote`
+  now sends the newest quote immediately, then tails from it.
+
 ## 2026-11-09
 
 ### Changed

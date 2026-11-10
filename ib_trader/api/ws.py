@@ -392,10 +392,43 @@ async def _fetch_channel_data_async(
 _STATUS_TRIGGERS = frozenset({"trades", "orders", "alerts", "heartbeats", "commands"})
 
 
+def _decode_quote_entry(raw_data: dict) -> dict:
+    data = {}
+    for k, v in raw_data.items():
+        try:
+            data[k] = json.loads(v)
+        except (ValueError, TypeError):
+            data[k] = v
+    return data
+
+
 async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
-    """Push live quote updates from Redis stream to WebSocket client."""
+    """Push live quote updates from Redis stream to WebSocket client.
+
+    Sends the stream's newest entry immediately on subscribe, then tails
+    from it. Tailing from ``$`` alone meant a client (re)subscribing —
+    e.g. a chart reconnecting when its tab wakes — showed a stale price
+    until the next tick, which in a quiet market took several seconds.
+    """
     stream = f"quote:{symbol}"
     last_id = "$"
+    try:
+        newest = await redis.xrevrange(stream, count=1)
+        if newest:
+            entry_id, raw_data = newest[0]
+            last_id = entry_id
+            await websocket.send_text(_json_dumps({
+                "type": "quote",
+                "symbol": symbol,
+                "data": _decode_quote_entry(raw_data),
+            }))
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        return
+    except (ConnectionError, OSError, _RedisConnectionError):
+        return
+    except Exception:
+        # Best effort — fall back to tailing new ticks only.
+        logger.exception('{"event": "WS_QUOTE_INITIAL_FAILED", "symbol": "%s"}', symbol)
     while True:
         try:
             results = await redis.xread({stream: last_id}, block=10000)
@@ -404,16 +437,10 @@ async def _stream_quote_to_ws(websocket: WebSocket, redis, symbol: str) -> None:
             for _stream_name, entries in results:
                 for entry_id, raw_data in entries:
                     last_id = entry_id
-                    data = {}
-                    for k, v in raw_data.items():
-                        try:
-                            data[k] = json.loads(v)
-                        except (ValueError, TypeError):
-                            data[k] = v
                     await websocket.send_text(_json_dumps({
                         "type": "quote",
                         "symbol": symbol,
-                        "data": data,
+                        "data": _decode_quote_entry(raw_data),
                     }))
         except (WebSocketDisconnect, asyncio.CancelledError):
             return
