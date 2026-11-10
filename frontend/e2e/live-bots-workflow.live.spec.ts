@@ -76,7 +76,12 @@ test.describe('Live bots workflow (test-ford)', () => {
   let baseline = 0;
 
   test.beforeAll(async ({ playwright }) => {
-    api = await playwright.request.newContext();
+    api = await playwright.request.newContext({
+      // ib-api access key (scripts/e2e-live.sh exports it from .env).
+      extraHTTPHeaders: process.env.API_SECRET_KEY
+        ? { Authorization: `Bearer ${process.env.API_SECRET_KEY}` }
+        : {},
+    });
     await reloadBotsRegistry(api);
     // Stop the test bot and flatten any residual F position from a prior
     // run so tests always start from a known zero baseline. Without this,

@@ -17,7 +17,8 @@ from sqlalchemy.orm import scoped_session
 
 from ib_trader.api.deps import set_session_factory
 from ib_trader.api.routes import commands, trades, orders, alerts, system, bots, bot_trades, templates, positions, logs, watchlist, instruments, history, sr, regime, debug, audit, console_pnl, direction, signal_rules
-from ib_trader.api import ws
+from ib_trader.api import auth, ws
+from ib_trader.api.auth import APIKeyMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -97,13 +98,18 @@ def create_app(
     session_factory: scoped_session,
     cors_origins: list[str] | None = None,
     api_key: str | None = None,
+    auth_cookie_max_age: int = 30 * 86400,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
     Args:
         session_factory: SQLAlchemy scoped session factory for DB access.
         cors_origins: Allowed CORS origins. Defaults to localhost dev servers.
-        api_key: If set, enables Bearer token auth on all API endpoints.
+        api_key: If set, every /api, /ws and docs request needs a Bearer
+            token or session cookie (see ``ib_trader.api.auth``). ``None``
+            disables auth; only tests do that — ``ib-api`` refuses to start
+            without a key.
+        auth_cookie_max_age: Browser session cookie lifetime in seconds.
     """
     if cors_origins is None:
         cors_origins = [
@@ -167,9 +173,11 @@ def create_app(
         lifespan=lifespan,
     )
 
-    # Auth middleware (if API key configured)
+    app.state.api_key = api_key
+    app.state.auth_cookie_max_age = auth_cookie_max_age
+    # Auth must sit inside CORS (add_middleware prepends, so CORS, added
+    # next, runs first) so preflights and 401s still carry CORS headers.
     if api_key:
-        from ib_trader.api.auth import APIKeyMiddleware
         app.add_middleware(APIKeyMiddleware, api_key=api_key)
 
     app.add_middleware(
@@ -180,6 +188,7 @@ def create_app(
         allow_headers=["*"],
     )
 
+    app.include_router(auth.router)
     app.include_router(commands.router)
     app.include_router(trades.router)
     app.include_router(orders.router)

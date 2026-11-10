@@ -5,18 +5,44 @@
 # trap in the `dev` target — a non-zero exit re-arms the trap and
 # keeps the session running.
 #
-# API failure (not yet up, network blip) is treated as "safe to
+# API not reachable (not yet up, network blip) is treated as "safe to
 # shut down" — the alternative is locking the session forever if
 # the API never came up, which is worse than letting Ctrl+C through
-# in the pre-trading-state window.
+# in the pre-trading-state window. An API that IS up but rejects the
+# access key is NOT safe: bot state is unknown, so we refuse (Ctrl+\
+# still force-quits).
 
 set -u
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 URL="http://127.0.0.1:8000/api/bots"
-RESP="$(curl -sf --max-time 2 "$URL" 2>/dev/null)" || {
+HTTP_CODE=0
+RESP="$("$HERE/../api_curl.sh" -s --max-time 2 -w '\n%{http_code}' "$URL" 2>/dev/null)"
+CURL_RC=$?
+if [ "$CURL_RC" -eq 100 ]; then
+    # No key: ib-api refuses to start without one, so it's most likely
+    # down. Only refuse if something is actually answering on :8000.
+    if curl -sf -o /dev/null --max-time 2 http://127.0.0.1:8000/api/auth/session; then
+        echo "[DEV] API_SECRET_KEY missing from .env — cannot check bot state; refusing shutdown (Ctrl+\\ to force)." >&2
+        exit 1
+    fi
     echo "[DEV] ib-api not responding — proceeding with shutdown." >&2
     exit 0
-}
+fi
+if [ "$CURL_RC" -ne 0 ]; then
+    echo "[DEV] ib-api not responding — proceeding with shutdown." >&2
+    exit 0
+fi
+HTTP_CODE="${RESP##*$'\n'}"
+RESP="${RESP%$'\n'*}"
+if [ "$HTTP_CODE" = 401 ] || [ "$HTTP_CODE" = 403 ]; then
+    echo "[DEV] ib-api rejected the access key — cannot check bot state; refusing shutdown (Ctrl+\\ to force)." >&2
+    exit 1
+fi
+if [ "$HTTP_CODE" != 200 ]; then
+    echo "[DEV] ib-api returned HTTP $HTTP_CODE — proceeding with shutdown." >&2
+    exit 0
+fi
 
 # Pass the response via env var, not stdin — a heredoc on python's
 # stdin would otherwise shadow the curl output.

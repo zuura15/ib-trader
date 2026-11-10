@@ -39,8 +39,19 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
     install_db_sink(db)
 
     # Load configuration
-    load_env(env)
+    env_values = load_env(env)
     settings = load_settings(settings_path)
+
+    # ib-api is reachable over the LAN / tailnet and can place orders, so
+    # it never serves without an access key.
+    from ib_trader.api.auth import APIKeyConfigError, validate_api_key
+    try:
+        api_key = validate_api_key(env_values.get("API_SECRET_KEY"))
+    except APIKeyConfigError as exc:
+        logger.error('{"event": "API_AUTH_KEY_INVALID", "error": "%s"}', exc)
+        print(f"[API] REFUSING TO START: {exc}")
+        raise SystemExit(2) from exc
+    cookie_days = int(settings.get("api_auth_cookie_days", 30))
 
     # Check DB permissions
     if Path(db).exists():
@@ -83,7 +94,12 @@ def main(db: str, env: str, settings_path: str, host: str, port: int):
     ])
 
     from ib_trader.api.app import create_app
-    app = create_app(session_factory, cors_origins=cors_origins)
+    app = create_app(
+        session_factory,
+        cors_origins=cors_origins,
+        api_key=api_key,
+        auth_cookie_max_age=cookie_days * 86400,
+    )
 
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)

@@ -5,6 +5,7 @@ import {
 import { useStore } from '../../data/store';
 import type { LayoutVariant, ThemeMode } from '../../types';
 import { LayoutToggle } from '../header/LayoutToggle';
+import { logout } from '../../app/auth';
 
 interface Props {
   open: boolean;
@@ -206,6 +207,27 @@ export function SettingsModal({ open, onClose }: Props) {
               suffix="min"
             />
           </SettingRow>
+
+          {useStore.getState().dataMode === 'live' && (
+            <>
+              <SectionTitle>Access</SectionTitle>
+              <SettingRow
+                label="Sign out of this browser"
+                help="Clears this browser's session cookie. You'll need the access key to sign back in."
+              >
+                <button
+                  onClick={() => { onClose(); void logout(); }}
+                  style={{
+                    background: 'transparent', border: '1px solid var(--border-default)',
+                    color: 'var(--accent-red)', fontSize: 12,
+                    padding: '4px 10px', borderRadius: 4, cursor: 'pointer',
+                  }}
+                >
+                  Sign out
+                </button>
+              </SettingRow>
+            </>
+          )}
         </div>
         <footer
           style={{

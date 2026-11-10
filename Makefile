@@ -123,7 +123,7 @@ dev:
 	( \
 		echo "[DEV] Waiting for ib-api on :8000 before starting Vite..."; \
 		for i in $$(seq 1 60); do \
-			if curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8000/api/status; then \
+			if curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8000/api/auth/session; then \
 				echo "[DEV] ib-api ready (after $${i}s) — launching Vite."; \
 				cd frontend && VITE_DATA_MODE=live exec npm run dev; \
 			fi; \

@@ -84,7 +84,7 @@ ensure_engine() {
 }
 
 ensure_api() {
-    if curl -fsS "http://$API_HOST:$API_PORT/api/status" >/dev/null 2>&1; then
+    if scripts/api_curl.sh -fsS "http://$API_HOST:$API_PORT/api/status" >/dev/null 2>&1; then
         log "API already running on :$API_PORT — reusing"
         return 0
     fi
@@ -96,7 +96,7 @@ ensure_api() {
     )
     API_STARTED_PID="$(cat run/e2e-api.pid)"
     wait_for "api (:$API_PORT)" \
-        "curl -fsS http://$API_HOST:$API_PORT/api/status" \
+        "scripts/api_curl.sh -fsS http://$API_HOST:$API_PORT/api/status" \
         "$HEALTH_TIMEOUT"
 }
 
@@ -120,7 +120,7 @@ ensure_bot_runner() {
     # ~2 s of startup. We poll the api for it to confirm the runner is
     # actually up before Playwright starts driving bot lifecycle events.
     wait_for "bot runner (BOT_RUNNER heartbeat)" \
-        "curl -fsS http://$API_HOST:$API_PORT/api/status | grep -q 'BOT_RUNNER'" \
+        "scripts/api_curl.sh -fsS http://$API_HOST:$API_PORT/api/status | grep -q 'BOT_RUNNER'" \
         15
 }
 
@@ -175,6 +175,12 @@ else
 fi
 
 log "Stack up. Handing off to Playwright..."
+# Playwright sends the ib-api access key as a Bearer header
+# (playwright.live.config.ts reads API_SECRET_KEY).
+if [ -z "${API_SECRET_KEY:-}" ]; then
+    API_SECRET_KEY="$(sed -n 's/^[[:space:]]*API_SECRET_KEY[[:space:]]*=[[:space:]]*//p' .env | tail -n 1 | tr -d "\"'")"
+    export API_SECRET_KEY
+fi
 cd frontend
 # shellcheck disable=SC2086
 npx playwright test --config=playwright.live.config.ts ${IB_TRADER_E2E_EXTRA_PW_ARGS:-} "$@"

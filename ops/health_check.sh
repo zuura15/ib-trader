@@ -122,6 +122,14 @@ _check_http() {
     fi
 }
 
+_check_http_auth() {
+    # _check_http_auth <label> <url> — ib-api needs the access key.
+    local label=$1 url=$2
+    if ! "$REPO_ROOT/scripts/api_curl.sh" -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+        _add_error "$label: HTTP probe failed ($url)"
+    fi
+}
+
 _check_process() {
     # _check_process <label> <pgrep-pattern>
     local label=$1 pattern=$2
@@ -163,7 +171,7 @@ _check_process "ib-bots"        "ib-bots"
 _check_process "redis-server"   "redis-server"
 
 _check_http "ib-engine"  "http://127.0.0.1:8081/engine/health"
-_check_http "ib-api"     "http://127.0.0.1:8000/api/system/health"
+_check_http_auth "ib-api" "http://127.0.0.1:8000/api/system/health"
 _check_http "ib-bots"    "http://127.0.0.1:8082/health"
 
 if command -v redis-cli >/dev/null 2>&1; then
@@ -269,7 +277,7 @@ _scan_recent_log
 
 _check_active_alerts() {
     local payload
-    payload=$(curl -fsS --max-time 3 http://127.0.0.1:8000/api/alerts 2>/dev/null) || return
+    payload=$("$REPO_ROOT/scripts/api_curl.sh" -fsS --max-time 3 http://127.0.0.1:8000/api/alerts 2>/dev/null) || return
     # Pull CATASTROPHIC entries and surface their trigger+message verbatim.
     local cata
     cata=$(echo "$payload" | python3 -c '
@@ -297,7 +305,7 @@ _check_active_alerts
 
 _check_bot_heartbeats() {
     local payload
-    payload=$(curl -fsS --max-time 3 http://127.0.0.1:8000/api/bots 2>/dev/null) || return
+    payload=$("$REPO_ROOT/scripts/api_curl.sh" -fsS --max-time 3 http://127.0.0.1:8000/api/bots 2>/dev/null) || return
     local stale
     stale=$(echo "$payload" | python3 -c '
 import json, sys

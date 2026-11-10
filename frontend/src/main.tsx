@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/app.css'
 import { App } from './app/App'
+import { AuthGate } from './app/AuthGate'
 import { ErrorBoundary } from './app/ErrorBoundary'
 import { DiagOverlay } from './app/DiagOverlay'
 import { installGlobalErrorHandlers, recordBoot } from './app/diagnostics'
@@ -30,7 +31,9 @@ if (typeof document !== 'undefined') {
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary label="root" variant="root">
-      <App />
+      <AuthGate>
+        <App />
+      </AuthGate>
     </ErrorBoundary>
     {/* DiagOverlay sits outside the ErrorBoundary so it can always render —
         even if <App /> itself failed to mount. Ctrl+Alt+D toggles it. */}

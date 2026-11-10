@@ -5,6 +5,7 @@ and re-derives the bar window the bot actually saw at trade time, so indices lin
 """
 from __future__ import annotations
 import json
+import os
 import urllib.request
 from datetime import datetime, timezone
 
@@ -24,7 +25,11 @@ def _fetch_bars(symbol: str, sec_type: str, hours: int):
         f"{PROD}/api/history?symbol={symbol}&sec_type={sec_type}"
         f"&hours={hours}&bar_size=3+mins"
     )
-    with urllib.request.urlopen(url, timeout=10) as resp:
+    # ib-api requires its access key: export API_SECRET_KEY before running.
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {os.environ['API_SECRET_KEY']}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
         return json.load(resp)
 
 

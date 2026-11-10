@@ -69,7 +69,11 @@ IB_CLIENT_ID=1
 IB_ACCOUNT_ID=U1234567
 IB_PORT_PAPER=4002
 IB_ACCOUNT_ID_PAPER=DU1234567
+API_SECRET_KEY=...        # required, >= 32 chars; see .env.example
 ```
+
+ib-api refuses to start without `API_SECRET_KEY`. Browsers sign in once with it
+(login screen → HttpOnly cookie); scripts use `scripts/api_curl.sh`. See ADR-019.
 
 ### 3. Configure symbols
 

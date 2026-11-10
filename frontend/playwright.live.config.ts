@@ -24,6 +24,11 @@ const VITE_PORT = Number(process.env.VITE_PORT || 5199);
 // since it's a self-signed dev cert.
 const BASE_URL = `https://localhost:${VITE_PORT}`;
 
+// ib-api requires its access key (API_SECRET_KEY in .env; scripts/e2e-live.sh
+// exports it). Sent as a Bearer header on every page and API request, so the
+// app skips its login screen and the specs' `request` calls authenticate too.
+const API_KEY = process.env.API_SECRET_KEY || '';
+
 export default defineConfig({
   testDir: './e2e',
   // Only the tests explicitly tagged for the live stack.
@@ -41,6 +46,7 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
     trace: 'retain-on-failure',
+    extraHTTPHeaders: API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {},
   },
   webServer: {
     command: `VITE_DATA_MODE=live npm run dev -- --port ${VITE_PORT}`,

@@ -114,6 +114,9 @@ prophylactic_resub_startup_delay_seconds: 600
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081
+# ib-api browser session cookie lifetime (days). The access key itself is
+# API_SECRET_KEY in .env; see ib_trader/api/auth.py.
+api_auth_cookie_days: 30
 # Startup reconcile: max seconds to wait for the IB open-orders
 # snapshot before reconciling degraded (empty snapshot + WARNING; the
 # sanity loop catches up once IB answers). Guards against the

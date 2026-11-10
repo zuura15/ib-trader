@@ -180,7 +180,12 @@ test.describe('Ford live console workflow', () => {
   let marketSerial: number | null = null;
 
   test.beforeAll(async ({ playwright }) => {
-    api = await playwright.request.newContext();
+    api = await playwright.request.newContext({
+      // ib-api access key (scripts/e2e-live.sh exports it from .env).
+      extraHTTPHeaders: process.env.API_SECRET_KEY
+        ? { Authorization: `Bearer ${process.env.API_SECRET_KEY}` }
+        : {},
+    });
     baseline = await fordPositionQty(api);
   });
 

@@ -5,7 +5,25 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-10
 
+### Added
+- **ib-api access key is now required (ADR-019, #104).** `API_SECRET_KEY`
+  (≥ 32 chars) must be in `.env`; ib-api exits with code 2 without it. Every `/api`, `/ws`
+  and docs request needs `Authorization: Bearer <key>` or the browser session
+  cookie. Previously the key was never wired in, and `/ws` was never checked
+  even when it was. Browsers get a **login screen** and enter the key once:
+  `POST /api/auth/login` sets an HttpOnly, `SameSite=Strict` cookie
+  (30 days, `api_auth_cookie_days`) that fetch, WebSocket and SSE all carry.
+  **Settings → Access → Sign out** clears it. `?token=` is no longer accepted.
+- **`scripts/api_curl.sh`** — curl with the access key from `.env` (passed on
+  stdin, never in `ps`). Used by `ops/health_check.sh`, `check_dev_can_shutdown.sh`,
+  `e2e-live.sh` and `deploy_prod.sh`.
+
 ### Changed
+- `check_dev_can_shutdown.sh` refuses Ctrl+C when ib-api is up but rejects
+  the key (bot state unknown). An unreachable API still lets the shutdown through.
+- `deploy_prod.sh` stops before touching prod if prod's `.env` has no
+  `API_SECRET_KEY`.
+- `make dev` waits on the public `/api/auth/session` instead of `/api/status`.
 - **Recommendation badge moved into the chart header**, right after the
   symbol and price (hover still shows the reasons), instead of floating
   over the top-centre of the plot. Charts without a header keep the

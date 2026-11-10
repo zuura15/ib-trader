@@ -70,6 +70,12 @@ else
     say "prod $before → origin/main; incoming:"
     printf '%s\n' "$incoming" | sed 's/^/    /'
 fi
+
+# ib-api refuses to start without a >=32-char API_SECRET_KEY in .env.
+# Catch that before we take prod down rather than after.
+remote "grep -Eq '^[[:space:]]*API_SECRET_KEY[[:space:]]*=[[:space:]]*[\"'\'']?[A-Za-z0-9_-]{32,}' .env" \
+    || die "prod .env has no API_SECRET_KEY (>= 32 chars); the new ib-api would refuse to start.
+    Add one on prod:  python3 -c 'import secrets; print(\"API_SECRET_KEY=\" + secrets.token_urlsafe(32))' >> .env"
 [ "$DRY" = 1 ] && { say "dry run — nothing changed."; exit 0; }
 
 # --- 2. Live-position guard --------------------------------------------
@@ -85,7 +91,9 @@ if [ "$YES" != 1 ]; then
 fi
 
 engine_pid() {
-    remote "curl -sf --max-time 3 localhost:8000/api/status" 2>/dev/null \
+    # api_curl.sh adds the access key; fall back to plain curl for a
+    # checkout that predates ib-api auth (first deploy of it).
+    remote "if [ -x scripts/api_curl.sh ]; then scripts/api_curl.sh -sf --max-time 3 http://127.0.0.1:8000/api/status; else curl -sf --max-time 3 localhost:8000/api/status; fi" 2>/dev/null \
         | python3 -c 'import json,sys; hb=[h for h in json.load(sys.stdin).get("heartbeats",[]) if h.get("process")=="ENGINE" and h.get("alive")]; print(hb[0]["pid"] if hb else "")' 2>/dev/null || true
 }
 old_pid=$(engine_pid)
