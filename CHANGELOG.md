@@ -39,6 +39,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   clip.
 
 ### Fixed
+- **Diagnostics overlay popped up over the login screen.** The white-screen
+  watchdog only recognised the trading layouts, so the access-key login
+  screen (which replaces them) looked like a blank page and the overlay
+  opened on top of it, most visibly in Burrow on the phone. The login screen
+  now counts as a rendered shell.
 - **Prices lag 4–5 s when returning to an idle tab.** On wake the charts
   and watchlist reconnect their quote stream, but the server only
   forwarded ticks that arrived *after* the subscribe, so the price stayed

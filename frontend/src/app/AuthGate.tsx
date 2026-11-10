@@ -4,6 +4,9 @@ import { AUTH_REQUIRED_EVENT, getSession, installAuthInterceptor, login } from '
 
 type GateState = 'checking' | 'open' | 'login';
 
+/** Marks the login screen as a legitimate render for the white-screen watchdog. */
+export const LOGIN_SHELL_CLASS = 'auth-login-shell';
+
 const LIVE = import.meta.env.VITE_DATA_MODE === 'live';
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -63,7 +66,9 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
   };
 
   return (
-    <div style={screen}>
+    // The class tells the white-screen watchdog (DiagOverlay) that this
+    // screen rendered on purpose; without it the overlay pops up over it.
+    <div className={LOGIN_SHELL_CLASS} style={screen}>
       <form onSubmit={submit} style={card} aria-labelledby="ibt-login-title">
         <h1 id="ibt-login-title" style={title}>IB Trader</h1>
         <p style={hint}>Enter the access key (API_SECRET_KEY on the server).</p>

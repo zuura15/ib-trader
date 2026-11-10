@@ -4,6 +4,7 @@ import {
   type DiagEvent,
 } from './diagnostics';
 import { MOBILE_QUERY } from './layoutBreakpoint';
+import { LOGIN_SHELL_CLASS } from './AuthGate';
 
 /**
  * Always-mounted diagnostic surface. Three modes:
@@ -44,7 +45,9 @@ export function DiagOverlay() {
       // the overlay on every mobile page load.
       const desktopLayout = document.querySelector('.flexlayout__layout');
       const mobileLayout = document.querySelector('.mobile-layout-shell');
-      const layout = desktopLayout || mobileLayout;
+      // The access-key login screen (AuthGate) replaces the app on purpose.
+      const loginShell = document.querySelector(`.${LOGIN_SHELL_CLASS}`);
+      const layout = desktopLayout || mobileLayout || loginShell;
       const rootRect = root?.getBoundingClientRect();
       const layoutRect = (layout as HTMLElement | null)?.getBoundingClientRect();
       const rootOk = !!rootRect && rootRect.width > 50 && rootRect.height > 50;
@@ -54,7 +57,7 @@ export function DiagOverlay() {
       recordBoot('watchdog-check', {
         rootRect: rootRect ? `${Math.round(rootRect.width)}x${Math.round(rootRect.height)}` : null,
         layoutRect: layoutRect ? `${Math.round(layoutRect.width)}x${Math.round(layoutRect.height)}` : null,
-        layoutFlavor: desktopLayout ? 'desktop' : mobileLayout ? 'mobile' : 'none',
+        layoutFlavor: desktopLayout ? 'desktop' : mobileLayout ? 'mobile' : loginShell ? 'login' : 'none',
         styleSheets,
       });
 
