@@ -9,7 +9,7 @@ import {
 import { getHistory } from '../../api/client';
 import {
   type SavedRange, type Bar,
-  VISIBLE_MINUTES, PRELOAD_HOURS, SR_LOOKBACK_HOURS, REFRESH_INTERVAL_MS, BAR_SIZE, BAR_SECONDS,
+  VISIBLE_MINUTES, SR_LOOKBACK_HOURS, REFRESH_INTERVAL_MS, TIMEFRAMES, type ChartTimeframe,
   targetKey, loadSavedRange, saveRange,
   toBars, themeColors, localUtcSeconds,
 } from './chartUtils';
@@ -82,6 +82,11 @@ interface Props {
   showRecommendation?: boolean;
   /** Show the RSI sub-pane. Default true. */
   showRsi?: boolean;
+  /** Bar timeframe (issue #105). Default ``'1m'``, which is the
+   *  original chart. Coarser timeframes turn off the S/R, signal and
+   *  recommendation overlays. Read once per mount: remount the chart
+   *  (``key``) to switch. */
+  timeframe?: ChartTimeframe;
   /** Render the placeholder "Click a row…" message when target is null. */
   placeholder?: string | null;
   /** Run S/R detection at all. Set to false on sparkline instances
@@ -243,11 +248,12 @@ function priceScaleMargins(volumeShown: boolean) {
 export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolChart(
   {
     target,
-    visibleMinutes = VISIBLE_MINUTES,
+    visibleMinutes: visibleMinutesProp = VISIBLE_MINUTES,
     showRsi = true,
-    showRecommendation = false,
+    timeframe = '1m',
+    showRecommendation: showRecommendationProp = false,
     placeholder = 'Click a row in Positions or Watchlist to chart it.',
-    enableSr = true,
+    enableSr: enableSrProp = true,
     showBrokenSr = false,
     brokenMinutes = 30,
     showCounterSupport = false,
@@ -258,7 +264,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     activeEntryBarTime = null,
     entrySide = null,
     paneBackground = null,
-    suppressAutoSignals = false,
+    suppressAutoSignals: suppressAutoSignalsProp = false,
     historicalFires,
     executionMarkers,
     onPricePick,
@@ -271,6 +277,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   }: Props,
   ref,
 ) {
+  // Timeframe-derived bar constants. They shadow the 1-min module
+  // defaults so every slot-end / live-tick calculation below follows
+  // the selected bar size.
+  const tf = TIMEFRAMES[timeframe] ?? TIMEFRAMES['1m'];
+  const BAR_SIZE = tf.barSize;
+  const BAR_SECONDS = tf.seconds;
+  const PRELOAD_HOURS = tf.preloadHours;
+  const visibleMinutes = timeframe === '1m'
+    ? visibleMinutesProp : Math.round(tf.visibleBars * tf.seconds / 60);
+  const enableSr = enableSrProp && tf.overlays;
+  const showRecommendation = showRecommendationProp && tf.overlays;
+  const suppressAutoSignals = suppressAutoSignalsProp || !tf.overlays;
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
 
@@ -2532,7 +2550,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         });
         retryDelayMs = 1500;
         if (cancelled) return;
-        const fullBars = toBars(bars);
+        const fullBars = toBars(bars, BAR_SECONDS);
         // ADDITIVE refresh — keep live-tick bars that are AHEAD of the
         // historical endpoint instead of discarding them. WHY: the
         // engine's /engine/history caches completed bars for
@@ -2987,8 +3005,13 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // (e.g. ticks in [15:27, 15:30) plot at x=15:30, matching
           // the bar that WILL close at that mark).
           const nowSec = localUtcSeconds(new Date());
-          const barSec = Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS
-            + BAR_SECONDS;
+          const allBarsNow = barsRef.current;
+          // 1h and coarser: IB aligns those bars to the exchange
+          // session, not to wall-clock multiples, so a tick just moves
+          // the newest bar; the 30 s history refresh adds new ones.
+          const barSec = tf.seconds >= 3600 && allBarsNow.length
+            ? (allBarsNow[allBarsNow.length - 1].time as number)
+            : Math.floor(nowSec / BAR_SECONDS) * BAR_SECONDS + BAR_SECONDS;
           series.update({ time: barSec as UTCTimestamp, value: last });
           onLastPriceRef.current?.(last);
           lastTickBarSecRef.current = barSec;

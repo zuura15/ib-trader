@@ -2,6 +2,8 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/app.css'
 import { App } from './app/App'
+import { EmbedChart } from './app/EmbedChart'
+import { isEmbedChartUrl } from './app/embedParams'
 import { AuthGate } from './app/AuthGate'
 import { ErrorBoundary } from './app/ErrorBoundary'
 import { DiagOverlay } from './app/DiagOverlay'
@@ -15,7 +17,9 @@ recordBoot('script-loaded');
 
 // Apply saved theme before first render to prevent flash. Default to light
 // when nothing is persisted — matches store.ts initial value.
-const savedTheme = localStorage.getItem('ib-theme') || 'light';
+// The chart-only embed (Burrow's native shell) sets its own theme.
+const embedChart = isEmbedChartUrl(window.location.search);
+const savedTheme = embedChart ? 'burrow-dark' : (localStorage.getItem('ib-theme') || 'light');
 document.documentElement.setAttribute('data-theme', savedTheme);
 recordBoot('theme-applied', { theme: savedTheme });
 
@@ -32,7 +36,7 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ErrorBoundary label="root" variant="root">
       <AuthGate>
-        <App />
+        {embedChart ? <EmbedChart /> : <App />}
       </AuthGate>
     </ErrorBoundary>
     {/* DiagOverlay sits outside the ErrorBoundary so it can always render —

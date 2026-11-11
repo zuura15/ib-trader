@@ -907,6 +907,32 @@ _HISTORY_STALE_FALLBACK_SECONDS = 1800.0  # 30 min
 _HISTORY_INFLIGHT: dict[tuple, asyncio.Task] = {}
 
 
+# IB ``barSizeSetting`` strings → bar length in seconds. Used to drop
+# the still-forming bar when ``include_partial`` is False. The chart's
+# timeframe picker (1m / 3m / 1h / 4h / 1D, issue #105) uses these.
+BAR_SECONDS_BY_SIZE: dict[str, int] = {
+    "1 min": 60, "2 mins": 120, "3 mins": 180, "5 mins": 300,
+    "10 mins": 600, "15 mins": 900, "20 mins": 1200, "30 mins": 1800,
+    "1 hour": 3600, "2 hours": 7200, "3 hours": 10800, "4 hours": 14400,
+    "8 hours": 28800, "1 day": 86400,
+}
+
+
+def history_duration_str(hours: int) -> str:
+    """IB ``durationStr`` covering at least ``hours`` of calendar time.
+
+    IB only accepts S/D/W/M/Y units. "S" is capped at 86400 (24h), and
+    "N D" is capped at 365, beyond which the window must be in years.
+    """
+    hours_int = max(1, int(hours))
+    if hours_int <= 24:
+        return f"{hours_int * 3600} S"
+    days = (hours_int + 23) // 24 + 1
+    if days <= 365:
+        return f"{days} D"
+    return f"{-(-hours_int // (24 * 365))} Y"
+
+
 async def _fetch_history_bars(
     contract, con_id: int, hours: int, bar_size: str,
     include_partial: bool, cache_key: tuple,
@@ -933,12 +959,7 @@ async def _fetch_history_bars(
     # buffer so the returned data covers the full requested calendar
     # window. Cheap — backend over-fetches modestly; frontend's
     # setVisibleRange clamps to the actual display window anyway.
-    hours_int = max(1, int(hours))
-    if hours_int <= 24:
-        duration_str = f"{hours_int * 3600} S"
-    else:
-        days = (hours_int + 23) // 24 + 1
-        duration_str = f"{days} D"
+    duration_str = history_duration_str(hours)
     # TRADES is what the bot reasons about and what the operator sees
     # on the chart. The prior BID_ASK feed put bot decisions on
     # avg_ask / mid while the operator's eye reads last-trade prints,
@@ -964,9 +985,7 @@ async def _fetch_history_bars(
     # isn't, because the in-progress close moves above/below it as
     # the tape ticks. Trimming the in-progress bar makes the feed a
     # pure record of *closed* bars.
-    bar_seconds_map = {"1 min": 60, "3 mins": 180, "5 mins": 300,
-                        "15 mins": 900, "30 mins": 1800, "1 hour": 3600}
-    bar_seconds = bar_seconds_map.get(bar_size, 0)
+    bar_seconds = BAR_SECONDS_BY_SIZE.get(bar_size, 0)
     from datetime import datetime as _dt, timezone as _tz
     now_utc = _dt.now(_tz.utc).timestamp()
     out: list[dict] = []

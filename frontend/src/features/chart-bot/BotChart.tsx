@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
-import { VISIBLE_MINUTES } from '../chart/chartUtils';
+import { VISIBLE_MINUTES, type ChartTimeframe } from '../chart/chartUtils';
 import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import { useStore, type ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
@@ -49,6 +49,8 @@ interface Props {
   onPricePick?: (price: number) => void;
   /** Tick size for strip price rounding — forwarded to SymbolChart. */
   pickTickSize?: number;
+  /** Bar timeframe, forwarded to SymbolChart (issue #105). */
+  timeframe?: ChartTimeframe;
 }
 
 /**
@@ -75,7 +77,7 @@ export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
   fullscreenFooter, onFullscreenChange,
-  onPricePick, pickTickSize, headerLeading,
+  onPricePick, pickTickSize, headerLeading, timeframe = '1m',
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -863,8 +865,10 @@ export function BotChart({
     <div className="flex flex-col h-full" style={{ minHeight: 0 }}>
       <div className="flex-1" style={{ minHeight: 0 }}>
         <SymbolChart
+          key={timeframe}
           ref={chartRef}
           target={target}
+          timeframe={timeframe}
           enableSr
           showRecommendation
           showBrokenSr={showBrokenSr}

@@ -47,7 +47,9 @@ export function DiagOverlay() {
       const mobileLayout = document.querySelector('.mobile-layout-shell');
       // The access-key login screen (AuthGate) replaces the app on purpose.
       const loginShell = document.querySelector(`.${LOGIN_SHELL_CLASS}`);
-      const layout = desktopLayout || mobileLayout || loginShell;
+      // Burrow's chart-only embed (?embed=chart) has no app shell at all.
+      const embedShell = document.querySelector('.embed-chart-shell');
+      const layout = desktopLayout || mobileLayout || loginShell || embedShell;
       const rootRect = root?.getBoundingClientRect();
       const layoutRect = (layout as HTMLElement | null)?.getBoundingClientRect();
       const rootOk = !!rootRect && rootRect.width > 50 && rootRect.height > 50;
@@ -57,7 +59,8 @@ export function DiagOverlay() {
       recordBoot('watchdog-check', {
         rootRect: rootRect ? `${Math.round(rootRect.width)}x${Math.round(rootRect.height)}` : null,
         layoutRect: layoutRect ? `${Math.round(layoutRect.width)}x${Math.round(layoutRect.height)}` : null,
-        layoutFlavor: desktopLayout ? 'desktop' : mobileLayout ? 'mobile' : loginShell ? 'login' : 'none',
+        layoutFlavor: desktopLayout ? 'desktop' : mobileLayout ? 'mobile' : loginShell ? 'login'
+          : embedShell ? 'embed' : 'none',
         styleSheets,
       });
 

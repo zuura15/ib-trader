@@ -568,3 +568,41 @@ html, body, #root {
   }
 
 }
+
+/* ================= BURROW NATIVE SHELL (issue #105) =================
+   Used only by the chart-only embed (?embed=chart) that the Burrow
+   Android app hosts under its native screens. Pure black / pure white
+   grounds match the native Compose palette, IBKR-Mobile style. */
+html[data-theme="burrow-dark"] {
+  color-scheme: dark;
+  --bg-root: #000000; --bg-primary: #000000; --bg-secondary: #121212;
+  --bg-tertiary: #1e1e1e; --bg-hover: #262626; --header-bg: #000000;
+  --panel-bg: #000000;
+  --border-default: #161616; --border-muted: #101010;
+  --text-primary: #ffffff; --text-secondary: #9a9a9a; --text-muted: #8a8a8a;
+  --text-heading: #ffffff;
+  --accent-green: #2ebd6b; --accent-red: #f0484a; --accent-yellow: #f5b83d;
+  --accent-blue: #5b9bff; --accent-purple: #b9a8ff; --accent-orange: #ff9f0a;
+  --badge-green-bg: rgba(46, 189, 107, 0.15); --badge-red-bg: rgba(240, 72, 74, 0.15);
+  --badge-yellow-bg: rgba(245, 184, 61, 0.12); --badge-blue-bg: rgba(91, 155, 255, 0.12);
+  --badge-purple-bg: rgba(185, 168, 255, 0.12); --badge-orange-bg: rgba(255, 159, 10, 0.12);
+  --badge-gray-bg: rgba(142, 142, 147, 0.12);
+  --row-hover: rgba(255, 255, 255, 0.03);
+}
+html[data-theme="burrow-light"] {
+  color-scheme: light;
+  --bg-root: #ffffff; --bg-primary: #ffffff; --bg-secondary: #f5f5f5;
+  --bg-tertiary: #eaeaea; --bg-hover: #e6e6e6; --header-bg: #ffffff;
+  --panel-bg: #ffffff;
+  --border-default: #eeeeee; --border-muted: #f3f3f3;
+  --text-primary: #111111; --text-secondary: #5f5f5f; --text-muted: #6b6b6b;
+  --text-heading: #111111;
+  --accent-green: #0e8a4a; --accent-red: #c62828; --accent-yellow: #8a5a00;
+  --accent-blue: #1f6fe0; --accent-purple: #5b3fd6; --accent-orange: #b35c00;
+  --badge-green-bg: rgba(14, 138, 74, 0.12); --badge-red-bg: rgba(198, 40, 40, 0.12);
+  --badge-yellow-bg: rgba(138, 90, 0, 0.12); --badge-blue-bg: rgba(31, 111, 224, 0.12);
+  --badge-purple-bg: rgba(91, 63, 214, 0.12); --badge-orange-bg: rgba(179, 92, 0, 0.12);
+  --badge-gray-bg: rgba(0, 0, 0, 0.06);
+  --row-hover: rgba(0, 0, 0, 0.03);
+}
+.embed-chart-shell { position: fixed; inset: 0; background: var(--panel-bg); }

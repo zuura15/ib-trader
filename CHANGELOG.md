@@ -3,6 +3,21 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-11
+
+### Added
+- **Chart timeframes (#105, ADR-020).** `SymbolChart`/`BotChart` take a
+  `timeframe` of 1m (default, unchanged), 3m, 1h, 4h or 1D, with IB doing
+  the bar aggregation. The history window grows with the timeframe
+  (3 days for 3m up to a year for 1D). S/R, auto-signals and the
+  recommendation gauge stay 1m-only. Daily bars are labelled by trading date.
+- **Chart-only embed page:** `/?embed=chart&symbol=…&secType=…&slot=…&tf=…&theme=dark|light`
+  renders one chart with no app shell, for Burrow's native screens.
+  Symbol, timeframe and theme switch in place through `window.burrowChart.set()`.
+  Adds the `burrow-dark` / `burrow-light` themes; neither is persisted.
+- Engine: `BAR_SECONDS_BY_SIZE` now covers every IB bar size up to 1 day,
+  and `history_duration_str` asks for years past 365 days, which IB requires.
+
 ## 2026-11-10
 
 ### Added

@@ -28,6 +28,30 @@ export const BAR_SIZE = '1 min';
 // time so sub-bar updates land on the same bar (no per-tick shift).
 export const BAR_SECONDS = 60;
 
+/** Chart timeframes offered by the native mobile shell (issue #105).
+ *  ``barSize`` is IB's ``barSizeSetting``; IB aggregates the bars, we
+ *  never resample. ``overlays`` gates the S/R, signal and
+ *  recommendation layers, whose look-backs are tuned for 1-min bars. */
+export type ChartTimeframe = '1m' | '3m' | '1h' | '4h' | '1D';
+export interface TimeframeSpec {
+  barSize: string;
+  seconds: number;
+  preloadHours: number;
+  visibleBars: number;
+  overlays: boolean;
+}
+export const TIMEFRAMES: Record<ChartTimeframe, TimeframeSpec> = {
+  '1m': { barSize: BAR_SIZE, seconds: BAR_SECONDS, preloadHours: PRELOAD_HOURS, visibleBars: VISIBLE_MINUTES, overlays: true },
+  '3m': { barSize: '3 mins', seconds: 180, preloadHours: 72, visibleBars: 120, overlays: false },
+  '1h': { barSize: '1 hour', seconds: 3600, preloadHours: 24 * 14, visibleBars: 120, overlays: false },
+  '4h': { barSize: '4 hours', seconds: 14_400, preloadHours: 24 * 60, visibleBars: 120, overlays: false },
+  '1D': { barSize: '1 day', seconds: 86_400, preloadHours: 24 * 365, visibleBars: 120, overlays: false },
+};
+
+export function isChartTimeframe(v: unknown): v is ChartTimeframe {
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(TIMEFRAMES, v);
+}
+
 // v2: bumped to discard ranges saved by an earlier build where transient
 // auto-fit states could persist as ~2-min "zooms". Old `v1` entries are
 // orphaned (small handful of bytes per target — left for the browser to
@@ -109,9 +133,22 @@ export function saveRange(key: string, range: SavedRange | null): void {
   } catch { /* quota — ignore */ }
 }
 
-export function toBars(bars: HistoryBar[]): Bar[] {
+export function toBars(bars: HistoryBar[], barSeconds: number = BAR_SECONDS): Bar[] {
   const out: Bar[] = [];
   for (const b of bars) {
+    // Daily bars arrive as a bare trading date ("2026-11-10"). Label
+    // them on that calendar day directly — a timezone shift would move
+    // them onto the previous day.
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(b.ts);
+    if (dateOnly) {
+      const [y, m, d] = b.ts.split('-').map(Number);
+      out.push({
+        time: (Date.UTC(y, m - 1, d) / 1000) as UTCTimestamp,
+        open: b.open, high: b.high, low: b.low, close: b.close,
+        volume: typeof b.volume === 'number' ? b.volume : 0,
+      });
+      continue;
+    }
     const date = new Date(b.ts);
     const ms = date.getTime();
     if (!Number.isFinite(ms)) continue;
@@ -125,7 +162,7 @@ export function toBars(bars: HistoryBar[]): Bar[] {
     // that started at 15:27. Pair with the same shift on badges and
     // entry-line anchor times below so they stay co-located.
     const tzOffsetMs = date.getTimezoneOffset() * 60_000;
-    const t = Math.floor((ms - tzOffsetMs) / 1000) + BAR_SECONDS;
+    const t = Math.floor((ms - tzOffsetMs) / 1000) + barSeconds;
     out.push({
       time: t as UTCTimestamp,
       open: b.open, high: b.high, low: b.low, close: b.close,
