@@ -6,6 +6,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-11
 
 ### Fixed
+- **`GET /api/trades` slow enough to time out.** Serializing the whole
+  trade history took ~50 s (3 MB, a few queries per trade), so Burrow's
+  Trades poll hit its 30 s timeout. New `limit` (1–500) with
+  `status=closed` returns only the most recently closed trades; Burrow
+  asks for 50. Without `limit` the endpoint is unchanged.
 - **Diagnostics overlay over Burrow's chart.** The white-screen watchdog
   treated the chart embed (`?embed=chart`) as blank on WebViews where
   `#root` collapses under the embed's `position: fixed` shell, and opened

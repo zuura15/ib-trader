@@ -88,6 +88,27 @@ class TestTradeRoutes:
         assert data[0]["symbol"] == "AAPL"
         assert data[0]["status"] == "OPEN"
 
+    def test_closed_with_limit_returns_newest_closed_only(self, client, api_session_factory):
+        from datetime import timedelta
+        s = api_session_factory()
+        base = _now()
+        for i in range(5):
+            s.add(TradeGroup(
+                serial_number=100 + i, symbol="GC", direction="LONG",
+                status=TradeStatus.CLOSED, opened_at=base,
+                closed_at=base + timedelta(minutes=i),
+            ))
+        s.add(TradeGroup(
+            serial_number=200, symbol="NQ", direction="SHORT",
+            status=TradeStatus.OPEN, opened_at=base,
+        ))
+        s.commit()
+
+        resp = client.get("/api/trades?status=closed&limit=2")
+        assert resp.status_code == 200
+        assert [t["serial_number"] for t in resp.json()] == [104, 103]
+        assert client.get("/api/trades?status=closed&limit=0").status_code == 422
+
     def test_get_trade_by_serial(self, client, api_session_factory):
         s = api_session_factory()
         s.add(TradeGroup(

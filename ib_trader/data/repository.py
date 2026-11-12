@@ -268,6 +268,17 @@ class TradeRepository(TradeRepositoryBase):
             .all()
         )
 
+    def get_recent_closed(self, limit: int) -> list[TradeGroup]:
+        """Return the ``limit`` most recently closed trade groups, newest first."""
+        return (
+            self._session()
+            .query(TradeGroup)
+            .filter(TradeGroup.status == TradeStatus.CLOSED)
+            .order_by(TradeGroup.closed_at.desc(), TradeGroup.serial_number.desc())
+            .limit(limit)
+            .all()
+        )
+
     def aggregate_by_source(self, source_prefix: str) -> dict[str, dict]:
         """Return ``{source: {total, today, pnl_today}}`` per source.
 

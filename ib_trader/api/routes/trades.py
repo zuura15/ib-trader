@@ -105,11 +105,22 @@ def _serialize_trade(t, transactions: TransactionRepository) -> TradeResponse:
 @router.get("", response_model=list[TradeResponse])
 def list_trades(
     status: str | None = Query(None, description="Filter by status: open, closed, all"),
+    limit: int | None = Query(
+        None, ge=1, le=500,
+        description="With status=closed: only the N most recently closed trades",
+    ),
     trades: TradeRepository = Depends(get_trades),
     transactions: TransactionRepository = Depends(get_transactions),
 ):
-    """List trade groups, optionally filtered by status."""
-    if status == "open":
+    """List trade groups, optionally filtered by status.
+
+    Serializing every trade costs a few queries each, so the full history
+    gets slow as it grows; callers that only show recent trades (Burrow)
+    pass ``status=closed&limit=N``.
+    """
+    if status == "closed" and limit is not None:
+        rows = trades.get_recent_closed(limit)
+    elif status == "open":
         rows = trades.get_open()
     elif status == "closed" or status is None:
         rows = trades.get_all()
