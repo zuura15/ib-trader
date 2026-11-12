@@ -5,6 +5,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-11
 
+### Changed
+- **Burrow chart embed uses a navy dark theme.** `burrow-dark` moves from
+  pure black to the navy palette Burrow 0.6.0's native screens use, so
+  the chart blends into the app.
+
 ### Fixed
 - **`GET /api/trades` slow enough to time out.** Serializing the whole
   trade history took ~50 s (3 MB, a few queries per trade), so Burrow's

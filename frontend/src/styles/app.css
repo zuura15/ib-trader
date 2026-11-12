@@ -575,13 +575,13 @@ html, body, #root {
    grounds match the native Compose palette, IBKR-Mobile style. */
 html[data-theme="burrow-dark"] {
   color-scheme: dark;
-  --bg-root: #000000; --bg-primary: #000000; --bg-secondary: #121212;
-  --bg-tertiary: #1e1e1e; --bg-hover: #262626; --header-bg: #000000;
-  --panel-bg: #000000;
-  --border-default: #161616; --border-muted: #101010;
-  --text-primary: #ffffff; --text-secondary: #9a9a9a; --text-muted: #8a8a8a;
+  --bg-root: #151a24; --bg-primary: #151a24; --bg-secondary: #1a202c;
+  --bg-tertiary: #232b3a; --bg-hover: #2a3241; --header-bg: #151a24;
+  --panel-bg: #151a24;
+  --border-default: #222a38; --border-muted: #1c2330;
+  --text-primary: #ffffff; --text-secondary: #a3abba; --text-muted: #8c95a6;
   --text-heading: #ffffff;
-  --accent-green: #2ebd6b; --accent-red: #f0484a; --accent-yellow: #f5b83d;
+  --accent-green: #2ebd6b; --accent-red: #ff5c6c; --accent-yellow: #f5b83d;
   --accent-blue: #5b9bff; --accent-purple: #b9a8ff; --accent-orange: #ff9f0a;
   --badge-green-bg: rgba(46, 189, 107, 0.15); --badge-red-bg: rgba(240, 72, 74, 0.15);
   --badge-yellow-bg: rgba(245, 184, 61, 0.12); --badge-blue-bg: rgba(91, 155, 255, 0.12);
