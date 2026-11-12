@@ -71,7 +71,10 @@ export function DiagOverlay() {
       // no in-flow content and collapses to 0 height on some WebViews
       // (seen as rootRect 296x0 on a Galaxy Fold cover screen). For that
       // shell, its own size is the signal; #root's is meaningless.
-      const suspicious = !root || !layoutOk || (!rootOk && !loginShell);
+      // Burrow's chart embed shell is position:fixed too, so the same holds:
+      // a collapsed #root under it is normal, not a white screen.
+      const fixedShell = loginShell || embedShell;
+      const suspicious = !root || !layoutOk || (!rootOk && !fixedShell);
       if (suspicious) {
         recordDiag({
           kind: 'watchdog',

@@ -5,6 +5,13 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-11
 
+### Fixed
+- **Diagnostics overlay over Burrow's chart.** The white-screen watchdog
+  treated the chart embed (`?embed=chart`) as blank on WebViews where
+  `#root` collapses under the embed's `position: fixed` shell, and opened
+  the full-screen Diagnostics list in place of the chart. The embed shell
+  is now exempt the same way the login shell already was.
+
 ### Added
 - **Chart timeframes (#105, ADR-020).** `SymbolChart`/`BotChart` take a
   `timeframe` of 1m (default, unchanged), 3m, 1h, 4h or 1D, with IB doing
