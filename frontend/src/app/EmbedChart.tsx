@@ -73,6 +73,7 @@ export function EmbedChart() {
           renderHeader={() => null}
           timeframe={params.timeframe}
           pickTickSize={tickSizeFor(params.symbol)}
+          compactAxis
           onPricePick={window.BurrowNative
             ? (price) => window.BurrowNative?.limitPick(String(price))
             : undefined}

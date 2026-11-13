@@ -88,6 +88,10 @@ interface Props {
    *  recommendation overlays. Read once per mount: remount the chart
    *  (``key``) to switch. */
   timeframe?: ChartTimeframe;
+  /** Phone embed (Burrow): whole-number price labels so the axis is as
+   *  narrow as it gets, a one-bar right gap, and an invisible pick strip,
+   *  giving the width back to the plot. Read once per mount. */
+  compactAxis?: boolean;
   /** Render the placeholder "Click a row…" message when target is null. */
   placeholder?: string | null;
   /** Run S/R detection at all. Set to false on sparkline instances
@@ -226,6 +230,11 @@ interface Props {
   onOrderCancel?: (id: string) => Promise<string | null>;
 }
 
+/** Whole-number price label for the compact (phone) axis. */
+function wholePrice(p: number): string {
+  return String(Math.round(p));
+}
+
 function trimPrice(p: number): string {
   return p.toFixed(2).replace(/\.?0+$/, '');
 }
@@ -270,6 +279,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     executionMarkers,
     onPricePick,
     pickTickSize = 0.01,
+    compactAxis = false,
     onLastPrice,
     onRecommendation,
     orderLines,
@@ -882,6 +892,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const hasOrderHandles = (orderLines ?? []).some(lineHasHandle);
   // Touch screens (Burrow's chart embed) get finger-sized targets: a
   // wider pick strip and bigger order handles.
+  // Creation-time option; the chart is built once per mount.
+  const compactAxisRef = useRef(compactAxis);
   const [coarsePointer] = useState(
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
   );
@@ -1282,7 +1294,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // and "now" is invisible — the user sees the chart "stop" 2-3
         // min before clock. 4 bars × 3 min = 12 min of headroom keeps
         // the live mark + horizontal price line clearly in view.
-        rightOffset: 4,
+        rightOffset: compactAxisRef.current ? 1 : 4,
       },
       // ``scaleMargins`` reserves the top and bottom thirds of the
       // chart as empty space, so the auto-fitted price polyline fills
@@ -1304,7 +1316,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Axis / last-price / crosshair labels without trailing zeros
       // ("4135.00" → "4135", "4132.50" → "4132.5") — saves axis width,
       // most noticeably on phones.
-      localization: { priceFormatter: trimPrice },
+      localization: { priceFormatter: compactAxisRef.current ? wholePrice : trimPrice },
     });
     const series = chart.addSeries(LineSeries, {
       color: colors.line,
@@ -3426,9 +3438,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             zIndex: 20,
             cursor: 'crosshair',
             touchAction: 'none',
+            // Compact (phone) axis: an invisible hit area over the plot's
+            // right edge, shown only while held.
             background: stripHover
-              ? 'rgba(59,130,246,0.16)' : 'rgba(59,130,246,0.05)',
-            borderLeft: '1px dashed rgba(59,130,246,0.35)',
+              ? 'rgba(59,130,246,0.16)'
+              : compactAxis ? 'transparent' : 'rgba(59,130,246,0.05)',
+            borderLeft: compactAxis && !stripHover ? 'none' : '1px dashed rgba(59,130,246,0.35)',
           }}
         >
           {stripHover && (

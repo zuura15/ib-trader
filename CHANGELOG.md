@@ -6,6 +6,10 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-12
 
 ### Added
+- **Wider plot in Burrow's chart.** The embed's price axis shows whole
+  numbers (narrowest labels), keeps a one-bar right gap instead of four,
+  and its pick strip is invisible until held, so the line runs to the
+  axis. Desktop charts are unchanged.
 - **Limit orders from the chart in Burrow.** In the chart embed a tap on
   the price strip beside the axis — press and hold for 1 s on touch (slide
   to adjust; a tap or shorter hold does nothing) — hands the tick-rounded price to

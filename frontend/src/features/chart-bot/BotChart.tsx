@@ -51,6 +51,8 @@ interface Props {
   pickTickSize?: number;
   /** Bar timeframe, forwarded to SymbolChart (issue #105). */
   timeframe?: ChartTimeframe;
+  /** Phone embed: compact price axis, forwarded to SymbolChart. */
+  compactAxis?: boolean;
 }
 
 /**
@@ -77,7 +79,7 @@ export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
   fullscreenFooter, onFullscreenChange,
-  onPricePick, pickTickSize, headerLeading, timeframe = '1m',
+  onPricePick, pickTickSize, headerLeading, timeframe = '1m', compactAxis = false,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -869,6 +871,7 @@ export function BotChart({
           ref={chartRef}
           target={target}
           timeframe={timeframe}
+          compactAxis={compactAxis}
           enableSr
           showRecommendation
           showBrokenSr={showBrokenSr}
