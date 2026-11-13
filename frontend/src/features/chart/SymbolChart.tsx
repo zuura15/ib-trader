@@ -886,6 +886,12 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
   );
   const STRIP_W = coarsePointer ? 30 : 16;
+  // Touch: press and hold the strip (sliding adjusts the price) to pick;
+  // a tap does nothing, so a stray touch can't open an order sheet.
+  const LONG_PRESS_MS = 1000;
+  const pressRef = useRef<{ timer: number; price: number | null } | null>(null);
+  const lastPointerTypeRef = useRef<string>('mouse');
+  const [pressing, setPressing] = useState(false);
   const HANDLE_W = coarsePointer ? 34 : 22;
   const HANDLE_H = coarsePointer ? 22 : 11;
   const [stripGeom, setStripGeom] = useState<
@@ -3349,7 +3355,55 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       {hasPricePick && target && stripGeom && (
         <div
           data-testid="price-pick-strip"
-          title="Click to draft a closing limit order at this price"
+          title={coarsePointer
+            ? 'Press and hold to place a limit order at this price'
+            : 'Click to draft a closing limit order at this price'}
+          onPointerDown={(e) => {
+            lastPointerTypeRef.current = e.pointerType;
+            if (e.pointerType === 'mouse') return;
+            e.preventDefault();
+            try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+            const top = e.currentTarget.getBoundingClientRect().top;
+            const price = stripPriceAt(e.clientY);
+            if (pressRef.current) window.clearTimeout(pressRef.current.timer);
+            const press = {
+              price,
+              timer: window.setTimeout(() => {
+                const picked = pressRef.current?.price ?? null;
+                pressRef.current = null;
+                setPressing(false);
+                setStripHover(null);
+                if (picked != null) {
+                  try { navigator.vibrate?.(25); } catch { /* unsupported */ }
+                  onPricePick?.(picked);
+                }
+              }, LONG_PRESS_MS),
+            };
+            pressRef.current = press;
+            setPressing(true);
+            setStripHover(price == null ? null : { y: e.clientY - top, price });
+          }}
+          onPointerMove={(e) => {
+            if (e.pointerType === 'mouse' || !pressRef.current) return;
+            const price = stripPriceAt(e.clientY);
+            if (price == null) return;
+            pressRef.current.price = price;
+            const top = e.currentTarget.getBoundingClientRect().top;
+            setStripHover({ y: e.clientY - top, price });
+          }}
+          onPointerUp={(e) => {
+            if (e.pointerType === 'mouse' || !pressRef.current) return;
+            window.clearTimeout(pressRef.current.timer);   // let go early: no pick
+            pressRef.current = null;
+            setPressing(false);
+            setStripHover(null);
+          }}
+          onPointerCancel={() => {
+            if (pressRef.current) window.clearTimeout(pressRef.current.timer);
+            pressRef.current = null;
+            setPressing(false);
+            setStripHover(null);
+          }}
           onMouseMove={(e) => {
             const p = stripPriceAt(e.clientY);
             if (p == null) { setStripHover(null); return; }
@@ -3358,6 +3412,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           }}
           onMouseLeave={() => setStripHover(null)}
           onClick={(e) => {
+            // Touch taps also synthesize a click; only a mouse click picks.
+            if (lastPointerTypeRef.current !== 'mouse') return;
             const p = stripPriceAt(e.clientY);
             if (p != null) onPricePick?.(p);
           }}
@@ -3369,6 +3425,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             height: stripGeom.height,
             zIndex: 20,
             cursor: 'crosshair',
+            touchAction: 'none',
             background: stripHover
               ? 'rgba(59,130,246,0.16)' : 'rgba(59,130,246,0.05)',
             borderLeft: '1px dashed rgba(59,130,246,0.35)',
@@ -3403,7 +3460,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                 }}
               >
                 {stripHover.price.toFixed(pickDecimals)}
+                {pressing && (
+                  // Hold progress: fills over LONG_PRESS_MS, then the pick fires.
+                  <div style={{
+                    position: 'absolute', left: 0, bottom: -3, height: 2,
+                    background: '#fff', borderRadius: 1,
+                    animation: `price-pick-hold ${LONG_PRESS_MS}ms linear forwards`,
+                  }} />
+                )}
               </div>
+              {pressing && (
+                <style>{'@keyframes price-pick-hold { from { width: 0 } to { width: 100% } }'}</style>
+              )}
             </>
           )}
         </div>

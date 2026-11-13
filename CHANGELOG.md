@@ -7,7 +7,8 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ### Added
 - **Limit orders from the chart in Burrow.** In the chart embed a tap on
-  the price strip beside the axis hands the tick-rounded price to
+  the price strip beside the axis — press and hold for 1 s on touch (slide
+  to adjust; a tap or shorter hold does nothing) — hands the tick-rounded price to
   Burrow's native bridge (`window.BurrowNative.limitPick`), which opens a
   confirm sheet; nothing is sent from the page. Order handles and the
   pick strip are finger-sized on touch screens, and drag-to-amend uses
