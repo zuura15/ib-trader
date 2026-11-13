@@ -164,6 +164,7 @@ def main(db: str, env: str, settings_path: str, symbols_path: str,
         min_call_interval_ms=settings["ib_min_call_interval_ms"],
         market_data_type=settings["ib_market_data_type"],
         order_snapshot_timeout=settings.get("ib_order_snapshot_timeout", 15),
+        completed_orders_cooldown=settings.get("ib_completed_orders_cooldown", 300),
     )
 
     # Assemble AppContext

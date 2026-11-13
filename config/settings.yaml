@@ -127,6 +127,10 @@ reconciler_snapshot_timeout: 30
 # without a bound the snapshot lock stayed held and every later order
 # listing and `close SYMBOL` hung (2026-11-13).
 ib_order_snapshot_timeout: 15
+# After the (best-effort) completed-orders request times out, skip it for
+# this many seconds so snapshots — and `close SYMBOL` — don't wait out the
+# timeout every time while the Gateway isn't answering it.
+ib_completed_orders_cooldown: 300
 
 # Chart-pane realized-P&L rollup (per-contract 24h + today figures, swept
 # from IB executions so manual TWS trades are included).

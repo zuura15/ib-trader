@@ -128,3 +128,33 @@ async def test_unanswered_bind_or_completed_request_still_returns_a_snapshot():
     either degrades to the plain open-orders snapshot."""
     client = _client_with(_FakeIB(hang_bind=True, hang_completed=True))
     assert await asyncio.wait_for(client.get_open_orders(), timeout=2) == []
+
+
+async def test_completed_orders_timeout_is_skipped_during_cooldown():
+    """Once completed-orders times out, later snapshots skip it rather than
+    waiting the timeout out again (it was adding 15 s to every close)."""
+    import time as _time
+
+    fake = _FakeIB(hang_completed=True)
+    calls = 0
+    real = fake.reqCompletedOrdersAsync
+
+    def counting(apiOnly: bool):
+        nonlocal calls
+        calls += 1
+        return real(apiOnly)
+
+    fake.reqCompletedOrdersAsync = counting
+    client = _client_with(fake)
+    client._completed_orders_cooldown = 60
+
+    await asyncio.wait_for(client.get_open_orders(), timeout=2)
+    started = _time.monotonic()
+    await asyncio.wait_for(client.get_open_orders(), timeout=2)
+    assert calls == 1
+    assert _time.monotonic() - started < 0.05
+
+    client._completed_orders_retry_at = 0.0
+    fake.hang_completed = False
+    await asyncio.wait_for(client.get_open_orders(), timeout=2)
+    assert calls == 2

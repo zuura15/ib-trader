@@ -202,6 +202,7 @@ class InsyncClient(IBClientBase):
         connect_timeout: int = 10,
         market_data_type: int = 3,
         order_snapshot_timeout: float = 15.0,
+        completed_orders_cooldown: float = 300.0,
     ) -> None:
         """Initialize with connection parameters.
 
@@ -221,9 +222,13 @@ class InsyncClient(IBClientBase):
             order_snapshot_timeout: Seconds to wait for each order-snapshot
                 request's end marker (reqOpenOrders / reqAllOpenOrders /
                 reqCompletedOrders) before giving up.
+            completed_orders_cooldown: Seconds to skip the (best-effort)
+                completed-orders request after it times out.
         """
         super().__init__(min_call_interval_ms=min_call_interval_ms)
         self._order_snapshot_timeout = order_snapshot_timeout
+        self._completed_orders_cooldown = completed_orders_cooldown
+        self._completed_orders_retry_at = 0.0
         self._host = host
         self._port = port
         self._client_id = client_id
@@ -1772,20 +1777,33 @@ class InsyncClient(IBClientBase):
         # authoritative — any permId that shows up there is done,
         # whatever the open-orders snapshot claims.
         completed_perms: set[int] = set()
-        await self._throttle()
-        try:
-            completed = await asyncio.wait_for(
-                self.__ib.reqCompletedOrdersAsync(apiOnly=False), timeout,
-            )
-            for t in completed:
-                pid = int(getattr(t.order, "permId", 0) or 0)
-                if pid:
-                    completed_perms.add(pid)
-        except Exception as e:
-            logger.warning(
-                '{"event": "REQ_COMPLETED_ORDERS_FAILED", "error": "%s"}',
-                str(e) or type(e).__name__,
-            )
+        # Best-effort. After an IB connection blip the Gateway can stop
+        # answering this request entirely (live 2026-11-13); paying the
+        # full timeout on every snapshot would add it to every
+        # ``close SYMBOL``. After a timeout, skip it for a cooldown.
+        if time.monotonic() >= self._completed_orders_retry_at:
+            await self._throttle()
+            try:
+                completed = await asyncio.wait_for(
+                    self.__ib.reqCompletedOrdersAsync(apiOnly=False), timeout,
+                )
+                for t in completed:
+                    pid = int(getattr(t.order, "permId", 0) or 0)
+                    if pid:
+                        completed_perms.add(pid)
+            except asyncio.TimeoutError:
+                self._completed_orders_retry_at = (
+                    time.monotonic() + self._completed_orders_cooldown
+                )
+                logger.warning(
+                    '{"event": "REQ_COMPLETED_ORDERS_TIMEOUT", "timeout_s": %s, '
+                    '"skip_for_s": %s}', timeout, self._completed_orders_cooldown,
+                )
+            except Exception as e:
+                logger.warning(
+                    '{"event": "REQ_COMPLETED_ORDERS_FAILED", "error": "%s"}',
+                    str(e) or type(e).__name__,
+                )
         logger.debug(
             '{"event": "OPEN_ORDERS_RAW", "count": %d, "orders": [%s]}',
             len(open_trades),

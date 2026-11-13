@@ -13,6 +13,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   held the snapshot lock, so every later order listing and `close SYMBOL`
   hung — a 10:22 `close MGCZ6` never ran. A timed-out snapshot now fails
   that one call (`REQ_ALL_OPEN_ORDERS_TIMEOUT`) and frees the lock.
+- **`close SYMBOL` no longer waits out a dead completed-orders request.**
+  After that blip the Gateway stopped answering completed-orders, so each
+  snapshot (and each close) paid the 15 s timeout. After one timeout the
+  request is now skipped for `ib_completed_orders_cooldown` (300 s), then
+  retried.
 
 ## 2026-11-12
 
