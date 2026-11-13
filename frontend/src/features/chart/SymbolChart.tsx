@@ -880,6 +880,14 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const lineHasHandle = (l: { id?: string; draggable?: boolean }) =>
     !!l.id && ((!!onOrderAmend && !!l.draggable) || !!onOrderCancel);
   const hasOrderHandles = (orderLines ?? []).some(lineHasHandle);
+  // Touch screens (Burrow's chart embed) get finger-sized targets: a
+  // wider pick strip and bigger order handles.
+  const [coarsePointer] = useState(
+    () => typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches,
+  );
+  const STRIP_W = coarsePointer ? 30 : 16;
+  const HANDLE_W = coarsePointer ? 34 : 22;
+  const HANDLE_H = coarsePointer ? 22 : 11;
   const [stripGeom, setStripGeom] = useState<
     { right: number; height: number } | null
   >(null);
@@ -1017,8 +1025,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amendFlow?.stage, amendFlow?.id, amendFlow?.price]);
 
+  // Pointer events, not mouse events: Android WebView only synthesizes
+  // mouse events for taps, so a touch drag never reached the old
+  // mousemove path.
   const startOrderDrag = (
-    h: { id: string; y: number; price: number }, e: React.MouseEvent,
+    h: { id: string; y: number; price: number }, e: React.PointerEvent,
   ) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1026,7 +1037,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!el || amendFlowRef.current) return;   // one gesture at a time
     setAmendFlow({ id: h.id, origPrice: h.price, price: h.price,
                    y: h.y, stage: 'drag' });
-    const move = (ev: MouseEvent) => {
+    const move = (ev: PointerEvent) => {
       const p = stripPriceAt(ev.clientY);
       if (p == null) return;
       const y = ev.clientY - el.getBoundingClientRect().top;
@@ -1036,22 +1047,28 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       setAmendFlow((f) => (f && f.id === h.id ? { ...f, price: p, y } : f));
     };
     const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup', up);
-      setAmendFlow((f) => {
-        if (!f || f.id !== h.id) return f;
-        if (Math.abs(f.price - f.origPrice) < pickTickSize / 2) {
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      document.removeEventListener('pointercancel', up);
+      const f = amendFlowRef.current;
+      const slip = !f || f.id !== h.id || Math.abs(f.price - f.origPrice) < pickTickSize / 2;
+      // A tap (no real move) reveals the cancel ✕ — touch has no hover.
+      if (slip) setHoverHandleId(h.id);
+      setAmendFlow((cur) => {
+        if (!cur || cur.id !== h.id) return cur;
+        if (Math.abs(cur.price - cur.origPrice) < pickTickSize / 2) {
           try {
             orderLinesApiRef.current.get(h.id)
-              ?.applyOptions({ price: f.origPrice });
+              ?.applyOptions({ price: cur.origPrice });
           } catch { /* torn down */ }
           return null;               // no real move — treat as a slip
         }
-        return { ...f, stage: 'confirm' };
+        return { ...cur, stage: 'confirm' };
       });
     };
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup', up);
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+    document.addEventListener('pointercancel', up);
   };
 
 
@@ -3348,7 +3365,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             position: 'absolute',
             top: 0,
             right: stripGeom.right,
-            width: 16,
+            width: STRIP_W,
             height: stripGeom.height,
             zIndex: 20,
             cursor: 'crosshair',
@@ -3363,7 +3380,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                   price tag up with the polyline. */}
               <div
                 style={{
-                  position: 'absolute', right: 0, width: 16, height: 0,
+                  position: 'absolute', right: 0, width: STRIP_W, height: 0,
                   top: stripHover.y,
                   borderTop: '1px solid var(--accent-blue, #3b82f6)',
                   pointerEvents: 'none',
@@ -3372,7 +3389,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
               <div
                 style={{
                   position: 'absolute',
-                  right: 18,
+                  right: STRIP_W + 2,
                   top: stripHover.y - 10,
                   padding: '1px 5px',
                   fontSize: 11,
@@ -3401,8 +3418,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           style={{
             position: 'absolute',
             right: stripGeom.right + 1,
-            top: h.y - 10,
-            height: 21,
+            top: h.y - Math.round(HANDLE_H / 2) - 5,
+            height: HANDLE_H + 10,
             zIndex: 22,
             display: 'flex', flexDirection: 'row-reverse', alignItems: 'center', gap: 3,
           }}
@@ -3412,10 +3429,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             title={h.draggable
               ? `drag to move ${h.label} @ ${h.price.toFixed(pickDecimals)}`
               : `${h.label} @ ${h.price.toFixed(pickDecimals)}`}
-            onMouseDown={h.draggable ? (e) => startOrderDrag(h, e) : undefined}
+            onPointerDown={h.draggable ? (e) => startOrderDrag(h, e) : () => setHoverHandleId(h.id)}
             style={{
-              width: 22,
-              height: 11,
+              width: HANDLE_W,
+              height: HANDLE_H,
+              touchAction: 'none',
               cursor: h.draggable ? 'ns-resize' : 'default',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               background: h.side === 'BUY'
@@ -3428,7 +3446,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           </div>
           {onOrderCancel && hoverHandleId === h.id && !amendFlow && (
             <CancelOrderButton
-              size="xs"
+              size={coarsePointer ? 'sm' : 'xs'}
               testId={`order-cancel-${h.id}`}
               onCancel={() => onOrderCancel(h.id)}
               disabledReason={h.cancellable ? undefined
@@ -3442,7 +3460,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           data-testid="order-amend-chip"
           style={{
             position: 'absolute',
-            right: stripGeom.right + 26,
+            right: stripGeom.right + HANDLE_W + 4,
             top: amendFlow.y - 11,
             zIndex: 30,
             display: 'flex', alignItems: 'center', gap: 4,
@@ -3466,7 +3484,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                 onClick={confirmAmendFlow}
                 title="Send amend to IB"
                 style={{
-                  width: 20, height: 20, border: 'none', borderRadius: 3,
+                  width: coarsePointer ? 30 : 20, height: coarsePointer ? 30 : 20, border: 'none', borderRadius: 3,
                   background: 'var(--accent-green, #16a34a)', color: '#fff',
                   fontSize: 12, fontWeight: 700, cursor: 'pointer', padding: 0,
                 }}
@@ -3477,7 +3495,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
                 onClick={revertAmendFlow}
                 title="Revert"
                 style={{
-                  width: 20, height: 20, border: 'none', borderRadius: 3,
+                  width: coarsePointer ? 30 : 20, height: coarsePointer ? 30 : 20, border: 'none', borderRadius: 3,
                   background: 'var(--bg-secondary, #444)',
                   color: 'var(--text-secondary, #ccc)',
                   fontSize: 12, fontWeight: 700, cursor: 'pointer', padding: 0,

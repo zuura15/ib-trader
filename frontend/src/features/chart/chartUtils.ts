@@ -231,3 +231,24 @@ export function historyHole(lastHistTime: number, liveAheadTimes: number[], barS
   if (!lastHistTime || liveAheadTimes.length === 0) return false;
   return liveAheadTimes[0] - lastHistTime > 2 * barSeconds;
 }
+
+// Exchange tick sizes by futures root — drives the price-pick strip's
+// rounding so a limit is always on-tick (IB rejects off-tick limits).
+// Extend as new contracts get chart slots; unknown roots fall back to
+// 0.01, the safest common denominator.
+const TICK_SIZE_BY_ROOT: Record<string, number> = {
+  GC: 0.1, MGC: 0.1,
+  ES: 0.25, MES: 0.25,
+  NQ: 0.25, MNQ: 0.25,
+  CL: 0.01, MCL: 0.01,
+  SI: 0.005, RTY: 0.1, M2K: 0.1, YM: 1, MYM: 1,
+};
+const FUT_ROOT_RE = /^([A-Z][A-Z0-9]{0,4}?)[FGHJKMNQUVXZ]\d{1,2}$/;
+
+/** Tick size for a symbol's limit prices (futures by root; else 0.01). */
+export function tickSizeFor(symbol: string | null): number {
+  if (!symbol) return 0.01;
+  const m = symbol.toUpperCase().match(FUT_ROOT_RE);
+  const root = m ? m[1] : symbol.toUpperCase();
+  return TICK_SIZE_BY_ROOT[root] ?? 0.01;
+}

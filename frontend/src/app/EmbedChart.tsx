@@ -10,10 +10,15 @@
 import { useEffect, useState } from 'react';
 import { BotChart } from '../features/chart-bot/BotChart';
 import { parseEmbedParams, type EmbedChartParams } from './embedParams';
+import { tickSizeFor } from '../features/chart/chartUtils';
 
 declare global {
   interface Window {
     burrowChart?: { set: (next: Record<string, unknown>) => void };
+    /** Burrow's native bridge (absent in a plain browser). A price pick
+     *  only asks the app to show its limit-order sheet; the app confirms
+     *  with the operator before anything is sent. */
+    BurrowNative?: { limitPick: (price: string) => void };
   }
 }
 
@@ -67,6 +72,10 @@ export function EmbedChart() {
           showHeader={false}
           renderHeader={() => null}
           timeframe={params.timeframe}
+          pickTickSize={tickSizeFor(params.symbol)}
+          onPricePick={window.BurrowNative
+            ? (price) => window.BurrowNative?.limitPick(String(price))
+            : undefined}
         />
       ) : null}
     </div>

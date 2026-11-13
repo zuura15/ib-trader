@@ -1,3 +1,4 @@
+import { tickSizeFor } from '../chart/chartUtils';
 import { useEffect, useRef, useState } from 'react';
 import { BotChart } from './BotChart';
 import type { ChartTarget } from '../../data/store';
@@ -65,26 +66,6 @@ function qtyStepFor(symbol: string | null): number {
   const m = symbol.toUpperCase().match(FUT_LOCAL_SYM_RE);
   const root = m ? m[1] : symbol.toUpperCase();
   return MICRO_ROOTS.has(root) ? 10 : 1;
-}
-
-// Exchange tick sizes by futures root — drives the click-to-close
-// strip's price rounding so a drafted limit is always on-tick (IB
-// rejects off-tick limits). Extend as new contracts get chart slots;
-// unknown roots fall back to 0.01, the safest common denominator.
-const TICK_SIZE_BY_ROOT: Record<string, number> = {
-  GC: 0.1, MGC: 0.1,
-  ES: 0.25, MES: 0.25,
-  NQ: 0.25, MNQ: 0.25,
-  CL: 0.01, MCL: 0.01,
-  SI: 0.005, RTY: 0.1, M2K: 0.1, YM: 1, MYM: 1,
-};
-
-/** Tick size for the click-to-close strip's price rounding. */
-function tickSizeFor(symbol: string | null): number {
-  if (!symbol) return 0.01;
-  const m = symbol.toUpperCase().match(FUT_LOCAL_SYM_RE);
-  const root = m ? m[1] : symbol.toUpperCase();
-  return TICK_SIZE_BY_ROOT[root] ?? 0.01;
 }
 
 /**

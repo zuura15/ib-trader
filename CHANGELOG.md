@@ -5,6 +5,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-12
 
+### Added
+- **Limit orders from the chart in Burrow.** In the chart embed a tap on
+  the price strip beside the axis hands the tick-rounded price to
+  Burrow's native bridge (`window.BurrowNative.limitPick`), which opens a
+  confirm sheet; nothing is sent from the page. Order handles and the
+  pick strip are finger-sized on touch screens, and drag-to-amend uses
+  pointer events so it works with touch (it was mouse-only); a tap on a
+  handle reveals its cancel ✕. `tickSizeFor` moves to `chartUtils`.
+
 ### Fixed
 - **Chart missing recent bars after switching away and back.** While
   Burrow (or a browser tab) was in the background the chart missed live
