@@ -69,3 +69,62 @@ async def test_lock_released_after_inner_failure():
 
     client._get_open_orders_unlocked = ok
     assert await asyncio.wait_for(client.get_open_orders(), timeout=1) == []
+
+
+class _FakeIB:
+    """ib_async stand-in whose snapshot requests can be made to never answer."""
+
+    def __init__(self, *, hang_all: bool = False, hang_bind: bool = False,
+                 hang_completed: bool = False) -> None:
+        self.hang_all = hang_all
+        self.hang_bind = hang_bind
+        self.hang_completed = hang_completed
+
+    @staticmethod
+    def _answer(hang: bool, value):
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        if not hang:
+            fut.set_result(value)
+        return fut
+
+    def reqOpenOrdersAsync(self):
+        return self._answer(self.hang_bind, [])
+
+    def reqAllOpenOrdersAsync(self):
+        return self._answer(self.hang_all, [])
+
+    def reqCompletedOrdersAsync(self, apiOnly: bool):
+        return self._answer(self.hang_completed, [])
+
+
+def _client_with(fake: _FakeIB) -> InsyncClient:
+    client = InsyncClient(
+        host="127.0.0.1", port=4002, client_id=9999, account_id="DU0",
+        min_call_interval_ms=0, order_snapshot_timeout=0.05,
+    )
+    client._InsyncClient__ib = fake
+    return client
+
+
+async def test_unanswered_open_orders_request_times_out_and_frees_the_lock():
+    """IB dropping the end marker (connection blip, live 2026-11-13) must not
+    wedge every later snapshot behind the lock."""
+    from ib_trader.ib.insync_client import IBOrderSnapshotTimeout
+
+    fake = _FakeIB(hang_all=True)
+    client = _client_with(fake)
+    try:
+        await asyncio.wait_for(client.get_open_orders(), timeout=2)
+        raise AssertionError("expected IBOrderSnapshotTimeout")
+    except IBOrderSnapshotTimeout:
+        pass
+
+    fake.hang_all = False
+    assert await asyncio.wait_for(client.get_open_orders(), timeout=2) == []
+
+
+async def test_unanswered_bind_or_completed_request_still_returns_a_snapshot():
+    """The bind and completed-orders requests are best-effort: a timeout on
+    either degrades to the plain open-orders snapshot."""
+    client = _client_with(_FakeIB(hang_bind=True, hang_completed=True))
+    assert await asyncio.wait_for(client.get_open_orders(), timeout=2) == []

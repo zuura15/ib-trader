@@ -122,6 +122,11 @@ api_auth_cookie_days: 30
 # sanity loop catches up once IB answers). Guards against the
 # 2026-10-01 wedge where this call hung forever.
 reconciler_snapshot_timeout: 30
+# Max seconds for each IB order-snapshot request (open / all-open /
+# completed orders). IB can drop the reply across a connection blip;
+# without a bound the snapshot lock stayed held and every later order
+# listing and `close SYMBOL` hung (2026-11-13).
+ib_order_snapshot_timeout: 15
 
 # Chart-pane realized-P&L rollup (per-contract 24h + today figures, swept
 # from IB executions so manual TWS trades are included).

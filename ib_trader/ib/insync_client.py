@@ -180,6 +180,10 @@ def _spawn_background(coro) -> asyncio.Task:
     return task
 
 
+class IBOrderSnapshotTimeout(TimeoutError):
+    """IB never sent the end marker for an open-orders snapshot."""
+
+
 class InsyncClient(IBClientBase):
     """IB API client implemented via ib_async.
 
@@ -197,6 +201,7 @@ class InsyncClient(IBClientBase):
         min_call_interval_ms: int = 100,
         connect_timeout: int = 10,
         market_data_type: int = 3,
+        order_snapshot_timeout: float = 15.0,
     ) -> None:
         """Initialize with connection parameters.
 
@@ -213,8 +218,12 @@ class InsyncClient(IBClientBase):
                 4=delayed-frozen).  Paper accounts require 3 to avoid error 10197
                 (competing live session); live accounts with real-time subscriptions
                 should use 1.
+            order_snapshot_timeout: Seconds to wait for each order-snapshot
+                request's end marker (reqOpenOrders / reqAllOpenOrders /
+                reqCompletedOrders) before giving up.
         """
         super().__init__(min_call_interval_ms=min_call_interval_ms)
+        self._order_snapshot_timeout = order_snapshot_timeout
         self._host = host
         self._port = port
         self._client_id = client_id
@@ -1727,15 +1736,33 @@ class InsyncClient(IBClientBase):
         # TWS-MODIFIED (a replace re-binds ownership to TWS; observed
         # live 2026-09-17 on a resting MNQZ6 stop) — still arrive from
         # reqAllOpenOrders with orderId=0 and are keyed by permId below.
+        #
+        # Every request is time-bound. IB can drop the end marker when the
+        # connection blips mid-request (code 1100 → 1102); unbounded, the
+        # await never returns and holds _order_snapshot_lock forever, so
+        # every later snapshot — the Orders view, ``close SYMBOL`` — hangs
+        # behind it (live 2026-11-13: wedged from 03:46 until a restart).
+        timeout = self._order_snapshot_timeout
         await self._throttle()
         try:
-            await self.__ib.reqOpenOrdersAsync()
+            await asyncio.wait_for(self.__ib.reqOpenOrdersAsync(), timeout)
         except Exception as e:
             logger.warning(
-                '{"event": "REQ_OPEN_ORDERS_BIND_FAILED", "error": "%s"}', str(e),
+                '{"event": "REQ_OPEN_ORDERS_BIND_FAILED", "error": "%s"}',
+                str(e) or type(e).__name__,
             )
         await self._throttle()
-        open_trades = await self.__ib.reqAllOpenOrdersAsync()
+        try:
+            open_trades = await asyncio.wait_for(
+                self.__ib.reqAllOpenOrdersAsync(), timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                '{"event": "REQ_ALL_OPEN_ORDERS_TIMEOUT", "timeout_s": %s}', timeout,
+            )
+            raise IBOrderSnapshotTimeout(
+                f"IB did not answer the open-orders request within {timeout:g}s"
+            ) from None
         # Gateway staleness cross-check (#98): the Gateway session never
         # receives cancels for orders it doesn't own, so an order
         # cancelled from ANOTHER client (TWS) keeps being re-reported
@@ -1747,14 +1774,17 @@ class InsyncClient(IBClientBase):
         completed_perms: set[int] = set()
         await self._throttle()
         try:
-            completed = await self.__ib.reqCompletedOrdersAsync(apiOnly=False)
+            completed = await asyncio.wait_for(
+                self.__ib.reqCompletedOrdersAsync(apiOnly=False), timeout,
+            )
             for t in completed:
                 pid = int(getattr(t.order, "permId", 0) or 0)
                 if pid:
                     completed_perms.add(pid)
         except Exception as e:
             logger.warning(
-                '{"event": "REQ_COMPLETED_ORDERS_FAILED", "error": "%s"}', str(e),
+                '{"event": "REQ_COMPLETED_ORDERS_FAILED", "error": "%s"}',
+                str(e) or type(e).__name__,
             )
         logger.debug(
             '{"event": "OPEN_ORDERS_RAW", "count": %d, "orders": [%s]}',

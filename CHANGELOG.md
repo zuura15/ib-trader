@@ -3,6 +3,17 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-13
+
+### Fixed
+- **Engine no longer wedges after an IB connection blip.** Each IB
+  order-snapshot request (open, all-open, completed orders) now times out
+  after `ib_order_snapshot_timeout` (15 s). At 03:46 an IB connectivity
+  loss (1100 → 1102) dropped a reply mid-snapshot; the unbounded await
+  held the snapshot lock, so every later order listing and `close SYMBOL`
+  hung — a 10:22 `close MGCZ6` never ran. A timed-out snapshot now fails
+  that one call (`REQ_ALL_OPEN_ORDERS_TIMEOUT`) and frees the lock.
+
 ## 2026-11-12
 
 ### Added
