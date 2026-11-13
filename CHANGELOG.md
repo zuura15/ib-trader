@@ -6,6 +6,14 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-12
 
 ### Fixed
+- **Chart missing recent bars after switching away and back.** While
+  Burrow (or a browser tab) was in the background the chart missed live
+  ticks, and the engine's history cache can trail by ~5 min, so the gap
+  drew as a straight segment with a stalled RSI until the cache expired.
+  `/api/history` takes `max_age` (floored at 30 s; stale entries are
+  still served while a refetch runs), and the chart asks for it on wake
+  and whenever its live bars start more than two bars past history,
+  then re-polls 10 s later (at most 3 tries per hole).
 - **Chart price axis stopped following the line on touch screens.** Any
   tap, X pan or swipe on the chart ended in a `pointerup` that locked the
   Y axis (auto-scale off), and every 30 s refresh then re-pinned that

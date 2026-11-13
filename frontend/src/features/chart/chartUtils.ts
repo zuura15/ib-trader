@@ -210,3 +210,24 @@ export function themeColors() {
 export function isAutoScale(ps: { options(): { autoScale?: boolean } }): boolean {
   try { return ps.options().autoScale !== false; } catch { return true; }
 }
+
+/**
+ * Chart catch-up after missed live ticks (app backgrounded, laptop
+ * asleep): the engine's history cache can be ~5 min behind, and live
+ * ticks only fill bars they saw, so a hole shows as a straight segment
+ * (and a stalled RSI) until the cache expires. On a hole, or on wake,
+ * the chart asks for history no older than this and polls again soon.
+ */
+export const HISTORY_CATCH_UP_MAX_AGE_S = 30;
+export const HISTORY_CATCH_UP_DELAY_MS = 10_000;
+/** Give up on a hole the engine's history can't fill (a quiet market has no bars). */
+export const HISTORY_CATCH_UP_MAX_TRIES = 3;
+
+/**
+ * True when the live-tick bars that sit past the last historical bar
+ * start more than two bars after it, i.e. bars are missing between.
+ */
+export function historyHole(lastHistTime: number, liveAheadTimes: number[], barSeconds: number): boolean {
+  if (!lastHistTime || liveAheadTimes.length === 0) return false;
+  return liveAheadTimes[0] - lastHistTime > 2 * barSeconds;
+}

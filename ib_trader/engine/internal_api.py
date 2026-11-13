@@ -901,6 +901,11 @@ _HISTORY_TTL_SECONDS = 300.0
 # refreshed AFTER pacing cleared, which is exactly the experience the
 # user reported 2026-05-19 / 2026-05-20.
 _HISTORY_STALE_FALLBACK_SECONDS = 1800.0  # 30 min
+# Floor for a caller's ``max_age`` (2026-11-12). The chart asks for a
+# fresher base layer only when its live-tick bars have a hole the cache
+# can't fill (it missed ticks while backgrounded / asleep); the floor
+# keeps that from turning into a per-poll IB refetch.
+_HISTORY_MIN_MAX_AGE_SECONDS = 30.0
 # Single-flight registry: at most one in-flight IB fetch per cache key.
 # Chart panes poll in sync, so a cache expiry used to fan out N
 # identical HMDS requests at once.
@@ -1067,8 +1072,14 @@ async def get_history(
     hours: int = 24,
     bar_size: str = "1 min",
     include_partial: bool = False,
+    max_age: float | None = None,
 ):
     """Return historical close-price bars for charting.
+
+    ``max_age`` (seconds, floored at ``_HISTORY_MIN_MAX_AGE_SECONDS``)
+    lowers the cache TTL for this call: an older entry is still served
+    (stale-while-revalidate) but a background refetch starts, so the
+    caller's next poll gets fresh bars.
 
     Identifier resolution:
       - ``con_id`` is preferred — routes through the contract cache.
@@ -1117,8 +1128,11 @@ async def get_history(
     # before the fix can still trip the subtraction here. Discard
     # any non-float baseline so the request falls through to a
     # fresh fetch.
+    ttl = _HISTORY_TTL_SECONDS
+    if max_age is not None:
+        ttl = min(ttl, max(float(max_age), _HISTORY_MIN_MAX_AGE_SECONDS))
     if cached and isinstance(cached[0], (int, float)) \
-            and (now - cached[0]) < _HISTORY_TTL_SECONDS:
+            and (now - cached[0]) < ttl:
         return cached[1]
     if cached and not isinstance(cached[0], (int, float)):
         _HISTORY_CACHE.pop(cache_key, None)

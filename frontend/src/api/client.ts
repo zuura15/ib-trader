@@ -319,6 +319,8 @@ export function getHistory(opts: {
   secType?: string;
   hours?: number;
   barSize?: string;
+  /** Seconds; asks the engine to refetch behind a cache entry older than this. */
+  maxAge?: number;
 }) {
   const qs = new URLSearchParams();
   if (opts.conId != null) qs.set('con_id', String(opts.conId));
@@ -326,6 +328,7 @@ export function getHistory(opts: {
   if (opts.secType) qs.set('sec_type', opts.secType);
   if (opts.hours != null) qs.set('hours', String(opts.hours));
   if (opts.barSize) qs.set('bar_size', opts.barSize);
+  if (opts.maxAge != null) qs.set('max_age', String(opts.maxAge));
   return request<HistoryBar[]>(`/history?${qs.toString()}`);
 }
 

@@ -12,6 +12,7 @@ import {
   VISIBLE_MINUTES, SR_LOOKBACK_HOURS, REFRESH_INTERVAL_MS, TIMEFRAMES, type ChartTimeframe,
   targetKey, loadSavedRange, saveRange,
   toBars, themeColors, localUtcSeconds, isAutoScale,
+  historyHole, HISTORY_CATCH_UP_MAX_AGE_S, HISTORY_CATCH_UP_DELAY_MS, HISTORY_CATCH_UP_MAX_TRIES,
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
 import { detectSupportResistance } from './supportResistance';
@@ -2547,8 +2548,18 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     let retryDelayMs = 1500;
     const RETRY_MAX_MS = 8_000;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    // Hole catch-up (see HISTORY_CATCH_UP_* in chartUtils): a follow-up
+    // load soon after asking the engine for fresher history, bounded
+    // per hole so a quiet market's genuinely missing bars don't poll IB.
+    let catchUpTimer: ReturnType<typeof setTimeout> | null = null;
+    let catchUpTries = 0;
+    let catchUpHistEnd = 0;
+    const scheduleCatchUp = () => {
+      if (cancelled || catchUpTimer) return;
+      catchUpTimer = setTimeout(() => { catchUpTimer = null; load(true); }, HISTORY_CATCH_UP_DELAY_MS);
+    };
 
-    const load = async () => {
+    const load = async (fresh = false) => {
       try {
         onLoadingChange?.(true);
         const bars = await getHistory({
@@ -2557,6 +2568,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           secType: target.conId == null ? target.secType : undefined,
           hours: PRELOAD_HOURS,
           barSize: BAR_SIZE,
+          maxAge: fresh ? HISTORY_CATCH_UP_MAX_AGE_S : undefined,
         });
         retryDelayMs = 1500;
         if (cancelled) return;
@@ -2587,6 +2599,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           (b) => (b.time as number) > lastHistTime,
         );
         const mergedBars = liveAhead.length ? fullBars.concat(liveAhead) : fullBars;
+        // Missed ticks left a hole between history and the live bars:
+        // ask for fresher history (the engine refetches behind this
+        // answer) and look again shortly. Intraday only; 1h+ bars are
+        // session-aligned and ticks never append them.
+        if (tf.seconds < 3600 && historyHole(lastHistTime, liveAhead.map((b) => b.time as number), BAR_SECONDS)) {
+          if (lastHistTime !== catchUpHistEnd) { catchUpHistEnd = lastHistTime; catchUpTries = 0; }
+          if (catchUpTries < HISTORY_CATCH_UP_MAX_TRIES) {
+            catchUpTries += 1;
+            if (fresh) scheduleCatchUp(); else load(true);
+          }
+        }
         const points = mergedBars.map((b) => ({ time: b.time, value: b.close }));
         // Stash the OHLC-rich bars so SR detection (which needs wick
         // high/low) has access. The lightweight-charts price series
@@ -2816,7 +2839,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         onError?.(msg);
         const isTransient = /\bAPI\s+5\d{2}\b/.test(msg);
         if (isTransient) {
-          retryTimer = setTimeout(load, retryDelayMs);
+          retryTimer = setTimeout(() => load(fresh), retryDelayMs);
           retryDelayMs = Math.min(retryDelayMs * 2, RETRY_MAX_MS);
         }
       } finally {
@@ -2827,14 +2850,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!seriesRef.current || !chartRef.current) return;
 
     load();
-    const id = setInterval(load, REFRESH_INTERVAL_MS);
-    const wake = () => { if (!cancelled) load(); };
+    const id = setInterval(() => load(), REFRESH_INTERVAL_MS);
+    // Back from hidden: ticks were missed, so ask for fresh history now
+    // and look again once the engine's refetch has landed.
+    const wake = () => { if (!cancelled) { load(true); scheduleCatchUp(); } };
     wakeSubs.add(wake);
     return () => {
       cancelled = true;
       wakeSubs.delete(wake);
       clearInterval(id);
       if (retryTimer) clearTimeout(retryTimer);
+      if (catchUpTimer) clearTimeout(catchUpTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target?.conId, target?.symbol, target?.secType, chartVersion, visibleMinutes, resyncToken]);

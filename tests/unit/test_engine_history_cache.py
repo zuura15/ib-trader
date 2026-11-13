@@ -205,3 +205,39 @@ class TestStaleWhileRevalidate:
         assert calls == 1, "concurrent identical requests must share one fetch"
         assert all(r == results[0] for r in results)
         assert results[0][0]["close"] == 102.0
+
+
+class TestMaxAge:
+    """``max_age`` lowers the TTL for one call so a chart that missed live
+    ticks (app backgrounded) can backfill its hole without waiting 5 min."""
+
+    @pytest.mark.asyncio
+    async def test_max_age_triggers_background_refresh(self, stub_ctx):
+        cache_key = (12345, 8, "1 min", True)
+        cached_bars = [{"ts": "two-min-old", "close": 100.0}]
+        _HISTORY_CACHE[cache_key] = (time.monotonic() - 120.0, cached_bars)
+        stub_ctx.req_historical_data_async.return_value = [_fake_bar(close=103.0)]
+
+        # Without max_age a 2-min-old entry is fresh: no IB call.
+        assert await get_history(con_id=12345, hours=8, bar_size="1 min",
+                                 include_partial=True) == cached_bars
+        stub_ctx.req_historical_data_async.assert_not_called()
+
+        # With max_age=60 it's served once more, and refetched behind it.
+        assert await get_history(con_id=12345, hours=8, bar_size="1 min",
+                                 include_partial=True, max_age=60) == cached_bars
+        await _settle_inflight()
+        stub_ctx.req_historical_data_async.assert_called_once()
+        assert _HISTORY_CACHE[cache_key][1][0]["close"] == 103.0
+
+    @pytest.mark.asyncio
+    async def test_max_age_is_floored(self, stub_ctx):
+        cache_key = (12345, 8, "1 min", True)
+        cached_bars = [{"ts": "ten-s-old", "close": 100.0}]
+        _HISTORY_CACHE[cache_key] = (time.monotonic() - 10.0, cached_bars)
+
+        result = await get_history(con_id=12345, hours=8, bar_size="1 min",
+                                   include_partial=True, max_age=1)
+
+        assert result == cached_bars
+        stub_ctx.req_historical_data_async.assert_not_called()
