@@ -11,7 +11,7 @@ import {
   type SavedRange, type Bar,
   VISIBLE_MINUTES, SR_LOOKBACK_HOURS, REFRESH_INTERVAL_MS, TIMEFRAMES, type ChartTimeframe,
   targetKey, loadSavedRange, saveRange,
-  toBars, themeColors, localUtcSeconds,
+  toBars, themeColors, localUtcSeconds, isAutoScale,
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
 import { detectSupportResistance } from './supportResistance';
@@ -2250,6 +2250,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // Repaint signals on any Y change (wheel/pinch/axis drag).
         repositionSrSignalsRef.current?.();
         if (!pr) return;
+        // Auto-scale still on means the operator didn't touch Y: a tap,
+        // an X pan or a pager swipe ends here too, and lightweight-charts
+        // only turns auto-scale off when the price axis itself is scaled
+        // (or by our Y-axis wheel). Leave Y following the line — locking
+        // it here froze the axis on touch screens after the first tap.
+        // This also covers the axis double-tap reset.
+        if (isAutoScale(ps)) {
+          userPriceRangeRef.current = null;
+          return;
+        }
         const cur = userPriceRangeRef.current;
         if (cur && cur.from === pr.from && cur.to === pr.to) return;
         userPriceRangeRef.current = { from: pr.from, to: pr.to };
@@ -2606,7 +2616,9 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // immediately afterwards so subsequent refreshes preserve
           // it.
           userPriceRangeRef.current = null;
-        } else {
+        } else if (!isAutoScale(priceScale)) {
+          // Keep a Y zoom the operator chose; an auto-fitted Y is not
+          // captured, so the axis keeps following the line as it moves.
           const currentPriceRange = priceScale.getVisibleRange();
           if (currentPriceRange) {
             userPriceRangeRef.current = {
@@ -3208,6 +3220,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       const priceScale = chart.priceScale('right');
       const lr = (() => { try { return ts.getVisibleLogicalRange(); } catch { return null; } })();
       const pr = (() => { try { return priceScale.getVisibleRange(); } catch { return null; } })();
+      const wasAutoScale = isAutoScale(priceScale);
       // Tell the custom ResizeObserver to skip its setAutoScale
       // re-fit — html2canvas's DOM clone trips that observer mid-
       // capture and that's what was popping Y back to autoscale.
@@ -3236,6 +3249,11 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         // before the user sees anything.
         try { if (lr) ts.setVisibleLogicalRange(lr); } catch { /* ignore */ }
         try { if (pr) priceScale.setVisibleRange(pr); } catch { /* ignore */ }
+        // setVisibleRange turned auto-scale off; give it back if Y was
+        // following the line before the capture.
+        if (wasAutoScale) {
+          try { priceScale.setAutoScale(true); } catch { /* ignore */ }
+        }
         try {
           chart.applyOptions({
             handleScroll: true,

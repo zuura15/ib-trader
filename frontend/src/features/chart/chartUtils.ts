@@ -201,3 +201,12 @@ export function themeColors() {
     archived: v('--accent-yellow', '#f7bd5c'),
   };
 }
+
+/**
+ * True while the price axis auto-fits the line, i.e. the operator hasn't
+ * zoomed Y (lightweight-charts turns auto-scale off only for that, or
+ * for an explicit setVisibleRange).
+ */
+export function isAutoScale(ps: { options(): { autoScale?: boolean } }): boolean {
+  try { return ps.options().autoScale !== false; } catch { return true; }
+}

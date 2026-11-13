@@ -3,6 +3,17 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-12
+
+### Fixed
+- **Chart price axis stopped following the line on touch screens.** Any
+  tap, X pan or swipe on the chart ended in a `pointerup` that locked the
+  Y axis (auto-scale off), and every 30 s refresh then re-pinned that
+  range, so in Burrow's chart embed the line could drift off-screen. Y
+  now locks only when the price axis itself was zoomed (lightweight-charts
+  turns auto-scale off for that alone), refreshes keep an auto-fitted Y
+  auto-fitted, and a chart capture no longer leaves Y pinned.
+
 ## 2026-11-11
 
 ### Changed
