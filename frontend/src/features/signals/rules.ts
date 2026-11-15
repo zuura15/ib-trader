@@ -6,7 +6,7 @@
  * ATR units so one setting works across instruments.
  */
 import {
-  alternatingSwings, clusterLevels, confirmedPivots,
+  clusterLevels, confirmedPivots,
 } from './indicators';
 import type {
   Adjustment, Contribution, ParamValue, PrimaryRuleDef, RuleDef,
@@ -190,68 +190,6 @@ function findMultiTouch(
   return null;
 }
 
-const headShoulders: PrimaryRuleDef = {
-  id: 'headShoulders',
-  group: 'primary',
-  label: 'Head & shoulders (and inverse)',
-  description:
-    'Five alternating swings with the middle one the extreme and the two '
-    + 'shoulders level. Votes on a close through the neckline (line through the two troughs).',
-  defaultEnabled: true,
-  params: [
-    ...pivotParams(2),
-    {
-      key: 'shoulderAtr', label: 'Shoulder level tolerance', type: 'number',
-      default: 1.0, min: 0.1, max: 5, step: 0.1, unit: '× ATR',
-    },
-    {
-      key: 'headAtr', label: 'Head beyond shoulders by', type: 'number',
-      default: 0.5, min: 0.1, max: 10, step: 0.1, unit: '× ATR',
-    },
-  ],
-  evaluate(ctx, i, p) {
-    const atr = ctx.atr[i];
-    if (atr == null || atr <= 0) return [];
-    const lookback = num(p, 'lookback');
-    const swings = alternatingSwings(
-      confirmedPivots(ctx.pivotsHigh, i, ctx.pivotRight, lookback),
-      confirmedPivots(ctx.pivotsLow, i, ctx.pivotRight, lookback),
-    );
-    const out: Contribution[] = [];
-    for (const top of [true, false]) {
-      // Last five swings ending on a high (top) or a low (inverse).
-      let end = swings.length - 1;
-      while (end >= 0 && swings[end].type !== (top ? 'high' : 'low')) end--;
-      if (end < 4) continue;
-      const [s1, t1, h, t2, s2] = swings.slice(end - 4, end + 1);
-      const beyond = (a: number, b: number) => (top ? a - b : b - a);
-      const headMin = num(p, 'headAtr') * atr;
-      if (beyond(h.price, s1.price) < headMin || beyond(h.price, s2.price) < headMin) continue;
-      if (Math.abs(s1.price - s2.price) > num(p, 'shoulderAtr') * atr) continue;
-      const neckAt = (k: number) =>
-        t1.price + (t2.price - t1.price) * (k - t1.idx) / Math.max(t2.idx - t1.idx, 1);
-      for (let age = 0; age < num(p, 'fresh') && i - age > s2.idx; age++) {
-        const k = i - age;
-        const c = ctx.bars[k].close;
-        const pc = ctx.bars[k - 1].close;
-        const broke = top
-          ? c < neckAt(k) && pc >= neckAt(k - 1)
-          : c > neckAt(k) && pc <= neckAt(k - 1);
-        if (!broke) continue;
-        const symmetry = 1 - Math.abs(s1.price - s2.price) / (num(p, 'shoulderAtr') * atr);
-        out.push({
-          ruleId: this.id, label: this.label, direction: top ? -1 : 1,
-          strength: clamp01((0.7 + 0.15 * symmetry) * fade(age)),
-          detail: `${top ? '' : 'inverse '}head & shoulders, head ${h.price.toFixed(2)}, `
-            + `neckline broken at ${neckAt(k).toFixed(2)}`,
-        });
-        break;
-      }
-    }
-    return out;
-  },
-};
-
 function pickStrongestPerSide(cs: Contribution[]): Contribution[] {
   const best = new Map<number, Contribution>();
   for (const c of cs) {
@@ -332,7 +270,7 @@ const rsiFilter: SecondaryRuleDef = {
   },
 };
 
-export const RULES: RuleDef[] = [srBounce, multiTouch, headShoulders, rsiFilter];
+export const RULES: RuleDef[] = [srBounce, multiTouch, rsiFilter];
 
 export const PRIMARY_RULES = RULES.filter((r): r is PrimaryRuleDef => r.group === 'primary');
 export const SECONDARY_RULES = RULES.filter((r): r is SecondaryRuleDef => r.group === 'secondary');

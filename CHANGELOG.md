@@ -3,6 +3,14 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-15
+
+### Changed
+- **Recommendation gauge: head & shoulders rule removed.** The operator
+  found structural problems with it; over 4 weeks of 1/3/5-min futures
+  bars it fired rarely and showed no edge (#102). Stored configs drop the
+  rule automatically (the merge only keeps rules in the registry).
+
 ## 2026-11-13
 
 ### Fixed

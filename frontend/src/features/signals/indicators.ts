@@ -63,25 +63,6 @@ export function confirmedPivots(
   return pivots.filter((p) => p.idx <= hi && p.idx >= lo);
 }
 
-/**
- * Merge highs and lows into a strictly alternating swing sequence —
- * consecutive same-type pivots collapse to the more extreme one.
- */
-export function alternatingSwings(highs: Pivot[], lows: Pivot[]): Pivot[] {
-  const all = [...highs, ...lows].sort((a, b) => a.idx - b.idx);
-  const out: Pivot[] = [];
-  for (const p of all) {
-    const last = out[out.length - 1];
-    if (last && last.type === p.type) {
-      const moreExtreme = p.type === 'high' ? p.price > last.price : p.price < last.price;
-      if (moreExtreme) out[out.length - 1] = p;
-    } else {
-      out.push(p);
-    }
-  }
-  return out;
-}
-
 export interface Level {
   price: number;
   touches: number;
