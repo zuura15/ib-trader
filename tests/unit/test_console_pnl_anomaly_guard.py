@@ -138,3 +138,44 @@ class TestConsoleClosePnlAnomalyGuard:
         assert not [c for c in captured
                     if c["event"] == "CONSOLE_CLOSE_PNL_DISPLAY"]
         assert any("PNL_ANOMALY_REJECTED" in r.getMessage() for r in caplog.records)
+
+
+class TestLifoBasisBypassesBadIbAvg:
+    """2026-11-16 #7508: IB reported MGCZ6 avgCost at half the fill price
+    (1934.098 vs ~3868). The LIFO lots — built from our own fills — were
+    correct, but the avg-cost guard ran first and suppressed the P&L."""
+
+    @pytest.mark.asyncio
+    async def test_lifo_lots_used_when_ib_avg_is_garbage(self, caplog):
+        from ib_trader.engine.lifo_pnl import Lot
+        ctx, captured = _make_ctx_with_router()
+        order_ctx = _make_order_ctx(
+            pre_qty=Decimal("10"), pre_avg=Decimal("1934.098"),
+            multiplier=Decimal("10"),
+        )
+        order_ctx.symbol = "MGCZ6"
+        order_ctx.pre_position_lifo_lots = [Lot(Decimal("10"), Decimal("3868.1"))]
+        with caplog.at_level("WARNING"):
+            await _emit_console_close_pnl(
+                ctx, order_ctx, qty_filled=Decimal("10"),
+                avg_price=Decimal("3869.8"), commission=Decimal("0"),
+            )
+        emits = [c for c in captured if c["event"] == "CONSOLE_CLOSE_PNL_DISPLAY"]
+        assert len(emits) == 1
+        assert "+$170.00" in emits[0]["msg"]
+        assert not any("PNL_ANOMALY_REJECTED" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_dash_shown_when_no_lots_and_ib_avg_is_garbage(self):
+        ctx, captured = _make_ctx_with_router()
+        order_ctx = _make_order_ctx(
+            pre_qty=Decimal("10"), pre_avg=Decimal("1934.098"),
+            multiplier=Decimal("10"),
+        )
+        await _emit_console_close_pnl(
+            ctx, order_ctx, qty_filled=Decimal("10"),
+            avg_price=Decimal("3869.8"), commission=Decimal("0"),
+        )
+        assert not [c for c in captured if c["event"] == "CONSOLE_CLOSE_PNL_DISPLAY"]
+        dash = [c for c in captured if c["event"] == "CONSOLE_CLOSE_PNL_UNAVAILABLE"]
+        assert len(dash) == 1 and "—" in dash[0]["msg"]

@@ -3,6 +3,17 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-16
+
+### Fixed
+- **Console close P&L missing when IB's average cost is wrong.** On
+  `close MGCZ6` (#7508) IB reported the position's avgCost at half the
+  fill price, so the sanity guard suppressed the P&L line even though the
+  LIFO lots built from our own fills were correct. The LIFO basis is now
+  used first and the guard only checks the average-cost fallback. When
+  neither basis is usable the console prints `P&L: — (cost basis
+  unavailable)` instead of nothing.
+
 ## 2026-11-15
 
 ### Changed

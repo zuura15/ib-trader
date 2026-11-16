@@ -2305,30 +2305,6 @@ async def _emit_console_close_pnl(
     if pre_is_long == order_is_buy:
         return  # opening or adding, not closing
 
-    # Sanity check: ``pre_avg`` is the per-unit price snapshotted from
-    # the positions cache. For a freshly-opened position it should be
-    # very close to ``avg_price`` (this fill's exit price) — they're
-    # both the same instrument trading minutes apart. A wild deviation
-    # means the cache had a stale or wrong multiplier (e.g. NQ
-    # normalized as ES, the 2026-06-09 trade #1121 bug where pre_avg
-    # came out 2.5× under because divisor 50 was used instead of 20).
-    # Refuse to emit P&L in that case — better to show nothing than a
-    # garbage number that contaminates the rolling 24h sum. Threshold
-    # is generous (50% deviation) so legitimate gap moves still emit.
-    deviation_ratio = (
-        abs(avg_price - pre_avg) / avg_price if avg_price else Decimal("0")
-    )
-    if deviation_ratio > Decimal("0.5"):
-        logger.warning(
-            '{"event": "PNL_ANOMALY_REJECTED", "serial": %d, "symbol": "%s", '
-            '"pre_avg": "%s", "exit_price": "%s", "deviation_ratio": "%s", '
-            '"detail": "pre_avg deviates >50%% from exit_price; '
-            'positions-cache pre-snapshot likely stale or wrong multiplier"}',
-            order_ctx.trade_serial, order_ctx.symbol,
-            pre_avg, avg_price, deviation_ratio,
-        )
-        return
-
     direction = Decimal("1") if pre_is_long else Decimal("-1")
     closed_qty = min(qty_filled, abs(pre_qty))
     multiplier = order_ctx.multiplier or Decimal("1")
@@ -2336,19 +2312,51 @@ async def _emit_console_close_pnl(
         (avg_price - pre_avg) * closed_qty * multiplier * direction
         - commission
     )
-    pnl = avg_pnl
+    pnl: Decimal | None = None
     method = "avg"
     if order_ctx.pre_position_lifo_lots:
-        # Futures LIFO (GH #101): match against the newest lots. Work on a
-        # copy — the snapshot stays as taken at order creation.
+        # Futures LIFO (GH #101): match against the newest lots. The lots
+        # come from our own execution fills, so they don't depend on IB's
+        # average cost. Work on a copy — the snapshot stays as taken at
+        # order creation.
         from ib_trader.engine.lifo_pnl import Lot, realize_lifo
         lots = [Lot(qty=lot.qty, cost=lot.cost)
                 for lot in order_ctx.pre_position_lifo_lots]
         signed = qty_filled if order_is_buy else -qty_filled
-        lifo_pnl = realize_lifo(lots, signed, avg_price, commission, multiplier)
-        if lifo_pnl is not None:
-            pnl = lifo_pnl
+        pnl = realize_lifo(lots, signed, avg_price, commission, multiplier)
+        if pnl is not None:
             method = "lifo"
+
+    if pnl is None:
+        # Sanity check on the average-cost fallback: ``pre_avg`` is IB's
+        # per-unit average cost snapshotted from the positions cache and
+        # should sit near this fill's price. A wild deviation means the
+        # basis is wrong — a stale multiplier (2026-06-09 trade #1121,
+        # NQ normalized as ES) or IB itself reporting a bad avgCost
+        # (2026-11-16 #7508: MGCZ6 avgCost came through at half the fill
+        # price). Show "—" rather than a garbage number that would also
+        # contaminate the rolling 24h sum. Threshold is generous (50%)
+        # so legitimate gap moves still emit.
+        deviation_ratio = (
+            abs(avg_price - pre_avg) / avg_price if avg_price else Decimal("0")
+        )
+        if deviation_ratio > Decimal("0.5"):
+            logger.warning(
+                '{"event": "PNL_ANOMALY_REJECTED", "serial": %d, "symbol": "%s", '
+                '"pre_avg": "%s", "exit_price": "%s", "deviation_ratio": "%s", '
+                '"detail": "pre_avg deviates >50%% from exit_price and no LIFO '
+                'lots; positions-cache basis is stale or IB avgCost is wrong"}',
+                order_ctx.trade_serial, order_ctx.symbol,
+                pre_avg, avg_price, deviation_ratio,
+            )
+            ctx.router.emit(
+                f"  P&L (closed {_fmt_qty(closed_qty)} {order_ctx.symbol}): \u2014 "
+                f"(cost basis unavailable)",
+                pane=OutputPane.COMMAND, severity=OutputSeverity.WARNING,
+                event="CONSOLE_CLOSE_PNL_UNAVAILABLE",
+            )
+            return
+        pnl = avg_pnl
     sign = "+" if pnl >= 0 else "-"
     sev = OutputSeverity.SUCCESS if pnl >= 0 else OutputSeverity.WARNING
     ctx.router.emit(
