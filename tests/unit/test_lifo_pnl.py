@@ -275,3 +275,42 @@ def test_history_commission_folded_like_ib():
     res = compute_lifo([], _pos(2, ib_avg, sym="GCZ6", mult="100"), {"GCZ6": hist})["GCZ6"]
     assert res.seed_source == "history"
     assert [lot.cost for lot in res.lots] == [D("4100.0251"), D("4110.0251")]
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-17 GCZ6: a pre-window short diluted by many in-window adds
+# ---------------------------------------------------------------------------
+
+# Seed: short 1 @ 3837.6, the day before. Then a day of add/cover pairs on
+# the short side, ending short 3. Each add re-averages IB's cost, so the
+# seed's weight in IB's average shrinks to a few percent.
+_GC_SEED = [_hist(1, "SLD", 1, "3837.6")]
+_GC_WINDOW_PX = [
+    ("SLD", "3852.0"), ("SLD", "3878.0"), ("BOT", "3875.4"), ("SLD", "3873.8"),
+    ("BOT", "3876.0"), ("SLD", "3875.2"), ("BOT", "3876.5"), ("SLD", "3885.2"),
+    ("BOT", "3883.0"), ("SLD", "3879.0"),
+]
+
+
+def _gc_window():
+    return [_ex(10 + i, s, 1, p, sym="GCZ6", mult="100")
+            for i, (s, p) in enumerate(_GC_WINDOW_PX)]
+
+
+def test_diluted_seed_rebuilt_from_history_against_ib_avg_now():
+    window = _gc_window()
+    ib_avg = _ib_avg(_GC_SEED + window) + D("0.01")  # IB rounds its average
+    pos = {"GCZ6": {"quantity": "-3", "avg_cost": str(ib_avg), "multiplier": "100"}}
+    res = compute_lifo(window, pos, {"GCZ6": _GC_SEED})["GCZ6"]
+    assert res.method == "lifo" and res.seed_source == "history"
+    assert [lot.cost for lot in res.lots] == [D("3837.6"), D("3852.0"), D("3879.0")]
+
+
+def test_diluted_seed_without_history_falls_back_to_ib_avg():
+    """No archive: back-solving the seed would amplify IB's rounding (the
+    live case produced 3551 for a 3837.6 short), so show IB's average."""
+    window = _gc_window()
+    ib_avg = _ib_avg(_GC_SEED + window) + D("0.01")  # IB rounds its average
+    pos = {"GCZ6": {"quantity": "-3", "avg_cost": str(ib_avg), "multiplier": "100"}}
+    res = compute_lifo(window, pos)["GCZ6"]
+    assert res.method == "avg" and res.reason == "seed_ill_conditioned"

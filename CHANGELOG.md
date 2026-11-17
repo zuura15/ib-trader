@@ -13,6 +13,13 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   used first and the guard only checks the average-cost fallback. When
   neither basis is usable the console prints `P&L: — (cost basis
   unavailable)` instead of nothing.
+- **Futures LIFO cost wrong after the oldest lot ages out of IB's 24 h
+  window.** GCZ6 short 3 showed a LIFO average of ~3811 (real 3856.2:
+  3837.6 / 3852.0 / 3879.0). The pre-window lot's cost was back-solved
+  from IB's average, but a day of adds had diluted its weight so far that
+  IB's rounding blew up into a 3551 "short". The archived fills are now
+  matched against IB's current average directly, and an ill-conditioned
+  back-solve falls back to IB's average instead of inventing a cost.
 
 ## 2026-11-15
 

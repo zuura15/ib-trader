@@ -39,6 +39,9 @@ _ONE = Decimal("1")
 # Seed cost further than this from the first fill price means our inputs
 # disagree (stale position snapshot, missing fills) — fall back to IB.
 _SEED_SANITY_RATIO = Decimal("0.5")
+# Below this remaining seed weight in IB's average, back-solving the seed
+# cost amplifies IB's rounding by 1/weight (≥10×) — fall back to IB.
+_SEED_MIN_WEIGHT = Decimal("0.1")
 # History replay must land on IB's average cost within this fraction of
 # price (~0.04 on gold at 4100) — tight enough that a wrong flat point
 # can't match by coincidence; IB's average includes commissions exactly
@@ -194,6 +197,12 @@ def _solve_seed_cost(
     if not gone:
         if ib_avg_now is None or avg0 is None or avg1 is None or avg1 == avg0:
             return None, "no_ib_avg_cost"
+        # avg1 - avg0 is the seed's remaining weight in IB's average. Once
+        # adds have diluted it, IB's rounding (and its commission folding)
+        # is amplified by 1/weight — 2026-11-17 GCZ6 back-solved a short at
+        # 3551 for a real 3837.6. Refuse rather than show a made-up cost.
+        if abs(avg1 - avg0) < _SEED_MIN_WEIGHT:
+            return None, "seed_ill_conditioned"
         return (ib_avg_now - avg0) / (avg1 - avg0), None
     # Seed fully closed out — use IB's realized on the fills that closed it.
     target = _ZERO
@@ -271,21 +280,25 @@ def _fills_from_rows(rows: list[dict]) -> tuple[list[tuple], dict] | None:
 
 def _lots_from_history(
     hist_rows: list[dict], seed_qty: Decimal, seed_cost: Decimal,
-    multiplier: Decimal,
+    multiplier: Decimal, window_fills: tuple = (),
 ) -> tuple[list[Lot] | None, str | None]:
     """Rebuild the seed's LIFO lots from archived fills.
 
     Scans back for the latest fill k such that replaying fills[k:] from
     flat reproduces IB's seed: same net quantity AND an average-cost
-    replay matching the seed cost. That k is where the position was last
-    flat with every later fill on record. Returns (lots, None) or
-    (None, reason).
+    replay of fills[k:] + ``window_fills`` landing on ``seed_cost``. With
+    no window fills ``seed_cost`` is the seed's own cost; with them it is
+    IB's average cost *now* — matching that directly avoids leaning on a
+    back-solved seed cost, which is ill-conditioned once many adds have
+    diluted the seed's weight. That k is where the position was last flat
+    with every later fill on record. Returns (lots, None) or (None, reason).
     """
     if not hist_rows:
         return None, "history_empty"
     key = (
         hist_rows[-1].get("exec_id"), len(hist_rows), seed_qty,
         seed_cost.quantize(Decimal("0.000001")), multiplier,
+        tuple(f[0] for f in window_fills),
     )
     hit = _history_memo.get(key)
     if hit is not None:
@@ -303,7 +316,9 @@ def _lots_from_history(
             if net != seed_qty:
                 continue
             suffix = fills[k:]
-            avg, _, _ = _simulate_avg(_ZERO, _ZERO, suffix, multiplier)
+            avg, _, _ = _simulate_avg(
+                _ZERO, _ZERO, suffix + list(window_fills), multiplier,
+            )
             if avg is None or abs(avg - seed_cost) > tol:
                 continue
             lots: list[Lot] = []
@@ -341,9 +356,21 @@ def _compute_one(
     seed_source: str | None = None
     history_note: str | None = None
     if seed_qty != 0:
-        if fills:
+        ib_avg_now = _dec(pos.get("avg_cost"))
+        _, _, seed_gone = _simulate_avg(seed_qty, _ZERO, fills, mult)
+        hist_lots = None
+        if hist_rows and ib_avg_now is not None and fills and not seed_gone:
+            # The seed is still part of IB's average: match history on
+            # IB's current number directly (well-conditioned), not on a
+            # back-solved seed cost.
+            hist_lots, history_note = _lots_from_history(
+                hist_rows, seed_qty, ib_avg_now, mult, tuple(fills),
+            )
+        if hist_lots is not None:
+            seed_cost = None
+        elif fills:
             seed_cost, reason = _solve_seed_cost(
-                seed_qty, fills, mult, _dec(pos.get("avg_cost")), ib_realized,
+                seed_qty, fills, mult, ib_avg_now, ib_realized,
             )
             if seed_cost is None:
                 return LifoResult(method="avg", reason=reason)
@@ -353,15 +380,13 @@ def _compute_one(
         else:
             # No fills in the window: the whole position is the seed and
             # IB's current average cost is its basis.
-            seed_cost = _dec(pos.get("avg_cost"))
+            seed_cost = ib_avg_now
             if seed_cost is None:
                 return LifoResult(method="avg", reason="no_ib_avg_cost")
-        if hist_rows:
+        if hist_lots is None and hist_rows and (not fills or seed_gone):
             hist_lots, history_note = _lots_from_history(
                 hist_rows, seed_qty, seed_cost, mult,
             )
-        else:
-            hist_lots = None
         if hist_lots is not None:
             lots.extend(hist_lots)
             seed_source = "history"
