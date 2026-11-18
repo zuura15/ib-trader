@@ -88,9 +88,10 @@ interface Props {
    *  recommendation overlays. Read once per mount: remount the chart
    *  (``key``) to switch. */
   timeframe?: ChartTimeframe;
-  /** Phone embed (Burrow): whole-number price labels so the axis is as
-   *  narrow as it gets, a one-bar right gap, and an invisible pick strip,
-   *  giving the width back to the plot. Read once per mount. */
+  /** Phone embed (Burrow): one-decimal price labels, the live point
+   *  opening just left of the axis with a small visible gap, and an
+   *  invisible pick strip, giving the width back to the plot. Read once
+   *  per mount. */
   compactAxis?: boolean;
   /** Render the placeholder "Click a row…" message when target is null. */
   placeholder?: string | null;
@@ -230,9 +231,15 @@ interface Props {
   onOrderCancel?: (id: string) => Promise<string | null>;
 }
 
-/** Whole-number price label for the compact (phone) axis. */
-function wholePrice(p: number): string {
-  return String(Math.round(p));
+/** One-decimal price label for the compact (phone) axis. */
+function compactPrice(p: number): string {
+  return p.toFixed(1);
+}
+
+/** Phone embed: bars of empty space between the live point and the price
+ *  axis — a visible gap, ~4% of the view, never less than 2 bars. */
+function compactRightGap(widthBars: number): number {
+  return Math.max(2, Math.round(widthBars * 0.04));
 }
 
 function trimPrice(p: number): string {
@@ -1325,7 +1332,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Axis / last-price / crosshair labels without trailing zeros
       // ("4135.00" → "4135", "4132.50" → "4132.5") — saves axis width,
       // most noticeably on phones.
-      localization: { priceFormatter: compactAxisRef.current ? wholePrice : trimPrice },
+      localization: { priceFormatter: compactAxisRef.current ? compactPrice : trimPrice },
     });
     const series = chart.addSeries(LineSeries, {
       color: colors.line,
@@ -2807,7 +2814,22 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
           // fall back to the width-preserve-anchor-to-now behavior.
           const sb = savedRange?.rightSpaceBars;
           const sw = savedRange?.widthBars;
-          if (
+          if (compactAxisRef.current) {
+            // Phone embed: keep the saved zoom width but always open
+            // with the live point just left of the price axis. A saved
+            // right gap (from an earlier pan) used to persist and leave
+            // the price 20-25% in from the edge.
+            const widthBars = sw != null && Number.isFinite(sw) && sw >= 10
+              ? sw : Math.max(10, Math.round(visibleMinutes * 60 / BAR_SECONDS));
+            const gap = compactRightGap(widthBars);
+            const newTo = (mergedBars.length - 1) + gap;
+            userLogicalRangeRef.current = { rightSpaceBars: gap, widthBars };
+            try {
+              chart.timeScale().setVisibleLogicalRange(
+                { from: newTo - widthBars, to: newTo },
+              );
+            } catch { /* range invalid for current data — skip */ }
+          } else if (
             sb != null && sw != null
             && Number.isFinite(sb) && Number.isFinite(sw)
             && sw >= 10   // reject corrupted saves < 30 min wide

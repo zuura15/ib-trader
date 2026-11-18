@@ -15,6 +15,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 - **Wedge (converging S/R triangle) shading off by default.** New
   Settings → Chart indicators → Wedges toggle (`chartShowWedges`) brings
   it back. Detection is unchanged; only the striped overlay is hidden.
+- **Burrow chart: price axis shows one decimal again, and the live point
+  opens next to the axis.** The phone chart restored an old saved right
+  gap on every open, leaving the price 20-25% in from the edge; it now
+  keeps the saved zoom width but always opens with a small fixed gap
+  (~4% of the view, at least 2 bars).
 
 ## 2026-11-16
 
