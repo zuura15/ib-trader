@@ -11,6 +11,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   tab or app), so it sat frozen while price ticked and then jumped. It now
   updates on every live tick, in the web app and Burrow's embedded chart.
 
+### Changed
+- **Wedge (converging S/R triangle) shading off by default.** New
+  Settings → Chart indicators → Wedges toggle (`chartShowWedges`) brings
+  it back. Detection is unchanged; only the striped overlay is hidden.
+
 ## 2026-11-16
 
 ### Fixed

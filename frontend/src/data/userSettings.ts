@@ -23,6 +23,9 @@ export interface UserSettings {
   chartShowRsi: boolean;
   /** Show the volume histogram along the bottom of charts. */
   chartShowVolume: boolean;
+  /** Shade the converging support/resistance wedge (triangle) on charts.
+   *  Default off. */
+  chartShowWedges: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -31,6 +34,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   fillMarkerScale: 2,
   chartShowRsi: true,
   chartShowVolume: true,
+  chartShowWedges: false,
 };
 
 const KEY_PREFIX = 'ib-trader:settings:';

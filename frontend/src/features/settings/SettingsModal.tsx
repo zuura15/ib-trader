@@ -42,6 +42,7 @@ export function SettingsModal({ open, onClose }: Props) {
   const fillMarkerScale = useUserSetting('fillMarkerScale');
   const chartShowVolume = useUserSetting('chartShowVolume');
   const chartShowRsi = useUserSetting('chartShowRsi');
+  const chartShowWedges = useUserSetting('chartShowWedges');
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
   const activeVariant = useStore((s) => s.activeVariant);
@@ -192,6 +193,15 @@ export function SettingsModal({ open, onClose }: Props) {
               onChange={(v) => setUserSetting('chartShowRsi', v)}
             />
           </SettingRow>
+          <SettingRow
+            label="Wedges"
+            help="Striped triangle where support and resistance lines converge ahead of price."
+          >
+            <Toggle
+              checked={chartShowWedges}
+              onChange={(v) => setUserSetting('chartShowWedges', v)}
+            />
+          </SettingRow>
 
           <SectionTitle>Support/Resistance</SectionTitle>
           <SettingRow
@@ -245,6 +255,7 @@ export function SettingsModal({ open, onClose }: Props) {
               setUserSetting('fillMarkerScale', DEFAULT_SETTINGS.fillMarkerScale);
               setUserSetting('chartShowVolume', DEFAULT_SETTINGS.chartShowVolume);
               setUserSetting('chartShowRsi', DEFAULT_SETTINGS.chartShowRsi);
+              setUserSetting('chartShowWedges', DEFAULT_SETTINGS.chartShowWedges);
             }}
             style={{
               background: 'transparent', border: '1px solid var(--border-default)',

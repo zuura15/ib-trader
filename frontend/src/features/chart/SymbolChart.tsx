@@ -369,6 +369,15 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // setting switches it per user. Volume toggles in place, no rebuild.
   const rsiSetting = useUserSetting('chartShowRsi');
   const rsiOn = showRsi && rsiSetting;
+  // Wedge (converging S/R triangle) shading — off by default; read by
+  // the SVG repaint through a ref so toggling needs no chart rebuild.
+  const wedgesOn = useUserSetting('chartShowWedges');
+  const wedgesOnRef = useRef(wedgesOn);
+  useEffect(() => {
+    wedgesOnRef.current = wedgesOn;
+    repositionSrSignalsRef.current?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wedgesOn]);
   const volumeOn = useUserSetting('chartShowVolume');
   const volumeOnRef = useRef(volumeOn);
   volumeOnRef.current = volumeOn;
@@ -1448,7 +1457,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // overlapping wedge buries the relevant one in stripes; the
       // ``△`` badge already enumerates all apex distances for the
       // operator's situational awareness.
-      const arrowList = srArrowsRef.current.slice(0, 1);
+      const arrowList = wedgesOnRef.current ? srArrowsRef.current.slice(0, 1) : [];
       if (arrowList.length > 0) {
         const tsArrow = ch.timeScale();
         let painted = 0;
