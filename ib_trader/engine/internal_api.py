@@ -708,7 +708,7 @@ async def reload_watchlist():
     from ib_trader.config.watchlist_runtime import (
         resolve_watchlist_symbols, chart_anchor_symbols,
     )
-    from ib_trader.repl.commands import _is_futures_local_symbol
+    from ib_trader.repl.commands import watch_contract_spec
 
     try:
         _operator_syms = await resolve_watchlist_symbols(_ctx.redis)
@@ -719,8 +719,10 @@ async def reload_watchlist():
                 # Same FUT-detection as the startup subscribe loop —
                 # IB-paste localSymbol form (``MESM6``) routes through
                 # the FUT qualify path; everything else stays STK.
-                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
-                info = await _ctx.ib.qualify_contract(sym, sec_type=sec_type)
+                sec_type, exchange = watch_contract_spec(sym)
+                info = await _ctx.ib.qualify_contract(
+                    sym, sec_type=sec_type, exchange=exchange,
+                )
                 await _ctx.ib.subscribe_market_data(info["con_id"], sym)
                 subscribed.append(sym)
             except Exception:
@@ -1104,12 +1106,18 @@ async def get_history(
         # WatchlistPanel click sends ``sec_type=STK`` for everything,
         # so without this fallback every futures symbol in the
         # watchlist would 502 here.
-        from ib_trader.repl.commands import _is_futures_local_symbol
-        effective_sec_type = sec_type
-        if (sec_type or "STK").upper() == "STK" and _is_futures_local_symbol(symbol or ""):
-            effective_sec_type = "FUT"
+        # Same routing for the watch-only cash indices (TNX, VIX…),
+        # which need IND on their home exchange.
+        from ib_trader.repl.commands import watch_contract_spec
+        effective_sec_type, exchange = sec_type, "SMART"
+        if (sec_type or "STK").upper() == "STK":
+            spec_type, spec_exchange = watch_contract_spec(symbol or "")
+            if spec_type != "STK":
+                effective_sec_type, exchange = spec_type, spec_exchange
         try:
-            qualified = await _ctx.ib.qualify_contract(symbol, sec_type=effective_sec_type)
+            qualified = await _ctx.ib.qualify_contract(
+                symbol, sec_type=effective_sec_type, exchange=exchange,
+            )
         except Exception as e:
             logger.exception(
                 '{"event": "HISTORY_QUALIFY_FAILED", "symbol": "%s", "sec_type": "%s"}',

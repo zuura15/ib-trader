@@ -324,7 +324,7 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         from ib_trader.config.watchlist_runtime import (
             resolve_watchlist_symbols, chart_anchor_symbols,
         )
-        from ib_trader.repl.commands import _is_futures_local_symbol
+        from ib_trader.repl.commands import watch_contract_spec
         _operator_syms = await resolve_watchlist_symbols(ctx.redis)
         watchlist_symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
         watchlist_subscribed = 0
@@ -333,8 +333,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
                 # Detect IB-paste FUT form (e.g. ``MESM6``) so MES futures
                 # in the watchlist qualify as FUT instead of failing the
                 # default STK qualify path.
-                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
-                info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
+                sec_type, exchange = watch_contract_spec(sym)
+                info = await ctx.ib.qualify_contract(
+                    sym, sec_type=sec_type, exchange=exchange,
+                )
                 # count_ref=False — watchlist is an ambient lifetime
                 # subscription (no paired unsubscribe), so don't take
                 # a refcount slot.
@@ -686,7 +688,7 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
     Idempotent — safe to call multiple times (subscribe_market_data
     short-circuits when the symbol is already in _streaming).
     """
-    from ib_trader.repl.commands import _is_futures_local_symbol
+    from ib_trader.repl.commands import watch_contract_spec
 
     started = asyncio.get_event_loop().time()
     watchlist_ok = watchlist_fail = 0
@@ -720,8 +722,10 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
         symbols = []
     for sym in symbols:
         try:
-            sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
-            info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
+            sec_type, exchange = watch_contract_spec(sym)
+            info = await ctx.ib.qualify_contract(
+                sym, sec_type=sec_type, exchange=exchange,
+            )
             await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
             watchlist_ok += 1
         except Exception:

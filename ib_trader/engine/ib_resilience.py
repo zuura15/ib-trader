@@ -93,7 +93,7 @@ async def reconnect_ib(ctx: "AppContext", *, source: str) -> ReconnectResult:
     so a single failed re-subscribe doesn't abort the whole cycle.
     """
     from ib_trader.config.loader import load_watchlist
-    from ib_trader.repl.commands import _is_futures_local_symbol
+    from ib_trader.repl.commands import watch_contract_spec
     from ib_trader.redis.state import StateKeys
 
     started_dt = datetime.now(PT)
@@ -142,8 +142,10 @@ async def reconnect_ib(ctx: "AppContext", *, source: str) -> ReconnectResult:
             symbols = []
         for sym in symbols:
             try:
-                sec_type = "FUT" if _is_futures_local_symbol(sym) else "STK"
-                info = await ctx.ib.qualify_contract(sym, sec_type=sec_type)
+                sec_type, exchange = watch_contract_spec(sym)
+                info = await ctx.ib.qualify_contract(
+                    sym, sec_type=sec_type, exchange=exchange,
+                )
                 # count_ref=False — watchlist is ambient lifetime (no paired
                 # unsub). Matches the startup-path semantics.
                 await ctx.ib.subscribe_market_data(

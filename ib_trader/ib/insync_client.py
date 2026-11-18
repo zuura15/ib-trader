@@ -184,6 +184,19 @@ class IBOrderSnapshotTimeout(TimeoutError):
     """IB never sent the end marker for an open-orders snapshot."""
 
 
+
+def _generic_ticks_for(contract) -> str:
+    """Generic tick list for ``reqMktData``.
+
+    "165" (Misc Stats: avg volume, 52-week high/low) for tradeables.
+    Indices get none: they have no volume, and IB rejects tick lists an
+    instrument doesn't support, which would drop the whole quote feed.
+    """
+    if (getattr(contract, "secType", "") or "").upper() == "IND":
+        return ""
+    return "165"
+
+
 class InsyncClient(IBClientBase):
     """IB API client implemented via ib_async.
 
@@ -541,11 +554,14 @@ class InsyncClient(IBClientBase):
         # includes them in the serialised API message.  exchange is forced to
         # 'SMART' regardless of what IB reports as the primary exchange —
         # SMART is the correct routing value for order submission.
+        # Indices are the exception: they don't route via SMART, so
+        # market-data requests need the index's own exchange (CBOE…).
+        # Indices are watch-only, so no order ever sees this contract.
         self._contract_cache[qualified.conId] = Contract(
             conId=qualified.conId,
             symbol=qualified.symbol,
             secType=qualified.secType,
-            exchange="SMART",
+            exchange=qualified.exchange if sec_type_u == "IND" else "SMART",
             currency=qualified.currency,
         )
         logger.info(
@@ -2088,8 +2104,6 @@ class InsyncClient(IBClientBase):
         avg-cost adjustment), leaking 2700+ refs per session and
         slowing the chart over hours (2026-05-21 incident).
         """
-        _GENERIC_TICKS = "165"  # Misc Stats: avVolume, 52-week high/low
-
         if con_id in self._streaming:
             entry = self._streaming[con_id]
             if count_ref:
@@ -2103,7 +2117,10 @@ class InsyncClient(IBClientBase):
                     self.__ib.cancelMktData(entry["contract"])
                 except Exception as e:
                     logger.debug("cancelMktData failed during upgrade", exc_info=e)
-                ticker = self.__ib.reqMktData(entry["contract"], _GENERIC_TICKS, False, False)
+                ticker = self.__ib.reqMktData(
+                    entry["contract"], _generic_ticks_for(entry["contract"]),
+                    False, False,
+                )
                 entry["ticker"] = ticker
                 entry["enriched"] = True
                 logger.info(
@@ -2123,7 +2140,9 @@ class InsyncClient(IBClientBase):
             conId=con_id, symbol=symbol, secType="STK",
             exchange="SMART", currency="USD",
         )
-        ticker = self.__ib.reqMktData(contract, _GENERIC_TICKS, False, False)
+        ticker = self.__ib.reqMktData(
+            contract, _generic_ticks_for(contract), False, False,
+        )
         self._streaming[con_id] = {"ticker": ticker, "refs": 1, "contract": contract, "enriched": True}
         logger.info(
             '{"event": "STREAMING_SUB_ADDED", "con_id": %d, "symbol": "%s"}',

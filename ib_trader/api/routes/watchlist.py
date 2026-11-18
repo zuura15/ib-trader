@@ -106,10 +106,10 @@ async def get_symbols(redis=Depends(get_redis)):
     clients that render futures.
     """
     from ib_trader.config.watchlist_runtime import resolve_watchlist_symbols
-    from ib_trader.repl.commands import _is_futures_local_symbol
+    from ib_trader.repl.commands import watch_contract_spec
     symbols = await resolve_watchlist_symbols(redis)
     entries = [
-        {"root": s, "sec_type": "FUT" if _is_futures_local_symbol(s) else "STK"}
+        {"root": s, "sec_type": watch_contract_spec(s)[0]}
         for s in symbols
     ]
     return {"symbols": symbols, "entries": entries, "max": _MAX_SYMBOLS}

@@ -65,6 +65,35 @@ def _is_futures_local_symbol(symbol: str) -> bool:
     return False
 
 
+# Cash indices the watchlist can show. Watch-only: IB indices have no
+# order path. Value is the IB exchange the index lives on (SMART does
+# not route indices). Yield indices quote the yield x 10 (TNX 42.5 =
+# 4.25%).
+_INDEX_EXCHANGES: dict[str, str] = {
+    "TNX": "CBOE",  # 10-year Treasury yield
+    "TYX": "CBOE",  # 30-year Treasury yield
+    "FVX": "CBOE",  # 5-year Treasury yield
+    "IRX": "CBOE",  # 13-week T-bill yield
+    "VIX": "CBOE",
+    "SPX": "CBOE",
+    "NDX": "NASDAQ",
+}
+
+
+def watch_contract_spec(symbol: str) -> tuple[str, str]:
+    """``(sec_type, exchange)`` to qualify a watchlist symbol with.
+
+    FUT for IB-paste futures localSymbols, IND for the known cash
+    indices in ``_INDEX_EXCHANGES``, STK (SMART) for everything else.
+    """
+    s = (symbol or "").upper()
+    if _is_futures_local_symbol(s):
+        return "FUT", "SMART"
+    if s in _INDEX_EXCHANGES:
+        return "IND", _INDEX_EXCHANGES[s]
+    return "STK", "SMART"
+
+
 class Strategy(StrEnum):
     """Valid order placement strategies.
 
