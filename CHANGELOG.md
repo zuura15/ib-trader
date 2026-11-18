@@ -3,6 +3,14 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-18
+
+### Fixed
+- **Chart RSI pane lagged the price line.** The RSI was only recomputed
+  on the 30 s history refresh (and the catch-up after returning to the
+  tab or app), so it sat frozen while price ticked and then jumped. It now
+  updates on every live tick, in the web app and Burrow's embedded chart.
+
 ## 2026-11-16
 
 ### Fixed

@@ -3105,6 +3105,21 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
               open: last, high: last, low: last, close: last,
             });
           }
+          // Move the RSI with the price line. Without this the RSI pane
+          // only redrew on the 30 s history refresh (or the post-wake
+          // catch-up), so it sat frozen while the price ticked and then
+          // jumped. Wilder RSI over the loaded bars is O(n) on ~1k
+          // closes — cheap enough per tick.
+          const rsiSeries = rsiSeriesRef.current;
+          if (rsiSeries && allBars.length >= RSI_DEFAULTS.period + 1) {
+            const rsiVals = computeRsi(allBars.map((b) => b.close), RSI_DEFAULTS.period);
+            const v = rsiVals[rsiVals.length - 1];
+            if (v != null) {
+              try {
+                rsiSeries.update({ time: barSec as UTCTimestamp, value: v });
+              } catch { /* series torn down mid-tick — next load resets it */ }
+            }
+          }
           // Trigger SR re-evaluation on every live tick. The throttle
           // inside scheduleSrRecomputeRef caps actual recomputes at
           // 1/sec so fast-tape charts don't churn. This is what
