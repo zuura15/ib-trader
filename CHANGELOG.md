@@ -7,7 +7,8 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ### Added
 - **Cash indices on the watchlist (watch-only).** TNX (10-year Treasury
-  yield), TYX, FVX, IRX, VIX, SPX, NDX and K200 (KOSPI 200, KRW) now qualify as IB indices on
+  yield), TYX, FVX, IRX, VIX, SPX, NDX, SOX (PHLX Semiconductor)
+  and K200 (KOSPI 200, KRW) now qualify as IB indices on
   their home exchange instead of failing as stocks, so they quote and
   chart like any other watchlist symbol. Yield indices read as yield × 10
   (TNX 42.5 = 4.25%). Live quotes need the matching IB index market-data

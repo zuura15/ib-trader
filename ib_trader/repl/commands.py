@@ -77,6 +77,7 @@ _INDEX_CONTRACTS: dict[str, tuple[str, str]] = {
     "VIX": ("CBOE", "USD"),
     "SPX": ("CBOE", "USD"),
     "NDX": ("NASDAQ", "USD"),
+    "SOX": ("PHLX", "USD"),  # PHLX Semiconductor
     "K200": ("KSE", "KRW"),  # KOSPI 200
 }
 

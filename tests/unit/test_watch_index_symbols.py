@@ -19,6 +19,9 @@ class TestWatchContractSpec:
     def test_ndx_on_nasdaq(self):
         assert watch_contract_spec("NDX") == ("IND", "NASDAQ", "USD")
 
+    def test_phlx_semiconductor_index(self):
+        assert watch_contract_spec("SOX") == ("IND", "PHLX", "USD")
+
     def test_kospi200_on_kse_in_krw(self):
         assert watch_contract_spec("K200") == ("IND", "KSE", "KRW")
 
