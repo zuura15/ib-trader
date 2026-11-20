@@ -333,9 +333,9 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
                 # Detect IB-paste FUT form (e.g. ``MESM6``) so MES futures
                 # in the watchlist qualify as FUT instead of failing the
                 # default STK qualify path.
-                sec_type, exchange = watch_contract_spec(sym)
+                sec_type, exchange, currency = watch_contract_spec(sym)
                 info = await ctx.ib.qualify_contract(
-                    sym, sec_type=sec_type, exchange=exchange,
+                    sym, sec_type=sec_type, exchange=exchange, currency=currency,
                 )
                 # count_ref=False — watchlist is an ambient lifetime
                 # subscription (no paired unsubscribe), so don't take
@@ -722,9 +722,9 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
         symbols = []
     for sym in symbols:
         try:
-            sec_type, exchange = watch_contract_spec(sym)
+            sec_type, exchange, currency = watch_contract_spec(sym)
             info = await ctx.ib.qualify_contract(
-                sym, sec_type=sec_type, exchange=exchange,
+                sym, sec_type=sec_type, exchange=exchange, currency=currency,
             )
             await ctx.ib.subscribe_market_data(info["con_id"], sym, count_ref=False)
             watchlist_ok += 1

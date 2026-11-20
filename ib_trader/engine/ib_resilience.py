@@ -142,9 +142,9 @@ async def reconnect_ib(ctx: "AppContext", *, source: str) -> ReconnectResult:
             symbols = []
         for sym in symbols:
             try:
-                sec_type, exchange = watch_contract_spec(sym)
+                sec_type, exchange, currency = watch_contract_spec(sym)
                 info = await ctx.ib.qualify_contract(
-                    sym, sec_type=sec_type, exchange=exchange,
+                    sym, sec_type=sec_type, exchange=exchange, currency=currency,
                 )
                 # count_ref=False — watchlist is ambient lifetime (no paired
                 # unsub). Matches the startup-path semantics.

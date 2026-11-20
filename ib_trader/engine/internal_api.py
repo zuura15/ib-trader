@@ -719,9 +719,9 @@ async def reload_watchlist():
                 # Same FUT-detection as the startup subscribe loop —
                 # IB-paste localSymbol form (``MESM6``) routes through
                 # the FUT qualify path; everything else stays STK.
-                sec_type, exchange = watch_contract_spec(sym)
+                sec_type, exchange, currency = watch_contract_spec(sym)
                 info = await _ctx.ib.qualify_contract(
-                    sym, sec_type=sec_type, exchange=exchange,
+                    sym, sec_type=sec_type, exchange=exchange, currency=currency,
                 )
                 await _ctx.ib.subscribe_market_data(info["con_id"], sym)
                 subscribed.append(sym)
@@ -1109,14 +1109,15 @@ async def get_history(
         # Same routing for the watch-only cash indices (TNX, VIX…),
         # which need IND on their home exchange.
         from ib_trader.repl.commands import watch_contract_spec
-        effective_sec_type, exchange = sec_type, "SMART"
+        effective_sec_type, exchange, currency = sec_type, "SMART", "USD"
         if (sec_type or "STK").upper() == "STK":
-            spec_type, spec_exchange = watch_contract_spec(symbol or "")
-            if spec_type != "STK":
-                effective_sec_type, exchange = spec_type, spec_exchange
+            spec = watch_contract_spec(symbol or "")
+            if spec[0] != "STK":
+                effective_sec_type, exchange, currency = spec
         try:
             qualified = await _ctx.ib.qualify_contract(
                 symbol, sec_type=effective_sec_type, exchange=exchange,
+                currency=currency,
             )
         except Exception as e:
             logger.exception(

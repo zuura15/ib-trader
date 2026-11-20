@@ -13,18 +13,21 @@ from ib_trader.repl.commands import watch_contract_spec
 
 class TestWatchContractSpec:
     def test_yield_index_routes_to_cboe_ind(self):
-        assert watch_contract_spec("TNX") == ("IND", "CBOE")
-        assert watch_contract_spec("tnx") == ("IND", "CBOE")
+        assert watch_contract_spec("TNX") == ("IND", "CBOE", "USD")
+        assert watch_contract_spec("tnx") == ("IND", "CBOE", "USD")
 
     def test_ndx_on_nasdaq(self):
-        assert watch_contract_spec("NDX") == ("IND", "NASDAQ")
+        assert watch_contract_spec("NDX") == ("IND", "NASDAQ", "USD")
+
+    def test_kospi200_on_kse_in_krw(self):
+        assert watch_contract_spec("K200") == ("IND", "KSE", "KRW")
 
     def test_futures_local_symbol_stays_fut(self):
-        assert watch_contract_spec("GCZ6") == ("FUT", "SMART")
+        assert watch_contract_spec("GCZ6") == ("FUT", "SMART", "USD")
 
     def test_stock_stays_stk(self):
-        assert watch_contract_spec("QQQ") == ("STK", "SMART")
-        assert watch_contract_spec("") == ("STK", "SMART")
+        assert watch_contract_spec("QQQ") == ("STK", "SMART", "USD")
+        assert watch_contract_spec("") == ("STK", "SMART", "USD")
 
 
 class TestGenericTicks:
