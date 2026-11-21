@@ -329,6 +329,7 @@ export const variantT: IJsonModel = {
             children: [
               { type: 'tab', name: 'NQZ6', component: 'chart-bot', config: { slot: 8 } },
               { type: 'tab', name: 'YMZ6', component: 'chart-bot', config: { slot: 10 } },
+              { type: 'tab', name: 'BTC', component: 'chart-bot', config: { slot: 11 } },
             ],
           },
         ],

@@ -82,14 +82,20 @@ _INDEX_CONTRACTS: dict[str, tuple[str, str]] = {
 }
 
 
-def watch_contract_spec(symbol: str) -> tuple[str, str, str]:
+def watch_contract_spec(
+    symbol: str, sec_type: str | None = None,
+) -> tuple[str, str, str]:
     """``(sec_type, exchange, currency)`` to qualify a watchlist symbol.
 
-    FUT for IB-paste futures localSymbols, IND for the known cash
-    indices in ``_INDEX_CONTRACTS``, STK (SMART, USD) for everything
-    else.
+    An explicit ``sec_type`` of CRYPTO (from a chart-bot config) wins,
+    since crypto tickers collide with stocks (BTC). Otherwise FUT for
+    IB-paste futures localSymbols, IND for the known cash indices in
+    ``_INDEX_CONTRACTS``, STK (SMART, USD) for everything else. SMART
+    for CRYPTO is resolved to IB's crypto venue by the IB client.
     """
     s = (symbol or "").upper()
+    if (sec_type or "").upper() == "CRYPTO":
+        return "CRYPTO", "SMART", "USD"
     if _is_futures_local_symbol(s):
         return "FUT", "SMART", "USD"
     if s in _INDEX_CONTRACTS:

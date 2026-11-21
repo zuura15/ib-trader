@@ -3,6 +3,21 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-21
+
+### Added
+- **Bitcoin chart (slot 11, watch-only).** New `chart-bot-11` charts BTC
+  spot through IB's crypto venue (ZEROHASH) on desktop, mobile web and
+  Burrow. Crypto contracts qualify on ZEROHASH instead of SMART, bars use
+  IB's AGGTRADES feed (IB has no TRADES data for crypto), and quotes skip
+  the stock-only generic ticks. Chart-bot `sec_type` now flows into the
+  engine's quote subscriptions so "BTC" isn't mistaken for the Grayscale
+  Bitcoin Mini ETF.
+- **Crypto orders refused for now.** Any CRYPTO order is rejected up front
+  (`CRYPTO_ORDER_REFUSED`) with a "watch-only" console message until IB's
+  crypto order rules (IOC/Minutes TIF, cash-quantity market buys,
+  fractional sizes) are supported.
+
 ## 2026-11-18
 
 ### Added

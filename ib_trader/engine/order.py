@@ -328,6 +328,22 @@ async def execute_order(
     # IB qualifier picks the right contract (ES vs MES) and returns the
     # real tick_size + multiplier for multiplier-aware pricing.
     sec_type_u = (getattr(cmd, "security_type", None) or "STK").upper()
+    if sec_type_u == "CRYPTO":
+        # Crypto charts are watch-only for now. IB crypto orders have
+        # their own rules (IOC/Minutes TIF, cash-quantity market buys,
+        # fractional sizes) that our order strategies don't handle yet,
+        # so refuse up front rather than send something IB rejects or,
+        # worse, half-accepts.
+        logger.warning(
+            '{"event": "CRYPTO_ORDER_REFUSED", "symbol": "%s", "side": "%s"}',
+            cmd.symbol, side,
+        )
+        ctx.router.emit(
+            f"\u2717 Error: crypto orders aren't supported yet \u2014 "
+            f"{cmd.symbol} is watch-only",
+            pane=OutputPane.COMMAND, severity=OutputSeverity.ERROR,
+        )
+        return
     qty = cmd.qty
     contract_info = await _get_contract(
         cmd.symbol, ctx,
@@ -543,6 +559,16 @@ async def _get_contract(
             trading_class=trading_class,
         )
         info.setdefault("sec_type", "FUT")
+        return info
+
+    if sec_type_u == "CRYPTO":
+        # Never fall through to the STK path: "BTC" as a stock is the
+        # Grayscale Bitcoin Mini ETF, not bitcoin. The IB client fills in
+        # the crypto venue when exchange is SMART.
+        info = await ctx.ib.qualify_contract(
+            symbol, sec_type="CRYPTO", exchange=exchange or "SMART",
+        )
+        info.setdefault("sec_type", "CRYPTO")
         return info
 
     ttl = ctx.settings["cache_ttl_seconds"]

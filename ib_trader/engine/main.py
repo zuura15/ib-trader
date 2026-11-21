@@ -322,18 +322,21 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # chart-bot contracts are auto-anchored so their quote subs never
         # lapse regardless of the operator watchlist.
         from ib_trader.config.watchlist_runtime import (
-            resolve_watchlist_symbols, chart_anchor_symbols,
+            resolve_watchlist_symbols, chart_anchor_sec_types,
         )
         from ib_trader.repl.commands import watch_contract_spec
         _operator_syms = await resolve_watchlist_symbols(ctx.redis)
-        watchlist_symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
+        anchor_types = chart_anchor_sec_types()
+        watchlist_symbols = list(dict.fromkeys(_operator_syms + list(anchor_types)))
         watchlist_subscribed = 0
         for sym in watchlist_symbols:
             try:
                 # Detect IB-paste FUT form (e.g. ``MESM6``) so MES futures
                 # in the watchlist qualify as FUT instead of failing the
                 # default STK qualify path.
-                sec_type, exchange, currency = watch_contract_spec(sym)
+                sec_type, exchange, currency = watch_contract_spec(
+                    sym, anchor_types.get(sym),
+                )
                 info = await ctx.ib.qualify_contract(
                     sym, sec_type=sec_type, exchange=exchange, currency=currency,
                 )
@@ -708,21 +711,25 @@ async def _resubscribe_all_after_reconnect(ctx: AppContext) -> None:
         except Exception:
             logger.exception('{"event": "POSTRECONNECT_RESUB_PENDING_FAILED"}')
 
+    anchor_types: dict[str, str] = {}
     try:
         # Redis watchlist + chart anchors — the same authoritative list
         # the startup loop uses. Previously read the YAML SEED, which
         # goes stale the moment the operator edits the list in the UI.
         from ib_trader.config.watchlist_runtime import (
-            resolve_watchlist_symbols, chart_anchor_symbols,
+            resolve_watchlist_symbols, chart_anchor_sec_types,
         )
         _operator_syms = await resolve_watchlist_symbols(ctx.redis)
-        symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
+        anchor_types = chart_anchor_sec_types()
+        symbols = list(dict.fromkeys(_operator_syms + list(anchor_types)))
     except Exception:
         logger.exception('{"event": "POSTRECONNECT_WATCHLIST_LOAD_FAILED"}')
         symbols = []
     for sym in symbols:
         try:
-            sec_type, exchange, currency = watch_contract_spec(sym)
+            sec_type, exchange, currency = watch_contract_spec(
+                sym, anchor_types.get(sym),
+            )
             info = await ctx.ib.qualify_contract(
                 sym, sec_type=sec_type, exchange=exchange, currency=currency,
             )

@@ -67,6 +67,15 @@ def chart_anchor_symbols() -> list[str]:
     """Chart-bot contract symbols, auto-anchored so their quote subs never
     lapse independent of the operator watchlist. Best-effort: returns []
     if the bot registry can't be read."""
+    return list(chart_anchor_sec_types())
+
+
+def chart_anchor_sec_types() -> dict[str, str]:
+    """``{symbol: sec_type}`` for every chart-bot, in registry order.
+
+    Symbols alone can't say what to subscribe: "BTC" is a stock (the
+    Grayscale mini ETF) unless the chart-bot says ``sec_type: CRYPTO``.
+    Best-effort: returns {} if the bot registry can't be read."""
     try:
         from ib_trader.bots import registry_config
         defns = registry_config.all_definitions()
@@ -79,14 +88,15 @@ def chart_anchor_symbols() -> list[str]:
             except Exception:
                 logger.exception('{"event": "CHART_ANCHOR_REGISTRY_LOAD_FAILED"}')
                 defns = []
-        out: list[str] = []
+        out: dict[str, str] = {}
         for defn in defns:
             if not str(getattr(defn, "id", "")).startswith("chart-bot"):
                 continue
-            sym = (getattr(defn, "config", None) or {}).get("symbol")
+            cfg = getattr(defn, "config", None) or {}
+            sym = cfg.get("symbol")
             if sym:
-                out.append(str(sym).upper())
+                out[str(sym).upper()] = str(cfg.get("sec_type") or "").upper()
         return out
     except Exception:
         logger.exception('{"event": "CHART_ANCHOR_ENUM_FAILED"}')
-        return []
+        return {}

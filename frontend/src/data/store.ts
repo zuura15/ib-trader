@@ -25,7 +25,7 @@ const DATA_MODE: DataMode = (import.meta.env.VITE_DATA_MODE === 'live') ? 'live'
 
 export type ChartTarget = {
   symbol: string;        // display label + underlying for OPT
-  secType: 'STK' | 'FUT' | 'OPT';
+  secType: 'STK' | 'FUT' | 'OPT' | 'CRYPTO';
   conId: number | null;  // preferred identifier; null for watchlist
 };
 
@@ -233,7 +233,8 @@ export const useStore = create<AppStore>((set, get) => ({
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.symbol === 'string'
-          && (parsed.secType === 'STK' || parsed.secType === 'FUT' || parsed.secType === 'OPT')) {
+          && (parsed.secType === 'STK' || parsed.secType === 'FUT' || parsed.secType === 'OPT'
+              || parsed.secType === 'CRYPTO')) {
         return parsed as ChartTarget;
       }
     } catch { /* corrupt entry — ignore */ }

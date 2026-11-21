@@ -221,7 +221,7 @@ class ChartSignalStrategy:
                 "sl_last_check_ts": "str|null",
             },
             version="1.0",
-            supported_sec_types=("STK", "ETF", "FUT", "FOP"),
+            supported_sec_types=("STK", "ETF", "FUT", "FOP", "CRYPTO"),
         )
 
     # ------------------------------------------------------------------

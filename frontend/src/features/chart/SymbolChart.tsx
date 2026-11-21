@@ -3048,7 +3048,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // anyway via the OPT→STK substitution in the store.
   useEffect(() => {
     if (!target || !target.symbol) return;
-    if (target.secType !== 'STK' && target.secType !== 'FUT') return;
+    if (target.secType !== 'STK' && target.secType !== 'FUT' && target.secType !== 'CRYPTO') return;
     if (!seriesRef.current) return;
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

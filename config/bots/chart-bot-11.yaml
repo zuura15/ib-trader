@@ -1,0 +1,24 @@
+id: chart-bot-11
+name: "Chart Bot 11 · Bitcoin"
+strategy: strategy_bot
+broker: ib
+tick_interval_seconds: 10
+# Watch-only for now: the engine refuses CRYPTO orders (see
+# engine/order.py CRYPTO_ORDER_REFUSED) until IB's crypto order rules
+# (IOC/Minutes TIF, cash-quantity market buys) are wired in.
+manual_entry_only: true
+auto_start: false   # operator-driven Start
+config:
+  strategy_name: chart_signal
+  strategy_config: config/strategies/chart_signal.yaml
+  ref_id: chart-bot-11-btc
+  # BTC spot via IB's crypto venue (ZEROHASH). Added 2026-11-21. Trades
+  # around the clock; bars use IB's AGGTRADES feed (no TRADES for crypto).
+  symbol: BTC
+  sec_type: CRYPTO
+  contract_multiplier: 1
+  trail_width_pct: 0.002
+  stop_on_exit: false
+  cooldown_seconds: 0
+symbols:
+- BTC

@@ -185,16 +185,37 @@ class IBOrderSnapshotTimeout(TimeoutError):
 
 
 
+# IB's crypto venue. SMART does not route crypto; IB moved its crypto
+# custody from PAXOS to ZEROHASH, which is where BTC/ETH now qualify.
+CRYPTO_EXCHANGE = "ZEROHASH"
+
+# Sec types whose market-data / bar requests must carry the contract's
+# own exchange rather than SMART.
+_NATIVE_EXCHANGE_SEC_TYPES = frozenset({"IND", "CRYPTO"})
+
+
+def _sec_type_of(contract) -> str:
+    return (getattr(contract, "secType", "") or "").upper()
+
+
 def _generic_ticks_for(contract) -> str:
     """Generic tick list for ``reqMktData``.
 
-    "165" (Misc Stats: avg volume, 52-week high/low) for tradeables.
-    Indices get none: they have no volume, and IB rejects tick lists an
+    "165" (Misc Stats: avg volume, 52-week high/low) for stocks and
+    futures. Indices and crypto get none: IB rejects tick lists an
     instrument doesn't support, which would drop the whole quote feed.
     """
-    if (getattr(contract, "secType", "") or "").upper() == "IND":
+    if _sec_type_of(contract) in _NATIVE_EXCHANGE_SEC_TYPES:
         return ""
     return "165"
+
+
+def _bar_data_type_for(contract, what_to_show: str) -> str:
+    """IB has no TRADES feed for crypto; its trade-print bars are
+    AGGTRADES. Everything else keeps the caller's choice."""
+    if _sec_type_of(contract) == "CRYPTO" and what_to_show.upper() == "TRADES":
+        return "AGGTRADES"
+    return what_to_show
 
 
 class InsyncClient(IBClientBase):
@@ -497,6 +518,8 @@ class InsyncClient(IBClientBase):
         ``trading_class`` and ``tick_size`` fields for FUT.
         """
         sec_type_u = sec_type.upper()
+        if sec_type_u == "CRYPTO" and exchange.upper() == "SMART":
+            exchange = CRYPTO_EXCHANGE
         # Symbol-level memoization. Skip throttle + IB roundtrip when
         # we've already resolved this (symbol, sec_type, exchange,
         # currency, expiry, trading_class) tuple. See
@@ -554,14 +577,17 @@ class InsyncClient(IBClientBase):
         # includes them in the serialised API message.  exchange is forced to
         # 'SMART' regardless of what IB reports as the primary exchange —
         # SMART is the correct routing value for order submission.
-        # Indices are the exception: they don't route via SMART, so
-        # market-data requests need the index's own exchange (CBOE…).
-        # Indices are watch-only, so no order ever sees this contract.
+        # Indices and crypto are the exception: they don't route via
+        # SMART, so requests need the contract's own exchange (CBOE,
+        # ZEROHASH…).
         self._contract_cache[qualified.conId] = Contract(
             conId=qualified.conId,
             symbol=qualified.symbol,
             secType=qualified.secType,
-            exchange=qualified.exchange if sec_type_u == "IND" else "SMART",
+            exchange=(
+                qualified.exchange
+                if sec_type_u in _NATIVE_EXCHANGE_SEC_TYPES else "SMART"
+            ),
             currency=qualified.currency,
         )
         logger.info(
@@ -2531,7 +2557,7 @@ class InsyncClient(IBClientBase):
             endDateTime=end_date_time,
             durationStr=duration_str,
             barSizeSetting=bar_size,
-            whatToShow=what_to_show,
+            whatToShow=_bar_data_type_for(contract, what_to_show),
             useRTH=use_rth,
             formatDate=format_date,
         )
@@ -2696,7 +2722,9 @@ class InsyncClient(IBClientBase):
             exchange="SMART", currency="USD",
         )
         bars = self.__ib.reqRealTimeBars(
-            contract, barSize=5, whatToShow=what_to_show, useRTH=False,
+            contract, barSize=5,
+            whatToShow=_bar_data_type_for(contract, what_to_show),
+            useRTH=False,
         )
         callbacks = [callback] if callback else []
         self._realtime_bars[con_id] = {

@@ -11,7 +11,7 @@ export interface EmbedChartParams {
   theme: 'dark' | 'light';
 }
 
-const SEC_TYPES: ReadonlyArray<ChartTarget['secType']> = ['STK', 'FUT', 'OPT'];
+const SEC_TYPES: ReadonlyArray<ChartTarget['secType']> = ['STK', 'FUT', 'OPT', 'CRYPTO'];
 
 /** True when the URL asks for the chart-only page. */
 export function isEmbedChartUrl(search: string): boolean {

@@ -147,6 +147,11 @@ const MIGRATED_TABS: Array<{
     component: 'chart-bot', name: 'YMZ6', anchor: 'chart-bot',
     config: { slot: 10 }, slot: 10, anchorSlot: 8,
   },
+  // Bitcoin (slot 11, added 2026-11-21) — next to the Dow chart.
+  {
+    component: 'chart-bot', name: 'BTC', anchor: 'chart-bot',
+    config: { slot: 11 }, slot: 11, anchorSlot: 10,
+  },
 ];
 
 // Chart-bot slots RETIRED from the default layout. Persisted layouts

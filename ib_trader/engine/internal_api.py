@@ -706,20 +706,21 @@ async def reload_watchlist():
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
     from ib_trader.config.watchlist_runtime import (
-        resolve_watchlist_symbols, chart_anchor_symbols,
+        resolve_watchlist_symbols, chart_anchor_sec_types,
     )
     from ib_trader.repl.commands import watch_contract_spec
 
     try:
         _operator_syms = await resolve_watchlist_symbols(_ctx.redis)
-        symbols = list(dict.fromkeys(_operator_syms + chart_anchor_symbols()))
+        anchor_types = chart_anchor_sec_types()
+        symbols = list(dict.fromkeys(_operator_syms + list(anchor_types)))
         subscribed = []
         for sym in symbols:
             try:
                 # Same FUT-detection as the startup subscribe loop —
                 # IB-paste localSymbol form (``MESM6``) routes through
                 # the FUT qualify path; everything else stays STK.
-                sec_type, exchange, currency = watch_contract_spec(sym)
+                sec_type, exchange, currency = watch_contract_spec(sym, anchor_types.get(sym))
                 info = await _ctx.ib.qualify_contract(
                     sym, sec_type=sec_type, exchange=exchange, currency=currency,
                 )
