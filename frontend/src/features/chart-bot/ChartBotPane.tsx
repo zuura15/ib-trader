@@ -1,6 +1,7 @@
 import { tickSizeFor } from '../chart/chartUtils';
 import { useEffect, useRef, useState } from 'react';
 import { BotChart } from './BotChart';
+import { isChartTimeframe, type ChartTimeframe } from '../chart/chartUtils';
 import type { ChartTarget } from '../../data/store';
 import { useStore } from '../../data/store';
 import { pnlBasisTooltip, type ChartPnlRollupEntry } from '../../api/client';
@@ -39,6 +40,14 @@ function fmtUsd(v: number, compact?: boolean): string {
 }
 
 const QTY_STORAGE_KEY = (slot: number) => `ib-chart-qty-${slot}`;
+const TF_STORAGE_KEY = (slot: number) => `ib-chart-tf-${slot}`;
+
+function loadTimeframe(slot: number): ChartTimeframe {
+  try {
+    const raw = localStorage.getItem(TF_STORAGE_KEY(slot));
+    return isChartTimeframe(raw) ? raw : '1m';
+  } catch { return '1m'; }
+}
 
 function loadQty(slot: number): number {
   try {
@@ -91,6 +100,11 @@ export function ChartBotPane({ slot, compact = false, headerLeading }: Props) {
   const [bot, setBot] = useState<BotApiShape | null>(null);
   const [botFetchError, setBotFetchError] = useState<string | null>(null);
   const [qty, setQty] = useState<number>(() => loadQty(slot));
+  const [timeframe, setTimeframe] = useState<ChartTimeframe>(() => loadTimeframe(slot));
+  const changeTimeframe = (tf: ChartTimeframe) => {
+    setTimeframe(tf);
+    try { localStorage.setItem(TF_STORAGE_KEY(slot), tf); } catch { /* storage blocked — session-only */ }
+  };
   const [pendingAction, setPendingAction] = useState<
     'buy' | 'sell' | 'close' | null
   >(null);
@@ -342,6 +356,8 @@ export function ChartBotPane({ slot, compact = false, headerLeading }: Props) {
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
           headerLeading={headerLeading}
+          timeframe={timeframe}
+          onTimeframeChange={changeTimeframe}
         />
         {/* Live P&L for the open position on this exact contract.
             Free-floating colored number, bottom-right of the plot

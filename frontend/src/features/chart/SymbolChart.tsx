@@ -204,6 +204,9 @@ interface Props {
    *  historical load, so pane headers can show the current price
    *  without opening a second quote socket. */
   onLastPrice?: (price: number) => void;
+  /** Latest RSI of the displayed bars — the value the RSI pane shows.
+   *  Fires on each history load and live tick. */
+  onRsi?: (value: number) => void;
   /** Receives the current recommendation (GH #102). When set, the chart
    *  draws no top-centre badge — the parent shows it (pane header). */
   onRecommendation?: (rec: Recommendation | null) => void;
@@ -288,6 +291,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     pickTickSize = 0.01,
     compactAxis = false,
     onLastPrice,
+    onRsi,
     onRecommendation,
     orderLines,
     onOrderAmend,
@@ -309,11 +313,17 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   const suppressAutoSignals = suppressAutoSignalsProp || !tf.overlays;
   const targetRef = useRef(target);
   useEffect(() => { targetRef.current = target; }, [target]);
+  // Saved zoom is per timeframe: a 1-min window restored onto 1D bars
+  // would show a sliver of one bar. 1m keeps the legacy key.
+  const zoomKey = (t: ChartTarget) => (timeframe === '1m'
+    ? targetKey(t) : `${targetKey(t)}@${timeframe}`);
 
   // Ref-tunneled so the tick handler / history loader never re-subscribe
   // when the parent passes a fresh closure.
   const onLastPriceRef = useRef(onLastPrice);
   useEffect(() => { onLastPriceRef.current = onLastPrice; }, [onLastPrice]);
+  const onRsiRef = useRef(onRsi);
+  useEffect(() => { onRsiRef.current = onRsi; }, [onRsi]);
 
   // Visibility-wake plumbing. Each data-source useEffect (historical
   // load, SR, fuzzy, regime, live-tick WS) pushes a callback onto this
@@ -2324,7 +2334,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const tgt = targetRef.current;
         const xRange = userRangeRef.current;
         if (tgt && xRange) {
-          saveRange(targetKey(tgt), {
+          saveRange(zoomKey(tgt), {
             ...xRange,
             priceFrom: pr.from,
             priceTo: pr.to,
@@ -2415,7 +2425,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const tgt = targetRef.current;
         const xr = userRangeRef.current;
         if (tgt && xr) {
-          saveRange(targetKey(tgt), { from: xr.from, to: xr.to });
+          saveRange(zoomKey(tgt), { from: xr.from, to: xr.to });
         }
         repositionSrSignalsRef.current?.();
       });
@@ -2485,7 +2495,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // the new viewport — independent of whether SR re-detects.
       repositionSrSignalsRef.current?.();
       const tgt = targetRef.current;
-      if (tgt) saveRange(targetKey(tgt), r);
+      if (tgt) saveRange(zoomKey(tgt), r);
     });
 
     // Re-fit Y when the chart pane resizes (drawer collapse/expand,
@@ -2671,7 +2681,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const chart = chartRef.current;
         if (!series || !chart) return;
 
-        const savedRange = firstLoad ? loadSavedRange(targetKey(target)) : null;
+        const savedRange = firstLoad ? loadSavedRange(zoomKey(target)) : null;
         const prevRange = userRangeRef.current ?? savedRange;
         // Hydrate Y-zoom from localStorage on the very first load so a
         // hard refresh restores the user's price-axis zoom. On
@@ -2703,7 +2713,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             const tgt = targetRef.current;
             const cur = userRangeRef.current;
             if (tgt && cur) {
-              saveRange(targetKey(tgt), {
+              saveRange(zoomKey(tgt), {
                 ...cur,
                 priceFrom: currentPriceRange.from,
                 priceTo: currentPriceRange.to,
@@ -2761,6 +2771,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             rsiPoints.push({ time: points[i].time, value: v });
           }
           rsiSeries.setData(rsiPoints);
+          if (rsiPoints.length) onRsiRef.current?.(rsiPoints[rsiPoints.length - 1].value);
 
           for (const ds of divergenceSeriesRef.current) {
             try { chart.removeSeries(ds); } catch { /* already gone */ }
@@ -2941,7 +2952,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     if (!target) return;
     const chart = chartRef.current;
     if (!chart) return;
-    const saved = loadSavedRange(targetKey(target));
+    const saved = loadSavedRange(zoomKey(target));
     const nowSec = localUtcSeconds(new Date());
     // Always anchor the right edge to "now" on initial load. We retain
     // the *width* of the saved zoom — i.e. how far back the user was
@@ -3148,6 +3159,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
             if (v != null) {
               try {
                 rsiSeries.update({ time: barSec as UTCTimestamp, value: v });
+                onRsiRef.current?.(v);
               } catch { /* series torn down mid-tick — next load resets it */ }
             }
           }
@@ -3230,7 +3242,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       userRangeRef.current = range;
       userLogicalRangeRef.current = null;
       const tgt = targetRef.current;
-      if (tgt) saveRange(targetKey(tgt), range);
+      if (tgt) saveRange(zoomKey(tgt), range);
       // Reset Y to the "polyline fills the middle third, centered"
       // rule. scaleMargins is reapplied here defensively so an
       // HMR-preserved chart instance from before this change picks

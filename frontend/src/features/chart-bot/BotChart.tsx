@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import html2canvas from 'html2canvas';
 import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
-import { VISIBLE_MINUTES, type ChartTimeframe } from '../chart/chartUtils';
+import { TIMEFRAMES, VISIBLE_MINUTES, type ChartTimeframe } from '../chart/chartUtils';
+import { RsiScaleStrip } from '../chart/RsiScaleStrip';
 import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import { useStore, type ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
@@ -51,6 +52,9 @@ interface Props {
   pickTickSize?: number;
   /** Bar timeframe, forwarded to SymbolChart (issue #105). */
   timeframe?: ChartTimeframe;
+  /** When set, the header shows a 1m/3m/1h/4h/1D toggle that calls
+   *  this. Embeds leave it unset (the host app owns the toggle). */
+  onTimeframeChange?: (tf: ChartTimeframe) => void;
   /** Phone embed: compact price axis, forwarded to SymbolChart. */
   compactAxis?: boolean;
 }
@@ -79,7 +83,7 @@ export function BotChart({
   botId, botRef, symbol, secType,
   renderHeader, renderTitle, showHeader = true,
   fullscreenFooter, onFullscreenChange,
-  onPricePick, pickTickSize, headerLeading, timeframe = '1m', compactAxis = false,
+  onPricePick, pickTickSize, headerLeading, timeframe = '1m', onTimeframeChange, compactAxis = false,
 }: Props) {
   const [state, setState] = useState<BotPositionState>({});
   const chartRef = useRef<SymbolChartHandle>(null);
@@ -91,6 +95,13 @@ export function BotChart({
   // SQLite). Polled on a slow 5s interval plus the same triggers the
   // Orders panel uses (command completion, resync).
   const [lastPrice, setLastPrice] = useState<number | null>(null);
+  // Tagged with timeframe+symbol: the chart remounts on either, and the
+  // previous chart's reading must not show against the new one.
+  const [rsiReading, setRsiReading] = useState<{ key: string; value: number } | null>(null);
+  const rsiKey = `${symbol ?? ''}@${timeframe}`;
+  const displayedRsi = rsiReading?.key === rsiKey ? rsiReading.value : null;
+  const onRsi = useCallback((value: number) => setRsiReading({ key: rsiKey, value }), [rsiKey]);
+  const rsiOn = useUserSetting('chartShowRsi');
   // Trade recommendation (GH #102), shown in this header next to the
   // price instead of floating over the chart.
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
@@ -535,6 +546,27 @@ export function BotChart({
   // and in the fullscreen header so the controls follow the chart.
   const vocToolbar = (
     <div className="flex items-center gap-2" style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+      {onTimeframeChange && (
+        <div style={{ display: 'flex', gap: 1 }} data-testid={`chart-timeframes-${botId}`}>
+          {(Object.keys(TIMEFRAMES) as ChartTimeframe[]).map((tf) => (
+            <button
+              key={tf}
+              onClick={() => onTimeframeChange(tf)}
+              aria-pressed={tf === timeframe}
+              style={{
+                background: tf === timeframe ? 'var(--bg-secondary)' : 'transparent',
+                border: '1px solid', borderColor: tf === timeframe
+                  ? 'var(--border-default)' : 'transparent',
+                color: tf === timeframe ? 'var(--text-primary)' : 'var(--text-secondary)',
+                padding: '1px 6px', borderRadius: 3, cursor: 'pointer',
+                fontWeight: tf === timeframe ? 600 : 400,
+              }}
+            >
+              {tf}
+            </button>
+          ))}
+        </div>
+      )}
       <button
         onClick={() => chartRef.current?.resetZoom()}
         title={`Reset to last ${VISIBLE_MINUTES}m`}
@@ -888,6 +920,7 @@ export function BotChart({
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
           onLastPrice={setLastPrice}
+          onRsi={onRsi}
           onRecommendation={setRecommendation}
           orderLines={orderLines}
           onOrderAmend={handleOrderAmend}
@@ -895,6 +928,14 @@ export function BotChart({
           placeholder={symbol ? null : 'No bot bound to this slot.'}
         />
       </div>
+      {rsiOn && target && (
+        <RsiScaleStrip
+          target={target}
+          displayed={timeframe}
+          displayedRsi={displayedRsi}
+          lastPrice={lastPrice}
+        />
+      )}
       {/* 2-row PositionStrip removed 2026-06-09. The metrics it
           surfaced (entry/last/stop/HWM/P&L/24h) were bot-FSM-
           centric — useful when chart-bots auto-fired, pure visual

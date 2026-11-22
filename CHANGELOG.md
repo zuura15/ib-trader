@@ -6,6 +6,16 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-21
 
 ### Added
+- **Multi-timeframe RSI scale under every chart.** A 0–100 strip with
+  oversold/overbought zones shows a marker each for 3m, 1h, 4h and 1D
+  RSI(14). The chart's own timeframe is ringed and reads the same value
+  as the RSI pane; the others re-fetch bars on their own cadence (3m
+  every minute, 1h every 30 min, 4h every 2 h, 1D every 12 h) and fold
+  the live price into their last bar. Display-only; hidden when the RSI
+  pane is turned off.
+- **Desktop chart timeframe toggle.** Chart panes get a 1m / 3m / 1h /
+  4h / 1D toggle in the header, remembered per slot. Saved zoom is now
+  per timeframe so a 1-min window isn't restored onto daily bars.
 - **Bitcoin chart (slot 11, watch-only).** New `chart-bot-11` charts BTC
   spot through IB's crypto venue (ZEROHASH) on desktop, mobile web and
   Burrow. Crypto contracts qualify on ZEROHASH instead of SMART, bars use
