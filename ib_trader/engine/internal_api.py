@@ -1115,11 +1115,21 @@ async def get_history(
             spec = watch_contract_spec(symbol or "")
             if spec[0] != "STK":
                 effective_sec_type, exchange, currency = spec
+        from ib_trader.broker.exceptions import ExpiredContractError
         try:
             qualified = await _ctx.ib.qualify_contract(
                 symbol, sec_type=effective_sec_type, exchange=exchange,
                 currency=currency,
             )
+        except ExpiredContractError as e:
+            # Expected after a roll while an old chart tab still polls the
+            # previous contract. 410 tells the client it's gone for good;
+            # a one-line WARNING (no traceback) keeps the log readable.
+            logger.warning(
+                '{"event": "HISTORY_CONTRACT_EXPIRED", "symbol": "%s", "expiry": "%s"}',
+                symbol, e.expiry,
+            )
+            raise HTTPException(status_code=410, detail=str(e)) from e
         except Exception as e:
             logger.exception(
                 '{"event": "HISTORY_QUALIFY_FAILED", "symbol": "%s", "sec_type": "%s"}',

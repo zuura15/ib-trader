@@ -284,3 +284,52 @@ class TestFutLocalSymbolMultiExchange:
         assert "GC@COMEX" in msg
         assert "GC@ICEUS" in msg
         assert "--exchange" in msg
+
+
+class TestExpiredQualifyNegativeCache:
+    """An expired FUT is answered from memory after the first IB lookup
+    (2026-11-22: a stale CLZ6 chart re-queried IB ~9x/s, holding the
+    throttle that order placement shares)."""
+
+    @pytest.mark.asyncio
+    async def test_second_qualify_skips_ib(self):
+        from types import SimpleNamespace
+        from ib_trader.broker.exceptions import ExpiredContractError
+
+        client = TestFutLocalSymbolMultiExchange._make_client()
+        calls = 0
+
+        async def fake_req(_contract):
+            nonlocal calls
+            calls += 1
+            return [TestFutLocalSymbolMultiExchange._details(
+                con_id=1, exchange="NYMEX", local="CLZ6", symbol="CL",
+                trading_class="CL", multiplier="1000", min_tick=0.01,
+                expiry="20201120",
+            )]
+
+        client._InsyncClient__ib = SimpleNamespace(reqContractDetailsAsync=fake_req)
+        for _ in range(3):
+            with pytest.raises(ExpiredContractError):
+                await client.qualify_contract("CLZ6", sec_type="FUT")
+        assert calls == 1
+
+
+class TestHistoryExpiredContract:
+    @pytest.mark.asyncio
+    async def test_expired_contract_returns_410(self, monkeypatch):
+        from types import SimpleNamespace
+        from fastapi import HTTPException
+        from ib_trader.broker.exceptions import ExpiredContractError
+        from ib_trader.engine import internal_api
+
+        async def expired(*_a, **_k):
+            raise ExpiredContractError("CLZ6", "20261120")
+
+        monkeypatch.setattr(
+            internal_api, "_ctx",
+            SimpleNamespace(ib=SimpleNamespace(qualify_contract=expired)),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await internal_api.get_history(symbol="CLZ6", sec_type="FUT")
+        assert exc.value.status_code == 410

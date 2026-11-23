@@ -346,6 +346,13 @@ class InsyncClient(IBClientBase):
         # ``_contract_cache`` semantics; futures roll naturally to new
         # symbols so stale entries are harmless.
         self._qualify_result_cache: dict[tuple, dict] = {}
+        # Negative cache for expired contracts, keyed like
+        # ``_qualify_result_cache``. A contract past its last-trade date
+        # never comes back, so the answer is permanent. Without this, a
+        # chart still pointed at a rolled contract re-asked IB on every
+        # history poll — 2026-11-22 CLZ6: ~9 reqContractDetails/s holding
+        # the global throttle that order placement shares.
+        self._expired_qualify_cache: dict[tuple, ExpiredContractError] = {}
         # Tracks last successful CONTRACT_FETCHED timestamp per con_id
         # for the CONTRACT_FETCH_BURST regression detector below.
         self._last_fetch_ts: dict[int, float] = {}
@@ -531,6 +538,9 @@ class InsyncClient(IBClientBase):
         cached = self._qualify_result_cache.get(cache_key)
         if cached is not None:
             return cached
+        expired = self._expired_qualify_cache.get(cache_key)
+        if expired is not None:
+            raise ExpiredContractError(expired.root, expired.expiry)
 
         await self._throttle()
         if sec_type_u == "FUT":
@@ -539,15 +549,23 @@ class InsyncClient(IBClientBase):
             # treat `symbol` as the IB-paste localSymbol (``MESM6``)
             # and qualify by that. Both paths land on the same dict
             # response and seed the contract cache identically.
-            if expiry:
-                result = await self._qualify_future(
-                    root=symbol, exchange=exchange, currency=currency,
-                    expiry=_normalize_expiry(expiry), trading_class=trading_class,
+            try:
+                if expiry:
+                    result = await self._qualify_future(
+                        root=symbol, exchange=exchange, currency=currency,
+                        expiry=_normalize_expiry(expiry), trading_class=trading_class,
+                    )
+                else:
+                    result = await self._qualify_future_by_local_symbol(
+                        local_symbol=symbol, exchange=exchange, currency=currency,
+                    )
+            except ExpiredContractError as e:
+                self._expired_qualify_cache[cache_key] = e
+                logger.warning(
+                    '{"event": "QUALIFY_EXPIRED_CACHED", "symbol": "%s", "expiry": "%s"}',
+                    symbol, e.expiry,
                 )
-            else:
-                result = await self._qualify_future_by_local_symbol(
-                    local_symbol=symbol, exchange=exchange, currency=currency,
-                )
+                raise
             self._record_qualify_result(symbol, cache_key, result)
             return result
 

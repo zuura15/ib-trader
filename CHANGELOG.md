@@ -5,6 +5,15 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-22
 
+### Fixed
+- **Expired-contract history polls no longer tie up IB.** A chart still
+  open on a rolled contract (CLZ6) re-asked IB for contract details on
+  every history poll — ~9 calls/s through the global IB throttle that
+  order placement shares. Expired futures are now negative-cached after
+  the first lookup, and `/engine/history` answers 410 with a one-line
+  `HISTORY_CONTRACT_EXPIRED` warning instead of a 502 + traceback, so
+  charts stop retrying.
+
 ### Changed
 - **Crude chart rolled CLZ6 -> CLF7 (Jan 2027).** CLZ6 expired
   2026-11-20. chart-bot-5 symbol, direction_symbols and the slot-5 tab
