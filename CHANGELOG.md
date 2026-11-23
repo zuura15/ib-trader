@@ -6,6 +6,11 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-22
 
 ### Fixed
+- **Open pages pick up contract rolls and watchlist edits.** The
+  watchlist and each chart pane read their symbol once at page load, so
+  a page opened before a roll kept showing (and polling) the old
+  contract until reloaded. Both now re-read every 60 s and when the tab
+  becomes visible; the chart only remounts when its symbol changes.
 - **Expired-contract history polls no longer tie up IB.** A chart still
   open on a rolled contract (CLZ6) re-asked IB for contract details on
   every history poll — ~9 calls/s through the global IB throttle that

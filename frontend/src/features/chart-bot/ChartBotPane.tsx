@@ -135,9 +135,13 @@ export function ChartBotPane({ slot, compact = false, headerLeading }: Props) {
 
   // Resolve symbol + secType from the bot config (operator picks via the
   // YAML; live picker is the Variant H plan, not this round).
+  // Re-read on a slow cadence and on tab-visible so a contract roll
+  // (symbols_json change) reaches open pages without a reload. Only a
+  // symbol / sec-type change replaces ``bot`` — the chart remounts on
+  // symbol, so unrelated field churn must not touch it.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const load = async () => {
       try {
         const resp = await fetch(`/api/bots/${botId}`);
         if (!resp.ok) {
@@ -148,14 +152,25 @@ export function ChartBotPane({ slot, compact = false, headerLeading }: Props) {
         }
         const body = await resp.json() as BotApiShape;
         if (cancelled) return;
-        setBot(body);
+        setBot((prev) => (prev
+          && prev.symbols_json === body.symbols_json
+          && prev.sec_type === body.sec_type
+          && prev.ref_id === body.ref_id ? prev : body));
         setBotFetchError(null);
       } catch (e) {
         if (cancelled) return;
         setBotFetchError(e instanceof Error ? e.message : String(e));
       }
-    })();
-    return () => { cancelled = true; };
+    };
+    void load();
+    const id = setInterval(() => { void load(); }, 60_000);
+    const onVisible = () => { if (document.visibilityState === 'visible') void load(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [botId]);
 
   // Persist qty per slot so each chart pane remembers its last-used

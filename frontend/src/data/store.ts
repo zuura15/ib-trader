@@ -624,7 +624,7 @@ export const useStore = create<AppStore>((set, get) => ({
     fetch(`/api/watchlist?_t=${Date.now()}`, { cache: 'no-store' })
       .then(r => r.ok ? r.json() : { items: [], generated_at: null })
       .then((data: { items: WatchlistItem[]; generated_at: string | null }) => {
-        const items = data.items || [];
+        let items = data.items || [];
         get().setWatchlist(items, data.generated_at || null);
 
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -656,6 +656,34 @@ export const useStore = create<AppStore>((set, get) => ({
         };
         open();
 
+        // Pick up symbol-list edits (contract rolls, watchlist changes)
+        // without a page reload: re-read the list on a slow cadence and
+        // on tab-visible; when the set changed, swap the items and
+        // subscribe the new symbols on the live socket.
+        const resyncSymbols = () => {
+          fetch(`/api/watchlist?_t=${Date.now()}`, { cache: 'no-store' })
+            .then(r => (r.ok ? r.json() : null))
+            .then((fresh: { items: WatchlistItem[]; generated_at: string | null } | null) => {
+              if (!fresh || closed) return;
+              const next = fresh.items || [];
+              const same = next.length === items.length
+                && next.every((it, i) => it.symbol === items[i].symbol);
+              if (same) return;
+              const known = new Set(items.map(it => it.symbol));
+              items = next;
+              get().setWatchlist(next, fresh.generated_at || null);
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                for (const it of next) {
+                  if (!known.has(it.symbol)) {
+                    ws.send(JSON.stringify({ type: 'subscribe_quote', symbol: it.symbol }));
+                  }
+                }
+              }
+            })
+            .catch((err) => { console.warn('WATCHLIST_RESYNC_FAILED', err); });
+        };
+        const resyncTimer = setInterval(resyncSymbols, 60_000);
+
         // Background tabs are throttled / discarded by the browser; the
         // 2 s reconnect timer may be mid-wait or the socket may be in a
         // half-closed state when the user returns. On visible, drop the
@@ -663,6 +691,7 @@ export const useStore = create<AppStore>((set, get) => ({
         // resumes without waiting for the next retry tick.
         const onVisible = () => {
           if (document.visibilityState !== 'visible' || closed) return;
+          resyncSymbols();
           if (retry) { clearTimeout(retry); retry = null; }
           if (ws) {
             ws.onclose = null;
@@ -676,6 +705,7 @@ export const useStore = create<AppStore>((set, get) => ({
         // Close the WS on page unload so we don't leak open subscriptions.
         window.addEventListener('beforeunload', () => {
           closed = true;
+          clearInterval(resyncTimer);
           document.removeEventListener('visibilitychange', onVisible);
           if (retry) clearTimeout(retry);
           if (ws) { ws.onclose = null; ws.close(); }
