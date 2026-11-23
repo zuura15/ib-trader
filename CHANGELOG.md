@@ -3,6 +3,13 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-22
+
+### Changed
+- **Crude chart rolled CLZ6 -> CLF7 (Jan 2027).** CLZ6 expired
+  2026-11-20. chart-bot-5 symbol, direction_symbols and the slot-5 tab
+  name updated; bot id/ref_id unchanged.
+
 ## 2026-11-21
 
 ### Added
