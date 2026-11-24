@@ -3,6 +3,16 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-24
+
+### Changed
+- **Gold charts rolled GCZ6 -> GCG7 and MGCZ6 -> MGCG7 (Feb 2027).**
+  IB is warning about the December delivery close-out. January gold
+  barely trades, and IB lists no January micro, so both roll to
+  February, the next active month. chart-bot-1/-7 symbols,
+  direction_symbols, and the slot-1/slot-7 tab names were updated; bot
+  ids and ref_ids are unchanged.
+
 ## 2026-11-22
 
 ### Fixed

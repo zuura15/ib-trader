@@ -1,7 +1,7 @@
 /**
  * Chart-only page for the Burrow Android app's native screens (#105).
  *
- * ``/?embed=chart&slot=1&symbol=MGCZ6&secType=FUT&tf=1m&theme=dark``
+ * ``/?embed=chart&slot=1&symbol=MGCG7&secType=FUT&tf=1m&theme=dark``
  * renders one chart-bot chart (price line + RSI, order lines, fills)
  * full-bleed with no app shell. The native app keeps a single WebView
  * on this page and switches symbol / timeframe / theme in place by

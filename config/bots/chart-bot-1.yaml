@@ -18,11 +18,13 @@ config:
   # GC = full Gold (100 oz). Switched from micro MGCQ6 → full GCQ6
   # on 2026-06-07 as the operator scaled into full contracts. Roll
   # history: Q6 → V6 2026-07-21, V6 → Z6 2026-09-27 (Oct delivery
-  # window; operator rolls the live position separately). Next roll:
-  # G7 (Feb) before late-Nov. QBALGO twin is dropped by the qualifier
-  # (insync_client commit 46953eb) so the bare ``GCZ6`` localSymbol
-  # resolves to COMEX unambiguously.
-  symbol: GCZ6
+  # window; operator rolls the live position separately), Z6 → G7
+  # 2026-11-24 (Dec delivery close-out; Jan F7 is thinly traded, so
+  # gold skips to the next active month). Next roll: J7 (Apr) before
+  # late-Jan. QBALGO twin is dropped by the qualifier (insync_client
+  # commit 46953eb) so the bare ``GCG7`` localSymbol resolves to COMEX
+  # unambiguously.
+  symbol: GCG7
   sec_type: FUT
   # Full Gold: 100 oz/contract (10x micro). Used by P/L math + trail
   # target.
@@ -38,4 +40,4 @@ config:
   stop_on_exit: false
   cooldown_seconds: 0
 symbols:
-- GCZ6
+- GCG7

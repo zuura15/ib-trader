@@ -108,11 +108,11 @@ const MIGRATED_TABS: Array<{
   { component: 'direction-lab', name: 'Direction Lab', anchor: 'bots' },
   // Gold (slot 1) — present in every persisted layout since the
   // beginning, so this entry exists for the RENAME pass (which keys
-  // off MIGRATED_TABS by slot), not for injection. GCZ6 since the
-  // 2026-09-27 roll (Oct delivery window). Listed before the entries
+  // off MIGRATED_TABS by slot), not for injection. GCG7 since the
+  // 2026-11-24 roll (Dec delivery window; GCZ6 before that). Listed before the entries
   // that anchor on slot 1.
   {
-    component: 'chart-bot', name: 'GCZ6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'GCG7', anchor: 'chart-bot',
     config: { slot: 1 }, slot: 1, anchorSlot: 7,
   },
   // Slot 5 chart (CLF7 since the 2026-11-22 roll; CLZ6/CLX6/CLV6 before that,
@@ -126,9 +126,9 @@ const MIGRATED_TABS: Array<{
     config: { slot: 5 }, slot: 5, anchorSlot: 1,
   },
   // Micro Gold (slot 7) — inject next to the full Gold chart (slot 1).
-  // MGCZ6 since the 2026-09-27 roll (Oct delivery close-out).
+  // MGCG7 since the 2026-11-24 roll (Dec delivery close-out).
   {
-    component: 'chart-bot', name: 'MGCZ6', anchor: 'chart-bot',
+    component: 'chart-bot', name: 'MGCG7', anchor: 'chart-bot',
     config: { slot: 7 }, slot: 7, anchorSlot: 1,
   },
   // Dec Nasdaq (slot 8) — re-anchored on CLV6 (slot 5, present or

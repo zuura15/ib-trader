@@ -42,7 +42,7 @@ orders_open_sync_seconds: 20
 # subs never lapse). Sampling is cache-reads every 2s; LLM spend stays
 # button-only. NB: on contract rolls, update here alongside the
 # chart-bot YAML (CLZ6 -> CLF7 rolled 2026-11-22).
-direction_symbols: [NQZ6, YMZ6, MGCZ6, CLF7]
+direction_symbols: [NQZ6, YMZ6, MGCG7, CLF7]
 direction_sample_seconds: 2
 direction_lookback_minutes: 30
 direction_flat_ticks_per_min: 0.5

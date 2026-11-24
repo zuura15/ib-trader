@@ -62,7 +62,7 @@ def test_crypto_hint_beats_stock_ticker_collision():
 def test_bitcoin_chart_bot_is_anchored_as_crypto():
     types = wr.chart_anchor_sec_types()
     assert types.get("BTC") == "CRYPTO"
-    assert types.get("GCZ6") == "FUT"
+    assert types.get("GCG7") == "FUT"
     assert wr.chart_anchor_symbols() == list(types)
 
 
