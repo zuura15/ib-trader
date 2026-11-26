@@ -5,6 +5,12 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
 ## 2026-11-25
 
+### Changed
+- **Lines off a wall are hidden by default.** The "Hide lines off a
+  wall" setting now defaults to on, so the SR filters checkbox for
+  them starts unticked. An explicit choice already saved in a browser
+  is kept.
+
 ### Added
 - **Chart setting to hide S/R lines off a wall.** When price runs
   steeply, each small pause on the way up (or down) anchors its own
@@ -13,8 +19,7 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
   (Settings modal, and the SR filters popover on every chart) hides
   these: unconfirmed (2-touch) lines whose origin has price on the
   wrong side of the line within the 10 bars before it. Confirmed lines
-  (3+ touches) always stay. The setting is saved per browser and is off
-  by default. It changes the display only; bot signals are unaffected.
+  (3+ touches) always stay. The setting is saved per browser. It changes the display only; bot signals are unaffected.
 
 ## 2026-11-24
 
