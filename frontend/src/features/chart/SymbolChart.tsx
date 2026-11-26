@@ -15,7 +15,7 @@ import {
   historyHole, HISTORY_CATCH_UP_MAX_AGE_S, HISTORY_CATCH_UP_DELAY_MS, HISTORY_CATCH_UP_MAX_TRIES,
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
-import { detectSupportResistance } from './supportResistance';
+import { detectSupportResistance, isWallFanLine } from './supportResistance';
 import {
   fetchBackendSr, backendLineToSRLine, backendTsToChartTime,
   type BackendSrPayload,
@@ -395,6 +395,16 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     repositionSrSignalsRef.current?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wedgesOn]);
+  // Hide S/R lines that start partway up a steep run (the fan off a
+  // wall). Read by the SR recompute through a ref; toggling re-renders
+  // the lines without a chart rebuild.
+  const hideWallSr = useUserSetting('chartHideWallSr');
+  const hideWallSrRef = useRef(hideWallSr);
+  useEffect(() => {
+    hideWallSrRef.current = hideWallSr;
+    scheduleSrRecomputeRef.current?.(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hideWallSr]);
   const volumeOn = useUserSetting('chartShowVolume');
   const volumeOnRef = useRef(volumeOn);
   volumeOnRef.current = volumeOn;
@@ -1899,6 +1909,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
       // Arrow/wedge detection runs against this list so the triangle
       // only highlights structures the user can see.
       const renderedLines: typeof lines = [];
+      const allCloses = hideWallSrRef.current ? allBars.map((b) => b.close) : null;
       for (const line of lines) {
         const isBroken = line.breakIdx != null;
         // Broken lines are noisy at zoom-out and clutter the active
@@ -1916,6 +1927,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const counterResistance = line.type === 'resistance' && line.slope > 0;
         if (counterSupport && !showCounterSupportRef.current) continue;
         if (counterResistance && !showCounterResistanceRef.current) continue;
+        // Wall filter: drop tentative lines whose origin is a pause
+        // partway up a steep run rather than a swing point — the fan
+        // of dotted lines off a rally or selloff (see isWallFanLine).
+        if (allCloses && isWallFanLine(line, allCloses)) continue;
         renderedLines.push(line);
         labelCounter += 1;
         const label = `L${labelCounter}`;

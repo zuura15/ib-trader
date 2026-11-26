@@ -338,6 +338,8 @@ export function BotChart({
   };
   const [showCounterSupport, setShowCounterSupport] = useState(false);
   const [showCounterResistance, setShowCounterResistance] = useState(false);
+  // Global (persisted) — hides the fan of lines off a steep run.
+  const hideWallSr = useUserSetting('chartHideWallSr');
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
 
@@ -382,6 +384,7 @@ export function BotChart({
   const activeFilterCount = (showBrokenSr ? 1 : 0)
     + (showCounterSupport ? 1 : 0)
     + (showCounterResistance ? 1 : 0)
+    + (hideWallSr ? 1 : 0)
     // Hide-S/R and FE-mode are diagnostic toggles that also live in
     // the popover now — surface them in the chip count so the
     // operator knows the popover holds a non-default setting even
@@ -712,6 +715,8 @@ export function BotChart({
             {([
               ['Counter-trend support (down-sloping)', showCounterSupport, setShowCounterSupport],
               ['Counter-trend resistance (up-sloping)', showCounterResistance, setShowCounterResistance],
+              ['Unconfirmed lines off a wall (steep run)', !hideWallSr,
+                (v: boolean) => setUserSetting('chartHideWallSr', !v)],
             ] as const).map(([label, val, set]) => (
               <label
                 key={label}

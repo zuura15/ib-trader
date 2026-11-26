@@ -26,6 +26,11 @@ export interface UserSettings {
   /** Shade the converging support/resistance wedge (triangle) on charts.
    *  Default off. */
   chartShowWedges: boolean;
+  /** Hide tentative (2-touch) S/R lines that start partway up a
+   *  steep run (a "wall") instead of at a real swing point — the fan
+   *  of dotted lines off a rally or selloff. Display only; the bot's
+   *  lines are unaffected. Default off (lines shown). */
+  chartHideWallSr: boolean;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -35,6 +40,7 @@ export const DEFAULT_SETTINGS: UserSettings = {
   chartShowRsi: true,
   chartShowVolume: true,
   chartShowWedges: false,
+  chartHideWallSr: false,
 };
 
 const KEY_PREFIX = 'ib-trader:settings:';

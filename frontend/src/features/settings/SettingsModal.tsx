@@ -42,6 +42,7 @@ export function SettingsModal({ open, onClose }: Props) {
   const fillMarkerScale = useUserSetting('fillMarkerScale');
   const chartShowVolume = useUserSetting('chartShowVolume');
   const chartShowRsi = useUserSetting('chartShowRsi');
+  const chartHideWallSr = useUserSetting('chartHideWallSr');
   const chartShowWedges = useUserSetting('chartShowWedges');
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
@@ -217,6 +218,15 @@ export function SettingsModal({ open, onClose }: Props) {
               suffix="min"
             />
           </SettingRow>
+          <SettingRow
+            label="Hide lines off a wall"
+            help="Hide the dotted (unconfirmed) S/R lines that start partway up a steep rally or selloff instead of at a real swing point: the fan of lines off the run. Confirmed lines stay. Display only; bots are unaffected."
+          >
+            <Toggle
+              checked={chartHideWallSr}
+              onChange={(v) => setUserSetting('chartHideWallSr', v)}
+            />
+          </SettingRow>
 
           {useStore.getState().dataMode === 'live' && (
             <>
@@ -256,6 +266,7 @@ export function SettingsModal({ open, onClose }: Props) {
               setUserSetting('chartShowVolume', DEFAULT_SETTINGS.chartShowVolume);
               setUserSetting('chartShowRsi', DEFAULT_SETTINGS.chartShowRsi);
               setUserSetting('chartShowWedges', DEFAULT_SETTINGS.chartShowWedges);
+              setUserSetting('chartHideWallSr', DEFAULT_SETTINGS.chartHideWallSr);
             }}
             style={{
               background: 'transparent', border: '1px solid var(--border-default)',

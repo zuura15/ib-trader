@@ -3,6 +3,19 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-25
+
+### Added
+- **Chart setting to hide S/R lines off a wall.** When price runs
+  steeply, each small pause on the way up (or down) anchors its own
+  dotted support/resistance line to the same later pivot, drawing a
+  fan of near-parallel lines. The new "Hide lines off a wall" setting
+  (Settings modal, and the SR filters popover on every chart) hides
+  these: unconfirmed (2-touch) lines whose origin has price on the
+  wrong side of the line within the 10 bars before it. Confirmed lines
+  (3+ touches) always stay. The setting is saved per browser and is off
+  by default. It changes the display only; bot signals are unaffected.
+
 ## 2026-11-24
 
 ### Changed

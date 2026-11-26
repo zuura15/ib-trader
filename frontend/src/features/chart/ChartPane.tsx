@@ -62,6 +62,8 @@ export function ChartPane() {
   };
   const [showCounterSupport, setShowCounterSupport] = useState(false);
   const [showCounterResistance, setShowCounterResistance] = useState(false);
+  // Global (persisted) — hides the fan of lines off a steep run.
+  const hideWallSr = useUserSetting('chartHideWallSr');
   const [filtersOpen, setFiltersOpen] = useState(false);
 
   // Esc closes fullscreen and the filter popover.
@@ -98,7 +100,8 @@ export function ChartPane() {
 
   const activeFilterCount = (showBrokenSr ? 1 : 0)
     + (showCounterSupport ? 1 : 0)
-    + (showCounterResistance ? 1 : 0);
+    + (showCounterResistance ? 1 : 0)
+    + (hideWallSr ? 1 : 0);
 
   const headerLabel = target ? `${target.symbol} · ${target.secType}` : 'Chart';
   const right = (
@@ -203,6 +206,8 @@ export function ChartPane() {
                 {([
                   ['Counter-trend support (down-sloping)', showCounterSupport, setShowCounterSupport],
                   ['Counter-trend resistance (up-sloping)', showCounterResistance, setShowCounterResistance],
+                  ['Unconfirmed lines off a wall (steep run)', !hideWallSr,
+                    (v: boolean) => setUserSetting('chartHideWallSr', !v)],
                 ] as const).map(([label, val, set]) => (
                   <label
                     key={label}

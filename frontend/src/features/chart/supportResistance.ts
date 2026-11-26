@@ -290,6 +290,52 @@ function detectOneSide(
   return out;
 }
 
+/** Bars left of a line's origin checked by ``originatesFromWall``. */
+export const WALL_LOOKBACK_BARS = 10;
+
+/** True when a line's origin pivot sits partway up (or down) a steep
+ *  run — a "wall" — rather than at a real swing point.
+ *
+ *  A genuine support starts at a low that price came *down* into, so
+ *  extending the line a few bars to the left keeps price above it.
+ *  A support whose origin is just a pause in a steep rally has price
+ *  below the line's leftward extension within a few bars: the rally
+ *  climbed through the origin. Each pause in such a rally anchors its
+ *  own line to the same later pivot, which is what draws the fan of
+ *  near-parallel lines off the wall. Resistance is the mirror image.
+ *
+ *  ``closes`` and the line's indices must share one coordinate space.
+ *  ``tolFraction`` is the same strict band the detector uses. */
+export function originatesFromWall(
+  line: Pick<SRLine, 'type' | 'fromIdx' | 'slope' | 'intercept'>,
+  closes: number[],
+  lookback: number = WALL_LOOKBACK_BARS,
+  tolFraction: number = SR_DEFAULTS.toleranceFraction,
+): boolean {
+  const q = line.fromIdx;
+  if (q <= 0 || q >= closes.length) return false;
+  const tol = Math.max(EPS, Math.abs(closes[q]) * tolFraction);
+  for (let i = q - 1; i >= Math.max(0, q - lookback); i--) {
+    const lineAt = line.slope * i + line.intercept;
+    const wrongSide = line.type === 'support'
+      ? closes[i] < lineAt - tol
+      : closes[i] > lineAt + tol;
+    if (wrongSide) return true;
+  }
+  return false;
+}
+
+/** A tentative (2-touch, dotted) line whose origin sits on a wall —
+ *  the lines the "hide lines off a wall" chart setting removes.
+ *  Confirmed lines (3+ touches) are kept even when their origin is on
+ *  a run: enough later pivots respected them to make them real. */
+export function isWallFanLine(
+  line: Pick<SRLine, 'type' | 'fromIdx' | 'slope' | 'intercept' | 'touches'>,
+  closes: number[],
+): boolean {
+  return line.touches < MIN_TOUCHES && originatesFromWall(line, closes);
+}
+
 export function detectSupportResistance(
   bars: Bar[],
   options: Partial<SROptions> = {},
