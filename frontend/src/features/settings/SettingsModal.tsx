@@ -220,7 +220,7 @@ export function SettingsModal({ open, onClose }: Props) {
           </SettingRow>
           <SettingRow
             label="Hide lines off a wall"
-            help="Hide the dotted (unconfirmed) S/R lines that start partway up a steep rally or selloff instead of at a real swing point: the fan of lines off the run. Confirmed lines stay. Display only; bots are unaffected."
+            help="Hide S/R lines that would run into the price line if extended left: lines that start partway along a steep rally or selloff instead of where the trend began, which fan out off the run. Display only; bots are unaffected."
           >
             <Toggle
               checked={chartHideWallSr}

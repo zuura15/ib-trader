@@ -6,6 +6,14 @@ Format: date, type (Added / Changed / Fixed / Deprecated), description.
 ## 2026-11-25
 
 ### Changed
+- **"Wall" now means any line that would run into price if extended
+  left.** The first version only looked 10 bars back from a line's
+  start and spared confirmed (3+ touch) lines, so solid fans off a
+  rally stayed. A line is now a wall line when, extended left from its
+  origin to the first visible bar, it crosses the price line, whatever
+  its touch count. In a fan off a steep run only the outermost line,
+  the one from where the run began, survives. Measured on prod's
+  12-hour 1m data: NQZ6 keeps 6 of 25 lines, GCG7 2 of 9.
 - **Lines off a wall are hidden by default.** The "Hide lines off a
   wall" setting now defaults to on, so the SR filters checkbox for
   them starts unticked. An explicit choice already saved in a browser

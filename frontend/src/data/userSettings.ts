@@ -26,10 +26,10 @@ export interface UserSettings {
   /** Shade the converging support/resistance wedge (triangle) on charts.
    *  Default off. */
   chartShowWedges: boolean;
-  /** Hide tentative (2-touch) S/R lines that start partway up a
-   *  steep run (a "wall") instead of at a real swing point — the fan
-   *  of dotted lines off a rally or selloff. Display only; the bot's
-   *  lines are unaffected. Default on (lines hidden). */
+  /** Hide "wall" S/R lines: lines whose leftward extension runs into
+   *  the visible price line, i.e. that start partway along a steep run
+   *  rather than where the trend began. Display only; the bot's lines
+   *  are unaffected. Default on (lines hidden). */
   chartHideWallSr: boolean;
 }
 

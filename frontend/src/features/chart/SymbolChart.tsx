@@ -15,7 +15,7 @@ import {
   historyHole, HISTORY_CATCH_UP_MAX_AGE_S, HISTORY_CATCH_UP_DELAY_MS, HISTORY_CATCH_UP_MAX_TRIES,
 } from './chartUtils';
 import { computeRsi, detectDivergences, RSI_DEFAULTS } from './rsiDivergence';
-import { detectSupportResistance, isWallFanLine } from './supportResistance';
+import { detectSupportResistance, isWallLine } from './supportResistance';
 import {
   fetchBackendSr, backendLineToSRLine, backendTsToChartTime,
   type BackendSrPayload,
@@ -1927,10 +1927,10 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         const counterResistance = line.type === 'resistance' && line.slope > 0;
         if (counterSupport && !showCounterSupportRef.current) continue;
         if (counterResistance && !showCounterResistanceRef.current) continue;
-        // Wall filter: drop tentative lines whose origin is a pause
-        // partway up a steep run rather than a swing point — the fan
-        // of dotted lines off a rally or selloff (see isWallFanLine).
-        if (allCloses && isWallFanLine(line, allCloses)) continue;
+        // Wall filter: drop lines whose leftward extension runs into
+        // the visible price line — the fan off a steep rally or
+        // selloff (see isWallLine).
+        if (allCloses && isWallLine(line, allCloses, fromIdx)) continue;
         renderedLines.push(line);
         labelCounter += 1;
         const label = `L${labelCounter}`;

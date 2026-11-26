@@ -715,7 +715,7 @@ export function BotChart({
             {([
               ['Counter-trend support (down-sloping)', showCounterSupport, setShowCounterSupport],
               ['Counter-trend resistance (up-sloping)', showCounterResistance, setShowCounterResistance],
-              ['Unconfirmed lines off a wall (steep run)', !hideWallSr,
+              ['Wall lines (would run into price if extended left)', !hideWallSr,
                 (v: boolean) => setUserSetting('chartHideWallSr', !v)],
             ] as const).map(([label, val, set]) => (
               <label
