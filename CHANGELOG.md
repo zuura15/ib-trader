@@ -3,6 +3,30 @@
 All notable changes to IB Trader are recorded here.
 Format: date, type (Added / Changed / Fixed / Deprecated), description.
 
+## 2026-11-27
+
+### Added
+- **Futures quote watchdog with automatic reconnect.** After an IB
+  market-data farm blip, IB sometimes stops streaming every futures
+  contract while stocks keep ticking (2026-11-25, and 2026-11-27 for
+  30 min). The existing watchdog keys off the all-symbol heartbeat, so
+  it never fired. A new engine loop checks each streaming FUT contract
+  every 15 s; when one that was ticking goes 60 s without a tick during
+  Globex hours (confirmed twice), it raises a WARNING naming the silent
+  contracts and reconnects IB, once per episode with a 30-minute
+  cooldown. The alert clears itself when the streams resume. Tunables:
+  `futures_watchdog_*` in `settings.yaml`.
+- **STALE tag on chart headers.** A futures chart shows a grey STALE
+  tag next to its price when no live quote has arrived for over a
+  minute while Globex is open.
+
+### Fixed
+- **SMART_MARKET walker now steps in the contract's tick.** It stepped
+  a hardcoded $0.01, so on gold ($0.10 tick) most amends were off-tick
+  and IB rejected them ("Invalid Price"); a GCG7 sell took ~50 s to
+  fill. Each step is now one contract tick, amended prices are snapped
+  to the tick grid, and the ETH slippage floor is snapped conservatively.
+
 ## 2026-11-25
 
 ### Changed

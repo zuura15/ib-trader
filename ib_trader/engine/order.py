@@ -80,7 +80,7 @@ from ib_trader.engine.pricing import (
     calc_mid, calc_profit_taker_price, calc_profit_taker_price_short, calc_step_price,
     calc_shares_from_dollars,
 )
-from ib_trader.engine.ticks import STK_TICK
+from ib_trader.engine.ticks import STK_TICK, snap_to_tick
 from ib_trader.repl.commands import BuyCommand, SellCommand, CloseCommand, Strategy
 
 logger = logging.getLogger(__name__)
@@ -1572,13 +1572,18 @@ async def _execute_bid_ask_order(
     ctx.tracker.unregister(ib_order_id)
 
 
-def _slippage_floor(trigger_price: Decimal, side: str, max_slip_pct: Decimal) -> Decimal:
+def _slippage_floor(
+    trigger_price: Decimal, side: str, max_slip_pct: Decimal,
+    tick_size: Decimal = STK_TICK,
+) -> Decimal:
     """Compute the worst price we're willing to walk to on SMART_MARKET
     during ETH. For SELL this is the lowest (trigger × (1 - pct)); for
-    BUY it's the highest (trigger × (1 + pct))."""
+    BUY it's the highest (trigger × (1 + pct)). Snapped onto the
+    contract's tick on the conservative side (SELL up, BUY down) so the
+    walker can sit exactly at the floor without IB rejecting the price."""
     if side == "SELL":
-        return (trigger_price * (Decimal("1") - max_slip_pct)).quantize(Decimal("0.01"))
-    return (trigger_price * (Decimal("1") + max_slip_pct)).quantize(Decimal("0.01"))
+        return snap_to_tick(trigger_price * (Decimal("1") - max_slip_pct), tick_size, "up")
+    return snap_to_tick(trigger_price * (Decimal("1") + max_slip_pct), tick_size, "down")
 
 
 def _apply_cap(step_price: Decimal, floor_price: Decimal, side: str) -> Decimal:
@@ -1659,9 +1664,15 @@ async def _walk_limit_aggressive(
     ctx: AppContext, con_id: int, ib_order_id: str, symbol: str, side: str,
     trigger_price: Decimal, interval_seconds: float,
     total_duration_seconds: float | None, floor_price: Decimal | None,
-    target_qty: Decimal,
+    target_qty: Decimal, tick_size: Decimal = STK_TICK,
 ) -> dict:
     """Reprice loop for SMART_MARKET.
+
+    ``tick_size`` is the contract's minimum price increment. Each step
+    moves exactly one tick, and every amended price is snapped onto the
+    tick grid — IB rejects off-tick prices ("Invalid Price", code 201),
+    which on 2026-11-25 left a GCG7 sell ($0.10 tick) walking in $0.01
+    steps for ~50 s.
 
     Every ``interval_seconds`` (default ~100 ms) we read the current
     mid and step the limit aggressively toward the far side (bid for
@@ -1768,7 +1779,7 @@ async def _walk_limit_aggressive(
             else:
                 # No data — skip this tick rather than amend blindly.
                 continue
-        tick = Decimal("0.01")
+        tick = tick_size if tick_size > 0 else STK_TICK
         if side == "SELL":
             step_price = last_sent - tick
             # If the market moved below us, chase it down in one jump.
@@ -1791,7 +1802,11 @@ async def _walk_limit_aggressive(
                 return {"status": "cap_reached", "hit_cap": True,
                         "last_sent_price": last_sent}
 
-        step_price = step_price.quantize(Decimal("0.01"))
+        # Snap toward the passive side (SELL up, BUY down) so snapping
+        # never crosses the floor or overshoots the quote we chased.
+        step_price = snap_to_tick(step_price, tick, "up" if side == "SELL" else "down")
+        if floor_price is not None:
+            step_price = _apply_cap(step_price, floor_price, side)
         if step_price == last_sent:
             continue
 
@@ -1905,7 +1920,7 @@ async def _execute_smart_market_order(
             )
         bid = ask = last
     trigger_price = calc_mid(bid, ask, tick_size=order_ctx.tick_size)
-    floor_price = _slippage_floor(trigger_price, side, max_slip)
+    floor_price = _slippage_floor(trigger_price, side, max_slip, order_ctx.tick_size)
     rth = not is_outside_rth()
 
     ctx.router.emit(
@@ -1965,6 +1980,7 @@ async def _execute_smart_market_order(
         total_duration_seconds=rth_duration if rth else None,
         floor_price=None if rth else floor_price,
         target_qty=qty,
+        tick_size=order_ctx.tick_size,
     )
 
     # 3. Post-walk decision.
@@ -4361,7 +4377,9 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             settings.get("smart_market_eth_max_slippage_pct", 0.005)
         ))
         sm_rth = not is_outside_rth()
-        sm_floor = _slippage_floor(initial_price, close_side, sm_max_slip)
+        sm_floor = _slippage_floor(
+            initial_price, close_side, sm_max_slip, close_ctx.tick_size,
+        )
 
         sm_walk = await _walk_limit_aggressive(
             ctx, con_id, ib_order_id, entry_symbol, close_side, initial_price,
@@ -4369,6 +4387,7 @@ async def execute_close(cmd: "CloseCommand", ctx: AppContext) -> None:
             total_duration_seconds=sm_rth_duration if sm_rth else None,
             floor_price=None if sm_rth else sm_floor,
             target_qty=qty_to_close,
+            tick_size=close_ctx.tick_size,
         )
 
         # ETH cap reached — leave the limit resting, alert, return.

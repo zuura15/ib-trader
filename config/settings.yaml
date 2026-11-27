@@ -111,6 +111,17 @@ prophylactic_resub_stagger_seconds: 2
 # initial watchlist + position subscribe has room to settle.
 prophylactic_resub_startup_delay_seconds: 600
 
+# Per-contract futures quote watchdog. A FUT contract that was ticking
+# and goes silent this long during Globex hours raises a WARNING and,
+# with auto_reconnect, reconnects IB once per episode (the fix for the
+# post-farm-blip futures stall). Cooldown spaces automatic reconnects.
+# Set ``futures_watchdog_interval_seconds: 0`` to disable.
+futures_watchdog_interval_seconds: 15
+futures_watchdog_silence_threshold_seconds: 60
+futures_watchdog_min_confirmations: 2
+futures_watchdog_auto_reconnect: true
+futures_watchdog_reconnect_cooldown_seconds: 1800
+
 cache_ttl_seconds: 86400
 redis_url: "redis://localhost:6379/0"
 engine_internal_port: 8081

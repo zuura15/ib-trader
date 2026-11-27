@@ -4,6 +4,7 @@ import { SymbolChart, type SymbolChartHandle } from '../chart/SymbolChart';
 import { BarCloseCountdown } from '../chart/ChartPane';
 import { TIMEFRAMES, VISIBLE_MINUTES, type ChartTimeframe } from '../chart/chartUtils';
 import { RsiScaleStrip } from '../chart/RsiScaleStrip';
+import { isQuoteStale } from '../chart/quoteStaleness';
 import { setUserSetting, useUserSetting } from '../../data/userSettings';
 import { useStore, type ChartTarget } from '../../data/store';
 import { useBotState, type BotPositionState } from '../../data/useBotState';
@@ -95,6 +96,22 @@ export function BotChart({
   // SQLite). Polled on a slow 5s interval plus the same triggers the
   // Orders panel uses (command completion, resync).
   const [lastPrice, setLastPrice] = useState<number | null>(null);
+  // Live-quote staleness (grey STALE tag). ``since`` starts at mount /
+  // symbol change so a stream that never ticks is flagged too.
+  const lastTickAtRef = useRef<number>(Date.now());
+  const [quoteStale, setQuoteStale] = useState(false);
+  const handleQuoteTick = useCallback(() => {
+    lastTickAtRef.current = Date.now();
+    setQuoteStale((prev) => (prev ? false : prev));
+  }, []);
+  useEffect(() => {
+    lastTickAtRef.current = Date.now();
+    setQuoteStale(false);
+    const id = setInterval(() => {
+      setQuoteStale(isQuoteStale(secType, lastTickAtRef.current, Date.now()));
+    }, 5_000);
+    return () => clearInterval(id);
+  }, [symbol, secType]);
   // Tagged with timeframe+symbol: the chart remounts on either, and the
   // previous chart's reading must not show against the new one.
   const [rsiReading, setRsiReading] = useState<{ key: string; value: number } | null>(null);
@@ -806,6 +823,20 @@ export function BotChart({
             {lastPrice.toFixed(priceDecimals)}
           </span>
         )}
+        {quoteStale && (
+          <span
+            style={{
+              fontSize: 9, fontWeight: 600, letterSpacing: 0.5,
+              padding: '0 4px', borderRadius: 3,
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border-default)',
+            }}
+            title="No live quote for over a minute while futures should be trading. The price may be out of date; the engine reconnects IB automatically if the stream stays silent."
+            data-testid={`chart-header-stale-${botId}`}
+          >
+            STALE
+          </span>
+        )}
         {recommendation && (
           <RecommendationBadge
             rec={recommendation}
@@ -925,6 +956,7 @@ export function BotChart({
           onPricePick={onPricePick}
           pickTickSize={pickTickSize}
           onLastPrice={setLastPrice}
+          onQuoteTick={handleQuoteTick}
           onRsi={onRsi}
           onRecommendation={setRecommendation}
           orderLines={orderLines}

@@ -311,6 +311,20 @@ class IBClientBase(ABC):
     # Streaming market data (ref-counted)
     # ------------------------------------------------------------------
 
+    def is_connected(self) -> bool:
+        """True while the broker socket is up. Default: assume connected."""
+        return True
+
+    def streaming_activity(self) -> list[dict]:
+        """Last-tick time for every live streaming subscription.
+
+        One dict per subscription: ``con_id``, ``symbol`` (local symbol,
+        e.g. ``NQZ6``), ``sec_type`` and ``last_tick_at`` (aware UTC
+        datetime of the last tick IB pushed, or None if none yet). Read
+        from in-memory ticker state; no IB API call. Default: none.
+        """
+        return []
+
     @abstractmethod
     async def subscribe_market_data(
         self, con_id: int, symbol: str, *, count_ref: bool = True,

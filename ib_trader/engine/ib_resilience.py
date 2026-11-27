@@ -27,6 +27,15 @@ What this module adds:
     every watchlist + position market-data subscription. Used by the
     manual ``POST /engine/ib/reconnect`` endpoint.
 
+  * :func:`futures_quote_watchdog_loop` watches each streaming FUT
+    contract on its own. The tick-silence watchdog above keys off the
+    cross-symbol heartbeat, so it can't see futures going quiet while
+    stocks keep ticking (2026-11-25 and 2026-11-27: after an IB farm
+    blip every FUT stream stopped, stocks didn't, and nothing fired
+    for 30 min). When a futures contract that was ticking goes silent
+    during Globex hours, it raises a WARNING and reconnects IB once per
+    episode — the manual fix that revived the streams both times.
+
   A daily 02:30 PT scheduled reconnect used to live here; it was removed
   2026-10-06. The watchdog, the hourly prophylactic resubscribe and the
   engine's reconnect-with-backoff loop cover what it was for, and its
@@ -340,6 +349,222 @@ async def tick_silence_watchdog_loop(ctx: "AppContext") -> None:
         except Exception:
             logger.exception('{"event": "TICK_WATCHDOG_LOOP_ERROR"}')
             # Don't tight-loop on persistent failure.
+            await asyncio.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Per-contract futures quote watchdog
+# ---------------------------------------------------------------------------
+
+DEFAULT_FUT_SILENCE_THRESHOLD_S = 60
+DEFAULT_FUT_WATCHDOG_INTERVAL_S = 15
+DEFAULT_FUT_MIN_CONFIRMATIONS = 2
+DEFAULT_FUT_RECONNECT_COOLDOWN_S = 1800
+FUT_WATCHDOG_TRIGGER = "FUTURES_QUOTES_SILENT"
+FUT_WATCHDOG_DEDUP_KEY = "watchdog:futures-quotes"
+
+
+def silent_futures(
+    activity: list[dict], now: datetime, threshold_s: float,
+) -> list[dict]:
+    """Streaming FUT contracts with no tick for more than ``threshold_s``.
+
+    A contract that hasn't ticked even once since it was subscribed is
+    skipped: that's an illiquid month or a fresh subscription, not a
+    stream that stopped. Returns rows with ``silent_s`` added, loudest
+    first.
+    """
+    out: list[dict] = []
+    for row in activity:
+        if (row.get("sec_type") or "").upper() != "FUT":
+            continue
+        ts = row.get("last_tick_at")
+        if ts is None:
+            continue
+        silent_s = (now - ts).total_seconds()
+        if silent_s > threshold_s:
+            out.append({**row, "silent_s": round(silent_s, 1)})
+    out.sort(key=lambda r: -r["silent_s"])
+    return out
+
+
+def futures_ticks_expected(now: datetime | None = None) -> bool:
+    """True while CME Globex should be streaming futures quotes.
+
+    Closed Fri 16:00 CT → Sun 17:00 CT and during the Mon–Thu 16:00–17:00
+    CT daily break. Holiday halts aren't modeled; a silent holiday
+    session costs one reconnect and one WARNING per episode.
+    """
+    from ib_trader.engine.market_hours_futures import CT, is_cme_equity_break
+
+    ct_now = (now or datetime.now(CT)).astimezone(CT)
+    wd = ct_now.weekday()  # Mon=0 … Sun=6
+    if wd == 5:
+        return False
+    if wd == 4 and ct_now.hour >= 16:
+        return False
+    if wd == 6 and ct_now.hour < 17:
+        return False
+    return not is_cme_equity_break(ct_now)
+
+
+@dataclass
+class FuturesWatchdogState:
+    """Decides what the futures watchdog does on each poll.
+
+    An *episode* starts when silence is confirmed and ends when every
+    FUT contract is ticking again. Within an episode the watchdog
+    reconnects at most once (and never within ``cooldown_s`` of its
+    previous reconnect), then only keeps the alert up — so a contract
+    that stays dark after a reconnect can't cause a reconnect loop.
+    """
+    min_confirmations: int = DEFAULT_FUT_MIN_CONFIRMATIONS
+    cooldown_s: float = DEFAULT_FUT_RECONNECT_COOLDOWN_S
+    auto_reconnect: bool = True
+    consecutive: int = 0
+    in_episode: bool = False
+    reconnected_this_episode: bool = False
+    last_reconnect_mono: float | None = None
+
+    def step(self, silent_count: int, now_mono: float) -> str:
+        """Return ``"none"``, ``"alert"``, ``"reconnect"`` or ``"resolve"``."""
+        if silent_count == 0:
+            self.consecutive = 0
+            if self.in_episode:
+                self.in_episode = False
+                self.reconnected_this_episode = False
+                return "resolve"
+            return "none"
+        self.consecutive += 1
+        if self.consecutive < self.min_confirmations:
+            return "none"
+        self.in_episode = True
+        cooled = (
+            self.last_reconnect_mono is None
+            or now_mono - self.last_reconnect_mono >= self.cooldown_s
+        )
+        if self.auto_reconnect and not self.reconnected_this_episode and cooled:
+            self.reconnected_this_episode = True
+            self.last_reconnect_mono = now_mono
+            return "reconnect"
+        return "alert"
+
+
+def _fut_watchdog_message(silent: list[dict], reconnecting: bool) -> str:
+    names = ", ".join(
+        f"{r.get('symbol') or r.get('con_id')} {r['silent_s']:.0f}s" for r in silent[:8]
+    )
+    more = f" (+{len(silent) - 8} more)" if len(silent) > 8 else ""
+    tail = (
+        "Reconnecting to IB to restart the streams."
+        if reconnecting else
+        "Still silent after an automatic reconnect — check the Gateway; "
+        "charts and bots may be on stale futures prices."
+    )
+    return f"Futures quotes silent: {names}{more}. {tail}"
+
+
+async def _resolve_alert(redis, trigger: str, dedup_key: str) -> None:
+    """Drop a dedup'd alert from ``alerts:active`` (same id scheme as log_and_alert)."""
+    if redis is None:
+        return
+    try:
+        import uuid as _uuid
+        from ib_trader.redis.state import StateKeys
+        from ib_trader.redis.streams import publish_activity
+
+        alert_id = str(_uuid.uuid5(_uuid.NAMESPACE_DNS, f"{trigger}|{dedup_key}"))
+        if await redis.hdel(StateKeys.alerts_active(), alert_id):
+            await publish_activity(redis, "alerts")
+    except Exception:
+        logger.exception('{"event": "ALERT_RESOLVE_FAILED", "trigger": "%s"}', trigger)
+
+
+async def futures_quote_watchdog_loop(ctx: "AppContext") -> None:
+    """Alert on, and recover from, per-contract futures quote silence.
+
+    Every ``futures_watchdog_interval_seconds`` it reads each streaming
+    subscription's last-tick time from the IB client. During Globex
+    hours, a FUT contract that was ticking and has been silent for more
+    than ``futures_watchdog_silence_threshold_seconds`` (confirmed on
+    ``futures_watchdog_min_confirmations`` polls in a row) raises a
+    WARNING and — if ``futures_watchdog_auto_reconnect`` — triggers
+    :func:`reconnect_ib` once per episode. The alert clears itself when
+    every futures stream is ticking again.
+    """
+    from ib_trader.logging_.alerts import log_and_alert
+
+    settings = ctx.settings
+    interval_s = float(settings.get(
+        "futures_watchdog_interval_seconds", DEFAULT_FUT_WATCHDOG_INTERVAL_S))
+    threshold_s = float(settings.get(
+        "futures_watchdog_silence_threshold_seconds", DEFAULT_FUT_SILENCE_THRESHOLD_S))
+    startup_grace_s = float(settings.get(
+        "tick_watchdog_startup_grace_seconds", DEFAULT_STARTUP_GRACE_S))
+    state = FuturesWatchdogState(
+        min_confirmations=int(settings.get(
+            "futures_watchdog_min_confirmations", DEFAULT_FUT_MIN_CONFIRMATIONS)),
+        cooldown_s=float(settings.get(
+            "futures_watchdog_reconnect_cooldown_seconds", DEFAULT_FUT_RECONNECT_COOLDOWN_S)),
+        auto_reconnect=bool(settings.get("futures_watchdog_auto_reconnect", True)),
+    )
+    if interval_s <= 0:
+        logger.info('{"event": "FUT_WATCHDOG_DISABLED"}')
+        return
+
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            if loop.time() - started < startup_grace_s:
+                continue
+            # A dropped socket is the reconnect-with-backoff loop's job.
+            if not ctx.ib.is_connected():
+                continue
+            if futures_ticks_expected():
+                silent = silent_futures(
+                    ctx.ib.streaming_activity(), datetime.now(PT), threshold_s,
+                )
+            else:
+                silent = []
+            action = state.step(len(silent), loop.time())
+            if action == "none":
+                continue
+            if action == "resolve":
+                logger.info('{"event": "FUT_WATCHDOG_RECOVERED"}')
+                await _resolve_alert(ctx.redis, FUT_WATCHDOG_TRIGGER, FUT_WATCHDOG_DEDUP_KEY)
+                continue
+
+            reconnecting = action == "reconnect"
+            logger.warning(
+                '{"event": "FUT_WATCHDOG_SILENCE", "action": "%s", "silent": %s}',
+                action, json.dumps(
+                    [{"symbol": r.get("symbol"), "con_id": r.get("con_id"),
+                      "silent_s": r["silent_s"]} for r in silent]),
+            )
+            try:
+                await log_and_alert(
+                    redis=ctx.redis,
+                    trigger=FUT_WATCHDOG_TRIGGER,
+                    message=_fut_watchdog_message(silent, reconnecting),
+                    severity="WARNING",
+                    exc_info=False,
+                    dedup_key=FUT_WATCHDOG_DEDUP_KEY,
+                )
+            except Exception:
+                logger.exception('{"event": "FUT_WATCHDOG_ALERT_FAILED"}')
+            if reconnecting:
+                result = await reconnect_ib(ctx, source="futures_watchdog")
+                if not result.reconnect_ok:
+                    logger.error(
+                        '{"event": "FUT_WATCHDOG_RECONNECT_FAILED", "error": %s}',
+                        json.dumps(result.reconnect_error),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('{"event": "FUT_WATCHDOG_LOOP_ERROR"}')
             await asyncio.sleep(5)
 
 

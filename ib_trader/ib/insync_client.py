@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -217,6 +217,24 @@ def _bar_data_type_for(contract, what_to_show: str) -> str:
         return "AGGTRADES"
     return what_to_show
 
+
+
+def _display_symbol(contract) -> str | None:
+    """``localSymbol`` when IB filled it in, else root (+ expiry for FUT).
+
+    The order-placement contract cache doesn't carry ``localSymbol``, so
+    a cached FUT reads ``GC 202702`` rather than ``GCG7``.
+    """
+    if contract is None:
+        return None
+    local = getattr(contract, "localSymbol", None)
+    if local:
+        return local
+    sym = getattr(contract, "symbol", None)
+    expiry = getattr(contract, "lastTradeDateOrContractMonth", None)
+    if sym and expiry and getattr(contract, "secType", None) == "FUT":
+        return f"{sym} {expiry[:6]}"
+    return sym
 
 class InsyncClient(IBClientBase):
     """IB API client implemented via ib_async.
@@ -2420,6 +2438,23 @@ class InsyncClient(IBClientBase):
             "mkt_ok": mkt_ok, "mkt_fail": mkt_fail, "mkt_total": len(mkt_items),
             "bar_ok": bar_ok, "bar_fail": bar_fail, "bar_total": len(bar_items)
         }
+
+    def streaming_activity(self) -> list[dict]:
+        """Last-tick time per live streaming subscription (see base)."""
+        rows: list[dict] = []
+        for con_id, entry in list(self._streaming.items()):
+            contract = entry.get("contract")
+            ticker = entry.get("ticker")
+            ts = getattr(ticker, "time", None) if ticker is not None else None
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            rows.append({
+                "con_id": con_id,
+                "symbol": _display_symbol(contract),
+                "sec_type": getattr(contract, "secType", None),
+                "last_tick_at": ts,
+            })
+        return rows
 
     def get_ticker(self, con_id: int) -> dict | None:
         """Return current streaming ticker data, or None."""

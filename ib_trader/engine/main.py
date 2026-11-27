@@ -356,6 +356,7 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
         # --- Start background tasks ---
         from ib_trader.engine.ib_resilience import (
             tick_silence_watchdog_loop, prophylactic_resubscribe_loop,
+            futures_quote_watchdog_loop,
         )
         bg_tasks = [
             asyncio.create_task(_heartbeat_loop(ctx, pid)),
@@ -382,6 +383,10 @@ async def run_engine(ctx: AppContext, symbols: list[str]) -> None:
             # Tick-silence watchdog: detect quote-stream stalls within ~60 s
             # instead of waking up hours later to discover stale prices.
             asyncio.create_task(tick_silence_watchdog_loop(ctx)),
+            # Per-contract futures watchdog: the heartbeat above stays fresh
+            # while stocks tick, so it misses futures-only stalls. This one
+            # alerts and reconnects IB once when a FUT stream goes dark.
+            asyncio.create_task(futures_quote_watchdog_loop(ctx)),
 
             # Hourly prophylactic resubscribe: cancels + re-issues every
             # market-data subscription to unstick IB-side parked symbols

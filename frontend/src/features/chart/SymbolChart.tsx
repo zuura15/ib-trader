@@ -204,6 +204,9 @@ interface Props {
    *  historical load, so pane headers can show the current price
    *  without opening a second quote socket. */
   onLastPrice?: (price: number) => void;
+  /** Fires on every live quote frame for this symbol (not on history
+   *  loads), so the header can flag a stream that stopped ticking. */
+  onQuoteTick?: () => void;
   /** Latest RSI of the displayed bars — the value the RSI pane shows.
    *  Fires on each history load and live tick. */
   onRsi?: (value: number) => void;
@@ -291,6 +294,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
     pickTickSize = 0.01,
     compactAxis = false,
     onLastPrice,
+    onQuoteTick,
     onRsi,
     onRecommendation,
     orderLines,
@@ -322,6 +326,8 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
   // when the parent passes a fresh closure.
   const onLastPriceRef = useRef(onLastPrice);
   useEffect(() => { onLastPriceRef.current = onLastPrice; }, [onLastPrice]);
+  const onQuoteTickRef = useRef(onQuoteTick);
+  useEffect(() => { onQuoteTickRef.current = onQuoteTick; }, [onQuoteTick]);
   const onRsiRef = useRef(onRsi);
   useEffect(() => { onRsiRef.current = onRsi; }, [onRsi]);
 
@@ -3110,6 +3116,7 @@ export const SymbolChart = forwardRef<SymbolChartHandle, Props>(function SymbolC
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type !== 'quote' || msg.symbol !== target.symbol) return;
+          onQuoteTickRef.current?.();
           // Drop ticks until the historical setData has populated the
           // series. lightweight-charts auto-fits the time scale to the
           // first few points if it gets data in an empty series, and
