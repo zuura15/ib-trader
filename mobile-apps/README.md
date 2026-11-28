@@ -1,0 +1,1 @@
+- [android-launcher](android-launcher/README.md) — sideloaded Android home-screen launcher that opens IB Trader through an embedded Tailscale tsnet node.
